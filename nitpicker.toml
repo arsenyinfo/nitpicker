@@ -1,0 +1,39 @@
+[aggregator]
+name = "gemini"
+model = "gemini-3-flash-preview"
+provider = "gemini"
+auth = "oauth"
+
+[[reviewer]]
+name = "gemini"
+model = "gemini-3.1-pro-preview"
+provider = "gemini"
+auth = "oauth"
+
+[[reviewer]]
+name = "kimi"
+model = "kimi-for-coding"
+provider = "anthropic_compatible"
+base_url = "https://api.kimi.com/coding/"
+api_key_env = "KIMI_API_KEY"
+
+[[reviewer]]
+name = "minimax"
+model = "MiniMax-M2.5"
+provider = "anthropic_compatible"
+base_url = "https://api.minimax.io/anthropic"
+api_key_env = "MINIMAX_API_KEY"
+
+[[reviewer]]
+name = "zai"
+model = "glm-5"
+provider = "anthropic_compatible"
+base_url = "https://api.z.ai/api/anthropic"
+api_key_env = "ZAI_API_KEY"
+
+# [[reviewer]]
+# name = "local"
+# model = "qwen2.5-coder-32b"
+# provider = "openai_compatible"
+# base_url = "http://localhost:1234/v1"
+# api_key_env = "LMSTUDIO_API_KEY"
