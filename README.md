@@ -23,10 +23,10 @@ cargo install --git https://github.com/arsenyinfo/nitpicker
 nitpicker
 
 # review a specific repo
-./target/release/nitpicker --repo /path/to/repo
+nitpicker --repo /path/to/repo
 
-# custom prompt
-./target/release/nitpicker --repo /path/to/repo --prompt "Review only src/api/"
+# customized prompt
+nitpicker --repo /path/to/repo --prompt "Review only src/api/"
 ```
 
 ## Configuration
@@ -35,7 +35,7 @@ Place `nitpicker.toml` at the root of the repo being reviewed, or pass `--config
 
 ```toml
 [aggregator]
-model = "claude-opus-4-6"
+model = "claude-sonnet-4-6"
 provider = "anthropic"
 max_tokens = 8192        # optional, default: no limit
 
@@ -52,6 +52,8 @@ base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 ```
 
+It is recommended to use providers that were not used for the initial building to enforce diversity of thought. 
+
 ### Provider types
 
 | `provider` | Auth | Required fields |
@@ -63,17 +65,17 @@ api_key_env = "OPENAI_API_KEY"
 
 ### Gemini OAuth 
 
-Gemini can be used via Google Code Assist OAuth (for free or with subscription, limits apply) — no API key needed, just a Google account.
+Gemini can be used via Google Code Assist OAuth (for free or with subscription, limits apply) — no API key needed, just a Google account. This approach mimics the auth of [Gemini CLI](https://geminicli.com/), so no guarantees on reliability.
 
 ```toml
 [aggregator]
-model = "gemini-2.5-pro"
+model = "gemini-3-flash-preview"
 provider = "gemini"
 auth = "oauth"
 
 [[reviewer]]
 name = "gemini"
-model = "gemini-2.5-pro"
+model = "gemini-3.1-pro-preview"
 provider = "gemini"
 auth = "oauth"
 ```
