@@ -1,14 +1,22 @@
-# nitpicker — codebase guide
+# nitpicker
 
-## Build & run
+Multi-reviewer code review using LLMs. Spawns parallel agents with different models/prompts, aggregates their feedback into a final verdict.
+
+## Quick start
 
 ```bash
-cargo check                          # fast type-check
-cargo build                          # debug build
-cargo build --release                # release build
-cargo run -- --repo .                # run against current repo
-cargo run -- --gemini-oauth          # trigger Gemini auth flow
-RUST_LOG=nitpicker=debug cargo run -- --repo .
+# Review current PR/diff
+cargo run -- --repo .
+
+# Static analysis of existing code
+cargo run -- --repo . --analyze
+cargo run -- --repo . --analyze src/db/
+
+# Custom focus
+cargo run -- --repo . --prompt "focus on SQL injection"
+
+# Gemini OAuth (first-time setup)
+cargo run -- --gemini-oauth
 ```
 
 ## Architecture
@@ -25,7 +33,7 @@ gemini_proxy/   local HTTP proxy that translates Gemini API calls to Google Code
 
 ### Request flow
 
-1. `review.rs` spawns one `tokio::task` per `[[reviewer]]`
+1. `review.rs` spawns one `tokio::task` per `[[reviewer]]` in config
 2. Each task runs `agent.rs::run_agent` — an agentic loop: call LLM → execute tool calls → feed results back → repeat until the model returns text (max 100 turns)
 3. All reviewer outputs are collected, concatenated, and sent to the aggregator model in a single completion call
 4. The aggregator's response is printed to stdout
@@ -43,6 +51,8 @@ Tools return `String`, never `Err` — errors are returned as `"Error: ..."` str
 
 `GitTool` only allows a fixed allowlist of read-only subcommands. Commands are passed directly to `Command::new("git").args(tokens)` — no shell involved.
 
+`GrepTool` recursively searches files, detecting binary files by checking for null bytes in the first 8 KiB.
+
 ### Gemini OAuth proxy (`gemini_proxy/`)
 
 When `auth = "oauth"` is set for a Gemini reviewer/aggregator, nitpicker:
@@ -53,6 +63,15 @@ When `auth = "oauth"` is set for a Gemini reviewer/aggregator, nitpicker:
 The OAuth client credentials in `mod.rs` are Google's public installed-app credentials — intentionally public, same pattern as `gcloud` CLI.
 
 Token stored at `~/.nitpicker/gemini-token.json` with `0o600` permissions.
+
+## Configuration
+
+Config hierarchy (first wins):
+1. `--config <path>` (explicit)
+2. `nitpicker.toml` in repo root
+3. `~/.nitpicker/config.toml` (global)
+
+Reviewers automatically load project context from `CLAUDE.md` or `AGENTS.md` if present in the repo root.
 
 ## Adding a new provider
 
@@ -67,3 +86,4 @@ Token stored at `~/.nitpicker/gemini-token.json` with `0o600` permissions.
 - Tool results are truncated to 50k bytes before being sent to the LLM
 - Git tool output is truncated to 50k chars
 - Agent loop is capped at 100 turns per reviewer
+- Context files (`CLAUDE.md`, `AGENTS.md`) are limited to 50k chars

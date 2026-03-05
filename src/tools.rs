@@ -219,7 +219,9 @@ impl Tool for GrepTool {
             let regex = Regex::new(pattern)?;
             let mut results = Vec::new();
             if base_path.is_file() {
-                search_file(&base_path, &regex, &work_dir, &mut results).await;
+                if let Err(e) = search_file(&base_path, &regex, &work_dir, &mut results).await {
+                    warn!("skipping file {}: {e}", base_path.display());
+                }
             } else {
                 let mut stack = vec![base_path];
                 while let Some(path) = stack.pop() {
@@ -253,7 +255,12 @@ impl Tool for GrepTool {
                                     continue;
                                 }
                             }
-                            search_file(&entry_path, &regex, &work_dir, &mut results).await;
+                            match search_file(&entry_path, &regex, &work_dir, &mut results).await {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    warn!("skipping file {}: {e}", entry_path.display());
+                                }
+                            }
                             if results.len() >= 100 {
                                 break;
                             }
@@ -272,14 +279,30 @@ impl Tool for GrepTool {
     }
 }
 
-async fn search_file(path: &PathBuf, regex: &Regex, work_dir: &Path, results: &mut Vec<String>) {
-    let content = match fs::read_to_string(path).await {
-        Ok(content) => content,
-        Err(e) => {
-            warn!("skipping unreadable file {}: {e}", path.display());
-            return;
-        }
-    };
+async fn search_file(path: &PathBuf, regex: &Regex, work_dir: &Path, results: &mut Vec<String>) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    
+    // Open file and check first 8KB for binary content before reading full file
+    let mut file = fs::File::open(path).await?;
+    let mut buffer = [0u8; 8192];
+    let bytes_read = file.read(&mut buffer).await?;
+    
+    // Check for null bytes in the sample (binary file indicator)
+    if buffer[..bytes_read].contains(&0) {
+        return Ok(()); // Skip binary files silently
+    }
+    
+    // Read the rest of the file
+    let mut remaining = Vec::new();
+    file.read_to_end(&mut remaining).await?;
+    
+    // Combine sample + remaining into full content
+    let mut full_content = Vec::with_capacity(bytes_read + remaining.len());
+    full_content.extend_from_slice(&buffer[..bytes_read]);
+    full_content.extend_from_slice(&remaining);
+    
+    // Convert to string and search
+    let content = String::from_utf8_lossy(&full_content);
     let relative = path.strip_prefix(work_dir).unwrap_or(path);
     for (idx, line) in content.lines().enumerate() {
         if regex.is_match(line) {
@@ -289,6 +312,7 @@ async fn search_file(path: &PathBuf, regex: &Regex, work_dir: &Path, results: &m
             }
         }
     }
+    Ok(())
 }
 
 fn glob_to_regex(pattern: &str) -> Result<Regex> {
@@ -302,6 +326,16 @@ fn glob_to_regex(pattern: &str) -> Result<Regex> {
         }
     }
     Ok(Regex::new(&format!("^{}$", escaped))?)
+}
+
+/// Check if a file is binary by reading the first 8 KiB and checking for null bytes.
+/// Returns `true` if binary, `false` if text, or an error if the file cannot be read.
+pub async fn is_binary_file(path: &Path) -> std::io::Result<bool> {
+    use tokio::io::AsyncReadExt;
+    let mut file = fs::File::open(path).await?;
+    let mut buffer = [0u8; 8192];
+    let bytes_read = file.read(&mut buffer).await?;
+    Ok(buffer[..bytes_read].contains(&0)) // null byte = binary
 }
 
 pub struct GitTool;

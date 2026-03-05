@@ -1,7 +1,7 @@
 use crate::agent::{AgentConfig, run_agent};
 use crate::config::{Config, ProviderType, ReviewerConfig};
 use crate::llm::{Completion, FinishReason, LLMClient, LLMProvider, WithRetryExt};
-use crate::tools::all_tools;
+use crate::tools::{all_tools, is_binary_file};
 use eyre::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rig::completion::Message;
@@ -17,7 +17,7 @@ pub async fn run_review(
     verbose: bool,
 ) -> Result<String> {
     let tools = all_tools();
-    let system_prompt = build_system_prompt(user_prompt);
+    let system_prompt = build_system_prompt(repo, user_prompt).await;
     let mut handles = Vec::new();
 
     let mp = MultiProgress::new();
@@ -145,30 +145,106 @@ pub async fn run_review(
     Ok(response.text())
 }
 
-fn build_system_prompt(user_prompt: &str) -> String {
+const MAX_CONTEXT_SIZE: usize = 50_000;
+
+async fn build_system_prompt(repo: &Path, user_prompt: &str) -> String {
     let user_instructions = if user_prompt.trim().is_empty() {
         String::new()
     } else {
         format!("\n\nFocus your review on: {user_prompt}")
     };
 
+    let mut context = String::new();
+    
+    // Canonicalize repo path once for consistent comparison
+    let repo_canonical = match tokio::fs::canonicalize(repo).await {
+        Ok(p) => p,
+        Err(_) => {
+            // Can't canonicalize repo, skip context file loading
+            tracing::warn!("Failed to canonicalize repo path, skipping context files");
+            return format_system_prompt(context, user_instructions);
+        }
+    };
+    
+    // Try to read CLAUDE.md or AGENTS.md for project context
+    for filename in ["CLAUDE.md", "AGENTS.md"] {
+        let path = repo_canonical.join(filename);
+        
+        // Validate path doesn't escape repo (both are canonicalized)
+        if !path.starts_with(&repo_canonical) {
+            tracing::warn!("Context file path escapes repo root: {}", filename);
+            continue;
+        }
+        
+        // Check if file exists and is readable
+        let metadata = match tokio::fs::metadata(&path).await {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                tracing::warn!("Cannot access context file {}: {}", filename, e);
+                continue;
+            }
+        };
+        
+        if !metadata.is_file() {
+            continue;
+        }
+        
+        // Check if it's a binary file before trying to read as text
+        match is_binary_file(&path).await {
+            Ok(true) => {
+                tracing::warn!("Context file appears to be binary, skipping: {}", filename);
+                continue;
+            }
+            Ok(false) => {} // not binary, continue
+            Err(e) => {
+                tracing::warn!("Cannot check if context file is binary {}: {}", filename, e);
+                continue;
+            }
+        }
+        
+        match tokio::fs::read_to_string(&path).await {
+            Ok(content) => {
+                // Truncate if too large
+                let content = if content.len() > MAX_CONTEXT_SIZE {
+                    let boundary = content.floor_char_boundary(MAX_CONTEXT_SIZE);
+                    format!("{}\n... truncated ({} chars)", &content[..boundary], content.len())
+                } else {
+                    content
+                };
+                context.push_str("\n\n## Project Context (from ");
+                context.push_str(filename);
+                context.push_str(")\n\n");
+                context.push_str(&content);
+                break; // Only include the first one found
+            }
+            Err(e) => {
+                tracing::warn!("Failed to read context file {}: {}", filename, e);
+            }
+        }
+    }
+
+    format_system_prompt(context, user_instructions)
+}
+
+fn format_system_prompt(context: String, user_instructions: String) -> String {
     format!(
         "You are a code reviewer. Use the available tools (git, read_file, glob, grep) \
-        to explore the repository and understand the changes.\n\
-        \n\
-        Review criteria:\n\
-        - Correctness: logic bugs, edge cases, off-by-one errors\n\
-        - Security: injection, auth issues, secrets in code, unsafe deserialization (only flag a security issue if you can trace a concrete exploit path, not just recognize a pattern)\n\
-        - Performance: unnecessary allocations, N+1 queries, blocking calls in async context\n\
-        - ML rigor: data leakage, incorrect loss/metrics, numerical instability, non-reproducibility\n\
-        - Maintainability: dead code, copy-paste, unused variables, missing error handling\n\
-        \n\
-        Style: fail loudly, not silently. No swallowed exceptions, no magic fallbacks, \
-        no unexplained constants. Anything that can go wrong at runtime must be explicitly \
-        checked and logged.\n\
-        \n\
-        Be concise. Skip nitpicks and purely stylistic issues. Do not suggest speculative improvements.\n\
-        Do not modify the repository. If you need scratch space, use /tmp.{user_instructions}"
+        to explore the repository and understand the changes.
+
+Review criteria:
+- Correctness: logic bugs, edge cases, off-by-one errors
+- Security: injection, auth issues, secrets in code, unsafe deserialization (only flag a security issue if you can trace a concrete exploit path, not just recognize a pattern)
+- Performance: unnecessary allocations, N+1 queries, blocking calls in async context
+- ML rigor: data leakage, incorrect loss/metrics, numerical instability, non-reproducibility
+- Maintainability: dead code, copy-paste, unused variables, missing error handling
+
+Style: fail loudly, not silently. No swallowed exceptions, no magic fallbacks, \
+no unexplained constants. Anything that can go wrong at runtime must be explicitly \
+checked and logged.
+
+Be concise. Skip nitpicks and purely stylistic issues. Do not suggest speculative improvements.
+Do not modify the repository. If you need scratch space, use /tmp.{context}{user_instructions}"
     )
 }
 
