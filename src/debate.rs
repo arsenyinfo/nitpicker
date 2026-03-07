@@ -3,7 +3,6 @@ use crate::llm::{Completion, LLMClient, LLMClientDyn, LLMProvider, WithRetryExt}
 use crate::tools::{Tool, all_tools};
 use eyre::Result;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
-use termimad::MadSkin;
 use rig::OneOrMany;
 use rig::completion::Message;
 use rig::completion::message::{ToolResult, ToolResultContent, UserContent};
@@ -13,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use termimad::MadSkin;
 use tracing::info;
 
 struct DebateVerdict {
@@ -150,8 +150,16 @@ async fn run_debate_turn(
             // all tools in the batch have been executed; if submit_verdict was among them,
             // the turn is complete — results don't need to be sent back since there's no
             // further LLM call for this turn
-            if let Some(verdict) = verdict_store.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                info!(tool_calls = tool_call_count, output_tokens = total_output_tokens, "turn finished via submit_verdict");
+            if let Some(verdict) = verdict_store
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                info!(
+                    tool_calls = tool_call_count,
+                    output_tokens = total_output_tokens,
+                    "turn finished via submit_verdict"
+                );
                 return Ok((verdict, tool_call_count));
             }
 
@@ -167,7 +175,11 @@ async fn run_debate_turn(
             if text.is_empty() {
                 eyre::bail!("empty response from model (no text, no tool calls)");
             }
-            info!(tool_calls = tool_call_count, output_tokens = total_output_tokens, "turn finished via text response");
+            info!(
+                tool_calls = tool_call_count,
+                output_tokens = total_output_tokens,
+                "turn finished via text response"
+            );
             return Ok((DebateVerdict { text, agree: false }, tool_call_count));
         }
     }
@@ -175,7 +187,12 @@ async fn run_debate_turn(
     eyre::bail!("debate turn exceeded {MAX_TURNS_PER_ROUND} turns")
 }
 
-fn build_turn_message(topic: &str, verdicts: &[(String, usize, String)], round: usize, role: &str) -> String {
+fn build_turn_message(
+    topic: &str,
+    verdicts: &[(String, usize, String)],
+    round: usize,
+    role: &str,
+) -> String {
     let mut msg = format!("Topic: {topic}\n");
     if verdicts.is_empty() {
         msg.push_str("\nNo prior dialogue yet.\n");
@@ -193,8 +210,8 @@ fn build_turn_message(topic: &str, verdicts: &[(String, usize, String)], round: 
 
 fn role_color(role: &str) -> &'static str {
     match role {
-        "Actor" => "\x1b[96m",      // bright cyan
-        "Critic" => "\x1b[93m",     // bright yellow
+        "Actor" => "\x1b[96m",       // bright cyan
+        "Critic" => "\x1b[93m",      // bright yellow
         "Meta-review" => "\x1b[92m", // bright green
         _ => "",
     }
@@ -259,9 +276,17 @@ fn build_client(
     Ok(provider.client_from_env()?.with_retry().into_arc())
 }
 
-pub async fn run_debate(repo: &Path, prompt: &str, config: &Config, max_rounds: usize, verbose: bool) -> Result<()> {
+pub async fn run_debate(
+    repo: &Path,
+    prompt: &str,
+    config: &Config,
+    max_rounds: usize,
+    verbose: bool,
+) -> Result<()> {
     if config.reviewer.len() < 2 {
-        eyre::bail!("debate requires at least 2 reviewers in config (actor = reviewer[0], critic = reviewer[1])");
+        eyre::bail!(
+            "debate requires at least 2 reviewers in config (actor = reviewer[0], critic = reviewer[1])"
+        );
     }
 
     let actor_cfg = &config.reviewer[0];
@@ -293,12 +318,24 @@ pub async fn run_debate(repo: &Path, prompt: &str, config: &Config, max_rounds: 
             ProviderType::Anthropic => LLMProvider::Anthropic,
             ProviderType::Gemini => LLMProvider::Gemini,
             ProviderType::AnthropicCompatible => LLMProvider::AnthropicCompatible {
-                base_url: agg_cfg.base_url.clone().ok_or_else(|| eyre::eyre!("base_url required"))?,
-                api_key_env: agg_cfg.api_key_env.clone().ok_or_else(|| eyre::eyre!("api_key_env required"))?,
+                base_url: agg_cfg
+                    .base_url
+                    .clone()
+                    .ok_or_else(|| eyre::eyre!("base_url required"))?,
+                api_key_env: agg_cfg
+                    .api_key_env
+                    .clone()
+                    .ok_or_else(|| eyre::eyre!("api_key_env required"))?,
             },
             ProviderType::OpenAiCompatible => LLMProvider::OpenAICompatible {
-                base_url: agg_cfg.base_url.clone().ok_or_else(|| eyre::eyre!("base_url required"))?,
-                api_key_env: agg_cfg.api_key_env.clone().ok_or_else(|| eyre::eyre!("api_key_env required"))?,
+                base_url: agg_cfg
+                    .base_url
+                    .clone()
+                    .ok_or_else(|| eyre::eyre!("base_url required"))?,
+                api_key_env: agg_cfg
+                    .api_key_env
+                    .clone()
+                    .ok_or_else(|| eyre::eyre!("api_key_env required"))?,
             },
         };
         provider.client_from_env()?.with_retry().into_arc()
@@ -316,8 +353,14 @@ pub async fn run_debate(repo: &Path, prompt: &str, config: &Config, max_rounds: 
     let skin = MadSkin::default();
 
     // print cast before debate starts
-    print_cast_line("Actor", &format!("{} · {}", actor_cfg.name, actor_cfg.model));
-    print_cast_line("Critic", &format!("{} · {}", critic_cfg.name, critic_cfg.model));
+    print_cast_line(
+        "Actor",
+        &format!("{} · {}", actor_cfg.name, actor_cfg.model),
+    );
+    print_cast_line(
+        "Critic",
+        &format!("{} · {}", critic_cfg.name, critic_cfg.model),
+    );
     print_cast_line("Meta-review", &agg_cfg.model);
     println!();
 
@@ -344,7 +387,9 @@ pub async fn run_debate(repo: &Path, prompt: &str, config: &Config, max_rounds: 
         .await?;
         let elapsed = start.elapsed().as_secs();
         pb.set_style(done_style.clone());
-        pb.finish_with_message(format!("✓ round {round} ({tool_calls} tool calls, {elapsed}s)"));
+        pb.finish_with_message(format!(
+            "✓ round {round} ({tool_calls} tool calls, {elapsed}s)"
+        ));
         println!();
         skin.print_text(&verdict.text);
         println!();
@@ -365,7 +410,9 @@ pub async fn run_debate(repo: &Path, prompt: &str, config: &Config, max_rounds: 
         .await?;
         let elapsed = start.elapsed().as_secs();
         pb.set_style(done_style.clone());
-        pb.finish_with_message(format!("✓ round {round} ({tool_calls} tool calls, {elapsed}s)"));
+        pb.finish_with_message(format!(
+            "✓ round {round} ({tool_calls} tool calls, {elapsed}s)"
+        ));
         println!();
         skin.print_text(&verdict.text);
         println!();
@@ -386,7 +433,7 @@ pub async fn run_debate(repo: &Path, prompt: &str, config: &Config, max_rounds: 
         .join("\n\n");
     let meta_prompt = format!(
         "The following is a debate about: {prompt}\n\n{dialogue}\n\n---\n\
-        Synthesize the key insights. What was agreed on? What trade-offs remain? \
+        Synthesize the key insights. What was agreed on? What trade-offs remain? Be concise. \
         What is the best actionable conclusion?"
     );
     let meta_completion = Completion {
@@ -404,7 +451,8 @@ pub async fn run_debate(repo: &Path, prompt: &str, config: &Config, max_rounds: 
     let (pb, _) = make_spinner(verbose);
     pb.set_prefix(colored_role("Meta-review"));
     pb.set_message("synthesizing…");
-    let meta_response: crate::llm::CompletionResponse = agg_client.completion(meta_completion).await?;
+    let meta_response: crate::llm::CompletionResponse =
+        agg_client.completion(meta_completion).await?;
     let meta_text = meta_response.text();
     pb.set_style(done_style);
     pb.finish_with_message("✓ done");

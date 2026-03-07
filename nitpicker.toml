@@ -17,19 +17,19 @@ provider = "anthropic_compatible"
 base_url = "https://api.kimi.com/coding/"
 api_key_env = "KIMI_API_KEY"
 
-[[reviewer]]
-name = "minimax"
-model = "MiniMax-M2.5"
-provider = "anthropic_compatible"
-base_url = "https://api.minimax.io/anthropic"
-api_key_env = "MINIMAX_API_KEY"
+# [[reviewer]]
+# name = "minimax"
+# model = "MiniMax-M2.5"
+# provider = "anthropic_compatible"
+# base_url = "https://api.minimax.io/anthropic"
+# api_key_env = "MINIMAX_API_KEY"
 
-[[reviewer]]
-name = "zai"
-model = "glm-5"
-provider = "anthropic_compatible"
-base_url = "https://api.z.ai/api/anthropic"
-api_key_env = "ZAI_API_KEY"
+# [[reviewer]]
+# name = "zai"
+# model = "glm-5"
+# provider = "anthropic_compatible"
+# base_url = "https://api.z.ai/api/anthropic"
+# api_key_env = "ZAI_API_KEY"
 
 # [[reviewer]]
 # name = "local"
