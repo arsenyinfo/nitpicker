@@ -1,5 +1,6 @@
 use crate::config::{Config, ProviderType, ReviewerConfig};
 use crate::llm::{Completion, LLMClient, LLMClientDyn, LLMProvider, WithRetryExt};
+pub use crate::prompts::DebateMode;
 use crate::tools::{Tool, all_tools};
 use eyre::Result;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -102,6 +103,7 @@ async fn run_debate_turn(
     history.push(prompt.clone());
     let mut tool_call_count = 0usize;
     let mut total_output_tokens = 0u64;
+    let mut empty_response_count = 0usize;
 
     for _turn in 0..MAX_TURNS_PER_ROUND {
         let completion = Completion {
@@ -163,6 +165,7 @@ async fn run_debate_turn(
                 return Ok((verdict, tool_call_count));
             }
 
+            empty_response_count = 0;
             let tool_message = Message::User {
                 content: OneOrMany::many(results.into_iter().map(UserContent::ToolResult))
                     .expect("tool results must not be empty"),
@@ -173,7 +176,17 @@ async fn run_debate_turn(
             // LLM returned text without calling submit_verdict — implicit non-agree verdict
             let text = response.text();
             if text.is_empty() {
-                eyre::bail!("empty response from model (no text, no tool calls)");
+                empty_response_count += 1;
+                if empty_response_count >= 3 {
+                    eyre::bail!("model returned empty response 3 times consecutively within this turn");
+                }
+                let nudge = Message::user(
+                    "Please proceed with your analysis and call submit_verdict with your findings."
+                        .to_string(),
+                );
+                history.push(nudge.clone());
+                prompt = nudge;
+                continue;
             }
             info!(
                 tool_calls = tool_call_count,
@@ -210,9 +223,9 @@ fn build_turn_message(
 
 fn role_color(role: &str) -> &'static str {
     match role {
-        "Actor" => "\x1b[96m",       // bright cyan
-        "Critic" => "\x1b[93m",      // bright yellow
-        "Meta-review" => "\x1b[92m", // bright green
+        "Actor" | "Reviewer" => "\x1b[96m",    // bright cyan
+        "Critic" | "Validator" => "\x1b[93m", // bright yellow
+        "Meta-review" => "\x1b[92m",          // bright green
         _ => "",
     }
 }
@@ -282,6 +295,7 @@ pub async fn run_debate(
     config: &Config,
     max_rounds: usize,
     verbose: bool,
+    mode: DebateMode,
 ) -> Result<()> {
     if config.reviewer.len() < 2 {
         eyre::bail!(
@@ -341,26 +355,17 @@ pub async fn run_debate(
         provider.client_from_env()?.with_retry().into_arc()
     };
 
-    let actor_system = "You are the ACTOR in a structured debate. Propose and defend the best solution. \
-        Use the available tools to explore the repository to support your arguments. \
-        When ready, call submit_verdict(verdict, agree=false) with your final position.";
-    let critic_system = "You are the CRITIC in a structured debate. Find flaws, verify claims, demand rigor. \
-        Use the available tools to check the actor's claims against the actual code. \
-        If you fully agree with the actor's latest position, call submit_verdict(verdict, agree=true). \
-        Otherwise call submit_verdict(verdict, agree=false) with your critique.";
+    let actor_role = mode.actor_role();
+    let critic_role = mode.critic_role();
+    let actor_system = mode.actor_system();
+    let critic_system = mode.critic_system();
 
     let done_style = ProgressStyle::with_template("  {prefix:<12} {msg}").unwrap();
     let skin = MadSkin::default();
 
     // print cast before debate starts
-    print_cast_line(
-        "Actor",
-        &format!("{} · {}", actor_cfg.name, actor_cfg.model),
-    );
-    print_cast_line(
-        "Critic",
-        &format!("{} · {}", critic_cfg.name, critic_cfg.model),
-    );
+    print_cast_line(actor_role, &format!("{} · {}", actor_cfg.name, actor_cfg.model));
+    print_cast_line(critic_role, &format!("{} · {}", critic_cfg.name, critic_cfg.model));
     print_cast_line("Meta-review", &agg_cfg.model);
     println!();
 
@@ -373,9 +378,9 @@ pub async fn run_debate(
         final_round = round;
 
         let (pb, _) = make_spinner(verbose);
-        pb.set_prefix(colored_role("Actor"));
+        pb.set_prefix(colored_role(actor_role));
         pb.set_message(format!("round {round} — debating…"));
-        let msg = build_turn_message(prompt, &verdicts, round, "Actor");
+        let msg = build_turn_message(prompt, &verdicts, round, actor_role);
         let start = std::time::Instant::now();
         let (verdict, tool_calls) = run_debate_turn(
             Arc::clone(&actor_client),
@@ -393,12 +398,12 @@ pub async fn run_debate(
         println!();
         skin.print_text(&verdict.text);
         println!();
-        verdicts.push(("Actor".to_string(), round, verdict.text));
+        verdicts.push((actor_role.to_string(), round, verdict.text));
 
         let (pb, _) = make_spinner(verbose);
-        pb.set_prefix(colored_role("Critic"));
+        pb.set_prefix(colored_role(critic_role));
         pb.set_message(format!("round {round} — debating…"));
-        let msg = build_turn_message(prompt, &verdicts, round, "Critic");
+        let msg = build_turn_message(prompt, &verdicts, round, critic_role);
         let start = std::time::Instant::now();
         let (verdict, tool_calls) = run_debate_turn(
             Arc::clone(&critic_client),
@@ -417,7 +422,7 @@ pub async fn run_debate(
         skin.print_text(&verdict.text);
         println!();
         let agreed = verdict.agree;
-        verdicts.push(("Critic".to_string(), round, verdict.text));
+        verdicts.push((critic_role.to_string(), round, verdict.text));
 
         if agreed {
             converged = true;
@@ -432,16 +437,13 @@ pub async fn run_debate(
         .collect::<Vec<_>>()
         .join("\n\n");
     let meta_prompt = format!(
-        "The following is a debate about: {prompt}\n\n{dialogue}\n\n---\n\
-        Synthesize the key insights. What was agreed on? What trade-offs remain? Be concise. \
-        What is the best actionable conclusion?"
+        "The following is a debate about: {prompt}\n\n{dialogue}\n\n---\n{}",
+        mode.meta_instruction()
     );
     let meta_completion = Completion {
         model: agg_cfg.model.clone(),
         prompt: Message::user(meta_prompt),
-        preamble: Some(
-            "You synthesize structured debates into concise, actionable conclusions.".to_string(),
-        ),
+        preamble: Some(mode.meta_preamble().to_string()),
         history: Vec::new(),
         tools: Vec::new(),
         temperature: None,
@@ -464,7 +466,7 @@ pub async fn run_debate(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let transcript_path = std::env::temp_dir().join(format!("debate-{ts}.md"));
+    let transcript_path = std::env::temp_dir().join(format!("{}-{ts}.md", mode.label()));
     let now = chrono::Local::now();
     let convergence_status = if converged {
         format!("converged at round {final_round}")
@@ -472,11 +474,12 @@ pub async fn run_debate(
         format!("max rounds ({max_rounds}) reached without convergence")
     };
 
+    let label = mode.label();
     let mut transcript = format!(
-        "# Debate Transcript\n\n\
+        "# Debate Transcript ({label})\n\n\
         **Topic:** {prompt}\n\
-        **Actor model:** {}\n\
-        **Critic model:** {}\n\
+        **{actor_role} model:** {}\n\
+        **{critic_role} model:** {}\n\
         **Meta-reviewer:** {}\n\
         **Date:** {}\n\
         **Convergence:** {convergence_status}\n\

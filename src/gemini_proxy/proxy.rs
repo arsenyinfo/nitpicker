@@ -381,10 +381,32 @@ async fn handle_request(
             // Parse and transform response
             match serde_json::from_str::<serde_json::Value>(&body) {
                 Ok(json) => {
+                    // Code Assist sometimes returns HTTP 4xx with an internal error code of 5xx,
+                    // which are transient server-side failures. Remap them to 500 so the caller's
+                    // retry logic treats them correctly.
+                    let effective_status = if status.is_client_error() {
+                        let inner_code = json
+                            .get("error")
+                            .and_then(|e| e.get("code"))
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("");
+                        if inner_code.starts_with('5') {
+                            error!(
+                                "Code Assist returned {} with internal code {}, remapping to 500",
+                                status, inner_code
+                            );
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        } else {
+                            status
+                        }
+                    } else {
+                        status
+                    };
+
                     // Transform response if needed
                     match transform::transform_response(json) {
                         Ok(transformed) => {
-                            let mut builder = Response::builder().status(status);
+                            let mut builder = Response::builder().status(effective_status);
 
                             // Copy relevant headers
                             for (key, value) in response_headers.iter() {

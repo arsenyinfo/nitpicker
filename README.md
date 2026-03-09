@@ -1,6 +1,6 @@
 # nitpicker
 
-Runs multiple LLM reviewers concurrently on a git repository, then aggregates their findings into a single prioritized report.
+Multi-reviewer code review using LLMs. Spawns parallel agents with different models/prompts, aggregates their feedback into a final verdict. Supports two modes — parallel aggregation and actor-critic debate — across two task types: code review and free-form questions.
 
 Each reviewer is an agentic loop that can call tools (read files, grep, glob, git commands) to explore the repo before writing its review. A separate aggregator model deduplicates and synthesizes the individual reviews into a final verdict.
 
@@ -19,23 +19,31 @@ cargo install --git https://github.com/arsenyinfo/nitpicker
 ## Quick start
 
 ```bash
-# review the last commit in the current repo (requires nitpicker.toml at repo root)
+# review current PR/diff (requires nitpicker.toml at repo root)
 nitpicker
 
 # review a specific repo
 nitpicker --repo /path/to/repo
 
 # customized prompt
-nitpicker --repo /path/to/repo --prompt "Review only src/api/"
+nitpicker --repo /path/to/repo --prompt "focus on src/api/"
 
 # analyze existing code (no PR/diff required)
 nitpicker --analyze src/components/
 nitpicker --analyze src/main.rs
 nitpicker --analyze  # analyze entire repo
 
-# two LLM agents debate a topic about the codebase (requires ≥2 reviewers in config)
-nitpicker debate --prompt "should we use eyre or thiserror for error handling?"
-nitpicker debate --prompt "is this authentication flow secure?" --rounds 3
+# debate mode: two agents argue about the diff, meta-reviewer synthesizes (requires ≥2 reviewers)
+nitpicker --debate
+nitpicker --debate --analyze src/  # debate about existing code
+nitpicker --debate --rounds 3
+
+# ask a free-form question (parallel: multiple opinions aggregated)
+nitpicker ask "should we use eyre or thiserror for error handling?"
+
+# ask with debate (actor-critic dialogue, then meta-review)
+nitpicker ask --debate "is this authentication flow secure?"
+nitpicker ask --debate --rounds 3 "should we split this module?"
 ```
 
 ## Configuration
@@ -111,24 +119,38 @@ This opens a browser, completes the OAuth flow, and saves the token to `~/.nitpi
 ## CLI reference
 
 ```
+nitpicker [OPTIONS]
+nitpicker ask [--debate] [--rounds N] [OPTIONS] <topic>
+nitpicker init
+```
+
+### Review (default)
+
+```
 --repo <PATH>      git repository to review [default: .]
 --config <PATH>    config file [default: <repo>/nitpicker.toml, then ~/.nitpicker/config.toml]
 --prompt <TEXT>    review instructions (optional, has a sensible default)
 --analyze [PATH]   analyze existing code instead of reviewing changes
+--debate           use actor-critic debate instead of parallel aggregation
+--rounds <N>       maximum debate rounds (only with --debate) [default: 5]
 --gemini-oauth     run Gemini OAuth authentication flow and exit
 -v, --verbose      show info-level logs (hidden by default)
 ```
 
-### Debate subcommand
+### Ask subcommand
 
 ```
-nitpicker debate --prompt <TEXT> [--repo .] [--config PATH] [--rounds 5] [-v]
+nitpicker ask [--debate] [--rounds N] [--repo .] [--config PATH] [-v] <topic>
 ```
 
-Two LLM agents — Actor and Critic — take turns exploring the codebase with file/git tools and submitting verdicts. The Critic can signal agreement (`agree=true`) to end the debate early. A meta-reviewer then synthesizes the dialogue into a conclusion.
+Runs agents on a free-form question instead of a code diff. Without `--debate`, agents answer in parallel and an aggregator synthesizes their responses. With `--debate`, two agents take turns as Actor/Critic before a meta-reviewer concludes.
 
-- `reviewer[0]` in config → Actor
-- `reviewer[1]` in config → Critic
+### Debate mode (`--debate`)
+
+Two LLM agents take turns exploring the codebase with file/git tools and submitting verdicts. The Critic can signal agreement (`agree=true`) to end early. A meta-reviewer synthesizes the dialogue.
+
+- `reviewer[0]` in config → Actor (review: Reviewer)
+- `reviewer[1]` in config → Critic (review: Validator)
 - `aggregator` → Meta-reviewer
 
-Transcript saved to `{tempdir}/debate-{timestamp}.md`.
+Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timestamp}.md`.

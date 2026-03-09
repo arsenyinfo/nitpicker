@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Args as ClapArgs, Parser, Subcommand};
 use eyre::Result;
 use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
@@ -8,8 +8,22 @@ mod config;
 mod debate;
 mod gemini_proxy;
 mod llm;
+mod prompts;
 mod review;
 mod tools;
+
+/// Flags shared between the default review mode and the ask subcommand.
+#[derive(Debug, ClapArgs)]
+struct CommonArgs {
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    #[arg(long, short)]
+    verbose: bool,
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "nitpicker")]
@@ -17,11 +31,8 @@ struct Args {
     #[command(subcommand)]
     command: Option<Command>,
 
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
-
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    common: CommonArgs,
 
     #[arg(long)]
     prompt: Option<String>,
@@ -29,24 +40,33 @@ struct Args {
     #[arg(long = "gemini-oauth")]
     gemini_oauth: bool,
 
-    #[arg(long, short)]
-    verbose: bool,
-
     /// Analyze existing code instead of reviewing changes
     #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
     analyze: Option<PathBuf>,
+
+    /// Use actor-critic debate instead of parallel aggregation
+    #[arg(long)]
+    debate: bool,
+
+    /// Maximum debate rounds (only with --debate)
+    #[arg(long, default_value = "5")]
+    rounds: usize,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Generate a nitpicker.toml template in the current directory
     Init,
-    /// Two LLM agents debate a topic about the codebase
-    Debate {
-        /// Topic or question to debate
+    /// Ask multiple LLM agents a free-form question about the codebase
+    Ask {
+        #[command(flatten)]
+        common: CommonArgs,
+        /// Question or topic to discuss
+        topic: String,
+        /// Use actor-critic debate instead of parallel aggregation
         #[arg(long)]
-        prompt: String,
-        /// Maximum number of debate rounds
+        debate: bool,
+        /// Maximum debate rounds (only with --debate)
         #[arg(long, default_value = "5")]
         rounds: usize,
     },
@@ -72,7 +92,9 @@ auth = "oauth"
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let default_level = if args.verbose { "info" } else { "warn" };
+    let verbose = args.common.verbose
+        || matches!(&args.command, Some(Command::Ask { common, .. }) if common.verbose);
+    let default_level = if verbose { "info" } else { "warn" };
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
     tracing_subscriber::fmt()
@@ -97,13 +119,32 @@ async fn main() -> Result<()> {
             println!("Created nitpicker.toml");
             return Ok(());
         }
-        Some(Command::Debate { prompt, rounds }) => {
-            let repo = args.repo.canonicalize()?;
+        Some(Command::Ask {
+            common,
+            topic,
+            debate,
+            rounds,
+        }) => {
+            let repo = common.repo.canonicalize()?;
             if !repo.join(".git").is_dir() {
                 eyre::bail!("--repo must point to a git repository (missing .git)");
             }
-            let config = load_config(args.config.as_deref(), &repo)?;
-            return debate::run_debate(&repo, &prompt, &config, rounds, args.verbose).await;
+            let config = load_config(common.config.as_deref(), &repo)?;
+            if debate {
+                return debate::run_debate(
+                    &repo,
+                    &topic,
+                    &config,
+                    rounds,
+                    common.verbose,
+                    debate::DebateMode::Topic,
+                )
+                .await;
+            } else {
+                let report = review::run_review(&repo, &topic, &config, common.verbose, review::TaskMode::Ask).await?;
+                println!("{report}");
+                return Ok(());
+            }
         }
         None => {}
     }
@@ -127,12 +168,12 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let repo = args.repo.canonicalize()?;
+    let repo = args.common.repo.canonicalize()?;
     if !repo.join(".git").is_dir() {
         eyre::bail!("--repo must point to a git repository (missing .git)");
     }
 
-    let config = load_config(args.config.as_deref(), &repo)?;
+    let config = load_config(args.common.config.as_deref(), &repo)?;
 
     let prompt = if let Some(path) = args.analyze {
         // Empty string means analyze entire repo (from default_missing_value)
@@ -149,9 +190,21 @@ async fn main() -> Result<()> {
         }
     };
 
-    let report = review::run_review(&repo, &prompt, &config, args.verbose).await?;
-    println!("{report}");
-    Ok(())
+    if args.debate {
+        debate::run_debate(
+            &repo,
+            &prompt,
+            &config,
+            args.rounds,
+            args.common.verbose,
+            debate::DebateMode::Review,
+        )
+        .await
+    } else {
+        let report = review::run_review(&repo, &prompt, &config, args.common.verbose, review::TaskMode::Review).await?;
+        println!("{report}");
+        Ok(())
+    }
 }
 
 fn load_config(explicit_path: Option<&Path>, repo: &Path) -> Result<config::Config> {

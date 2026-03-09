@@ -5,8 +5,12 @@ Multi-reviewer code review using LLMs. Spawns parallel agents with different mod
 ## Quick start
 
 ```bash
-# Review current PR/diff
+# Review current PR/diff (map-reduce)
 cargo run -- --repo .
+
+# Debate the diff (actor-critic, requires ≥2 reviewers)
+cargo run -- --repo . --debate
+cargo run -- --repo . --debate --rounds 3
 
 # Static analysis of existing code
 cargo run -- --repo . --analyze
@@ -15,8 +19,11 @@ cargo run -- --repo . --analyze src/db/
 # Custom focus
 cargo run -- --repo . --prompt "focus on SQL injection"
 
-# Debate mode (requires ≥2 reviewers in config)
-cargo run -- debate --prompt "should we use eyre or thiserror?"
+# Ask a free-form question (map-reduce: parallel answers, aggregated)
+cargo run -- ask "should we use eyre or thiserror?"
+
+# Ask with debate (actor-critic dialogue, then meta-review)
+cargo run -- ask --debate "should we use eyre or thiserror?"
 
 # Gemini OAuth (first-time setup)
 cargo run -- --gemini-oauth
@@ -42,13 +49,15 @@ gemini_proxy/   local HTTP proxy that translates Gemini API calls to Google Code
 3. All reviewer outputs are collected, concatenated, and sent to the aggregator model in a single completion call
 4. The aggregator's response is printed to stdout
 
-### Debate flow (`nitpicker debate`)
+### Debate flow (`--debate` / `ask --debate`)
 
-1. `reviewer[0]` = Actor, `reviewer[1]` = Critic, `aggregator` = Meta-reviewer
+1. `reviewer[0]` = Actor/Reviewer, `reviewer[1]` = Critic/Validator, `aggregator` = Meta-reviewer
 2. Each round: Actor turn → Critic turn. Both have access to all file/git tools plus `submit_verdict(verdict, agree)`
 3. `agree=true` from Critic → convergence, loop ends early
 4. After all rounds: meta-reviewer synthesizes the full dialogue in a single non-agentic completion
-5. Transcript saved to `debate-{ts}.md`
+5. Transcript saved to `debate-{ts}.md` (topic) or `review-debate-{ts}.md` (code review)
+6. `DebateMode::Topic` (from `ask --debate`) uses Actor/Critic roles and general debate prompts
+7. `DebateMode::Review` (from `--debate`) uses Reviewer/Validator roles and code-review-focused prompts
 
 ### LLM abstraction (`llm.rs`)
 
