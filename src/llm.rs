@@ -12,8 +12,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_COMPLETION_ATTEMPTS: usize = 4;
+const RATE_LIMIT_MAX_COMPLETION_ATTEMPTS: usize = 8;
 const BASE_BACKOFF_MS: u64 = 250;
 const MAX_BACKOFF_MS: u64 = 5_000;
+const RATE_LIMIT_BASE_BACKOFF_MS: u64 = 5_000;
+const RATE_LIMIT_MAX_BACKOFF_MS: u64 = 60_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Completion {
@@ -196,10 +199,15 @@ impl<C: LLMClient> LLMClient for RetryingLLM<C> {
                 match self.inner.completion(completion.clone()).await {
                     Ok(response) => return Ok(response),
                     Err(err) => {
-                        if is_client_error(&err) || attempt >= MAX_COMPLETION_ATTEMPTS {
+                        let policy = retry_policy(&err);
+                        if !policy.retry || attempt >= policy.max_attempts {
                             return Err(err);
                         }
-                        let backoff = jittered_backoff(attempt);
+                        let backoff = jittered_backoff(
+                            attempt,
+                            policy.base_backoff_ms,
+                            policy.max_backoff_ms,
+                        );
                         tokio::time::sleep(backoff).await;
                     }
                 }
@@ -208,14 +216,57 @@ impl<C: LLMClient> LLMClient for RetryingLLM<C> {
     }
 }
 
-fn is_client_error(err: &eyre::Report) -> bool {
+struct RetryPolicy {
+    retry: bool,
+    max_attempts: usize,
+    base_backoff_ms: u64,
+    max_backoff_ms: u64,
+}
+
+fn retry_policy(err: &eyre::Report) -> RetryPolicy {
+    if is_rate_limit_error(err) {
+        return RetryPolicy {
+            retry: true,
+            max_attempts: RATE_LIMIT_MAX_COMPLETION_ATTEMPTS,
+            base_backoff_ms: RATE_LIMIT_BASE_BACKOFF_MS,
+            max_backoff_ms: RATE_LIMIT_MAX_BACKOFF_MS,
+        };
+    }
+
+    if is_non_retryable_client_error(err) {
+        return RetryPolicy {
+            retry: false,
+            max_attempts: 0,
+            base_backoff_ms: 0,
+            max_backoff_ms: 0,
+        };
+    }
+
+    RetryPolicy {
+        retry: true,
+        max_attempts: MAX_COMPLETION_ATTEMPTS,
+        base_backoff_ms: BASE_BACKOFF_MS,
+        max_backoff_ms: MAX_BACKOFF_MS,
+    }
+}
+
+fn is_non_retryable_client_error(err: &eyre::Report) -> bool {
     let msg = err.to_string();
     msg.contains(" 400") || msg.contains(" 401") || msg.contains(" 403") || msg.contains(" 404")
 }
 
-fn jittered_backoff(attempt: usize) -> Duration {
+fn is_rate_limit_error(err: &eyre::Report) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains(" 429")
+        || msg.contains("rate limit")
+        || msg.contains("too many requests")
+        || msg.contains("tokens per minute")
+        || msg.contains("requests per minute")
+}
+
+fn jittered_backoff(attempt: usize, base_backoff_ms: u64, max_backoff_ms: u64) -> Duration {
     let exp = 2u64.saturating_pow((attempt - 1) as u32);
-    let base = (BASE_BACKOFF_MS * exp).min(MAX_BACKOFF_MS);
+    let base = (base_backoff_ms * exp).min(max_backoff_ms);
     let jitter = jitter_factor();
     let jittered = (base as f64 * jitter).round() as u64;
     Duration::from_millis(jittered.max(1))

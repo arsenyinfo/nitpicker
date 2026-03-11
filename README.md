@@ -65,7 +65,7 @@ Example `nitpicker.toml`:
 [aggregator]
 model = "claude-sonnet-4-6"
 provider = "anthropic"
-max_tokens = 8192        # optional, default: no limit
+max_tokens = 8192        # optional, default: 8192
 
 [[reviewer]]
 name = "claude"          # used in output headers and logs
@@ -81,6 +81,8 @@ api_key_env = "OPENAI_API_KEY"
 ```
 
 It is recommended to use providers that were not used for the initial building to enforce diversity of thought. 
+
+Unknown config keys are rejected. For example, use `max_tokens` for output length; `token_limit` is not a supported field.
 
 ### Provider types
 

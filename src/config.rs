@@ -1,12 +1,14 @@
 use serde::Deserialize;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub aggregator: AggregatorConfig,
     pub reviewer: Vec<ReviewerConfig>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AggregatorConfig {
     pub model: String,
     pub provider: ProviderType,
@@ -18,6 +20,7 @@ pub struct AggregatorConfig {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewerConfig {
     pub name: String,
     pub model: String,
