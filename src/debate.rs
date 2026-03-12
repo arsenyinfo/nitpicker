@@ -1,7 +1,7 @@
 use crate::config::{Config, ProviderType, ReviewerConfig};
 use crate::llm::{Completion, LLMClient, LLMClientDyn, LLMProvider, WithRetryExt};
 pub use crate::prompts::DebateMode;
-use crate::tools::{Tool, all_tools};
+use crate::tools::{Tool, all_tools, floor_char_boundary};
 use eyre::Result;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rig::OneOrMany;
@@ -138,7 +138,7 @@ async fn run_debate_turn(
                 };
                 let mut output = output;
                 if output.len() > MAX_TOOL_RESULT_BYTES {
-                    let boundary = output.floor_char_boundary(MAX_TOOL_RESULT_BYTES);
+                    let boundary = floor_char_boundary(&output, MAX_TOOL_RESULT_BYTES);
                     output.truncate(boundary);
                     output.push_str("\n... truncated (>50k bytes)");
                 }
@@ -385,7 +385,7 @@ pub async fn run_debate(
         let (verdict, tool_calls) = run_debate_turn(
             Arc::clone(&actor_client),
             &actor_cfg.model,
-            actor_system,
+            &actor_system,
             &msg,
             repo,
         )
@@ -408,7 +408,7 @@ pub async fn run_debate(
         let (verdict, tool_calls) = run_debate_turn(
             Arc::clone(&critic_client),
             &critic_cfg.model,
-            critic_system,
+            &critic_system,
             &msg,
             repo,
         )

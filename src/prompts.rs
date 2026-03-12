@@ -4,7 +4,7 @@ pub enum TaskMode {
 }
 
 impl TaskMode {
-    fn preamble(&self) -> &'static str {
+    pub fn system_prompt(&self) -> &'static str {
         match self {
             TaskMode::Review => {
                 "You are a code reviewer. Use the available tools (git, read_file, glob, grep) \
@@ -32,23 +32,23 @@ impl TaskMode {
         }
     }
 
-    pub fn initial_message(&self) -> &'static str {
-        match self {
-            TaskMode::Review => "Begin your review. Start with the changes or target path specified in your instructions, then explore surrounding context as needed.",
-            TaskMode::Ask => "Begin your investigation. Explore the codebase as needed to give an accurate, well-grounded answer to the question in your instructions.",
+    pub fn initial_message(&self, context: &str, user_prompt: &str) -> String {
+        let mut msg = String::new();
+        if !context.is_empty() {
+            msg.push_str(context);
+            msg.push_str("\n\n");
         }
-    }
-
-    pub fn system_prompt(&self, context: &str, user_prompt: &str) -> String {
-        let user_instructions = if user_prompt.trim().is_empty() {
-            String::new()
-        } else {
+        if !user_prompt.trim().is_empty() {
             match self {
-                TaskMode::Review => format!("\n\nFocus your review on: {user_prompt}"),
-                TaskMode::Ask => format!("\n\nQuestion to answer: {user_prompt}"),
+                TaskMode::Review => msg.push_str(&format!("Focus your review on: {user_prompt}\n\n")),
+                TaskMode::Ask => msg.push_str(&format!("Question to answer: {user_prompt}\n\n")),
             }
-        };
-        format!("{}{context}{user_instructions}", self.preamble())
+        }
+        match self {
+            TaskMode::Review => msg.push_str("Begin your review. Start with the changes or target path specified in your instructions, then explore surrounding context as needed."),
+            TaskMode::Ask => msg.push_str("Begin your investigation. Explore the codebase as needed to give an accurate, well-grounded answer to the question in your instructions."),
+        }
+        msg
     }
 
     pub fn reduce_prompt(&self, combined: &str) -> String {
@@ -83,7 +83,6 @@ impl TaskMode {
     }
 }
 
-
 pub enum DebateMode {
     Topic,
     Review,
@@ -109,13 +108,17 @@ impl DebateMode {
             DebateMode::Topic => {
                 "You are the ACTOR in a structured debate. Propose and defend the best solution. \
                 Use the available tools to explore the repository to support your arguments. \
-                When ready, call submit_verdict(verdict, agree=false) with your final position."
+                When ready, call submit_verdict(verdict, agree=false) with your final position.\n\n\
+                Your opponent may sound confident but still make factual errors or overlook edge cases. \
+                Independently verify every claim against the actual code before accepting it."
             }
             DebateMode::Review => {
                 "You are a thorough code reviewer. Find genuine issues — bugs, security flaws, \
                 performance problems, unclear logic — in the changes described. Use the available \
                 tools to read the code and understand context. Call submit_verdict with a clear, \
-                evidence-based list of findings."
+                evidence-based list of findings.\n\n\
+                Your opponent may sound confident but still make factual errors or overlook edge cases. \
+                Independently verify every claim against the actual code before accepting it."
             }
         }
     }
@@ -132,7 +135,9 @@ impl DebateMode {
                 Agreeing immediately or without doing your own investigation is a failure of your role. \
                 Only call submit_verdict(agree=true) when you have exhausted your challenges and the \
                 actor's position is demonstrably correct. Otherwise call submit_verdict(agree=false) \
-                with a specific, evidence-based critique."
+                with a specific, evidence-based critique.\n\n\
+                Your opponent may sound confident but still make factual errors or overlook edge cases. \
+                Independently verify every claim against the actual code before accepting it."
             }
             DebateMode::Review => {
                 "You are a senior engineer stress-testing a code review. Treat every finding as a \
@@ -142,7 +147,9 @@ impl DebateMode {
                 Agreeing without reading the code is a failure of your role. \
                 Only call submit_verdict(agree=true) when every finding is verified correct AND you \
                 have checked for missed issues. Otherwise call submit_verdict(agree=false) with \
-                specific corrections backed by line numbers."
+                specific corrections backed by line numbers.\n\n\
+                Your opponent may sound confident but still make factual errors or overlook edge cases. \
+                Independently verify every claim against the actual code before accepting it."
             }
         }
     }

@@ -1,5 +1,5 @@
 use crate::llm::{Completion, LLMClientDyn};
-use crate::tools::{Tool, tool_definitions};
+use crate::tools::{Tool, floor_char_boundary, tool_definitions};
 use eyre::Result;
 use rig::OneOrMany;
 use rig::completion::Message;
@@ -74,7 +74,7 @@ pub async fn run_agent(
                 };
                 let mut output = output;
                 if output.len() > MAX_TOOL_RESULT_BYTES {
-                    let boundary = output.floor_char_boundary(MAX_TOOL_RESULT_BYTES);
+                    let boundary = floor_char_boundary(&output, MAX_TOOL_RESULT_BYTES);
                     output.truncate(boundary);
                     output.push_str("\n... truncated (>50k bytes)");
                 }

@@ -1,5 +1,4 @@
 [aggregator]
-name = "gemini"
 model = "gemini-3-flash-preview"
 provider = "gemini"
 auth = "oauth"

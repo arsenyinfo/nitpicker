@@ -2,7 +2,7 @@ use crate::agent::{AgentConfig, run_agent};
 use crate::config::{Config, ProviderType, ReviewerConfig};
 use crate::llm::{Completion, FinishReason, LLMClient, LLMProvider, WithRetryExt};
 pub use crate::prompts::TaskMode;
-use crate::tools::{all_tools, is_binary_file};
+use crate::tools::{all_tools, floor_char_boundary, is_binary_file};
 use eyre::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rig::completion::Message;
@@ -19,7 +19,9 @@ pub async fn run_review(
     mode: TaskMode,
 ) -> Result<String> {
     let tools = all_tools();
-    let system_prompt = build_system_prompt(repo, user_prompt, &mode).await;
+    let context = build_context(repo).await;
+    let system_prompt = mode.system_prompt();
+    let initial_message = mode.initial_message(&context, user_prompt);
     let mut handles = Vec::new();
 
     let mp = MultiProgress::new();
@@ -59,7 +61,7 @@ pub async fn run_review(
         pb.enable_steady_tick(Duration::from_millis(80));
 
         let done = done_style.clone();
-        let initial_message = mode.initial_message();
+        let initial_message = initial_message.clone();
         let handle: JoinHandle<(String, Result<String>)> = tokio::spawn(async move {
             let config = match agent_config {
                 Ok(config) => config,
@@ -72,7 +74,7 @@ pub async fn run_review(
             let start = Instant::now();
             let result = run_agent(
                 config,
-                initial_message,
+                &initial_message,
                 &tools_map,
                 &repo,
             )
@@ -139,17 +141,17 @@ pub async fn run_review(
 
 const MAX_CONTEXT_SIZE: usize = 50_000;
 
-async fn build_system_prompt(repo: &Path, user_prompt: &str, mode: &TaskMode) -> String {
+async fn build_context(repo: &Path) -> String {
     let mut context = String::new();
 
     let repo_canonical = match tokio::fs::canonicalize(repo).await {
         Ok(p) => p,
         Err(_) => {
             tracing::warn!("Failed to canonicalize repo path, skipping context files");
-            return mode.system_prompt(&context, user_prompt);
+            return context;
         }
     };
-    
+
     for filename in ["CLAUDE.md", "AGENTS.md"] {
         let path = repo_canonical.join(filename);
 
@@ -186,12 +188,12 @@ async fn build_system_prompt(repo: &Path, user_prompt: &str, mode: &TaskMode) ->
         match tokio::fs::read_to_string(&path).await {
             Ok(content) => {
                 let content = if content.len() > MAX_CONTEXT_SIZE {
-                    let boundary = content.floor_char_boundary(MAX_CONTEXT_SIZE);
+                    let boundary = floor_char_boundary(&content, MAX_CONTEXT_SIZE);
                     format!("{}\n... truncated ({} chars)", &content[..boundary], content.len())
                 } else {
                     content
                 };
-                context.push_str("\n\n## Project Context (from ");
+                context.push_str("## Project Context (from ");
                 context.push_str(filename);
                 context.push_str(")\n\n");
                 context.push_str(&content);
@@ -203,7 +205,7 @@ async fn build_system_prompt(repo: &Path, user_prompt: &str, mode: &TaskMode) ->
         }
     }
 
-    mode.system_prompt(&context, user_prompt)
+    context
 }
 
 async fn build_agent_config(

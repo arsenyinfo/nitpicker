@@ -167,11 +167,8 @@ impl<T: LLMClient> LLMClientDyn for T {
 }
 
 impl LLMClient for Box<dyn LLMClientDyn> {
-    fn completion(
-        &self,
-        completion: Completion,
-    ) -> impl Future<Output = Result<CompletionResponse>> + Send {
-        async move { (**self).completion(completion).await }
+    async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
+        (**self).completion(completion).await
     }
 }
 
@@ -188,28 +185,23 @@ pub trait WithRetryExt: Sized {
 impl<T: LLMClient> WithRetryExt for T {}
 
 impl<C: LLMClient> LLMClient for RetryingLLM<C> {
-    fn completion(
-        &self,
-        completion: Completion,
-    ) -> impl Future<Output = Result<CompletionResponse>> + Send {
-        async move {
-            let mut attempt = 0usize;
-            loop {
-                attempt += 1;
-                match self.inner.completion(completion.clone()).await {
-                    Ok(response) => return Ok(response),
-                    Err(err) => {
-                        let policy = retry_policy(&err);
-                        if !policy.retry || attempt >= policy.max_attempts {
-                            return Err(err);
-                        }
-                        let backoff = jittered_backoff(
-                            attempt,
-                            policy.base_backoff_ms,
-                            policy.max_backoff_ms,
-                        );
-                        tokio::time::sleep(backoff).await;
+    async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            match self.inner.completion(completion.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(err) => {
+                    let policy = retry_policy(&err);
+                    if !policy.retry || attempt >= policy.max_attempts {
+                        return Err(err);
                     }
+                    let backoff = jittered_backoff(
+                        attempt,
+                        policy.base_backoff_ms,
+                        policy.max_backoff_ms,
+                    );
+                    tokio::time::sleep(backoff).await;
                 }
             }
         }
@@ -342,114 +334,99 @@ pub fn create_gemini_client_with_proxy(
 }
 
 impl LLMClient for anthropic::Client {
-    fn completion(
-        &self,
-        completion: Completion,
-    ) -> impl Future<Output = Result<CompletionResponse>> + Send {
-        async move {
-            let model_name = completion.model.clone();
-            let mut request: rig::completion::CompletionRequest = completion.into();
-            request.model = Some(model_name.clone());
-            let model = self.completion_model(model_name);
-            let response = model.completion(request).await?;
-            let mut finish_reason = response
-                .raw_response
-                .stop_reason
-                .clone()
-                .map(|reason| match reason.as_str() {
-                    "end_turn" => FinishReason::Stop,
-                    "max_tokens" => FinishReason::MaxTokens,
-                    "tool_use" => FinishReason::ToolUse,
-                    other => FinishReason::Other(other.to_string()),
-                })
-                .unwrap_or(FinishReason::None);
-            if response
-                .choice
-                .iter()
-                .any(|content| matches!(content, AssistantContent::ToolCall(_)))
-            {
-                finish_reason = FinishReason::ToolUse;
-            }
-            Ok(CompletionResponse {
-                choice: response.choice,
-                finish_reason,
-                output_tokens: response.usage.output_tokens,
+    async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
+        let model_name = completion.model.clone();
+        let mut request: rig::completion::CompletionRequest = completion.into();
+        request.model = Some(model_name.clone());
+        let model = self.completion_model(model_name);
+        let response = model.completion(request).await?;
+        let mut finish_reason = response
+            .raw_response
+            .stop_reason
+            .clone()
+            .map(|reason| match reason.as_str() {
+                "end_turn" => FinishReason::Stop,
+                "max_tokens" => FinishReason::MaxTokens,
+                "tool_use" => FinishReason::ToolUse,
+                other => FinishReason::Other(other.to_string()),
             })
+            .unwrap_or(FinishReason::None);
+        if response
+            .choice
+            .iter()
+            .any(|content| matches!(content, AssistantContent::ToolCall(_)))
+        {
+            finish_reason = FinishReason::ToolUse;
         }
+        Ok(CompletionResponse {
+            choice: response.choice,
+            finish_reason,
+            output_tokens: response.usage.output_tokens,
+        })
     }
 }
 
 impl LLMClient for gemini::Client {
-    fn completion(
-        &self,
-        completion: Completion,
-    ) -> impl Future<Output = Result<CompletionResponse>> + Send {
-        async move {
-            let model_name = completion.model.clone();
-            let params = GeminiAdditionalParams::from_completion(&completion);
-            let mut request: rig::completion::CompletionRequest = completion.into();
-            request.model = Some(model_name.clone());
-            request.additional_params = Some(serde_json::to_value(params)?);
-            let model = self.completion_model(model_name);
-            let response = model.completion(request).await?;
-            let mut finish_reason = response
-                .raw_response
-                .candidates
-                .first()
-                .and_then(|candidate| candidate.finish_reason.clone())
-                .map(map_gemini_finish_reason)
-                .unwrap_or(FinishReason::None);
-            if response
-                .choice
-                .iter()
-                .any(|content| matches!(content, AssistantContent::ToolCall(_)))
-            {
-                finish_reason = FinishReason::ToolUse;
-            }
-            Ok(CompletionResponse {
-                choice: response.choice,
-                finish_reason,
-                output_tokens: response.usage.output_tokens,
-            })
+    async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
+        let model_name = completion.model.clone();
+        let params = GeminiAdditionalParams::from_completion(&completion);
+        let mut request: rig::completion::CompletionRequest = completion.into();
+        request.model = Some(model_name.clone());
+        request.additional_params = Some(serde_json::to_value(params)?);
+        let model = self.completion_model(model_name);
+        let response = model.completion(request).await?;
+        let mut finish_reason = response
+            .raw_response
+            .candidates
+            .first()
+            .and_then(|candidate| candidate.finish_reason.clone())
+            .map(map_gemini_finish_reason)
+            .unwrap_or(FinishReason::None);
+        if response
+            .choice
+            .iter()
+            .any(|content| matches!(content, AssistantContent::ToolCall(_)))
+        {
+            finish_reason = FinishReason::ToolUse;
         }
+        Ok(CompletionResponse {
+            choice: response.choice,
+            finish_reason,
+            output_tokens: response.usage.output_tokens,
+        })
     }
 }
 
 impl LLMClient for openai::CompletionsClient {
-    fn completion(
-        &self,
-        completion: Completion,
-    ) -> impl Future<Output = Result<CompletionResponse>> + Send {
-        async move {
-            let model_name = completion.model.clone();
-            let mut request: rig::completion::CompletionRequest = completion.into();
-            request.model = Some(model_name.clone());
-            let model = self.completion_model(model_name);
-            let response = model.completion(request).await?;
-            let mut finish_reason = response
-                .raw_response
-                .choices
-                .first()
-                .map(|choice| match choice.finish_reason.as_str() {
-                    "stop" => FinishReason::Stop,
-                    "length" => FinishReason::MaxTokens,
-                    "tool_calls" => FinishReason::ToolUse,
-                    other => FinishReason::Other(other.to_string()),
-                })
-                .unwrap_or(FinishReason::None);
-            if response
-                .choice
-                .iter()
-                .any(|content| matches!(content, AssistantContent::ToolCall(_)))
-            {
-                finish_reason = FinishReason::ToolUse;
-            }
-            Ok(CompletionResponse {
-                choice: response.choice,
-                finish_reason,
-                output_tokens: response.usage.output_tokens,
+    async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
+        let model_name = completion.model.clone();
+        let mut request: rig::completion::CompletionRequest = completion.into();
+        request.model = Some(model_name.clone());
+        let model = self.completion_model(model_name);
+        let response = model.completion(request).await?;
+        let mut finish_reason = response
+            .raw_response
+            .choices
+            .first()
+            .map(|choice| match choice.finish_reason.as_str() {
+                "stop" => FinishReason::Stop,
+                "length" => FinishReason::MaxTokens,
+                "tool_calls" => FinishReason::ToolUse,
+                other => FinishReason::Other(other.to_string()),
             })
+            .unwrap_or(FinishReason::None);
+        if response
+            .choice
+            .iter()
+            .any(|content| matches!(content, AssistantContent::ToolCall(_)))
+        {
+            finish_reason = FinishReason::ToolUse;
         }
+        Ok(CompletionResponse {
+            choice: response.choice,
+            finish_reason,
+            output_tokens: response.usage.output_tokens,
+        })
     }
 }
 

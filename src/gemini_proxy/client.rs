@@ -16,6 +16,9 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};
 
+/// Type alias for the OAuth callback channel state to reduce complexity
+type OAuthCallbackState = Arc<mpsc::Sender<(oneshot::Sender<String>, String, String)>>;
+
 /// Client that manages OAuth authentication and runs a local proxy
 pub struct GeminiProxyClient {
     port: u16,
@@ -206,7 +209,7 @@ async fn authenticate_interactive(token_store: &TokenStore) -> Result<()> {
 
 async fn oauth_callback_handler(
     Query(params): Query<HashMap<String, String>>,
-    State(tx): State<Arc<mpsc::Sender<(oneshot::Sender<String>, String, String)>>>,
+    State(tx): State<OAuthCallbackState>,
 ) -> impl axum::response::IntoResponse {
     let code = params.get("code").cloned().unwrap_or_default();
     let state = params.get("state").cloned().unwrap_or_default();

@@ -10,6 +10,21 @@ use std::sync::Arc;
 use tokio::fs;
 use tracing::warn;
 
+/// Find a valid UTF-8 character boundary at or before the given position.
+/// This is a polyfill for `str::floor_char_boundary` which requires Rust 1.91.
+pub fn floor_char_boundary(s: &str, pos: usize) -> usize {
+    let pos = pos.min(s.len());
+    // UTF-8 continuation bytes start with 10xxxxxx (0x80-0xBF)
+    // We need to find a byte that is NOT a continuation byte
+    let bytes = s.as_bytes();
+    for i in (0..=pos).rev() {
+        if i == 0 || (bytes[i] & 0xC0) != 0x80 {
+            return i;
+        }
+    }
+    0
+}
+
 pub trait Tool: Send + Sync {
     fn name(&self) -> String;
     fn definition(&self) -> ToolDefinition;
@@ -396,7 +411,7 @@ impl Tool for GitTool {
                 .await?;
             let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
             if stdout.len() > 50_000 {
-                let boundary = stdout.floor_char_boundary(50_000);
+                let boundary = floor_char_boundary(&stdout, 50_000);
                 stdout.truncate(boundary);
                 stdout.push_str("\n... truncated (50k chars)");
             }
