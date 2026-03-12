@@ -196,11 +196,8 @@ impl<C: LLMClient> LLMClient for RetryingLLM<C> {
                     if !policy.retry || attempt >= policy.max_attempts {
                         return Err(err);
                     }
-                    let backoff = jittered_backoff(
-                        attempt,
-                        policy.base_backoff_ms,
-                        policy.max_backoff_ms,
-                    );
+                    let backoff =
+                        jittered_backoff(attempt, policy.base_backoff_ms, policy.max_backoff_ms);
                     tokio::time::sleep(backoff).await;
                 }
             }

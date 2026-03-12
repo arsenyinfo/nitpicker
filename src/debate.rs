@@ -178,7 +178,9 @@ async fn run_debate_turn(
             if text.is_empty() {
                 empty_response_count += 1;
                 if empty_response_count >= 3 {
-                    eyre::bail!("model returned empty response 3 times consecutively within this turn");
+                    eyre::bail!(
+                        "model returned empty response 3 times consecutively within this turn"
+                    );
                 }
                 let nudge = Message::user(
                     "Please proceed with your analysis and call submit_verdict with your findings."
@@ -223,7 +225,7 @@ fn build_turn_message(
 
 fn role_color(role: &str) -> &'static str {
     match role {
-        "Actor" | "Reviewer" => "\x1b[96m",    // bright cyan
+        "Actor" | "Reviewer" => "\x1b[96m",   // bright cyan
         "Critic" | "Validator" => "\x1b[93m", // bright yellow
         "Meta-review" => "\x1b[92m",          // bright green
         _ => "",
@@ -364,8 +366,14 @@ pub async fn run_debate(
     let skin = MadSkin::default();
 
     // print cast before debate starts
-    print_cast_line(actor_role, &format!("{} · {}", actor_cfg.name, actor_cfg.model));
-    print_cast_line(critic_role, &format!("{} · {}", critic_cfg.name, critic_cfg.model));
+    print_cast_line(
+        actor_role,
+        &format!("{} · {}", actor_cfg.name, actor_cfg.model),
+    );
+    print_cast_line(
+        critic_role,
+        &format!("{} · {}", critic_cfg.name, critic_cfg.model),
+    );
     print_cast_line("Meta-review", &agg_cfg.model);
     println!();
 

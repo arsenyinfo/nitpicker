@@ -294,28 +294,33 @@ impl Tool for GrepTool {
     }
 }
 
-async fn search_file(path: &PathBuf, regex: &Regex, work_dir: &Path, results: &mut Vec<String>) -> Result<()> {
+async fn search_file(
+    path: &PathBuf,
+    regex: &Regex,
+    work_dir: &Path,
+    results: &mut Vec<String>,
+) -> Result<()> {
     use tokio::io::AsyncReadExt;
-    
+
     // Open file and check first 8KB for binary content before reading full file
     let mut file = fs::File::open(path).await?;
     let mut buffer = [0u8; 8192];
     let bytes_read = file.read(&mut buffer).await?;
-    
+
     // Check for null bytes in the sample (binary file indicator)
     if buffer[..bytes_read].contains(&0) {
         return Ok(()); // Skip binary files silently
     }
-    
+
     // Read the rest of the file
     let mut remaining = Vec::new();
     file.read_to_end(&mut remaining).await?;
-    
+
     // Combine sample + remaining into full content
     let mut full_content = Vec::with_capacity(bytes_read + remaining.len());
     full_content.extend_from_slice(&buffer[..bytes_read]);
     full_content.extend_from_slice(&remaining);
-    
+
     // Convert to string and search
     let content = String::from_utf8_lossy(&full_content);
     let relative = path.strip_prefix(work_dir).unwrap_or(path);

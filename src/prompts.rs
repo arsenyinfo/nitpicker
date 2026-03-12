@@ -1,3 +1,6 @@
+const VERIFY_WARNING: &str = "Your opponent may sound confident but still make factual errors or overlook edge cases. \
+Independently verify every claim against the actual code before accepting it.";
+
 pub enum TaskMode {
     Review,
     Ask,
@@ -40,7 +43,9 @@ impl TaskMode {
         }
         if !user_prompt.trim().is_empty() {
             match self {
-                TaskMode::Review => msg.push_str(&format!("Focus your review on: {user_prompt}\n\n")),
+                TaskMode::Review => {
+                    msg.push_str(&format!("Focus your review on: {user_prompt}\n\n"))
+                }
                 TaskMode::Ask => msg.push_str(&format!("Question to answer: {user_prompt}\n\n")),
             }
         }
@@ -103,27 +108,27 @@ impl DebateMode {
         }
     }
 
-    pub(crate) fn actor_system(&self) -> &'static str {
+    pub(crate) fn actor_system(&self) -> String {
         match self {
             DebateMode::Topic => {
                 "You are the ACTOR in a structured debate. Propose and defend the best solution. \
                 Use the available tools to explore the repository to support your arguments. \
-                When ready, call submit_verdict(verdict, agree=false) with your final position.\n\n\
-                Your opponent may sound confident but still make factual errors or overlook edge cases. \
-                Independently verify every claim against the actual code before accepting it."
+                When ready, call submit_verdict(verdict, agree=false) with your final position.\n\n"
+                    .to_string()
+                    + VERIFY_WARNING
             }
             DebateMode::Review => {
                 "You are a thorough code reviewer. Find genuine issues — bugs, security flaws, \
                 performance problems, unclear logic — in the changes described. Use the available \
                 tools to read the code and understand context. Call submit_verdict with a clear, \
-                evidence-based list of findings.\n\n\
-                Your opponent may sound confident but still make factual errors or overlook edge cases. \
-                Independently verify every claim against the actual code before accepting it."
+                evidence-based list of findings.\n\n"
+                    .to_string()
+                    + VERIFY_WARNING
             }
         }
     }
 
-    pub(crate) fn critic_system(&self) -> &'static str {
+    pub(crate) fn critic_system(&self) -> String {
         match self {
             DebateMode::Topic => {
                 "You are the CRITIC in a structured debate. Your job is to stress-test the actor's \
@@ -135,9 +140,9 @@ impl DebateMode {
                 Agreeing immediately or without doing your own investigation is a failure of your role. \
                 Only call submit_verdict(agree=true) when you have exhausted your challenges and the \
                 actor's position is demonstrably correct. Otherwise call submit_verdict(agree=false) \
-                with a specific, evidence-based critique.\n\n\
-                Your opponent may sound confident but still make factual errors or overlook edge cases. \
-                Independently verify every claim against the actual code before accepting it."
+                with a specific, evidence-based critique.\n\n"
+                    .to_string()
+                    + VERIFY_WARNING
             }
             DebateMode::Review => {
                 "You are a senior engineer stress-testing a code review. Treat every finding as a \
@@ -147,9 +152,9 @@ impl DebateMode {
                 Agreeing without reading the code is a failure of your role. \
                 Only call submit_verdict(agree=true) when every finding is verified correct AND you \
                 have checked for missed issues. Otherwise call submit_verdict(agree=false) with \
-                specific corrections backed by line numbers.\n\n\
-                Your opponent may sound confident but still make factual errors or overlook edge cases. \
-                Independently verify every claim against the actual code before accepting it."
+                specific corrections backed by line numbers.\n\n"
+                    .to_string()
+                    + VERIFY_WARNING
             }
         }
     }

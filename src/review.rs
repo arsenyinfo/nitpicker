@@ -50,8 +50,7 @@ pub async fn run_review(
         let tools_map = tools.clone();
         let repo = repo.to_path_buf();
         let name = reviewer.name.clone();
-        let agent_config =
-            build_agent_config(reviewer, &system_prompt, gemini_proxy.as_ref()).await;
+        let agent_config = build_agent_config(reviewer, system_prompt, gemini_proxy.as_ref()).await;
         info!(reviewer = %name, "spawning agent");
 
         let pb = mp.add(ProgressBar::new_spinner());
@@ -72,13 +71,7 @@ pub async fn run_review(
                 }
             };
             let start = Instant::now();
-            let result = run_agent(
-                config,
-                &initial_message,
-                &tools_map,
-                &repo,
-            )
-            .await;
+            let result = run_agent(config, &initial_message, &tools_map, &repo).await;
             let elapsed = start.elapsed().as_secs();
             pb.set_style(done);
             match &result {
@@ -189,7 +182,11 @@ async fn build_context(repo: &Path) -> String {
             Ok(content) => {
                 let content = if content.len() > MAX_CONTEXT_SIZE {
                     let boundary = floor_char_boundary(&content, MAX_CONTEXT_SIZE);
-                    format!("{}\n... truncated ({} chars)", &content[..boundary], content.len())
+                    format!(
+                        "{}\n... truncated ({} chars)",
+                        &content[..boundary],
+                        content.len()
+                    )
                 } else {
                     content
                 };
