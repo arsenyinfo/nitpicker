@@ -313,17 +313,25 @@ fn detect_diff_context(repo: &Path) -> Result<String> {
         .trim()
         .is_empty();
 
-    let has_branch_commits = if branch != base {
-        !run_git(repo, &["log", &format!("{base}..HEAD"), "--oneline"])
-            .unwrap_or_default()
-            .trim()
-            .is_empty()
-    } else {
-        false
+    let has_branch_commits = match base.as_ref() {
+        Some(base) if branch != base.name => {
+            !run_git(repo, &["log", &format!("{}..HEAD", base.revision), "--oneline"])?
+                .trim()
+                .is_empty()
+        }
+        _ => false,
     };
 
     if !has_uncommitted && !has_branch_commits {
-        eyre::bail!("no changes to review: no uncommitted changes and no branch commits vs {base}");
+        if let Some(base) = base.as_ref() {
+            eyre::bail!(
+                "no changes to review: no uncommitted changes and no branch commits vs {}",
+                base.name
+            );
+        }
+        eyre::bail!(
+            "no changes to review: no uncommitted changes and no detectable base branch commits"
+        );
     }
 
     let mut parts = Vec::new();
@@ -331,8 +339,12 @@ fn detect_diff_context(repo: &Path) -> Result<String> {
         parts.push("- uncommitted changes (`git diff HEAD`)".to_string());
     }
     if has_branch_commits {
+        let base = base
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("base branch required when branch commits are present"))?;
         parts.push(format!(
-            "- commits on this branch vs {base} (`git log {base}..HEAD`, `git diff {base}..HEAD`)"
+            "- commits on this branch vs {} (`git log {}..HEAD`, `git diff {}..HEAD`)",
+            base.name, base.revision, base.revision
         ));
     }
 
@@ -342,7 +354,12 @@ fn detect_diff_context(repo: &Path) -> Result<String> {
     ))
 }
 
-fn detect_base_branch(repo: &Path) -> String {
+struct BaseBranch {
+    name: String,
+    revision: String,
+}
+
+fn detect_base_branch(repo: &Path) -> Option<BaseBranch> {
     run_git(repo, &["symbolic-ref", "refs/remotes/origin/HEAD"])
         .ok()
         .and_then(|s| {
@@ -350,7 +367,32 @@ fn detect_base_branch(repo: &Path) -> String {
                 .strip_prefix("refs/remotes/origin/")
                 .map(str::to_string)
         })
-        .unwrap_or_else(|| "main".to_string())
+        .and_then(|branch| resolve_base_branch(repo, &branch))
+        .or_else(|| {
+            ["main", "master"]
+                .into_iter()
+                .find_map(|branch| resolve_base_branch(repo, branch))
+        })
+}
+
+fn resolve_base_branch(repo: &Path, branch: &str) -> Option<BaseBranch> {
+    let local = format!("refs/heads/{branch}");
+    if run_git(repo, &["rev-parse", "--verify", &local]).is_ok() {
+        return Some(BaseBranch {
+            name: branch.to_string(),
+            revision: branch.to_string(),
+        });
+    }
+
+    let remote = format!("refs/remotes/origin/{branch}");
+    if run_git(repo, &["rev-parse", "--verify", &remote]).is_ok() {
+        return Some(BaseBranch {
+            name: branch.to_string(),
+            revision: format!("origin/{branch}"),
+        });
+    }
+
+    None
 }
 
 fn run_git(repo: &Path, args: &[&str]) -> Result<String> {
@@ -363,4 +405,101 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<String> {
         eyre::bail!("git {}: {}", args.join(" "), stderr.trim());
     }
     Ok(String::from_utf8(output.stdout)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{detect_base_branch, detect_diff_context};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn temp_repo_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "nitpicker-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .expect("git should start");
+        assert!(status.success(), "git {:?} failed with {status}", args);
+    }
+
+    #[test]
+    fn detect_base_branch_falls_back_to_master_without_origin_head() {
+        let repo = temp_repo_path("base-branch");
+        fs::create_dir_all(&repo).expect("temp repo dir should be created");
+
+        run_git(&repo, &["init", "-b", "master"]);
+        fs::write(repo.join("file.txt"), "one\n").expect("seed file should be written");
+        run_git(&repo, &["add", "file.txt"]);
+        run_git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Test User",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+        run_git(&repo, &["checkout", "-b", "feature"]);
+
+        assert_eq!(
+            detect_base_branch(&repo).as_ref().map(|base| base.name.as_str()),
+            Some("master")
+        );
+
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn detect_diff_context_uses_master_when_origin_head_is_missing() {
+        let repo = temp_repo_path("diff-context");
+        fs::create_dir_all(&repo).expect("temp repo dir should be created");
+
+        run_git(&repo, &["init", "-b", "master"]);
+        fs::write(repo.join("file.txt"), "one\n").expect("seed file should be written");
+        run_git(&repo, &["add", "file.txt"]);
+        run_git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Test User",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+        run_git(&repo, &["checkout", "-b", "feature"]);
+        fs::write(repo.join("file.txt"), "one\ntwo\n").expect("feature change should be written");
+        run_git(&repo, &["add", "file.txt"]);
+        run_git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Test User",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "feature change",
+            ],
+        );
+
+        let context = detect_diff_context(&repo).expect("diff context should be detected");
+        assert!(context.contains("commits on this branch vs master"));
+
+        let _ = fs::remove_dir_all(&repo);
+    }
 }
