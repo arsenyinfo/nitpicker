@@ -38,6 +38,16 @@ nitpicker --debate
 nitpicker --debate --analyze src/  # debate about existing code
 nitpicker --debate --rounds 3
 
+# review the current branch's open PR and post result as a comment
+nitpicker pr
+
+# review a specific PR by URL and post result as a comment
+nitpicker pr https://github.com/owner/repo/pull/42
+
+# review a PR without posting a comment
+nitpicker pr --no-comment
+nitpicker pr https://github.com/owner/repo/pull/42 --no-comment
+
 # ask a free-form question (parallel: multiple opinions aggregated)
 nitpicker ask "should we use eyre or thiserror for error handling?"
 
@@ -131,6 +141,7 @@ This opens a browser, completes the OAuth flow, and saves the token to `~/.nitpi
 ```
 nitpicker [OPTIONS]
 nitpicker ask [--debate] [--rounds N] [OPTIONS] <topic>
+nitpicker pr [URL] [--no-comment] [--debate] [--rounds N] [OPTIONS]
 nitpicker init [--global]
 ```
 
@@ -146,6 +157,19 @@ nitpicker init [--global]
 --gemini-oauth     run Gemini OAuth authentication flow and exit
 -v, --verbose      show info-level logs (hidden by default)
 ```
+
+### PR subcommand
+
+```
+nitpicker pr [URL] [--no-comment] [--debate] [--rounds N] [--prompt TEXT] [--repo .] [--config PATH] [-v]
+```
+
+Reviews a GitHub PR using its title, description, and diff. Requires the `gh` CLI (`gh auth login` to authenticate).
+
+- Without `URL`: reviews the current branch's open PR (must be run inside the repo)
+- With `URL` (`https://github.com/owner/repo/pull/N`): clones the repo into a temp dir, checks out the PR branch, reviews it, then cleans up
+- By default, posts the review as a PR comment. Pass `--no-comment` to skip posting.
+- `--debate` and `--rounds` work the same as in the default review mode (debate output is not posted as a comment yet)
 
 ### Ask subcommand
 

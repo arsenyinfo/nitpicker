@@ -25,6 +25,12 @@ cargo run -- ask "should we use eyre or thiserror?"
 # Ask with debate (actor-critic dialogue, then meta-review)
 cargo run -- ask --debate "should we use eyre or thiserror?"
 
+# Review current branch's open PR and post result as a comment (requires gh CLI)
+cargo run -- pr
+
+# Review a remote PR by URL
+cargo run -- pr https://github.com/owner/repo/pull/42
+
 # Gemini OAuth (first-time setup)
 cargo run -- --gemini-oauth
 ```
@@ -39,6 +45,7 @@ debate.rs       sequential actor/critic debate loop → meta-review
 agent.rs        agentic tool-use loop for a single reviewer
 llm.rs          LLM client trait, per-provider impls, retry wrapper
 tools.rs        tool definitions: read_file, glob, grep, git
+pr.rs           GitHub PR subcommand: fetch metadata via gh, review, post comment
 gemini_proxy/   local HTTP proxy that translates Gemini API calls to Google Code Assist
 ```
 
@@ -58,6 +65,16 @@ gemini_proxy/   local HTTP proxy that translates Gemini API calls to Google Code
 5. Transcript saved to `debate-{ts}.md` (topic) or `review-debate-{ts}.md` (code review)
 6. `DebateMode::Topic` (from `ask --debate`) uses Actor/Critic roles and general debate prompts
 7. `DebateMode::Review` (from `--debate`) uses Reviewer/Validator roles and code-review-focused prompts
+
+### PR flow (`pr.rs`)
+
+1. `check_gh()` verifies the `gh` CLI is available
+2. If a URL is provided: `parse_pr_url` extracts repo slug and PR number → `clone_pr` clones into a `tempfile::TempDir` at a shallow depth and checks out the PR branch with `gh pr checkout`
+3. `fetch_pr_meta` retrieves title, body, and commit list via `gh pr view --json`
+4. `build_pr_prompt` assembles the review prompt from PR title + body + diff context + optional `--prompt`
+5. Review runs via `review::run_review` (or `debate::run_debate` with `--debate`)
+6. Unless `--no-comment`, result is posted back via `gh pr comment`
+7. `TempDir` drops at the end, cleaning up the clone
 
 ### LLM abstraction (`llm.rs`)
 

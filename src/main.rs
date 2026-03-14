@@ -8,6 +8,7 @@ mod config;
 mod debate;
 mod gemini_proxy;
 mod llm;
+mod pr;
 mod prompts;
 mod review;
 mod tools;
@@ -77,6 +78,8 @@ enum Command {
         #[arg(long, default_value = "5")]
         rounds: usize,
     },
+    /// Review a GitHub PR (current branch's PR or a remote PR by URL)
+    Pr(pr::PrArgs),
 }
 
 const INIT_TEMPLATE: &str = r#"[aggregator]
@@ -103,7 +106,8 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     let verbose = args.common.verbose
-        || matches!(&args.command, Some(Command::Ask { common, .. }) if common.verbose);
+        || matches!(&args.command, Some(Command::Ask { common, .. }) if common.verbose)
+        || matches!(&args.command, Some(Command::Pr(a)) if a.common.verbose);
     let default_level = if verbose { "info" } else { "warn" };
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
@@ -165,6 +169,10 @@ async fn main() -> Result<()> {
                 println!("{report}");
                 return Ok(());
             }
+        }
+        Some(Command::Pr(pr_args)) => {
+            let config = load_config(pr_args.common.config.as_deref(), &pr_args.common.repo)?;
+            return pr::run_pr(pr_args, config).await;
         }
         None => {}
     }
@@ -298,7 +306,7 @@ fn build_analysis_prompt(path: Option<&Path>, custom_prompt: Option<&str>) -> St
     }
 }
 
-fn detect_diff_context(repo: &Path) -> Result<String> {
+pub fn detect_diff_context(repo: &Path) -> Result<String> {
     let branch = run_git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     let branch = branch.trim();
 
