@@ -340,7 +340,7 @@ pub fn detect_diff_context(repo: &Path) -> Result<String> {
     }
     if has_branch_commits {
         parts.push(format!(
-            "- commits on this branch vs {base} (`git log {base}..HEAD`, `git diff {base}..HEAD`)"
+            "- commits on this branch vs {base} (`git log {base}..HEAD`, `git diff {base}...HEAD`)"
         ));
     }
 
