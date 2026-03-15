@@ -325,34 +325,24 @@ async fn run_review_inner(
     verbose: bool,
     meta: &PrMeta,
 ) -> Result<()> {
+    const FOOTER: &str =
+        "\n\n---\n🔍 Reviewed by [nitpicker](https://github.com/arsenyinfo/nitpicker)";
+
     let diff_context = crate::detect_diff_context(repo)?;
     let full_prompt = build_pr_prompt(meta, &diff_context, args.prompt.as_deref());
 
-    if args.debate || config.default_debate() {
-        if !args.no_comment {
-            eprintln!("note: --debate mode output will be printed but not posted as a PR comment (not yet supported)");
-        }
-        debate::run_debate(
-            repo,
-            &full_prompt,
-            config,
-            args.rounds,
-            verbose,
-            DebateMode::Review,
-        )
-        .await?;
+    let report = if args.debate || config.default_debate() {
+        debate::run_debate(repo, &full_prompt, config, args.rounds, verbose, DebateMode::Review)
+            .await?
     } else {
-        let report = review::run_review(repo, &full_prompt, config, verbose, TaskMode::Review)
-            .await?;
-
+        let report =
+            review::run_review(repo, &full_prompt, config, verbose, TaskMode::Review).await?;
         println!("{report}");
+        report
+    };
 
-        if !args.no_comment {
-            let comment = format!(
-                "{report}\n\n---\n🔍 Reviewed by [nitpicker](https://github.com/arsenyinfo/nitpicker)"
-            );
-            post_comment(url_for_gh, repo, &comment)?;
-        }
+    if !args.no_comment {
+        post_comment(url_for_gh, repo, &format!("{report}{FOOTER}"))?;
     }
 
     Ok(())

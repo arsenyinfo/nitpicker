@@ -148,7 +148,7 @@ async fn main() -> Result<()> {
             }
             let config = load_config(common.config.as_deref(), &repo)?;
             if debate || config.default_debate() {
-                return debate::run_debate(
+                debate::run_debate(
                     &repo,
                     &topic,
                     &config,
@@ -156,7 +156,8 @@ async fn main() -> Result<()> {
                     common.verbose,
                     debate::DebateMode::Topic,
                 )
-                .await;
+                .await?;
+                return Ok(());
             } else {
                 let report = review::run_review(
                     &repo,
@@ -228,7 +229,8 @@ async fn main() -> Result<()> {
             args.common.verbose,
             debate::DebateMode::Review,
         )
-        .await
+        .await?;
+        Ok(())
     } else {
         let report = review::run_review(
             &repo,
@@ -340,7 +342,7 @@ pub fn detect_diff_context(repo: &Path) -> Result<String> {
     }
     if has_branch_commits {
         parts.push(format!(
-            "- commits on this branch vs {base} (`git log {base}..HEAD`, `git diff {base}..HEAD`)"
+            "- commits on this branch vs {base} (`git log {base}..HEAD`, `git diff {base}...HEAD`)"
         ));
     }
 

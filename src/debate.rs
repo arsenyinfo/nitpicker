@@ -298,7 +298,7 @@ pub async fn run_debate(
     max_rounds: usize,
     verbose: bool,
     mode: DebateMode,
-) -> Result<()> {
+) -> Result<String> {
     if config.reviewer.len() < 2 {
         eyre::bail!(
             "debate requires at least 2 reviewers in config (actor = reviewer[0], critic = reviewer[1])"
@@ -505,5 +505,5 @@ pub async fn run_debate(
     tokio::fs::write(&transcript_path, &transcript).await?;
     eprintln!("\nTranscript saved to: {}", transcript_path.display());
 
-    Ok(())
+    Ok(meta_text)
 }
