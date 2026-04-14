@@ -145,7 +145,7 @@ async fn build_context(repo: &Path) -> String {
         }
     };
 
-    for filename in ["CLAUDE.md", "AGENTS.md"] {
+    for filename in ["NITPICKER.md", "CLAUDE.md", "AGENTS.md"] {
         let path = repo_canonical.join(filename);
 
         if !path.starts_with(&repo_canonical) {
