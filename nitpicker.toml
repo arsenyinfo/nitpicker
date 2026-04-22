@@ -36,3 +36,21 @@ api_key_env = "KIMI_API_KEY"
 # provider = "openai_compatible"
 # base_url = "http://localhost:1234/v1"
 # api_key_env = "LMSTUDIO_API_KEY"
+
+# Example: a reviewer can declare one or more [[reviewer.fallbacks]] blocks.
+# Each fallback is tried in order if the primary (or previous fallback) fails
+# to construct a client, fails the first API call, or exhausts RetryingLLM
+# mid-run. Fallbacks use the same fields as a primary (minus `name`).
+#
+# [[reviewer]]
+# name = "gemini-with-backup"
+# model = "gemini-3.1-pro-preview"
+# provider = "gemini"
+# auth = "oauth"
+#
+# [[reviewer.fallbacks]]
+# model = "claude-opus-4-7"
+# provider = "anthropic"
+#
+# The [[aggregator.fallbacks]] syntax is identical and applies to the
+# meta-review / aggregation step.

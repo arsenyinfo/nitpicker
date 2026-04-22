@@ -1,13 +1,13 @@
-use crate::config::{Config, ProviderType, ReviewerConfig};
 use crate::agent::{
     AgentConfig, AgentDepth, AgentProgress, add_spawn_subagent_tool, run_agent,
 };
-use crate::llm::{Completion, LLMClient, LLMClientDyn, LLMProvider, WithRetryExt};
+use crate::config::Config;
+use crate::llm::LLMClientDyn;
 pub use crate::prompts::DebateMode;
+use crate::review::{ClientAttempt, aggregator_attempts, reviewer_attempts, run_aggregator_with_fallback};
 use crate::tools::{Tool, all_tools};
 use eyre::Result;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
-use rig::completion::Message;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -16,7 +16,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use termimad::MadSkin;
-use tracing::info;
+use tracing::{info, warn};
 
 struct DebateVerdict {
     text: String,
@@ -79,6 +79,93 @@ impl Tool for SubmitVerdictTool {
             Ok("ok".to_string())
         })
     }
+}
+
+struct DebateTurnOutcome {
+    verdict: DebateVerdict,
+    model: String,
+    turns: usize,
+    tool_calls: usize,
+    subagents_spawned: usize,
+    total_output_tokens: u64,
+    used_attempt_label: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_debate_turn_with_fallback(
+    attempts: &[ClientAttempt],
+    gemini_proxy: Option<&crate::gemini_proxy::GeminiProxyClient>,
+    role: &str,
+    system_prompt: &str,
+    initial_message: &str,
+    max_turns: usize,
+    work_dir: &Path,
+    progress: Option<Arc<dyn Fn(AgentProgress) + Send + Sync>>,
+    pb: &ProgressBar,
+    round: usize,
+) -> Result<DebateTurnOutcome> {
+    let mut last_err: Option<eyre::Report> = None;
+    for (idx, attempt) in attempts.iter().enumerate() {
+        if idx > 0 {
+            pb.set_message(format!(
+                "round {round} — debating… ({}: {})",
+                attempt.label, attempt.model
+            ));
+            info!(
+                role,
+                attempt = %attempt.label,
+                model = %attempt.model,
+                "{role} falling back to next model"
+            );
+        }
+        let client = match attempt.build(gemini_proxy) {
+            Ok(c) => c,
+            Err(err) => {
+                warn!(
+                    role,
+                    attempt = %attempt.label,
+                    error = %err,
+                    "failed to build debate client"
+                );
+                last_err = Some(err);
+                continue;
+            }
+        };
+        match run_debate_turn(
+            client,
+            &attempt.model,
+            system_prompt,
+            initial_message,
+            max_turns,
+            work_dir,
+            progress.clone(),
+        )
+        .await
+        {
+            Ok((verdict, turns, tool_calls, subagents_spawned, total_output_tokens)) => {
+                return Ok(DebateTurnOutcome {
+                    verdict,
+                    model: attempt.model.clone(),
+                    turns,
+                    tool_calls,
+                    subagents_spawned,
+                    total_output_tokens,
+                    used_attempt_label: attempt.label.clone(),
+                });
+            }
+            Err(err) => {
+                warn!(
+                    role,
+                    attempt = %attempt.label,
+                    model = %attempt.model,
+                    error = %err,
+                    "debate turn failed"
+                );
+                last_err = Some(err);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| eyre::eyre!("no client attempts available for {role}")))
 }
 
 async fn run_debate_turn(
@@ -192,43 +279,6 @@ fn make_spinner(verbose: bool) -> (ProgressBar, ProgressStyle) {
     (pb, spinner_style)
 }
 
-fn build_client(
-    reviewer: &ReviewerConfig,
-    gemini_proxy: Option<&crate::gemini_proxy::GeminiProxyClient>,
-) -> Result<Arc<dyn LLMClientDyn>> {
-    if reviewer.provider.is_gemini() && reviewer.use_oauth() {
-        let proxy_url = gemini_proxy
-            .map(|p| p.base_url())
-            .ok_or_else(|| eyre::eyre!("Gemini OAuth requires proxy"))?;
-        return crate::llm::create_gemini_client_with_proxy(&proxy_url);
-    }
-    let provider = match &reviewer.provider {
-        ProviderType::Anthropic => LLMProvider::Anthropic,
-        ProviderType::Gemini => LLMProvider::Gemini,
-        ProviderType::AnthropicCompatible => LLMProvider::AnthropicCompatible {
-            base_url: reviewer
-                .base_url
-                .clone()
-                .ok_or_else(|| eyre::eyre!("base_url required for anthropic_compatible"))?,
-            api_key_env: reviewer
-                .api_key_env
-                .clone()
-                .ok_or_else(|| eyre::eyre!("api_key_env required for anthropic_compatible"))?,
-        },
-        ProviderType::OpenAiCompatible => LLMProvider::OpenAICompatible {
-            base_url: reviewer
-                .base_url
-                .clone()
-                .ok_or_else(|| eyre::eyre!("base_url required for openai_compatible"))?,
-            api_key_env: reviewer
-                .api_key_env
-                .clone()
-                .ok_or_else(|| eyre::eyre!("api_key_env required for openai_compatible"))?,
-        },
-    };
-    Ok(provider.client_from_env()?.with_retry().into_arc())
-}
-
 pub async fn run_debate(
     repo: &Path,
     prompt: &str,
@@ -248,10 +298,9 @@ pub async fn run_debate(
     let critic_cfg = &config.reviewer[1];
     let agg_cfg = &config.aggregator;
 
-    let needs_oauth = [actor_cfg, critic_cfg]
-        .iter()
-        .any(|r| r.provider.is_gemini() && r.use_oauth())
-        || (agg_cfg.provider.is_gemini() && agg_cfg.use_oauth());
+    let needs_oauth = actor_cfg.needs_gemini_proxy()
+        || critic_cfg.needs_gemini_proxy()
+        || agg_cfg.needs_gemini_proxy();
     let gemini_proxy = if needs_oauth {
         info!("Starting Gemini proxy for OAuth authentication...");
         Some(crate::gemini_proxy::GeminiProxyClient::new().await?)
@@ -259,42 +308,9 @@ pub async fn run_debate(
         None
     };
 
-    let actor_client = build_client(actor_cfg, gemini_proxy.as_ref())?;
-    let critic_client = build_client(critic_cfg, gemini_proxy.as_ref())?;
-
-    let agg_client: Arc<dyn LLMClientDyn> = if agg_cfg.provider.is_gemini() && agg_cfg.use_oauth() {
-        let proxy_url = gemini_proxy
-            .as_ref()
-            .map(|p| p.base_url())
-            .ok_or_else(|| eyre::eyre!("Gemini OAuth requires proxy"))?;
-        crate::llm::create_gemini_client_with_proxy(&proxy_url)?
-    } else {
-        let provider = match &agg_cfg.provider {
-            ProviderType::Anthropic => LLMProvider::Anthropic,
-            ProviderType::Gemini => LLMProvider::Gemini,
-            ProviderType::AnthropicCompatible => LLMProvider::AnthropicCompatible {
-                base_url: agg_cfg
-                    .base_url
-                    .clone()
-                    .ok_or_else(|| eyre::eyre!("base_url required"))?,
-                api_key_env: agg_cfg
-                    .api_key_env
-                    .clone()
-                    .ok_or_else(|| eyre::eyre!("api_key_env required"))?,
-            },
-            ProviderType::OpenAiCompatible => LLMProvider::OpenAICompatible {
-                base_url: agg_cfg
-                    .base_url
-                    .clone()
-                    .ok_or_else(|| eyre::eyre!("base_url required"))?,
-                api_key_env: agg_cfg
-                    .api_key_env
-                    .clone()
-                    .ok_or_else(|| eyre::eyre!("api_key_env required"))?,
-            },
-        };
-        provider.client_from_env()?.with_retry().into_arc()
-    };
+    let actor_attempts = reviewer_attempts(actor_cfg);
+    let critic_attempts = reviewer_attempts(critic_cfg);
+    let agg_attempts = aggregator_attempts(agg_cfg);
 
     let actor_role = mode.actor_role();
     let critic_role = mode.critic_role();
@@ -336,25 +352,34 @@ pub async fn run_debate(
                 progress.turns, progress.tool_calls, progress.subagents_spawned
             ));
         }) as Arc<dyn Fn(AgentProgress) + Send + Sync>);
-        let (verdict, turns, tool_calls, subagents_spawned, total_output_tokens) = run_debate_turn(
-            Arc::clone(&actor_client),
-            &actor_cfg.model,
+        let outcome = run_debate_turn_with_fallback(
+            &actor_attempts,
+            gemini_proxy.as_ref(),
+            actor_role,
             &actor_system,
             &msg,
             max_turns,
             repo,
             actor_progress,
+            &pb,
+            round,
         )
         .await?;
         let elapsed = start.elapsed().as_secs();
         pb.set_style(done_style.clone());
+        let model_note = if outcome.used_attempt_label == "primary" {
+            String::new()
+        } else {
+            format!(", via {}: {}", outcome.used_attempt_label, outcome.model)
+        };
         pb.finish_with_message(format!(
-            "✓ round {round} ({turns} turns, {tool_calls} tool calls, {subagents_spawned} subagents, {total_output_tokens} output tokens, {elapsed}s)"
+            "✓ round {round} ({} turns, {} tool calls, {} subagents, {} output tokens, {elapsed}s{model_note})",
+            outcome.turns, outcome.tool_calls, outcome.subagents_spawned, outcome.total_output_tokens
         ));
         println!();
-        skin.print_text(&verdict.text);
+        skin.print_text(&outcome.verdict.text);
         println!();
-        verdicts.push((actor_role.to_string(), round, verdict.text));
+        verdicts.push((actor_role.to_string(), round, outcome.verdict.text));
 
         let (pb, _) = make_spinner(verbose);
         pb.set_prefix(colored_role(critic_role));
@@ -368,26 +393,35 @@ pub async fn run_debate(
                 progress.turns, progress.tool_calls, progress.subagents_spawned
             ));
         }) as Arc<dyn Fn(AgentProgress) + Send + Sync>);
-        let (verdict, turns, tool_calls, subagents_spawned, total_output_tokens) = run_debate_turn(
-            Arc::clone(&critic_client),
-            &critic_cfg.model,
+        let outcome = run_debate_turn_with_fallback(
+            &critic_attempts,
+            gemini_proxy.as_ref(),
+            critic_role,
             &critic_system,
             &msg,
             max_turns,
             repo,
             critic_progress,
+            &pb,
+            round,
         )
         .await?;
         let elapsed = start.elapsed().as_secs();
         pb.set_style(done_style.clone());
+        let model_note = if outcome.used_attempt_label == "primary" {
+            String::new()
+        } else {
+            format!(", via {}: {}", outcome.used_attempt_label, outcome.model)
+        };
         pb.finish_with_message(format!(
-            "✓ round {round} ({turns} turns, {tool_calls} tool calls, {subagents_spawned} subagents, {total_output_tokens} output tokens, {elapsed}s)"
+            "✓ round {round} ({} turns, {} tool calls, {} subagents, {} output tokens, {elapsed}s{model_note})",
+            outcome.turns, outcome.tool_calls, outcome.subagents_spawned, outcome.total_output_tokens
         ));
         println!();
-        skin.print_text(&verdict.text);
+        skin.print_text(&outcome.verdict.text);
         println!();
-        let agreed = verdict.agree;
-        verdicts.push((critic_role.to_string(), round, verdict.text));
+        let agreed = outcome.verdict.agree;
+        verdicts.push((critic_role.to_string(), round, outcome.verdict.text));
 
         if agreed {
             converged = true;
@@ -405,22 +439,17 @@ pub async fn run_debate(
         "The following is a debate about: {prompt}\n\n{dialogue}\n\n---\n{}",
         mode.meta_instruction()
     );
-    let meta_completion = Completion {
-        model: agg_cfg.model.clone(),
-        prompt: Message::user(meta_prompt),
-        preamble: Some(mode.meta_preamble().to_string()),
-        history: Vec::new(),
-        tools: Vec::new(),
-        temperature: None,
-        max_tokens: agg_cfg.max_tokens.or(Some(8192)),
-        additional_params: None,
-    };
     let (pb, _) = make_spinner(verbose);
     pb.set_prefix(colored_role("Meta-review"));
     pb.set_message("synthesizing…");
-    let meta_response: crate::llm::CompletionResponse =
-        agg_client.completion(meta_completion).await?;
-    let meta_text = meta_response.text();
+    let (meta_text, _finish_reason) = run_aggregator_with_fallback(
+        &agg_attempts,
+        gemini_proxy.as_ref(),
+        mode.meta_preamble(),
+        &meta_prompt,
+        &pb,
+    )
+    .await?;
     pb.set_style(done_style);
     pb.finish_with_message("✓ done");
     println!();
