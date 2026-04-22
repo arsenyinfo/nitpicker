@@ -1,4 +1,6 @@
-use crate::agent::{AgentConfig, run_agent};
+use crate::agent::{
+    AgentConfig, AgentDepth, AgentProgress, add_spawn_subagent_tool, run_agent,
+};
 use crate::config::{Config, ProviderType, ReviewerConfig};
 use crate::llm::{Completion, FinishReason, LLMClient, LLMProvider, WithRetryExt};
 pub use crate::prompts::TaskMode;
@@ -7,6 +9,8 @@ use eyre::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rig::completion::Message;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tracing::info;
@@ -19,7 +23,8 @@ pub async fn run_review(
     verbose: bool,
     mode: TaskMode,
 ) -> Result<String> {
-    let tools = all_tools();
+    let mut tools = all_tools();
+    add_spawn_subagent_tool(&mut tools);
     let context = build_context(repo).await;
     let system_prompt = mode.system_prompt();
     let initial_message = mode.initial_message(&context, user_prompt);
@@ -51,8 +56,16 @@ pub async fn run_review(
         let tools_map = tools.clone();
         let repo = repo.to_path_buf();
         let name = reviewer.name.clone();
+        let subagent_counter = Arc::new(AtomicUsize::new(0));
         let agent_config =
-            build_agent_config(reviewer, system_prompt, max_turns, gemini_proxy.as_ref()).await;
+            build_agent_config(
+                reviewer,
+                system_prompt,
+                max_turns,
+                gemini_proxy.as_ref(),
+                Arc::clone(&subagent_counter),
+            )
+            .await;
         info!(reviewer = %name, "spawning agent");
 
         let pb = mp.add(ProgressBar::new_spinner());
@@ -64,7 +77,7 @@ pub async fn run_review(
         let done = done_style.clone();
         let initial_message = initial_message.clone();
         let handle: JoinHandle<(String, Result<String>)> = tokio::spawn(async move {
-            let config = match agent_config {
+            let mut config = match agent_config {
                 Ok(config) => config,
                 Err(err) => {
                     pb.set_style(done.clone());
@@ -72,12 +85,24 @@ pub async fn run_review(
                     return (name, Err(err));
                 }
             };
+            if !verbose {
+                let progress_pb = pb.clone();
+                config.progress = Some(Arc::new(move |progress: AgentProgress| {
+                    progress_pb.set_message(format!(
+                        "reviewing… ({} turns, {} tool calls, {} subagents)",
+                        progress.turns, progress.tool_calls, progress.subagents_spawned
+                    ));
+                }));
+            }
             let start = Instant::now();
             let result = run_agent(config, &initial_message, &tools_map, &repo).await;
             let elapsed = start.elapsed().as_secs();
             pb.set_style(done);
             match &result {
-                Ok(r) => pb.finish_with_message(format!("✓ done ({elapsed}s, {} turns)", r.turns)),
+                Ok(r) => pb.finish_with_message(format!(
+                    "✓ done ({elapsed}s, {} turns, {} tool calls, {} subagents, {} output tokens)",
+                    r.turns, r.tool_calls, r.subagents_spawned, r.total_output_tokens
+                )),
                 Err(e) => pb.finish_with_message(format!("✗ failed: {e}")),
             }
             (name, result.map(|r| r.text))
@@ -212,6 +237,7 @@ async fn build_agent_config(
     system_prompt: &str,
     max_turns: usize,
     gemini_proxy: Option<&crate::gemini_proxy::GeminiProxyClient>,
+    subagent_counter: Arc<AtomicUsize>,
 ) -> Result<AgentConfig> {
     let client: std::sync::Arc<dyn crate::llm::LLMClientDyn> =
         if reviewer.provider.is_gemini() && reviewer.use_oauth() {
@@ -239,6 +265,12 @@ async fn build_agent_config(
         max_turns,
         system_prompt: system_prompt.to_string(),
         client,
+        depth: AgentDepth::TopLevel,
+        terminal_tools: Vec::new(),
+        empty_response_nudge: None,
+        max_empty_responses: 0,
+        subagent_counter,
+        progress: None,
     })
 }
 

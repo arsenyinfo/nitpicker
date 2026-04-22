@@ -1,6 +1,11 @@
 const VERIFY_WARNING: &str = "Your opponent may sound confident but still make factual errors or overlook edge cases. \
 Independently verify every claim against the actual code before accepting it.";
 
+const DELEGATION_GUIDANCE: &str = "You can delegate a focused investigation with spawn_subagent(task). Prefer this when a narrow \
+check would otherwise require several tool calls across specific files or one concrete question. \
+Keep the parent agent focused on synthesis and final judgment; use subagents for bounded digging. \
+Use small tasks to avoid context overflow, run few concurrent subagents when applicable. ";
+
 pub enum TaskMode {
     Review,
     Ask,
@@ -115,6 +120,8 @@ impl DebateMode {
                 Use the available tools to explore the repository to support your arguments. \
                 When ready, call submit_verdict(verdict, agree=false) with your final position.\n\n"
                     .to_string()
+                    + DELEGATION_GUIDANCE
+                    + "\n\n"
                     + VERIFY_WARNING
             }
             DebateMode::Review => {
@@ -123,6 +130,8 @@ impl DebateMode {
                 tools to read the code and understand context. Call submit_verdict with a clear, \
                 evidence-based list of findings.\n\n"
                     .to_string()
+                    + DELEGATION_GUIDANCE
+                    + "\n\n"
                     + VERIFY_WARNING
             }
         }
@@ -142,6 +151,8 @@ impl DebateMode {
                 actor's position is demonstrably correct. Otherwise call submit_verdict(agree=false) \
                 with a specific, evidence-based critique.\n\n"
                     .to_string()
+                    + DELEGATION_GUIDANCE
+                    + "\n\n"
                     + VERIFY_WARNING
             }
             DebateMode::Review => {
@@ -154,6 +165,8 @@ impl DebateMode {
                 have checked for missed issues. Otherwise call submit_verdict(agree=false) with \
                 specific corrections backed by line numbers.\n\n"
                     .to_string()
+                    + DELEGATION_GUIDANCE
+                    + "\n\n"
                     + VERIFY_WARNING
             }
         }
@@ -186,4 +199,11 @@ impl DebateMode {
             DebateMode::Review => "review-debate",
         }
     }
+}
+
+pub fn subagent_system_prompt() -> &'static str {
+    "You are a focused subagent working for another agent. Solve only the assigned task. \
+    Use the available tools to inspect the repository as needed. Keep your final result concise, \
+    evidence-based, and grounded in the code. Include file paths and line numbers when relevant. \
+    Do not ask follow-up questions. When you are done, call finish with your final result."
 }

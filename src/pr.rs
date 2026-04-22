@@ -278,9 +278,8 @@ pub async fn run_pr(args: PrArgs, config: Config) -> Result<()> {
                 // fetch meta first — a failure here leaves the branch untouched
                 let meta = fetch_pr_meta(Some(u), &repo)?;
                 let branch = get_current_branch(&repo)?;
-                checkout_pr_branch(&repo, pr_number).map_err(|e| {
+                checkout_pr_branch(&repo, pr_number).inspect_err(|_e| {
                     restore_branch(&repo, &branch);
-                    e
                 })?;
                 original_branch = Some((repo.clone(), branch));
                 _tmpdir_guard = None;

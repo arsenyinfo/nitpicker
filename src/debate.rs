@@ -1,16 +1,18 @@
 use crate::config::{Config, ProviderType, ReviewerConfig};
+use crate::agent::{
+    AgentConfig, AgentDepth, AgentProgress, add_spawn_subagent_tool, run_agent,
+};
 use crate::llm::{Completion, LLMClient, LLMClientDyn, LLMProvider, WithRetryExt};
 pub use crate::prompts::DebateMode;
-use crate::tools::{Tool, all_tools, floor_char_boundary};
+use crate::tools::{Tool, all_tools};
 use eyre::Result;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
-use rig::OneOrMany;
 use rig::completion::Message;
-use rig::completion::message::{ToolResult, ToolResultContent, UserContent};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use termimad::MadSkin;
@@ -79,9 +81,6 @@ impl Tool for SubmitVerdictTool {
     }
 }
 
-const MAX_TOOL_RESULT_BYTES: usize = 50_000;
-const AGENT_MAX_TOKENS: u64 = 8192;
-
 async fn run_debate_turn(
     client: Arc<dyn LLMClientDyn>,
     model: &str,
@@ -89,117 +88,56 @@ async fn run_debate_turn(
     initial_message: &str,
     max_turns: usize,
     work_dir: &Path,
-) -> Result<(DebateVerdict, usize)> {
+    progress: Option<Arc<dyn Fn(AgentProgress) + Send + Sync>>,
+) -> Result<(DebateVerdict, usize, usize, usize, u64)> {
     let verdict_store: Arc<Mutex<Option<DebateVerdict>>> = Arc::new(Mutex::new(None));
     let submit_tool = Arc::new(SubmitVerdictTool {
         verdict: Arc::clone(&verdict_store),
     });
 
     let mut tools_map: HashMap<String, Arc<dyn Tool>> = all_tools();
+    add_spawn_subagent_tool(&mut tools_map);
     tools_map.insert("submit_verdict".to_string(), submit_tool as Arc<dyn Tool>);
+    let subagent_counter = Arc::new(AtomicUsize::new(0));
+    let config = AgentConfig {
+        name: format!("debate-{model}"),
+        model: model.to_string(),
+        max_turns,
+        system_prompt: system_prompt.to_string(),
+        client,
+        depth: AgentDepth::TopLevel,
+        terminal_tools: vec!["submit_verdict".to_string()],
+        empty_response_nudge: Some("Please proceed with your analysis and call submit_verdict when you are done.".to_string()),
+        max_empty_responses: 3,
+        subagent_counter,
+        progress,
+    };
 
-    let mut history = Vec::new();
-    let mut prompt = Message::user(initial_message.to_string());
-    history.push(prompt.clone());
-    let mut tool_call_count = 0usize;
-    let mut total_output_tokens = 0u64;
-    let mut empty_response_count = 0usize;
-
-    for _turn in 0..max_turns {
-        let completion = Completion {
-            model: model.to_string(),
-            prompt: prompt.clone(),
-            preamble: Some(system_prompt.to_string()),
-            history: history[..history.len().saturating_sub(1)].to_vec(),
-            tools: crate::tools::tool_definitions(&tools_map),
-            temperature: None,
-            max_tokens: Some(AGENT_MAX_TOKENS),
-            additional_params: None,
-        };
-
-        let response = client.completion(completion).await?;
-        total_output_tokens += response.output_tokens;
-        let assistant_message = response.message();
-        history.push(assistant_message.clone());
-
-        if let Some(tool_calls) = response.tool_calls() {
-            tool_call_count += tool_calls.len();
-            let mut results = Vec::new();
-            for call in &tool_calls {
-                let tool_name = call.function.name.clone();
-                let args = call.function.arguments.clone();
-                info!(tool = %tool_name, args = %args, "tool call");
-                let output = match tools_map.get(&tool_name) {
-                    Some(tool) => match tool.call(args, work_dir.to_path_buf()).await {
-                        Ok(output) => output,
-                        Err(err) => format!("Error: {err}"),
-                    },
-                    None => format!("Error: unknown tool '{tool_name}'"),
-                };
-                let mut output = output;
-                if output.len() > MAX_TOOL_RESULT_BYTES {
-                    let boundary = floor_char_boundary(&output, MAX_TOOL_RESULT_BYTES);
-                    output.truncate(boundary);
-                    output.push_str("\n... truncated (>50k bytes)");
-                }
-                results.push(ToolResult {
-                    id: call.id.clone(),
-                    call_id: call.call_id.clone(),
-                    content: OneOrMany::one(ToolResultContent::text(output)),
-                });
-            }
-
-            // all tools in the batch have been executed; if submit_verdict was among them,
-            // the turn is complete — results don't need to be sent back since there's no
-            // further LLM call for this turn
-            if let Some(verdict) = verdict_store
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take()
-            {
-                info!(
-                    tool_calls = tool_call_count,
-                    output_tokens = total_output_tokens,
-                    "turn finished via submit_verdict"
-                );
-                return Ok((verdict, tool_call_count));
-            }
-
-            empty_response_count = 0;
-            let tool_message = Message::User {
-                content: OneOrMany::many(results.into_iter().map(UserContent::ToolResult))
-                    .expect("tool results must not be empty"),
-            };
-            history.push(tool_message.clone());
-            prompt = tool_message;
-        } else {
-            // LLM returned text without calling submit_verdict — implicit non-agree verdict
-            let text = response.text();
-            if text.is_empty() {
-                empty_response_count += 1;
-                if empty_response_count >= 3 {
-                    eyre::bail!(
-                        "model returned empty response 3 times consecutively within this turn"
-                    );
-                }
-                let nudge = Message::user(
-                    "Please proceed with your analysis and call submit_verdict with your findings."
-                        .to_string(),
-                );
-                history.push(nudge.clone());
-                prompt = nudge;
-                continue;
-            }
-            info!(
-                tool_calls = tool_call_count,
-                output_tokens = total_output_tokens,
-                "turn finished via text response"
-            );
-            return Ok((DebateVerdict { text, agree: false }, tool_call_count));
-        }
+    let result = run_agent(config, initial_message, &tools_map, work_dir).await?;
+    if let Some(verdict) = verdict_store
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        return Ok((
+            verdict,
+            result.turns,
+            result.tool_calls,
+            result.subagents_spawned,
+            result.total_output_tokens,
+        ));
     }
 
-    eyre::bail!("debate turn exceeded {max_turns} turns")
+    Ok((
+        DebateVerdict {
+            text: result.text,
+            agree: false,
+        },
+        result.turns,
+        result.tool_calls,
+        result.subagents_spawned,
+        result.total_output_tokens,
+    ))
 }
 
 fn build_turn_message(
@@ -391,19 +329,27 @@ pub async fn run_debate(
         pb.set_message(format!("round {round} — debating…"));
         let msg = build_turn_message(prompt, &verdicts, round, actor_role);
         let start = std::time::Instant::now();
-        let (verdict, tool_calls) = run_debate_turn(
+        let actor_pb = pb.clone();
+        let actor_progress = (!verbose).then_some(Arc::new(move |progress: AgentProgress| {
+            actor_pb.set_message(format!(
+                "round {round} — debating… ({} turns, {} tool calls, {} subagents)",
+                progress.turns, progress.tool_calls, progress.subagents_spawned
+            ));
+        }) as Arc<dyn Fn(AgentProgress) + Send + Sync>);
+        let (verdict, turns, tool_calls, subagents_spawned, total_output_tokens) = run_debate_turn(
             Arc::clone(&actor_client),
             &actor_cfg.model,
             &actor_system,
             &msg,
             max_turns,
             repo,
+            actor_progress,
         )
         .await?;
         let elapsed = start.elapsed().as_secs();
         pb.set_style(done_style.clone());
         pb.finish_with_message(format!(
-            "✓ round {round} ({tool_calls} tool calls, {elapsed}s)"
+            "✓ round {round} ({turns} turns, {tool_calls} tool calls, {subagents_spawned} subagents, {total_output_tokens} output tokens, {elapsed}s)"
         ));
         println!();
         skin.print_text(&verdict.text);
@@ -415,19 +361,27 @@ pub async fn run_debate(
         pb.set_message(format!("round {round} — debating…"));
         let msg = build_turn_message(prompt, &verdicts, round, critic_role);
         let start = std::time::Instant::now();
-        let (verdict, tool_calls) = run_debate_turn(
+        let critic_pb = pb.clone();
+        let critic_progress = (!verbose).then_some(Arc::new(move |progress: AgentProgress| {
+            critic_pb.set_message(format!(
+                "round {round} — debating… ({} turns, {} tool calls, {} subagents)",
+                progress.turns, progress.tool_calls, progress.subagents_spawned
+            ));
+        }) as Arc<dyn Fn(AgentProgress) + Send + Sync>);
+        let (verdict, turns, tool_calls, subagents_spawned, total_output_tokens) = run_debate_turn(
             Arc::clone(&critic_client),
             &critic_cfg.model,
             &critic_system,
             &msg,
             max_turns,
             repo,
+            critic_progress,
         )
         .await?;
         let elapsed = start.elapsed().as_secs();
         pb.set_style(done_style.clone());
         pb.finish_with_message(format!(
-            "✓ round {round} ({tool_calls} tool calls, {elapsed}s)"
+            "✓ round {round} ({turns} turns, {tool_calls} tool calls, {subagents_spawned} subagents, {total_output_tokens} output tokens, {elapsed}s)"
         ));
         println!();
         skin.print_text(&verdict.text);
