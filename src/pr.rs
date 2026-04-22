@@ -15,9 +15,11 @@ pub struct PrArgs {
     #[arg(long)]
     pub prompt: Option<String>,
     #[arg(long)]
-    pub debate: bool,
+    pub no_debate: bool,
     #[arg(long, default_value = "5")]
     pub rounds: usize,
+    #[arg(long, value_parser = crate::parse_positive_usize)]
+    pub max_turns: Option<usize>,
     /// Skip posting review as a PR comment
     #[arg(long)]
     pub no_comment: bool,
@@ -330,13 +332,23 @@ async fn run_review_inner(
 
     let diff_context = crate::detect_diff_context(repo)?;
     let full_prompt = build_pr_prompt(meta, &diff_context, args.prompt.as_deref());
+    let max_turns = config.max_turns(args.max_turns)?;
 
-    let report = if args.debate || config.default_debate() {
-        debate::run_debate(repo, &full_prompt, config, args.rounds, verbose, DebateMode::Review)
-            .await?
+    let report = if !args.no_debate && config.default_debate() {
+        debate::run_debate(
+            repo,
+            &full_prompt,
+            config,
+            args.rounds,
+            max_turns,
+            verbose,
+            DebateMode::Review,
+        )
+        .await?
     } else {
         let report =
-            review::run_review(repo, &full_prompt, config, verbose, TaskMode::Review).await?;
+            review::run_review(repo, &full_prompt, config, max_turns, verbose, TaskMode::Review)
+                .await?;
         println!("{report}");
         report
     };

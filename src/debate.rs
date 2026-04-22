@@ -79,7 +79,6 @@ impl Tool for SubmitVerdictTool {
     }
 }
 
-const MAX_TURNS_PER_ROUND: usize = 50;
 const MAX_TOOL_RESULT_BYTES: usize = 50_000;
 const AGENT_MAX_TOKENS: u64 = 8192;
 
@@ -88,6 +87,7 @@ async fn run_debate_turn(
     model: &str,
     system_prompt: &str,
     initial_message: &str,
+    max_turns: usize,
     work_dir: &Path,
 ) -> Result<(DebateVerdict, usize)> {
     let verdict_store: Arc<Mutex<Option<DebateVerdict>>> = Arc::new(Mutex::new(None));
@@ -105,7 +105,7 @@ async fn run_debate_turn(
     let mut total_output_tokens = 0u64;
     let mut empty_response_count = 0usize;
 
-    for _turn in 0..MAX_TURNS_PER_ROUND {
+    for _turn in 0..max_turns {
         let completion = Completion {
             model: model.to_string(),
             prompt: prompt.clone(),
@@ -199,7 +199,7 @@ async fn run_debate_turn(
         }
     }
 
-    eyre::bail!("debate turn exceeded {MAX_TURNS_PER_ROUND} turns")
+    eyre::bail!("debate turn exceeded {max_turns} turns")
 }
 
 fn build_turn_message(
@@ -296,6 +296,7 @@ pub async fn run_debate(
     prompt: &str,
     config: &Config,
     max_rounds: usize,
+    max_turns: usize,
     verbose: bool,
     mode: DebateMode,
 ) -> Result<String> {
@@ -395,6 +396,7 @@ pub async fn run_debate(
             &actor_cfg.model,
             &actor_system,
             &msg,
+            max_turns,
             repo,
         )
         .await?;
@@ -418,6 +420,7 @@ pub async fn run_debate(
             &critic_cfg.model,
             &critic_system,
             &msg,
+            max_turns,
             repo,
         )
         .await?;

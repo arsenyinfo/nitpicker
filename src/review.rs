@@ -15,6 +15,7 @@ pub async fn run_review(
     repo: &Path,
     user_prompt: &str,
     config: &Config,
+    max_turns: usize,
     verbose: bool,
     mode: TaskMode,
 ) -> Result<String> {
@@ -50,7 +51,8 @@ pub async fn run_review(
         let tools_map = tools.clone();
         let repo = repo.to_path_buf();
         let name = reviewer.name.clone();
-        let agent_config = build_agent_config(reviewer, system_prompt, gemini_proxy.as_ref()).await;
+        let agent_config =
+            build_agent_config(reviewer, system_prompt, max_turns, gemini_proxy.as_ref()).await;
         info!(reviewer = %name, "spawning agent");
 
         let pb = mp.add(ProgressBar::new_spinner());
@@ -208,6 +210,7 @@ async fn build_context(repo: &Path) -> String {
 async fn build_agent_config(
     reviewer: &ReviewerConfig,
     system_prompt: &str,
+    max_turns: usize,
     gemini_proxy: Option<&crate::gemini_proxy::GeminiProxyClient>,
 ) -> Result<AgentConfig> {
     let client: std::sync::Arc<dyn crate::llm::LLMClientDyn> =
@@ -233,6 +236,7 @@ async fn build_agent_config(
     Ok(AgentConfig {
         name: reviewer.name.clone(),
         model: reviewer.model.clone(),
+        max_turns,
         system_prompt: system_prompt.to_string(),
         client,
     })

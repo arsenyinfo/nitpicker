@@ -1,4 +1,7 @@
+use eyre::Result;
 use serde::Deserialize;
+
+pub const DEFAULT_MAX_TURNS: usize = 70;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -12,6 +15,7 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct DefaultsConfig {
     pub debate: Option<bool>,
+    pub max_turns: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -75,6 +79,27 @@ impl Config {
         self.defaults
             .as_ref()
             .and_then(|defaults| defaults.debate)
-            .unwrap_or(false)
+            .unwrap_or(true)
+    }
+
+    pub fn max_turns(&self, override_max_turns: Option<usize>) -> Result<usize> {
+        match override_max_turns {
+            Some(max_turns) => Ok(max_turns),
+            None => self.default_max_turns(),
+        }
+    }
+
+    pub fn default_max_turns(&self) -> Result<usize> {
+        let max_turns = self
+            .defaults
+            .as_ref()
+            .and_then(|defaults| defaults.max_turns)
+            .unwrap_or(DEFAULT_MAX_TURNS);
+
+        if max_turns == 0 {
+            eyre::bail!("[defaults].max_turns must be greater than 0");
+        }
+
+        Ok(max_turns)
     }
 }

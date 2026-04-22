@@ -48,13 +48,17 @@ struct Args {
     #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
     analyze: Option<PathBuf>,
 
-    /// Use actor-critic debate instead of parallel aggregation
+    /// Disable actor-critic debate and use parallel aggregation instead
     #[arg(long)]
-    debate: bool,
+    no_debate: bool,
 
-    /// Maximum debate rounds (only with --debate)
+    /// Maximum debate rounds
     #[arg(long, default_value = "5")]
     rounds: usize,
+
+    /// Maximum tool-use turns per agent or debate turn
+    #[arg(long, value_parser = parse_positive_usize)]
+    max_turns: Option<usize>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -71,23 +75,27 @@ enum Command {
         common: CommonArgs,
         /// Question or topic to discuss
         topic: String,
-        /// Use actor-critic debate instead of parallel aggregation
+        /// Disable actor-critic debate and use parallel aggregation instead
         #[arg(long)]
-        debate: bool,
-        /// Maximum debate rounds (only with --debate)
+        no_debate: bool,
+        /// Maximum debate rounds
         #[arg(long, default_value = "5")]
         rounds: usize,
+        /// Maximum tool-use turns per agent or debate turn
+        #[arg(long, value_parser = parse_positive_usize)]
+        max_turns: Option<usize>,
     },
     /// Review a GitHub PR (current branch's PR or a remote PR by URL)
     Pr(pr::PrArgs),
 }
 
-const INIT_TEMPLATE: &str = r#"[aggregator]
+const INIT_TEMPLATE: &str = r#"[defaults]
+debate = true
+max_turns = 70
+
+[aggregator]
 model = "claude-sonnet-4-6"
 provider = "anthropic"
-
-[defaults]
-debate = false
 
 [[reviewer]]
 name = "claude"
@@ -139,37 +147,42 @@ async fn main() -> Result<()> {
         Some(Command::Ask {
             common,
             topic,
-            debate,
+            no_debate,
             rounds,
+            max_turns,
         }) => {
             let repo = common.repo.canonicalize()?;
             if !repo.join(".git").is_dir() {
                 eyre::bail!("--repo must point to a git repository (missing .git)");
             }
             let config = load_config(common.config.as_deref(), &repo)?;
-            if debate || config.default_debate() {
+            let max_turns = config.max_turns(max_turns)?;
+
+            if !no_debate && config.default_debate() {
                 debate::run_debate(
                     &repo,
                     &topic,
                     &config,
                     rounds,
+                    max_turns,
                     common.verbose,
                     debate::DebateMode::Topic,
                 )
                 .await?;
                 return Ok(());
-            } else {
-                let report = review::run_review(
-                    &repo,
-                    &topic,
-                    &config,
-                    common.verbose,
-                    review::TaskMode::Ask,
-                )
-                .await?;
-                println!("{report}");
-                return Ok(());
             }
+
+            let report = review::run_review(
+                &repo,
+                &topic,
+                &config,
+                max_turns,
+                common.verbose,
+                review::TaskMode::Ask,
+            )
+            .await?;
+            println!("{report}");
+            return Ok(());
         }
         Some(Command::Pr(pr_args)) => {
             let config = load_config(pr_args.common.config.as_deref(), &pr_args.common.repo)?;
@@ -178,7 +191,6 @@ async fn main() -> Result<()> {
         None => {}
     }
 
-    // Handle OAuth login if requested (before validating repo or config)
     if args.gemini_oauth {
         println!("Starting Gemini OAuth authentication flow...");
         let proxy_client = gemini_proxy::GeminiProxyClient::new().await?;
@@ -203,9 +215,9 @@ async fn main() -> Result<()> {
     }
 
     let config = load_config(args.common.config.as_deref(), &repo)?;
+    let max_turns = config.max_turns(args.max_turns)?;
 
     let prompt = if let Some(path) = args.analyze {
-        // Empty string means analyze entire repo (from default_missing_value)
         let path_opt = if path.as_os_str().is_empty() {
             None
         } else {
@@ -220,12 +232,13 @@ async fn main() -> Result<()> {
         }
     };
 
-    if args.debate || config.default_debate() {
+    if !args.no_debate && config.default_debate() {
         debate::run_debate(
             &repo,
             &prompt,
             &config,
             args.rounds,
+            max_turns,
             args.common.verbose,
             debate::DebateMode::Review,
         )
@@ -236,6 +249,7 @@ async fn main() -> Result<()> {
             &repo,
             &prompt,
             &config,
+            max_turns,
             args.common.verbose,
             review::TaskMode::Review,
         )
@@ -246,14 +260,12 @@ async fn main() -> Result<()> {
 }
 
 fn load_config(explicit_path: Option<&Path>, repo: &Path) -> Result<config::Config> {
-    // 1. explicit --config flag
     if let Some(path) = explicit_path {
         let content = std::fs::read_to_string(path)
             .map_err(|e| eyre::eyre!("failed to read config {:?}: {e}", path))?;
         return toml::from_str(&content).map_err(|e| eyre::eyre!("invalid config: {e}"));
     }
 
-    // 2. repo-level nitpicker.toml
     let repo_config = repo.join("nitpicker.toml");
     if repo_config.exists() {
         let content = std::fs::read_to_string(&repo_config)
@@ -261,7 +273,6 @@ fn load_config(explicit_path: Option<&Path>, repo: &Path) -> Result<config::Conf
         return toml::from_str(&content).map_err(|e| eyre::eyre!("invalid config: {e}"));
     }
 
-    // 3. global config: ~/.nitpicker/config.toml (same dir as oauth token)
     if let Some(home) = dirs::home_dir() {
         let global_config = home.join(".nitpicker").join("config.toml");
         if global_config.exists() {
@@ -287,6 +298,18 @@ fn init_config_path(global: bool) -> Result<PathBuf> {
     } else {
         Ok(Path::new("nitpicker.toml").to_path_buf())
     }
+}
+
+pub(crate) fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid positive integer: {value}"))?;
+
+    if parsed == 0 {
+        return Err("value must be greater than 0".to_string());
+    }
+
+    Ok(parsed)
 }
 
 fn build_analysis_prompt(path: Option<&Path>, custom_prompt: Option<&str>) -> String {

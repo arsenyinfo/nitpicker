@@ -9,7 +9,6 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-const MAX_TURNS: usize = 100;
 const MAX_TOOL_RESULT_BYTES: usize = 50_000;
 
 pub struct AgentResult {
@@ -20,6 +19,7 @@ pub struct AgentResult {
 pub struct AgentConfig {
     pub name: String,
     pub model: String,
+    pub max_turns: usize,
     pub system_prompt: String,
     pub client: Arc<dyn LLMClientDyn>,
 }
@@ -35,7 +35,7 @@ pub async fn run_agent(
     history.push(prompt.clone());
     let mut total_output_tokens = 0u64;
 
-    for turn in 0..MAX_TURNS {
+    for turn in 0..config.max_turns {
         let completion = Completion {
             model: config.model.clone(),
             prompt: prompt.clone(),
@@ -110,5 +110,5 @@ pub async fn run_agent(
         }
     }
 
-    eyre::bail!("agent loop exceeded MAX_TURNS")
+    eyre::bail!("agent loop exceeded {} turns", config.max_turns)
 }

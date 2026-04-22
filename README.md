@@ -19,41 +19,43 @@ cargo install --git https://github.com/arsenyinfo/nitpicker
 ## Quick start
 
 ```bash
-# review current PR/diff (requires nitpicker.toml at repo root)
+export ANTHROPIC_API_KEY="your-api-key-here"
+```
+
+### Review
+
+```bash
 nitpicker
-
-# review a specific repo
 nitpicker --repo /path/to/repo
-
-# customized prompt
 nitpicker --repo /path/to/repo --prompt "focus on src/api/"
-
-# analyze existing code (no PR/diff required)
 nitpicker --analyze src/components/
-nitpicker --analyze src/main.rs
-nitpicker --analyze  # analyze entire repo
+nitpicker --analyze  # entire repo
+```
 
-# debate mode: two agents argue about the diff, meta-reviewer synthesizes (requires ≥2 reviewers)
-nitpicker --debate
-nitpicker --debate --analyze src/  # debate about existing code
-nitpicker --debate --rounds 3
+### Parallel Mode
 
-# review the current branch's open PR and post result as a comment
+```bash
+nitpicker --no-debate
+nitpicker --no-debate --analyze src/
+nitpicker --no-debate --max-turns 40
+```
+
+### PR review
+
+```bash
 nitpicker pr
-
-# review a specific PR by URL and post result as a comment
 nitpicker pr https://github.com/owner/repo/pull/42
-
-# review a PR without posting a comment
 nitpicker pr --no-comment
 nitpicker pr https://github.com/owner/repo/pull/42 --no-comment
+```
 
-# ask a free-form question (parallel: multiple opinions aggregated)
+### Ask
+
+```bash
 nitpicker ask "should we use eyre or thiserror for error handling?"
-
-# ask with debate (actor-critic dialogue, then meta-review)
-nitpicker ask --debate "is this authentication flow secure?"
-nitpicker ask --debate --rounds 3 "should we split this module?"
+nitpicker ask --no-debate "is this authentication flow secure?"
+nitpicker ask --rounds 3 "should we split this module?"
+nitpicker ask --max-turns 40 "should we split this module?"
 ```
 
 ## Configuration
@@ -76,7 +78,8 @@ Example `nitpicker.toml`:
 
 ```toml
 [defaults]
-debate = false         # optional, default: false
+debate = true          # optional, default: true
+max_turns = 70         # optional, default: 70
 
 [aggregator]
 model = "claude-sonnet-4-6"
@@ -96,11 +99,11 @@ base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 ```
 
-It is recommended to use providers that were not used for the initial building to enforce diversity of thought. 
+> **Tip:** Use providers that were not used for the initial building of your codebase to enforce diversity of thought.
 
 Unknown config keys are rejected. For example, use `max_tokens` for output length; `token_limit` is not a supported field.
 
-Set `[defaults].debate = true` to enable debate mode by default for both `nitpicker` and `nitpicker ask`. Passing `--debate` still works and explicitly enables debate for a single run.
+Debate mode is enabled by default for `nitpicker`, `nitpicker ask`, and `nitpicker pr`. Pass `--no-debate` to use parallel aggregation for a single run. Use `[defaults].max_turns` or `--max-turns` to control the per-agent tool-use loop limit.
 
 ### Provider types
 
@@ -140,8 +143,8 @@ This opens a browser, completes the OAuth flow, and saves the token to `~/.nitpi
 
 ```
 nitpicker [OPTIONS]
-nitpicker ask [--debate] [--rounds N] [OPTIONS] <topic>
-nitpicker pr [URL] [--no-comment] [--debate] [--rounds N] [OPTIONS]
+nitpicker ask [--no-debate] [--rounds N] [--max-turns N] [OPTIONS] <topic>
+nitpicker pr [URL] [--no-comment] [--no-debate] [--rounds N] [--max-turns N] [OPTIONS]
 nitpicker init [--global]
 ```
 
@@ -152,8 +155,9 @@ nitpicker init [--global]
 --config <PATH>    config file [default: <repo>/nitpicker.toml, then ~/.nitpicker/config.toml]
 --prompt <TEXT>    review instructions (optional, has a sensible default)
 --analyze [PATH]   analyze existing code instead of reviewing changes
---debate           use actor-critic debate instead of parallel aggregation
---rounds <N>       maximum debate rounds (only with --debate) [default: 5]
+--no-debate        use parallel aggregation instead of actor-critic debate
+--rounds <N>       maximum debate rounds [default: 5]
+--max-turns <N>    maximum tool-use turns per agent or debate turn [default: 70 via config]
 --gemini-oauth     run Gemini OAuth authentication flow and exit
 -v, --verbose      show info-level logs (hidden by default)
 ```
@@ -161,7 +165,7 @@ nitpicker init [--global]
 ### PR subcommand
 
 ```
-nitpicker pr [URL] [--no-comment] [--debate] [--rounds N] [--prompt TEXT] [--repo .] [--config PATH] [-v]
+nitpicker pr [URL] [--no-comment] [--no-debate] [--rounds N] [--max-turns N] [--prompt TEXT] [--repo .] [--config PATH] [-v]
 ```
 
 Reviews a GitHub PR using its title, description, and diff. Requires the `gh` CLI (`gh auth login` to authenticate).
@@ -169,17 +173,17 @@ Reviews a GitHub PR using its title, description, and diff. Requires the `gh` CL
 - Without `URL`: reviews the current branch's open PR (must be run inside the repo)
 - With `URL` (`https://github.com/owner/repo/pull/N`): clones the repo into a temp dir, checks out the PR branch, reviews it, then cleans up
 - By default, posts the review as a PR comment. Pass `--no-comment` to skip posting.
-- `--debate` and `--rounds` work the same as in the default review mode (debate output is not posted as a comment yet)
+- `--no-debate`, `--rounds`, and `--max-turns` work the same as in the default review mode
 
 ### Ask subcommand
 
 ```
-nitpicker ask [--debate] [--rounds N] [--repo .] [--config PATH] [-v] <topic>
+nitpicker ask [--no-debate] [--rounds N] [--max-turns N] [--repo .] [--config PATH] [-v] <topic>
 ```
 
-Runs agents on a free-form question instead of a code diff. Without `--debate`, agents answer in parallel and an aggregator synthesizes their responses. With `--debate`, two agents take turns as Actor/Critic before a meta-reviewer concludes.
+ Runs agents on a free-form question instead of a code diff. By default, two agents take turns as Actor/Critic before a meta-reviewer concludes. Pass `--no-debate` to switch to the parallel reviewer plus aggregator flow.
 
-### Debate mode (`--debate`)
+### Debate mode (default)
 
 Two LLM agents take turns exploring the codebase with file/git tools and submitting verdicts. The Critic can signal agreement (`agree=true`) to end early. A meta-reviewer synthesizes the dialogue.
 
