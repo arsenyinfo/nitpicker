@@ -16,6 +16,8 @@ use tracing::{info, warn};
 const MAX_TOOL_RESULT_BYTES: usize = 50_000;
 const MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS: usize = 3;
 const MAX_SUBAGENT_DEPTH: usize = 2;
+const DEFAULT_AGENT_TEMPERATURE: f64 = 0.2;
+const REPEATED_TOOL_CALL_RECOVERY_TEMPERATURE: f64 = 0.6;
 
 pub struct AgentResult {
     pub text: String,
@@ -84,6 +86,12 @@ struct ToolCallContext<'a> {
     current_turns: usize,
     total_tool_calls: usize,
     initial_subagent_count: usize,
+}
+
+struct ToolCallOutcome {
+    output: String,
+    nested_tool_calls: usize,
+    repeated_tool_call_blocked: bool,
 }
 
 impl Tool for FinishTool {
@@ -160,6 +168,7 @@ pub async fn run_agent(
     let mut consecutive_identical_tool_calls = 0usize;
     let mut last_tool_call_outputs: HashMap<String, String> = HashMap::new();
     let initial_subagent_count = config.subagent_counter.load(Ordering::Relaxed);
+    let mut boost_next_completion_temperature = false;
 
     for turn in 0..config.max_turns {
         if conversation_usage.should_compact() {
@@ -182,13 +191,26 @@ pub async fn run_agent(
             }
         }
 
+        let temperature = if boost_next_completion_temperature {
+            info!(
+                agent = %config.name,
+                turn,
+                temperature = REPEATED_TOOL_CALL_RECOVERY_TEMPERATURE,
+                "temporarily increasing temperature after repeated tool-call block"
+            );
+            REPEATED_TOOL_CALL_RECOVERY_TEMPERATURE
+        } else {
+            DEFAULT_AGENT_TEMPERATURE
+        };
+        boost_next_completion_temperature = false;
+
         let completion = Completion {
             model: config.model.clone(),
             prompt: prompt.clone(),
             preamble: Some(config.system_prompt.clone()),
             history: history[..history.len().saturating_sub(1)].to_vec(),
             tools: tool_definitions(&runtime_tools),
-            temperature: Some(0.2),
+            temperature: Some(temperature),
             max_tokens: Some(8192),
             additional_params: None,
         };
@@ -219,7 +241,7 @@ pub async fn run_agent(
                 }
                 should_terminate |= config.terminal_tools.iter().any(|name| name == &tool_name);
                 info!(agent = %config.name, tool = %tool_name, args = %args, turn, "tool call");
-                let (output, nested_tool_calls) = execute_tool_call(
+                let outcome = execute_tool_call(
                     ToolCallContext {
                         config: &config,
                         runtime_tools: &runtime_tools,
@@ -235,6 +257,14 @@ pub async fn run_agent(
                     consecutive_identical_tool_calls,
                 )
                 .await?;
+                if outcome.repeated_tool_call_blocked {
+                    boost_next_completion_temperature = true;
+                }
+                let ToolCallOutcome {
+                    output,
+                    nested_tool_calls,
+                    repeated_tool_call_blocked: _,
+                } = outcome;
                 last_tool_call_outputs.insert(tool_call_key, output.clone());
                 total_tool_calls += nested_tool_calls;
                 report_progress(&config, turn + 1, total_tool_calls, initial_subagent_count);
@@ -466,7 +496,7 @@ async fn execute_tool_call(
     tool_name: &str,
     args: Value,
     consecutive_identical_tool_calls: usize,
-) -> Result<(String, usize)> {
+) -> Result<ToolCallOutcome> {
     if consecutive_identical_tool_calls >= MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS {
         warn!(
             agent = %ctx.config.name,
@@ -474,25 +504,29 @@ async fn execute_tool_call(
             args = %args,
             turn = ctx.turn,
             consecutive_identical_tool_calls,
+            next_temperature = REPEATED_TOOL_CALL_RECOVERY_TEMPERATURE,
             "blocking repeated identical tool call"
         );
-        return Ok((
-            format!(
+        return Ok(ToolCallOutcome {
+            output: format!(
                 "Warning: repeated identical tool call blocked for {tool_name} after {consecutive_identical_tool_calls} attempts. Think twice; try changing the arguments or using a different tool."
             ),
-            0,
-        ));
+            nested_tool_calls: 0,
+            repeated_tool_call_blocked: true,
+        });
     }
 
     if tool_name == "spawn_subagent" {
         if !ctx.config.depth.can_spawn_subagent() {
-            return Ok((
-                "Error: subagent depth limit reached; cannot spawn another subagent".to_string(),
-                0,
-            ));
+            return Ok(ToolCallOutcome {
+                output: "Error: subagent depth limit reached; cannot spawn another subagent"
+                    .to_string(),
+                nested_tool_calls: 0,
+                repeated_tool_call_blocked: false,
+            });
         }
         info!(agent = %ctx.config.name, task = %args, turn = ctx.turn, "spawning subagent");
-        return Ok(run_subagent(
+        let (output, nested_tool_calls) = run_subagent(
             ctx.config,
             &args,
             ctx.tools_map,
@@ -501,21 +535,38 @@ async fn execute_tool_call(
             ctx.total_tool_calls,
             ctx.initial_subagent_count,
         )
-        .await);
+        .await;
+        return Ok(ToolCallOutcome {
+            output,
+            nested_tool_calls,
+            repeated_tool_call_blocked: false,
+        });
     }
 
     match ctx.runtime_tools.get(tool_name) {
         Some(tool) => match tool.call(args, ctx.work_dir.to_path_buf()).await {
-            Ok(output) => Ok((output, 0)),
+            Ok(output) => Ok(ToolCallOutcome {
+                output,
+                nested_tool_calls: 0,
+                repeated_tool_call_blocked: false,
+            }),
             Err(err) => {
                 warn!(agent = %ctx.config.name, tool = %tool_name, error = %err, "tool error");
-                Ok((format!("Error: {err}"), 0))
+                Ok(ToolCallOutcome {
+                    output: format!("Error: {err}"),
+                    nested_tool_calls: 0,
+                    repeated_tool_call_blocked: false,
+                })
             }
         },
         None => {
             let msg = format!("Error: unknown tool '{tool_name}'");
             warn!(agent = %ctx.config.name, tool = %tool_name, "unknown tool");
-            Ok((msg, 0))
+            Ok(ToolCallOutcome {
+                output: msg,
+                nested_tool_calls: 0,
+                repeated_tool_call_blocked: false,
+            })
         }
     }
 }

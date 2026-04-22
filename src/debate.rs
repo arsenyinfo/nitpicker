@@ -213,15 +213,6 @@ fn build_client(
     build_reviewer_client(reviewer, gemini_proxy)
 }
 
-fn compact_threshold(config: &Config, reviewer: &ReviewerConfig) -> Result<Option<u64>> {
-    if reviewer.compact_threshold == Some(0) {
-        eyre::bail!("reviewer {} compact_threshold must be greater than 0", reviewer.name);
-    }
-    Ok(reviewer
-        .compact_threshold
-        .or(config.default_compact_threshold()?))
-}
-
 pub async fn run_debate(
     repo: &Path,
     prompt: &str,
@@ -254,8 +245,8 @@ pub async fn run_debate(
 
     let actor_client = build_client(actor_cfg, gemini_proxy.as_ref())?;
     let critic_client = build_client(critic_cfg, gemini_proxy.as_ref())?;
-    let actor_compact_threshold = compact_threshold(config, actor_cfg)?;
-    let critic_compact_threshold = compact_threshold(config, critic_cfg)?;
+    let actor_compact_threshold = config.reviewer_compact_threshold(actor_cfg)?;
+    let critic_compact_threshold = config.reviewer_compact_threshold(critic_cfg)?;
 
     let agg_client: Arc<dyn LLMClientDyn> =
         build_aggregator_client(agg_cfg, gemini_proxy.as_ref())?;

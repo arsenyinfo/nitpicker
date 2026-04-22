@@ -248,13 +248,8 @@ fn build_agent_config(
     gemini_proxy: Option<&crate::gemini_proxy::GeminiProxyClient>,
     subagent_counter: Arc<AtomicUsize>,
 ) -> Result<AgentConfig> {
-    if reviewer.compact_threshold == Some(0) {
-        eyre::bail!("reviewer {} compact_threshold must be greater than 0", reviewer.name);
-    }
     let client = build_reviewer_client(reviewer, gemini_proxy)?;
-    let compact_threshold = reviewer
-        .compact_threshold
-        .or(config.default_compact_threshold()?);
+    let compact_threshold = config.reviewer_compact_threshold(reviewer)?;
 
     Ok(AgentConfig {
         name: reviewer.name.clone(),

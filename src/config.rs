@@ -103,4 +103,17 @@ impl Config {
 
         Ok(threshold)
     }
+
+    pub fn reviewer_compact_threshold(&self, reviewer: &ReviewerConfig) -> Result<Option<u64>> {
+        if reviewer.compact_threshold == Some(0) {
+            eyre::bail!(
+                "reviewer {} compact_threshold must be greater than 0",
+                reviewer.name
+            );
+        }
+
+        Ok(reviewer
+            .compact_threshold
+            .or(self.default_compact_threshold()?))
+    }
 }
