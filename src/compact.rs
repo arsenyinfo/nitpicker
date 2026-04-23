@@ -19,19 +19,14 @@ pub async fn compact_history(
         return Ok(None);
     }
 
-    let (thread, residual_messages) = split_thread(history);
-    if thread.is_empty() {
-        return Ok(None);
-    }
+    let (response, summary) = summarize_history(client, model, system_prompt, history.clone(), turn, usage).await?;
 
-    let (response, summary) = summarize_history(client, model, system_prompt, thread, turn, usage).await?;
-
-    let mut compacted = vec![Message::user(format!(
-        "compacted conversation summary before turn {turn}:\n\n{summary}"
-    ))];
-    compacted.extend(residual_messages);
-    *history = compacted;
-    *prompt = history.last().cloned().unwrap_or_else(|| prompt.clone());
+    let continue_msg = Message::user("Continue from where you left off.".to_string());
+    *history = vec![
+        Message::user(format!("compacted conversation summary before turn {turn}:\n\n{summary}")),
+        continue_msg.clone(),
+    ];
+    *prompt = continue_msg;
     Ok(Some(response.usage))
 }
 
@@ -70,16 +65,6 @@ async fn summarize_history(
         "compaction output missing <summary> block after {COMPACTION_MAX_ATTEMPTS} attempts: {}",
         last_text.unwrap_or_default()
     ))
-}
-
-fn split_thread(history: &[Message]) -> (Vec<Message>, Vec<Message>) {
-    match history.last() {
-        Some(Message::User { .. }) => (
-            history[..history.len().saturating_sub(1)].to_vec(),
-            vec![history.last().cloned().expect("last message exists")],
-        ),
-        _ => (history.to_vec(), Vec::new()),
-    }
 }
 
 fn build_compaction_prompt(turn: usize, usage: TokenUsage, attempt: usize) -> String {
@@ -127,7 +112,10 @@ fn extract_tag(text: &str, tag: &str) -> Option<String> {
     let start_tag = format!("<{tag}>");
     let end_tag = format!("</{tag}>");
     let start = text.find(&start_tag)? + start_tag.len();
-    let end = text[start..].find(&end_tag)? + start;
+    let end = text.rfind(&end_tag)?;
+    if end < start {
+        return None;
+    }
     let content = text[start..end].trim();
     if content.is_empty() {
         None

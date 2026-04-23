@@ -7,7 +7,7 @@ use rig::OneOrMany;
 use rig::completion::Message;
 use rig::completion::message::{ToolResult, ToolResultContent, UserContent};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,6 +15,8 @@ use tracing::{info, warn};
 
 const MAX_TOOL_RESULT_BYTES: usize = 50_000;
 const MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS: usize = 3;
+const MAX_CYCLE_REPETITIONS: usize = 2;
+const TOOL_CALL_HISTORY_WINDOW: usize = 8;
 const MAX_SUBAGENT_DEPTH: usize = 2;
 const DEFAULT_AGENT_TEMPERATURE: f64 = 0.2;
 const REPEATED_TOOL_CALL_RECOVERY_TEMPERATURE: f64 = 0.6;
@@ -164,8 +166,7 @@ pub async fn run_agent(
     let mut conversation_usage = ConversationUsageWindow::new(config.compact_threshold);
     let mut total_tool_calls = 0usize;
     let mut empty_response_count = 0usize;
-    let mut last_tool_call_key: Option<String> = None;
-    let mut consecutive_identical_tool_calls = 0usize;
+    let mut tool_call_history: VecDeque<String> = VecDeque::new();
     let mut last_tool_call_outputs: HashMap<String, String> = HashMap::new();
     let initial_subagent_count = config.subagent_counter.load(Ordering::Relaxed);
     let mut boost_next_completion_temperature = false;
@@ -184,9 +185,9 @@ pub async fn run_agent(
             )
             .await?
             {
-                total_input_tokens += compaction_usage.input_tokens;
-                total_output_tokens += compaction_usage.output_tokens;
-                total_tokens += compaction_usage.total_tokens;
+                total_input_tokens = total_input_tokens.saturating_add(compaction_usage.input_tokens);
+                total_output_tokens = total_output_tokens.saturating_add(compaction_usage.output_tokens);
+                total_tokens = total_tokens.saturating_add(compaction_usage.total_tokens);
                 conversation_usage.reset();
             }
         }
@@ -216,9 +217,9 @@ pub async fn run_agent(
         };
 
         let response = config.client.completion(completion).await?;
-        total_input_tokens += response.usage.input_tokens;
-        total_output_tokens += response.usage.output_tokens;
-        total_tokens += response.usage.total_tokens;
+        total_input_tokens = total_input_tokens.saturating_add(response.usage.input_tokens);
+        total_output_tokens = total_output_tokens.saturating_add(response.usage.output_tokens);
+        total_tokens = total_tokens.saturating_add(response.usage.total_tokens);
         conversation_usage.record(response.usage);
         let assistant_message = response.message();
         history.push(assistant_message.clone());
@@ -233,12 +234,11 @@ pub async fn run_agent(
                 let tool_name = call.function.name.clone();
                 let args = call.function.arguments.clone();
                 let tool_call_key = format!("{tool_name}:{args}");
-                if last_tool_call_key.as_ref() == Some(&tool_call_key) {
-                    consecutive_identical_tool_calls += 1;
-                } else {
-                    last_tool_call_key = Some(tool_call_key.clone());
-                    consecutive_identical_tool_calls = 1;
+                tool_call_history.push_back(tool_call_key.clone());
+                if tool_call_history.len() > TOOL_CALL_HISTORY_WINDOW {
+                    tool_call_history.pop_front();
                 }
+                let cycle_len = detect_tool_call_cycle(&tool_call_history);
                 should_terminate |= config.terminal_tools.iter().any(|name| name == &tool_name);
                 info!(agent = %config.name, tool = %tool_name, args = %args, turn, "tool call");
                 let outcome = execute_tool_call(
@@ -254,7 +254,7 @@ pub async fn run_agent(
                     },
                     &tool_name,
                     args,
-                    consecutive_identical_tool_calls,
+                    cycle_len,
                 )
                 .await?;
                 if outcome.repeated_tool_call_blocked {
@@ -341,8 +341,7 @@ pub async fn run_agent(
             history.push(tool_message.clone());
             prompt = tool_message;
         } else {
-            last_tool_call_key = None;
-            consecutive_identical_tool_calls = 0;
+            tool_call_history.clear();
             let text = response.text();
             report_progress(&config, turn + 1, total_tool_calls, initial_subagent_count);
             if text.is_empty() {
@@ -491,26 +490,57 @@ async fn run_subagent(
     }
 }
 
+/// Returns the cycle period (1, 2, or 3) if the tail of `history` forms a repeated cycle,
+/// or 0 if no cycle is detected. Period-1 maps to the existing consecutive-identical check.
+fn detect_tool_call_cycle(history: &VecDeque<String>) -> usize {
+    let h: Vec<&str> = history.iter().map(String::as_str).collect();
+    let n = h.len();
+    for period in 1..=3 {
+        let reps = if period == 1 {
+            MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS
+        } else {
+            MAX_CYCLE_REPETITIONS
+        };
+        let needed = period * reps;
+        if n < needed {
+            continue;
+        }
+        let start = n - needed;
+        let pattern = &h[start..start + period];
+        if h[start..]
+            .chunks(period)
+            .take(reps)
+            .all(|chunk| chunk == pattern)
+        {
+            return period;
+        }
+    }
+    0
+}
+
 async fn execute_tool_call(
     ctx: ToolCallContext<'_>,
     tool_name: &str,
     args: Value,
-    consecutive_identical_tool_calls: usize,
+    cycle_len: usize,
 ) -> Result<ToolCallOutcome> {
-    if consecutive_identical_tool_calls >= MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS {
+    if cycle_len > 0 {
         warn!(
             agent = %ctx.config.name,
             tool = %tool_name,
             args = %args,
             turn = ctx.turn,
-            consecutive_identical_tool_calls,
+            cycle_len,
             next_temperature = REPEATED_TOOL_CALL_RECOVERY_TEMPERATURE,
-            "blocking repeated identical tool call"
+            "blocking cyclic tool call"
         );
+        let msg = if cycle_len == 1 {
+            format!("Warning: repeated identical tool call blocked for {tool_name}. Think twice; try changing the arguments or using a different tool.")
+        } else {
+            format!("Warning: tool call cycle of period {cycle_len} detected (e.g. A→B→A→B). You are looping without making progress. Try a different approach or tool.")
+        };
         return Ok(ToolCallOutcome {
-            output: format!(
-                "Warning: repeated identical tool call blocked for {tool_name} after {consecutive_identical_tool_calls} attempts. Think twice; try changing the arguments or using a different tool."
-            ),
+            output: msg,
             nested_tool_calls: 0,
             repeated_tool_call_blocked: true,
         });
