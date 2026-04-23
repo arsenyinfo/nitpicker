@@ -386,8 +386,16 @@ pub fn create_gemini_client_with_proxy(
     Ok(client.with_retry().into_arc())
 }
 
+fn model_supports_sampling_params(model: &str) -> bool {
+    // claude-opus-4-7+ rejects temperature/top_p/top_k with a 400 error
+    !model.starts_with("claude-opus-4-7")
+}
+
 impl LLMClient for anthropic::Client {
-    async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
+    async fn completion(&self, mut completion: Completion) -> Result<CompletionResponse> {
+        if !model_supports_sampling_params(&completion.model) {
+            completion.temperature = None;
+        }
         let model_name = completion.model.clone();
         let mut request: rig::completion::CompletionRequest = completion.into();
         request.model = Some(model_name.clone());
