@@ -192,3 +192,22 @@ Two LLM agents take turns exploring the codebase with file/git tools and submitt
 - `aggregator` → Meta-reviewer
 
 Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timestamp}.md`.
+
+## Changelog
+
+**0.1.4** — 2026-04-23
+- Proactive conversation compaction to prevent context overflow mid-review
+- Claude Opus 4.7 compatibility fix
+- Base branch detection fix for repos with `master` as default
+
+**0.1.3** — 2026-04-22
+- Bounded subagent runtime for debate and review
+- Configurable turn limits (`--max-turns`, `[defaults].max_turns`)
+- Kimi repeating tool-call fix
+
+**0.1.2** — 2026-03-15
+- `pr` subcommand: review GitHub PRs and post result as comment
+- Debate synthesis posted as PR comment
+- Three-dot diff for accurate stale-branch diffs
+- Global config (`nitpicker init --global`)
+- Rate limit handling with backoff
