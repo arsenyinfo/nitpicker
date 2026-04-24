@@ -1,4 +1,5 @@
-const VERIFY_WARNING: &str = "Your opponent may sound confident but still make factual errors or overlook edge cases. \
+const VERIFY_WARNING: &str =
+    "Your opponent may sound confident but still make factual errors or overlook edge cases. \
 Independently verify every claim against the actual code before accepting it.";
 
 const DELEGATION_GUIDANCE: &str = "You can delegate focused investigations with spawn_subagent(task). \
@@ -65,14 +66,28 @@ impl TaskMode {
     pub fn reduce_prompt(&self, combined: &str) -> String {
         match self {
             TaskMode::Review => format!(
-                "Your job is to synthesize multiple code reviews into a single,\n\
-                actionable summary. Deduplicate findings, resolve conflicts, and prioritize by severity. Include source of every item (refer reviewers).\n\n\
-                Format your response as:\n\
-                1. **Critical** - must fix before merge\n\
-                2. **Important** - should fix, but not blocking\n\
-                3. **Suggestions** - nice to have improvements\n\n\
-                If there are no findings in a category, omit it.\n\n\
-                Start your response with a one-sentence overall verdict on whether the code is ready to merge or not (must start with APPROVE or REJECT). Markdown is not supported.\n\n\
+                "Your job is to synthesize multiple code reviews into a single self-contained final report.\n\
+                Focus on fidelity, not compression. Deduplicate findings, resolve conflicts, preserve the \
+                important technical detail behind each confirmed issue, and include which reviewers raised \
+                or supported it.\n\n\
+                Rules:\n\
+                1. Include only confirmed findings. If reviewers disagree, resolve the disagreement based on \
+                the evidence in the reviews and exclude findings that were not substantiated.\n\
+                2. For each finding, preserve the key context: what is wrong, why it matters, any important \
+                conditions or edge cases, relevant file/line references, and which reviewers support it.\n\
+                3. Do not include discarded or weakly supported issues as findings. If useful for \
+                transparency, mention them only in a short final \"Rejected false positives\" section.\n\
+                4. Group duplicates and closely related points into a single finding.\n\
+                5. Preserve severity: Critical, Important, Suggestions.\n\
+                6. Start with a one-sentence overall verdict that begins with APPROVE or REJECT.\n\n\
+                Format your response as plain text with these headings:\n\
+                Overall verdict\n\
+                Critical issues\n\
+                Important issues\n\
+                Suggestions\n\
+                Rejected false positives (optional, brief)\n\n\
+                If a category has no items, omit it. The report should be detailed enough that a reader can \
+                understand and act on the findings without reading the original individual reviews.\n\n\
                 Individual reviews:\n\n\
                 {combined}"
             ),
@@ -88,7 +103,11 @@ impl TaskMode {
 
     pub fn aggregator_preamble(&self) -> &'static str {
         match self {
-            TaskMode::Review => "You synthesize code reviews into a concise final verdict.",
+            TaskMode::Review => {
+                "You synthesize code reviews into detailed, self-contained final reports. \
+                Preserve concrete technical detail, supporting evidence, reviewer attribution, and severity. \
+                Exclude refuted or weakly supported findings from the main findings sections."
+            }
             TaskMode::Ask => "You synthesize multiple expert answers into a single clear response.",
         }
     }
@@ -129,7 +148,9 @@ impl DebateMode {
                 "You are a thorough code reviewer. Find genuine issues — bugs, security flaws, \
                 performance problems, unclear logic — in the changes described. Use the available \
                 tools to read the code and understand context. Call submit_verdict with a clear, \
-                evidence-based list of findings.\n\n"
+                evidence-based list of findings. For each finding, include severity, file/line references, \
+                the concrete failure mode or risk, why it matters, and any important triggering conditions \
+                or constraints.\n\n"
                     .to_string()
                     + DELEGATION_GUIDANCE
                     + "\n\n"
@@ -162,6 +183,8 @@ impl DebateMode {
                 finding: read the relevant file, check the surrounding context, and decide independently \
                 whether the issue is real. Also actively look for important issues the reviewer missed. \
                 Agreeing without reading the code is a failure of your role. \
+                Classify each reviewed issue as confirmed, rejected false positive, or still uncertain, \
+                and explain that classification with evidence. \
                 Only call submit_verdict(agree=true) when every finding is verified correct AND you \
                 have checked for missed issues. Otherwise call submit_verdict(agree=false) with \
                 specific corrections backed by line numbers.\n\n"
@@ -180,16 +203,44 @@ impl DebateMode {
                 What is the best actionable conclusion?"
             }
             DebateMode::Review => {
-                "Synthesize the review findings. Which issues are confirmed real? Which were false positives? \
-                What is the most important thing to fix? Be concise and actionable."
+                "You are synthesizing a code-review debate into the final report. \
+                Your goal is to produce a self-contained review that preserves the technical detail \
+                needed by someone who has not read the debate.\n\n\
+                Focus on fidelity, not compression. Preserve the important specifics: what the issue is, \
+                why it matters, the conditions under which it occurs, and the exact file and line references \
+                cited in the debate. Omit conversational filler and repeated arguments.\n\n\
+                Rules:\n\
+                1. Include only issues that survived the debate and are confirmed real.\n\
+                2. Do not present discarded or refuted issues as findings.\n\
+                3. If you mention false positives for transparency, put them only in a short final \
+                \"Rejected false positives\" section.\n\
+                4. For each confirmed finding, preserve the key reasoning: what is wrong, why it matters, \
+                and any important constraints, edge cases, or exploit/runtime conditions established in the debate.\n\
+                5. Keep the debate's severity distinctions: Critical, Important, Suggestions.\n\
+                6. Group duplicates or closely related points into a single finding.\n\
+                7. Start with a one-sentence overall verdict beginning with APPROVE or REJECT.\n\n\
+                Format your response as:\n\
+                Overall verdict\n\
+                Critical issues\n\
+                Important issues\n\
+                Suggestions\n\
+                Rejected false positives (optional, brief)\n\n\
+                Each finding should be detailed enough that a reader can understand the problem and act on it \
+                without reading the original debate."
             }
         }
     }
 
     pub(crate) fn meta_preamble(&self) -> &'static str {
         match self {
-            DebateMode::Topic | DebateMode::Review => {
+            DebateMode::Topic => {
                 "You synthesize structured debates into concise, actionable conclusions."
+            }
+            DebateMode::Review => {
+                "You synthesize code-review debates into detailed, self-contained final reports. \
+                Preserve the concrete technical details behind each confirmed finding, including file paths, \
+                line numbers, impact, and the reasoning established during the debate. \
+                Exclude refuted findings from the main findings sections."
             }
         }
     }
