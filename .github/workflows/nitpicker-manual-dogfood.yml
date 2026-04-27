@@ -72,13 +72,14 @@ jobs:
           AGGREGATOR_MODEL: ${{ inputs.aggregator_model }}
           REVIEWER_ONE_MODEL: ${{ inputs.reviewer_one_model }}
           REVIEWER_TWO_MODEL: ${{ inputs.reviewer_two_model }}
+          MAX_TURNS: ${{ inputs.max_turns }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP"
           cat > "$RUNNER_TEMP/nitpicker-openrouter.toml" <<EOF
           [defaults]
           debate = true
-          max_turns = 30
+          max_turns = ${MAX_TURNS}
 
           [aggregator]
           model = "${AGGREGATOR_MODEL}"
