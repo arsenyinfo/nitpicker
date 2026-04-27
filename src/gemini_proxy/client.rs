@@ -51,6 +51,7 @@ impl GeminiProxyClient {
             http_client: reqwest::Client::new(),
             project_id: Arc::new(tokio::sync::RwLock::new(None)),
             token_refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+            retry_state: super::retry::RetryState::new(),
         });
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
