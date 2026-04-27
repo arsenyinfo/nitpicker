@@ -139,6 +139,18 @@ nitpicker --gemini-oauth
 
 This opens a browser, completes the OAuth flow, and saves the token to `~/.nitpicker/gemini-token.json`. The token is refreshed automatically on subsequent runs.
 
+## Project context
+
+Nitpicker automatically loads a project context file from the repo root and prepends it to every reviewer's first message. This lets you give reviewers project-specific conventions, anti-patterns, or pointers to documentation files they should read (reviewers have `read_file`, `glob`, `grep`, and `git` tools).
+
+The first matching file wins (only one is loaded):
+
+1. `NITPICKER.md` — review-focused context (highest priority)
+2. `CLAUDE.md` — general project context
+3. `AGENTS.md` — agent-oriented project context
+
+Files are read as plain text (max 50,000 characters, truncated if larger). Binary files are skipped.
+
 ## CLI reference
 
 ```
