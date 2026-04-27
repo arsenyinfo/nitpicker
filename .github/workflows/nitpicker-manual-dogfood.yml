@@ -1,0 +1,135 @@
+name: Nitpicker manual dogfood
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: Extra review instructions appended to the diff context
+        required: false
+        default: focus on changed files, correctness, edge cases, and CI safety
+        type: string
+      mode:
+        description: Review mode
+        required: true
+        default: parallel
+        type: choice
+        options:
+          - parallel
+          - debate
+      max_turns:
+        description: Maximum tool-use turns per reviewer or debate turn
+        required: true
+        default: '30'
+        type: string
+      aggregator_model:
+        description: OpenRouter model ID for the aggregator
+        required: true
+        default: openai/gpt-4.1-mini
+        type: string
+      reviewer_one_model:
+        description: OpenRouter model ID for reviewer one
+        required: true
+        default: anthropic/claude-3.7-sonnet
+        type: string
+      reviewer_two_model:
+        description: OpenRouter model ID for reviewer two
+        required: true
+        default: openai/gpt-4.1-mini
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  dogfood:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.85-bookworm
+    steps:
+      - name: Install system dependencies
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates pkg-config libssl-dev
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build nitpicker from this branch
+        run: |
+          set -euo pipefail
+          cargo install --path . --locked --root "$RUNNER_TEMP/nitpicker"
+          echo "$RUNNER_TEMP/nitpicker/bin" >> "$GITHUB_PATH"
+
+      - name: Write temporary OpenRouter config
+        env:
+          AGGREGATOR_MODEL: ${{ inputs.aggregator_model }}
+          REVIEWER_ONE_MODEL: ${{ inputs.reviewer_one_model }}
+          REVIEWER_TWO_MODEL: ${{ inputs.reviewer_two_model }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP"
+          cat > "$RUNNER_TEMP/nitpicker-openrouter.toml" <<EOF
+          [defaults]
+          debate = true
+          max_turns = 30
+
+          [aggregator]
+          model = "${AGGREGATOR_MODEL}"
+          provider = "openai_compatible"
+          base_url = "https://openrouter.ai/api/v1"
+          api_key_env = "OPENROUTER_API_KEY"
+          max_tokens = 8192
+
+          [[reviewer]]
+          name = "reviewer-one"
+          model = "${REVIEWER_ONE_MODEL}"
+          provider = "openai_compatible"
+          base_url = "https://openrouter.ai/api/v1"
+          api_key_env = "OPENROUTER_API_KEY"
+
+          [[reviewer]]
+          name = "reviewer-two"
+          model = "${REVIEWER_TWO_MODEL}"
+          provider = "openai_compatible"
+          base_url = "https://openrouter.ai/api/v1"
+          api_key_env = "OPENROUTER_API_KEY"
+          EOF
+
+      - name: Run nitpicker dogfood review
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          REVIEW_PROMPT: ${{ inputs.prompt }}
+          REVIEW_MODE: ${{ inputs.mode }}
+          MAX_TURNS: ${{ inputs.max_turns }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+            echo "OPENROUTER_API_KEY secret is required" >&2
+            exit 1
+          fi
+
+          CMD=(nitpicker --repo . --config "$RUNNER_TEMP/nitpicker-openrouter.toml" --max-turns "$MAX_TURNS" --prompt "$REVIEW_PROMPT")
+          if [ "$REVIEW_MODE" = "parallel" ]; then
+            CMD+=(--no-debate)
+          fi
+
+          printf 'Running:'
+          printf ' %q' "${CMD[@]}"
+          printf '\n'
+
+          "${CMD[@]}" | tee nitpicker-report.txt
+
+      - name: Upload nitpicker artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nitpicker-report
+          path: nitpicker-report.txt
+          if-no-files-found: warn
