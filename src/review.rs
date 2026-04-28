@@ -31,7 +31,7 @@ pub async fn run_review(
     add_spawn_subagent_tool(&mut tools);
     let context = build_context(repo).await;
     let system_prompt = mode.system_prompt();
-    let initial_message = mode.initial_message(&context, user_prompt);
+    let initial_message = mode.initial_message("", user_prompt);
     let mut handles = Vec::new();
 
     let mp = MultiProgress::new();
@@ -79,6 +79,7 @@ pub async fn run_review(
 
         let done = done_style.clone();
         let initial_message = initial_message.clone();
+        let context = context.clone();
         let handle: JoinHandle<(String, Result<String>)> = tokio::spawn(async move {
             let mut config = match agent_config {
                 Ok(config) => config,
@@ -88,6 +89,7 @@ pub async fn run_review(
                     return (name, Err(err));
                 }
             };
+            config.project_context = Some(context);
             if !verbose {
                 let progress_pb = pb.clone();
                 config.progress = Some(Arc::new(move |progress: AgentProgress| {
@@ -169,7 +171,7 @@ pub async fn run_review(
 
 const MAX_CONTEXT_SIZE: usize = 50_000;
 
-async fn build_context(repo: &Path) -> String {
+pub async fn build_context(repo: &Path) -> String {
     let mut context = String::new();
 
     let repo_canonical = match tokio::fs::canonicalize(repo).await {
@@ -264,5 +266,6 @@ fn build_agent_config(
         max_empty_responses: 0,
         subagent_counter,
         progress: None,
+        project_context: None,
     })
 }

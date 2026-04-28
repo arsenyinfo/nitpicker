@@ -73,6 +73,7 @@ pub struct AgentConfig {
     pub max_empty_responses: usize,
     pub subagent_counter: Arc<AtomicUsize>,
     pub progress: Option<Arc<dyn Fn(AgentProgress) + Send + Sync>>,
+    pub project_context: Option<String>,
 }
 
 struct FinishTool {
@@ -157,6 +158,14 @@ pub async fn run_agent(
         runtime_tools.insert("finish".to_string(), finish_tool as Arc<dyn Tool>);
     }
 
+    let mut effective_system_prompt = config.system_prompt.clone();
+    if let Some(ref ctx) = config.project_context {
+        if !ctx.is_empty() {
+            effective_system_prompt.push_str("\n\n");
+            effective_system_prompt.push_str(ctx);
+        }
+    }
+
     let mut history = Vec::new();
     let mut prompt = Message::user(initial_message.to_string());
     history.push(prompt.clone());
@@ -176,7 +185,7 @@ pub async fn run_agent(
             if let Some(compaction_usage) = compact_history(
                 Arc::clone(&config.client),
                 &config.model,
-                &config.system_prompt,
+                &effective_system_prompt,
                 &mut history,
                 &mut prompt,
                 turn + 1,
@@ -207,7 +216,7 @@ pub async fn run_agent(
         let completion = Completion {
             model: config.model.clone(),
             prompt: prompt.clone(),
-            preamble: Some(config.system_prompt.clone()),
+            preamble: Some(effective_system_prompt.clone()),
             history: history[..history.len().saturating_sub(1)].to_vec(),
             tools: tool_definitions(&runtime_tools),
             temperature: Some(temperature),
@@ -480,6 +489,7 @@ async fn run_subagent(
         max_empty_responses: 0,
         subagent_counter: Arc::clone(&parent_config.subagent_counter),
         progress: None,
+        project_context: parent_config.project_context.clone(),
     };
 
     match Box::pin(run_agent(subagent_config, task, tools_map, work_dir)).await {

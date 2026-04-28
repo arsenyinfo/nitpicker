@@ -36,6 +36,7 @@ struct DebateTurnRequest<'a> {
     max_turns: usize,
     work_dir: &'a Path,
     progress: Option<Arc<dyn Fn(AgentProgress) + Send + Sync>>,
+    project_context: Option<String>,
 }
 
 struct SubmitVerdictTool {
@@ -121,6 +122,7 @@ async fn run_debate_turn(
         max_empty_responses: 3,
         subagent_counter,
         progress: request.progress,
+        project_context: request.project_context,
     };
 
     let result = run_agent(config, request.initial_message, &tools_map, request.work_dir).await?;
@@ -248,6 +250,8 @@ pub async fn run_debate(
     let actor_compact_threshold = config.reviewer_compact_threshold(actor_cfg)?;
     let critic_compact_threshold = config.reviewer_compact_threshold(critic_cfg)?;
 
+    let project_context = crate::review::build_context(repo).await;
+
     let agg_client: Arc<dyn LLMClientDyn> =
         build_aggregator_client(agg_cfg, gemini_proxy.as_ref())?;
 
@@ -308,6 +312,7 @@ pub async fn run_debate(
             max_turns,
             work_dir: repo,
             progress: actor_progress,
+            project_context: Some(project_context.clone()),
         })
         .await?;
         let elapsed = start.elapsed().as_secs();
@@ -349,6 +354,7 @@ pub async fn run_debate(
             max_turns,
             work_dir: repo,
             progress: critic_progress,
+            project_context: Some(project_context.clone()),
         })
         .await?;
         let elapsed = start.elapsed().as_secs();
