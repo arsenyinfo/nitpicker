@@ -202,6 +202,11 @@ Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timesta
 
 ## Changelog
 
+**0.2.0** — 2026-04-28
+- PR comments are now included in the review prompt for full context
+- Per-repo file lock prevents concurrent `nitpicker pr` runs on the same repository
+- Atomic lock acquisition with stale lock detection (no TOCTOU race)
+
 **0.1.4** — 2026-04-23
 - Proactive conversation compaction to prevent context overflow mid-review
 - Claude Opus 4.7 compatibility fix

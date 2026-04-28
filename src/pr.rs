@@ -3,8 +3,78 @@ use crate::debate::{self, DebateMode};
 use crate::review::{self, TaskMode};
 use eyre::{Result, WrapErr};
 use serde::Deserialize;
+use sha2::Digest;
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+fn lock_path(repo: &Path) -> PathBuf {
+    let canonical = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    let hash = sha2::Sha256::digest(canonical.as_os_str().as_encoded_bytes());
+    let hash_hex = format!("{:x}", hash);
+    std::env::temp_dir().join(format!("nitpicker-pr-review-{hash_hex}.lock"))
+}
+
+struct PrLock {
+    path: PathBuf,
+}
+
+impl PrLock {
+    fn acquire(repo: &Path) -> Result<Self> {
+        let path = lock_path(repo);
+
+        if path.exists() {
+            if let Ok(contents) = fs::read_to_string(&path) {
+                if let Ok(pid) = contents.trim().parse::<u32>() {
+                    if !is_process_running(pid) {
+                        let _ = fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                eyre::bail!(
+                    "Another PR review is already running for this repo (lock file: {}). Wait for it to finish or remove the lock file if it crashed.",
+                    path.display()
+                );
+            }
+            Err(e) => return Err(e).wrap_err("failed to create lock file"),
+        };
+
+        let pid = std::process::id();
+        writeln!(file, "{pid}").wrap_err("failed to write to lock file")?;
+        Ok(Self { path })
+    }
+}
+
+fn is_process_running(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::path::Path::new("/proc")
+            .join(pid.to_string())
+            .join("stat")
+            .exists()
+    }
+    #[cfg(not(unix))]
+    {
+        // on non-unix, assume the process is still running to be safe
+        true
+    }
+}
+
+impl Drop for PrLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
 
 #[derive(Debug, clap::Args)]
 pub struct PrArgs {
@@ -32,6 +102,17 @@ struct PrMeta {
     commits: Vec<serde_json::Value>,
 }
 
+#[derive(Deserialize)]
+struct PrComment {
+    author: PrCommentAuthor,
+    body: String,
+}
+
+#[derive(Deserialize)]
+struct PrCommentAuthor {
+    login: String,
+}
+
 pub fn check_gh() -> Result<()> {
     let status = Command::new("gh").arg("--version").output();
     match status {
@@ -57,6 +138,29 @@ fn fetch_pr_meta(url: Option<&str>, repo: &Path) -> Result<PrMeta> {
     serde_json::from_slice(&out.stdout).wrap_err("failed to parse gh pr view output")
 }
 
+fn fetch_pr_comments(url: Option<&str>, repo: &Path) -> Result<Vec<PrComment>> {
+    let mut cmd = Command::new("gh");
+    cmd.args(["pr", "view", "--json", "comments"])
+        .current_dir(repo);
+    if let Some(u) = url {
+        cmd.arg(u);
+    }
+    let out = cmd
+        .output()
+        .wrap_err("failed to run gh pr view --json comments")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        eyre::bail!("gh pr view comments failed: {}", stderr.trim());
+    }
+    #[derive(Deserialize)]
+    struct CommentsWrapper {
+        comments: Vec<PrComment>,
+    }
+    let wrapper: CommentsWrapper =
+        serde_json::from_slice(&out.stdout).wrap_err("failed to parse gh pr comments output")?;
+    Ok(wrapper.comments)
+}
+
 pub fn parse_pr_url(url: &str) -> Result<(String, u32)> {
     // expects https://github.com/owner/repo/pull/N
     let url_obj = url::Url::parse(url).wrap_err("invalid URL")?;
@@ -77,9 +181,7 @@ pub fn parse_pr_url(url: &str) -> Result<(String, u32)> {
                 .wrap_err_with(|| format!("PR number `{n}` is not a valid integer"))?;
             Ok((format!("{owner}/{repo}"), pr_number))
         }
-        _ => eyre::bail!(
-            "expected a URL like https://github.com/owner/repo/pull/N, got: {url}"
-        ),
+        _ => eyre::bail!("expected a URL like https://github.com/owner/repo/pull/N, got: {url}"),
     }
 }
 
@@ -148,7 +250,10 @@ fn restore_branch(repo: &Path, branch: &str) {
         Ok(out) if out.status.success() => {}
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            eprintln!("warning: failed to restore branch '{branch}': {}", stderr.trim());
+            eprintln!(
+                "warning: failed to restore branch '{branch}': {}",
+                stderr.trim()
+            );
         }
         Err(e) => eprintln!("warning: failed to restore branch '{branch}': {e}"),
     }
@@ -241,10 +346,25 @@ fn post_comment(url: Option<&str>, repo: &Path, body: &str) -> Result<()> {
     Ok(())
 }
 
-fn build_pr_prompt(meta: &PrMeta, diff_context: &str, extra: Option<&str>) -> String {
+fn build_pr_prompt(
+    meta: &PrMeta,
+    comments: &[PrComment],
+    diff_context: &str,
+    extra: Option<&str>,
+) -> String {
     let mut parts = vec![format!("## PR: {}", meta.title)];
     if !meta.body.trim().is_empty() {
         parts.push(meta.body.trim().to_string());
+    }
+    if !comments.is_empty() {
+        let mut comments_section = String::from("## PR Comments\n");
+        for comment in comments {
+            comments_section.push_str(&format!(
+                "**{}**: {}\n\n",
+                comment.author.login, comment.body
+            ));
+        }
+        parts.push(comments_section);
     }
     parts.push(diff_context.to_string());
     if let Some(p) = extra {
@@ -265,51 +385,63 @@ pub async fn run_pr(args: PrArgs, config: Config) -> Result<()> {
     // so we can restore it after the review
     let original_branch: Option<(PathBuf, String)>;
 
-    let (repo, url_for_gh, meta): (PathBuf, Option<String>, PrMeta) =
-        if let Some(ref u) = args.url {
-            let (repo_slug, pr_number) = parse_pr_url(u)?;
-            let repo_raw = &args.common.repo;
-            if !repo_raw.join(".git").exists() {
-                eyre::bail!("--repo must point to a git repository (missing .git)");
-            }
-            let repo = repo_raw.canonicalize()?;
+    let (repo, url_for_gh, meta): (PathBuf, Option<String>, PrMeta) = if let Some(ref u) = args.url
+    {
+        let (repo_slug, pr_number) = parse_pr_url(u)?;
+        let repo_raw = &args.common.repo;
+        if !repo_raw.join(".git").exists() {
+            eyre::bail!("--repo must point to a git repository (missing .git)");
+        }
+        let repo = repo_raw.canonicalize()?;
 
-            if get_origin_slug(&repo).as_deref() == Some(&repo_slug) {
-                // fetch meta first — a failure here leaves the branch untouched
-                let meta = fetch_pr_meta(Some(u), &repo)?;
-                let branch = get_current_branch(&repo)?;
-                checkout_pr_branch(&repo, pr_number).inspect_err(|_e| {
-                    restore_branch(&repo, &branch);
-                })?;
-                original_branch = Some((repo.clone(), branch));
-                _tmpdir_guard = None;
-                (repo, Some(u.clone()), meta)
-            } else {
-                // different repo — clone into a temp dir
-                let cwd = std::env::current_dir().wrap_err("failed to get current directory")?;
-                let meta = fetch_pr_meta(Some(u), &cwd)?;
-                let pr_commit_count = meta.commits.len();
-                let tmpdir = tempfile::TempDir::new().wrap_err("failed to create temp dir")?;
-                let path = tmpdir.path().to_path_buf();
-                clone_pr(&repo_slug, pr_number, pr_commit_count, &path)?;
-                _tmpdir_guard = Some(tmpdir);
-                original_branch = None;
-                (path, Some(u.clone()), meta)
-            }
-        } else {
+        if get_origin_slug(&repo).as_deref() == Some(&repo_slug) {
+            // fetch meta first — a failure here leaves the branch untouched
+            let meta = fetch_pr_meta(Some(u), &repo)?;
+            let branch = get_current_branch(&repo)?;
+            checkout_pr_branch(&repo, pr_number).inspect_err(|_e| {
+                restore_branch(&repo, &branch);
+            })?;
+            original_branch = Some((repo.clone(), branch));
             _tmpdir_guard = None;
+            (repo, Some(u.clone()), meta)
+        } else {
+            // different repo — clone into a temp dir
+            let cwd = std::env::current_dir().wrap_err("failed to get current directory")?;
+            let meta = fetch_pr_meta(Some(u), &cwd)?;
+            let pr_commit_count = meta.commits.len();
+            let tmpdir = tempfile::TempDir::new().wrap_err("failed to create temp dir")?;
+            let path = tmpdir.path().to_path_buf();
+            clone_pr(&repo_slug, pr_number, pr_commit_count, &path)?;
+            _tmpdir_guard = Some(tmpdir);
             original_branch = None;
-            let repo_raw = &args.common.repo;
-            if !repo_raw.join(".git").exists() {
-                eyre::bail!("--repo must point to a git repository (missing .git)");
-            }
-            let repo = repo_raw.canonicalize()?;
-            let meta = fetch_pr_meta(None, &repo)?;
-            (repo, None, meta)
-        };
+            (path, Some(u.clone()), meta)
+        }
+    } else {
+        _tmpdir_guard = None;
+        original_branch = None;
+        let repo_raw = &args.common.repo;
+        if !repo_raw.join(".git").exists() {
+            eyre::bail!("--repo must point to a git repository (missing .git)");
+        }
+        let repo = repo_raw.canonicalize()?;
+        let meta = fetch_pr_meta(None, &repo)?;
+        (repo, None, meta)
+    };
 
-    let result =
-        run_review_inner(&repo, url_for_gh.as_deref(), &args, &config, verbose, &meta).await;
+    let _lock = PrLock::acquire(&repo)?;
+
+    let comments = fetch_pr_comments(url_for_gh.as_deref(), &repo)?;
+
+    let result = run_review_inner(
+        &repo,
+        url_for_gh.as_deref(),
+        &args,
+        &config,
+        verbose,
+        &meta,
+        &comments,
+    )
+    .await;
 
     if let Some((ref restore_repo, ref branch)) = original_branch {
         restore_branch(restore_repo, branch);
@@ -325,12 +457,13 @@ async fn run_review_inner(
     config: &Config,
     verbose: bool,
     meta: &PrMeta,
+    comments: &[PrComment],
 ) -> Result<()> {
     const FOOTER: &str =
         "\n\n---\n🔍 Reviewed by [nitpicker](https://github.com/arsenyinfo/nitpicker)";
 
     let diff_context = crate::detect_diff_context(repo)?;
-    let full_prompt = build_pr_prompt(meta, &diff_context, args.prompt.as_deref());
+    let full_prompt = build_pr_prompt(meta, comments, &diff_context, args.prompt.as_deref());
     let max_turns = config.max_turns(args.max_turns)?;
 
     let report = if !args.no_debate && config.default_debate() {
@@ -345,9 +478,15 @@ async fn run_review_inner(
         )
         .await?
     } else {
-        let report =
-            review::run_review(repo, &full_prompt, config, max_turns, verbose, TaskMode::Review)
-                .await?;
+        let report = review::run_review(
+            repo,
+            &full_prompt,
+            config,
+            max_turns,
+            verbose,
+            TaskMode::Review,
+        )
+        .await?;
         println!("{report}");
         report
     };
