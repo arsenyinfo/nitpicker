@@ -1,5 +1,7 @@
 # nitpicker
 
+[![crates.io](https://img.shields.io/crates/v/nitpicker.svg)](https://crates.io/crates/nitpicker)
+
 Multi-reviewer code review using LLMs. Spawns parallel agents with different models/prompts, aggregates their feedback into a final verdict. Supports two modes — parallel aggregation and actor-critic debate — across two task types: code review and free-form questions.
 
 Each reviewer is an agentic loop that can call tools (read files, grep, glob, git commands) to explore the repo before writing its review. A separate aggregator model deduplicates and synthesizes the individual reviews into a final verdict.
@@ -13,7 +15,7 @@ Each reviewer is an agentic loop that can call tools (read files, grep, glob, gi
 ## Installation
 
 ```bash
-cargo install --git https://github.com/arsenyinfo/nitpicker
+cargo install nitpicker
 ```
 
 ## Quick start
