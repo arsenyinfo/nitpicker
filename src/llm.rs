@@ -3,10 +3,12 @@ use rig::OneOrMany;
 use rig::client::{CompletionClient, ProviderClient};
 use rig::completion::message::ToolCall;
 use rig::completion::{AssistantContent, CompletionModel, Message};
-use rig::providers::{anthropic, gemini, openai};
+use rig::providers::{anthropic, gemini, openai, openrouter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::error::Error;
 use std::future::Future;
+use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -190,6 +192,25 @@ impl CompletionResponse {
             .collect::<Vec<_>>()
             .join("\n")
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.tool_calls().is_none() && self.text().is_empty()
+    }
+}
+
+#[derive(Debug)]
+struct EmptyResponseError;
+
+impl fmt::Display for EmptyResponseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "empty response from model (no message or tool call)")
+    }
+}
+
+impl Error for EmptyResponseError {}
+
+fn empty_response_error() -> eyre::Report {
+    EmptyResponseError.into()
 }
 
 pub trait LLMClient: Send + Sync {
@@ -246,7 +267,23 @@ impl<C: LLMClient> LLMClient for RetryingLLM<C> {
         loop {
             attempt += 1;
             match self.inner.completion(completion.clone()).await {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    if response.is_empty() {
+                        let err = empty_response_error();
+                        let policy = retry_policy(&err);
+                        if !policy.retry || attempt >= policy.max_attempts {
+                            return Err(err);
+                        }
+                        let backoff = jittered_backoff(
+                            attempt,
+                            policy.base_backoff_ms,
+                            policy.max_backoff_ms,
+                        );
+                        tokio::time::sleep(backoff).await;
+                        continue;
+                    }
+                    return Ok(response);
+                }
                 Err(err) => {
                     let policy = retry_policy(&err);
                     if !policy.retry || attempt >= policy.max_attempts {
@@ -278,6 +315,15 @@ fn retry_policy(err: &eyre::Report) -> RetryPolicy {
         };
     }
 
+    if is_empty_response_error(err) {
+        return RetryPolicy {
+            retry: true,
+            max_attempts: MAX_COMPLETION_ATTEMPTS,
+            base_backoff_ms: BASE_BACKOFF_MS,
+            max_backoff_ms: MAX_BACKOFF_MS,
+        };
+    }
+
     if is_non_retryable_client_error(err) {
         return RetryPolicy {
             retry: false,
@@ -298,6 +344,10 @@ fn retry_policy(err: &eyre::Report) -> RetryPolicy {
 fn is_non_retryable_client_error(err: &eyre::Report) -> bool {
     let msg = err.to_string();
     msg.contains(" 400") || msg.contains(" 401") || msg.contains(" 403") || msg.contains(" 404")
+}
+
+fn is_empty_response_error(err: &eyre::Report) -> bool {
+    err.downcast_ref::<EmptyResponseError>().is_some()
 }
 
 fn is_rate_limit_error(err: &eyre::Report) -> bool {
@@ -327,14 +377,16 @@ fn jitter_factor() -> f64 {
 }
 
 pub enum LLMProvider {
-    Anthropic,
-    Gemini,
-    AnthropicCompatible {
-        base_url: String,
-        api_key_env: String,
+    Anthropic {
+        base_url: Option<String>,
+        api_key_env: Option<String>,
     },
-    OpenAICompatible {
-        base_url: String,
+    Gemini,
+    OpenAi {
+        base_url: Option<String>,
+        api_key_env: Option<String>,
+    },
+    OpenRouter {
         api_key_env: String,
     },
 }
@@ -342,33 +394,92 @@ pub enum LLMProvider {
 impl LLMProvider {
     pub fn client_from_env(&self) -> Result<Box<dyn LLMClientDyn>> {
         match self {
-            LLMProvider::Anthropic => Ok(Box::new(anthropic::Client::from_env())),
-            LLMProvider::Gemini => Ok(Box::new(gemini::Client::from_env())),
-            LLMProvider::AnthropicCompatible {
-                base_url,
-                api_key_env,
-            } => {
-                let api_key = std::env::var(api_key_env)
-                    .map_err(|_| eyre::eyre!("missing env var {api_key_env}"))?;
-                let client = anthropic::Client::builder()
-                    .api_key(api_key)
-                    .base_url(base_url)
-                    .build()?;
-                Ok(Box::new(client))
+            LLMProvider::Anthropic { base_url, api_key_env } => {
+                let key_env = api_key_env.as_deref().unwrap_or("ANTHROPIC_API_KEY");
+                let api_key = std::env::var(key_env)
+                    .map_err(|_| eyre::eyre!("missing env var {key_env}"))?;
+                let mut builder = anthropic::Client::builder().api_key(api_key);
+                if let Some(url) = base_url {
+                    builder = builder.base_url(url);
+                }
+                Ok(Box::new(builder.build()?))
             }
-            LLMProvider::OpenAICompatible {
-                base_url,
-                api_key_env,
-            } => {
+            LLMProvider::Gemini => Ok(Box::new(gemini::Client::from_env())),
+            LLMProvider::OpenAi { base_url, api_key_env } => {
+                let key_env = api_key_env.as_deref().unwrap_or("OPENAI_API_KEY");
+                let api_key = std::env::var(key_env)
+                    .map_err(|_| eyre::eyre!("missing env var {key_env}"))?;
+                let mut builder = openai::CompletionsClient::builder().api_key(&api_key);
+                if let Some(url) = base_url {
+                    builder = builder.base_url(url);
+                }
+                Ok(Box::new(builder.build()?))
+            }
+            LLMProvider::OpenRouter { api_key_env } => {
                 let api_key = std::env::var(api_key_env)
                     .map_err(|_| eyre::eyre!("missing env var {api_key_env}"))?;
-                let client = openai::CompletionsClient::builder()
-                    .api_key(&api_key)
-                    .base_url(base_url)
-                    .build()?;
+                let client = openrouter::Client::new(&api_key)?;
                 Ok(Box::new(client))
             }
         }
+    }
+}
+
+impl LLMClient for openrouter::Client {
+    async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
+        let model_name = completion.model.clone();
+        let mut request: rig::completion::CompletionRequest = completion.into();
+        request.model = Some(model_name.clone());
+        let model = self.completion_model(model_name);
+        let response = model.completion(request).await
+            .map_err(|e| {
+                // Check if this is a CompletionError::ResponseError with empty content.
+                // This happens with free tier models that return no choices or empty messages.
+                // We downcast to the concrete type instead of string-matching.
+                use rig::completion::CompletionError;
+                let is_empty = <dyn std::error::Error>::downcast_ref::<CompletionError>(&e)
+                    .map(|ce| match ce {
+                        CompletionError::ResponseError(msg) => {
+                            msg.contains("no message or tool call") || msg.contains("no choices")
+                        }
+                        _ => false,
+                    })
+                    .unwrap_or(false);
+                if is_empty {
+                    empty_response_error()
+                } else {
+                    eyre::eyre!("{e}")
+                }
+            })?;
+        let mut finish_reason = response
+            .raw_response
+            .choices
+            .first()
+            .and_then(|c| c.finish_reason.as_deref())
+            .map(|reason| match reason {
+                "stop" => FinishReason::Stop,
+                "length" => FinishReason::MaxTokens,
+                "tool_calls" => FinishReason::ToolUse,
+                other => FinishReason::Other(other.to_string()),
+            })
+            .unwrap_or(FinishReason::None);
+        if response
+            .choice
+            .iter()
+            .any(|content| matches!(content, AssistantContent::ToolCall(_)))
+        {
+            finish_reason = FinishReason::ToolUse;
+        }
+        let usage = response
+            .raw_response
+            .usage
+            .map(|u| TokenUsage::new(u.prompt_tokens as u64, u.completion_tokens as u64))
+            .unwrap_or_default();
+        Ok(CompletionResponse {
+            choice: response.choice,
+            finish_reason,
+            usage,
+        })
     }
 }
 

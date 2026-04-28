@@ -109,12 +109,38 @@ Debate mode is enabled by default for `nitpicker`, `nitpicker ask`, and `nitpick
 
 ### Provider types
 
-| `provider` | Auth | Required fields |
+| `provider` | Auth | Notes |
 |---|---|---|
-| `anthropic` | `ANTHROPIC_API_KEY` env var | — |
+| `anthropic` | `ANTHROPIC_API_KEY` env var (or `api_key_env`) | `base_url` optional |
 | `gemini` | `GEMINI_API_KEY` env var, or `auth = "oauth"` | — |
-| `anthropic_compatible` | env var named by `api_key_env` | `base_url`, `api_key_env` |
-| `openai_compatible` | env var named by `api_key_env` | `base_url`, `api_key_env` |
+| `openai` | `OPENAI_API_KEY` env var (or `api_key_env`) | `base_url` optional |
+| `openrouter` | `OPENROUTER_API_KEY` env var (or `api_key_env`) | omit `model` or set `"free"` to auto-select |
+
+`anthropic_compatible` and `openai_compatible` are accepted as aliases for backward compatibility.
+
+### OpenRouter models
+
+`openrouter` supports both explicit models and free auto-selection:
+
+```toml
+# explicit model
+[[reviewer]]
+name = "qwen"
+model = "qwen/qwen3-30b-a3b"
+provider = "openrouter"
+
+# auto-select best available free model (omit model or set model = "free")
+[[reviewer]]
+provider = "openrouter"
+```
+
+When `model` is omitted or set to `"free"`, nitpicker fetches the best available free models at startup — filtered to free, tool-capable, programming-category models, sorted by parameter count. Models are assigned in reviewer config order (first reviewer gets rank-1, second rank-2, and so on). In debate mode, actor always gets the top-ranked model and critic the second.
+
+```bash
+export OPENROUTER_API_KEY="your-key"
+```
+
+A free OpenRouter account is sufficient — no credit card required, just rate limits.
 
 ### Gemini OAuth
 

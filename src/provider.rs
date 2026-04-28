@@ -22,15 +22,17 @@ pub fn provider_from_config(
     api_key_env: Option<&str>,
 ) -> Result<LLMProvider> {
     match provider {
-        ProviderType::Anthropic => Ok(LLMProvider::Anthropic),
-        ProviderType::Gemini => Ok(LLMProvider::Gemini),
-        ProviderType::AnthropicCompatible => Ok(LLMProvider::AnthropicCompatible {
-            base_url: require_field(base_url, "base_url", "anthropic_compatible")?,
-            api_key_env: require_field(api_key_env, "api_key_env", "anthropic_compatible")?,
+        ProviderType::Anthropic => Ok(LLMProvider::Anthropic {
+            base_url: base_url.map(str::to_string),
+            api_key_env: api_key_env.map(str::to_string),
         }),
-        ProviderType::OpenAiCompatible => Ok(LLMProvider::OpenAICompatible {
-            base_url: require_field(base_url, "base_url", "openai_compatible")?,
-            api_key_env: require_field(api_key_env, "api_key_env", "openai_compatible")?,
+        ProviderType::Gemini => Ok(LLMProvider::Gemini),
+        ProviderType::OpenAi => Ok(LLMProvider::OpenAi {
+            base_url: base_url.map(str::to_string),
+            api_key_env: api_key_env.map(str::to_string),
+        }),
+        ProviderType::OpenRouter => Ok(LLMProvider::OpenRouter {
+            api_key_env: api_key_env.unwrap_or("OPENROUTER_API_KEY").to_string(),
         }),
     }
 }
@@ -77,8 +79,3 @@ pub fn build_aggregator_client(
     .into_arc())
 }
 
-fn require_field(value: Option<&str>, field: &str, provider: &str) -> Result<String> {
-    value
-        .map(str::to_string)
-        .ok_or_else(|| eyre::eyre!("{provider} provider requires `{field}`"))
-}

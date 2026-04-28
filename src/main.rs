@@ -9,6 +9,7 @@ mod config;
 mod debate;
 mod gemini_proxy;
 mod llm;
+mod openrouter;
 mod provider;
 mod pr;
 mod prompts;
@@ -157,7 +158,8 @@ async fn main() -> Result<()> {
             if !repo.join(".git").is_dir() {
                 eyre::bail!("--repo must point to a git repository (missing .git)");
             }
-            let config = load_config(common.config.as_deref(), &repo)?;
+            let mut config = load_config(common.config.as_deref(), &repo)?;
+            openrouter::resolve_free_models(&mut config).await?;
             let max_turns = config.max_turns(max_turns)?;
 
             if !no_debate && config.default_debate() {
@@ -187,7 +189,8 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Command::Pr(pr_args)) => {
-            let config = load_config(pr_args.common.config.as_deref(), &pr_args.common.repo)?;
+            let mut config = load_config(pr_args.common.config.as_deref(), &pr_args.common.repo)?;
+            openrouter::resolve_free_models(&mut config).await?;
             return pr::run_pr(pr_args, config).await;
         }
         None => {}
@@ -216,7 +219,8 @@ async fn main() -> Result<()> {
         eyre::bail!("--repo must point to a git repository (missing .git)");
     }
 
-    let config = load_config(args.common.config.as_deref(), &repo)?;
+    let mut config = load_config(args.common.config.as_deref(), &repo)?;
+    openrouter::resolve_free_models(&mut config).await?;
     let max_turns = config.max_turns(args.max_turns)?;
 
     let prompt = if let Some(path) = args.analyze {
