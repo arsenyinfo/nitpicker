@@ -4,6 +4,10 @@ version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 default-run = "nitpicker"
+description = "Multi-reviewer code review using LLMs with parallel agents and debate mode"
+license = "MIT"
+repository = "https://github.com/arsenyinfo/nitpicker"
+documentation = "https://github.com/arsenyinfo/nitpicker"
 
 [[bin]]
 name = "nitpicker"
