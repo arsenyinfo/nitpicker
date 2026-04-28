@@ -114,7 +114,14 @@ Debate mode is enabled by default for `nitpicker`, `nitpicker ask`, and `nitpick
 | `anthropic_compatible` | env var named by `api_key_env` | `base_url`, `api_key_env` |
 | `openai_compatible` | env var named by `api_key_env` | `base_url`, `api_key_env` |
 
-### Gemini OAuth 
+### Gemini OAuth
+
+> [!WARNING]
+> Google has stated that using Gemini CLI OAuth with third-party software is a
+> policy-violating use case and may trigger abuse detection or account
+> restrictions. It is unclear how aggressively this is enforced, but you should
+> assume there is real risk and use this at your own discretion.
+> See: https://github.com/google-gemini/gemini-cli/discussions/22970
 
 Gemini can be used via Google Code Assist OAuth (for free or with subscription, limits apply) — no API key needed, just a Google account. This approach mimics the auth of [Gemini CLI](https://geminicli.com/), so no guarantees on reliability.
 

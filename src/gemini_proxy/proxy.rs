@@ -15,6 +15,7 @@ use tracing::{debug, error, info};
 use super::{
     CODE_ASSIST_BASE_URL,
     oauth::refresh_access_token,
+    retry::{RetryState, fetch_with_retry},
     token::{TokenData, TokenStore},
     transform,
 };
@@ -25,6 +26,7 @@ pub struct ProxyState {
     pub http_client: reqwest::Client,
     pub project_id: Arc<RwLock<Option<String>>>,
     pub token_refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    pub retry_state: RetryState,
 }
 
 #[derive(Debug, Serialize)]
@@ -284,7 +286,7 @@ async fn handle_request(
     debug!("Using model: {}", model);
 
     // Transform to Code Assist format
-    let code_assist_req = transform::transform_request(gemini_req, model.clone(), Some(project_id));
+    let code_assist_req = transform::transform_request(gemini_req, model.clone(), Some(project_id.clone()));
 
     // Build the Code Assist API URL
     let code_assist_url = format!("{}/v1internal:generateContent", CODE_ASSIST_BASE_URL);
@@ -318,20 +320,18 @@ async fn handle_request(
     );
 
     // Set User-Agent with model to match gemini-cli format
-    let platform = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
-    let user_agent = format!("GeminiCLI/0.34.0/{} ({}; {})", model, platform, arch);
+    let user_agent = super::build_gemini_user_agent(&model);
     request_headers.insert(
         header::USER_AGENT,
         HeaderValue::from_str(&user_agent)
-            .unwrap_or_else(|_| HeaderValue::from_static("GeminiCLI/0.34.0 (unknown; unknown)")),
+            .unwrap_or_else(|_| HeaderValue::from_static("GeminiCLI/0.0.0 (unknown; unknown)")),
     );
 
     // Request-scoped identifier for backend tracing
     request_headers.insert(
         header::HeaderName::from_static("x-activity-request-id"),
-        HeaderValue::from_str(&uuid::Uuid::new_v4().to_string())
-            .unwrap_or_else(|_| HeaderValue::from_static("00000000-0000-0000-0000-000000000000")),
+        HeaderValue::from_str(&super::create_activity_request_id())
+            .unwrap_or_else(|_| HeaderValue::from_static("00000000")),
     );
 
     // Copy accept header from original request if present
@@ -351,18 +351,25 @@ async fn handle_request(
 
     debug!("Forwarding request to Code Assist API");
 
-    // Send request to Code Assist API
-    let response = match state
+    // Send request to Code Assist API with retry logic
+    let request_builder = state
         .http_client
         .post(&code_assist_url)
         .headers(request_headers)
-        .json(&code_assist_req)
-        .send()
-        .await
+        .json(&code_assist_req);
+
+    let response = match fetch_with_retry(
+        request_builder,
+        &state.retry_state,
+        &code_assist_url,
+        Some(&project_id),
+        Some(&model),
+    )
+    .await
     {
         Ok(resp) => resp,
         Err(e) => {
-            error!("Failed to forward request: {}", e);
+            error!("Failed to forward request after retries: {}", e);
             return (
                 StatusCode::BAD_GATEWAY,
                 format!("Failed to connect to Code Assist API: {}", e),
