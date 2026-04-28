@@ -31,7 +31,7 @@ pub async fn run_review(
     add_spawn_subagent_tool(&mut tools);
     let context = build_context(repo).await;
     let system_prompt = mode.system_prompt();
-    let initial_message = mode.initial_message("", user_prompt);
+    let initial_message = mode.initial_message(user_prompt);
     let mut handles = Vec::new();
 
     let mp = MultiProgress::new();
