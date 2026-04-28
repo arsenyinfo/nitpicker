@@ -114,6 +114,35 @@ Debate mode is enabled by default for `nitpicker`, `nitpicker ask`, and `nitpick
 | `anthropic_compatible` | env var named by `api_key_env` | `base_url`, `api_key_env` |
 | `openai_compatible` | env var named by `api_key_env` | `base_url`, `api_key_env` |
 
+### OpenRouter
+
+OpenRouter works through `openai_compatible`. Point `base_url` at the OpenRouter API and set `api_key_env` to an env var that contains your OpenRouter key.
+
+```toml
+[aggregator]
+model = "openai/gpt-4.1-mini"   # replace with your preferred OpenRouter model ID
+provider = "openai_compatible"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+max_tokens = 8192
+
+[[reviewer]]
+name = "claude"
+model = "anthropic/claude-3.7-sonnet"   # replace with your preferred OpenRouter model ID
+provider = "openai_compatible"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+[[reviewer]]
+name = "gpt"
+model = "openai/gpt-4.1-mini"   # replace with your preferred OpenRouter model ID
+provider = "openai_compatible"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+```
+
+Nitpicker passes the model name straight through to the configured provider, so any OpenRouter-compatible model ID can be used here.
+
 ### Gemini OAuth 
 
 Gemini can be used via Google Code Assist OAuth (for free or with subscription, limits apply) — no API key needed, just a Google account. This approach mimics the auth of [Gemini CLI](https://geminicli.com/), so no guarantees on reliability.
@@ -192,6 +221,25 @@ Two LLM agents take turns exploring the codebase with file/git tools and submitt
 - `aggregator` → Meta-reviewer
 
 Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timestamp}.md`.
+
+## Manual CI / Docker dogfood
+
+This repo includes a manual GitHub Actions workflow at `.github/workflows/nitpicker-manual-dogfood.yml`.
+It is designed for safe dogfooding on this codebase:
+
+- runs in a Docker container (`rust:bookworm`)
+- builds nitpicker from the checked-out branch
+- writes a temporary OpenRouter config from workflow inputs + secrets
+- runs in stdout-first mode and uploads the report as an artifact
+- does **not** auto-comment on PRs
+
+To use it:
+1. add a repository secret named `OPENROUTER_API_KEY`
+2. open **Actions → Nitpicker manual dogfood → Run workflow**
+3. choose the branch/ref you want to review
+4. optionally override the prompt, debate mode, max turns, and model IDs
+
+The workflow uses local review mode (`nitpicker --repo .`) instead of the GitHub-specific `pr` subcommand so the report stays artifact-first and does not require `gh`.
 
 ## Changelog
 
