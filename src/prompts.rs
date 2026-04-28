@@ -1,13 +1,14 @@
-const VERIFY_WARNING: &str = "Your opponent may sound confident but still make factual errors or overlook edge cases. \
+const VERIFY_WARNING: &str =
+    "Your opponent may sound confident but still make factual errors or overlook edge cases. \
 Independently verify every claim against the actual code before accepting it.";
 
-const DELEGATION_GUIDANCE: &str = "You can delegate focused investigations with spawn_subagent(task). \
-Each task should be a single concrete question or lookup — one symbol, one file, one concept. \
+const DELEGATION_GUIDANCE: &str = "You should delegate focused investigations with spawn_subagent(task). \
+Each task should be a single concrete question or lookup — one component, one concept, one perspective. \
 When you have multiple independent questions, spawn them all at once in a single turn rather than sequentially. \
 Keep the parent agent focused on synthesis and final judgment; use subagents for bounded digging. \
 Prefer many narrow parallel subagents over one broad multi-part task.";
 
-const NO_FINDINGS: &str = "No findings.";
+const NO_FINDINGS: &str = "No findings. Great job! 🎉";
 
 const FINDING_FIELDS: &str = "<One sentence title about the issue>\n\
 - Priority: <P0 - P3>\n\
@@ -94,12 +95,8 @@ impl TaskMode {
         }
     }
 
-    pub fn initial_message(&self, context: &str, user_prompt: &str) -> String {
+    pub fn initial_message(&self, user_prompt: &str) -> String {
         let mut msg = String::new();
-        if !context.is_empty() {
-            msg.push_str(context);
-            msg.push_str("\n\n");
-        }
         if !user_prompt.trim().is_empty() {
             match self {
                 TaskMode::Review => {
