@@ -387,8 +387,19 @@ pub fn create_gemini_client_with_proxy(
 }
 
 fn model_supports_sampling_params(model: &str) -> bool {
-    // claude-opus-4-7+ rejects temperature/top_p/top_k with a 400 error
-    !model.starts_with("claude-opus-4-7")
+    // claude-opus-4-7+ rejects temperature/top_p/top_k with a 400 error.
+    // OpenAI reasoning models (o1, o3, o4, gpt-5) also reject temperature;
+    // only temperature=1 (the default) is accepted.
+    if model.starts_with("claude-opus-4-7") {
+        return false;
+    }
+    if model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") {
+        return false;
+    }
+    if model == "gpt-5" || model.starts_with("gpt-5-") {
+        return false;
+    }
+    true
 }
 
 impl LLMClient for anthropic::Client {
@@ -459,7 +470,10 @@ impl LLMClient for gemini::Client {
 }
 
 impl LLMClient for openai::CompletionsClient {
-    async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
+    async fn completion(&self, mut completion: Completion) -> Result<CompletionResponse> {
+        if !model_supports_sampling_params(&completion.model) {
+            completion.temperature = None;
+        }
         let model_name = completion.model.clone();
         let mut request: rig::completion::CompletionRequest = completion.into();
         request.model = Some(model_name.clone());
