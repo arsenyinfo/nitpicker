@@ -246,6 +246,10 @@ Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timesta
 
 ## Changelog
 
+**0.2.1** — 2026-04-30
+- First class support for OpenRouter: new provider type, and experimental free auto-selection mode
+- Minor bug fixes (breaking the cycle, temperature params)
+
 **0.2.0** — 2026-04-28
 - PR comments are now included in the review prompt for full context
 - Per-repo file lock prevents concurrent `nitpicker pr` runs on the same repository
