@@ -318,7 +318,11 @@ fn retry_policy(err: &eyre::Report) -> RetryPolicy {
 
 fn is_non_retryable_client_error(err: &eyre::Report) -> bool {
     let msg = err.to_string();
-    msg.contains(" 400") || msg.contains(" 401") || msg.contains(" 403") || msg.contains(" 404")
+    msg.contains(" 400")
+        || msg.contains(" 401")
+        || msg.contains(" 402")
+        || msg.contains(" 403")
+        || msg.contains(" 404")
 }
 
 fn is_rate_limit_error(err: &eyre::Report) -> bool {
@@ -452,11 +456,10 @@ impl LLMClient for openrouter::Client {
         let mut request: rig::completion::CompletionRequest = completion.into();
         request.model = Some(model_name.clone());
         let model = self.completion_model(model_name);
-        let response = model.completion(request).await.map_err(|e| {
-            <dyn std::error::Error>::downcast_ref::<CompletionError>(&e)
-                .map(normalize_openrouter_completion_error)
-                .unwrap_or_else(|| eyre::eyre!("{e}"))
-        })?;
+        let response = model
+            .completion(request)
+            .await
+            .map_err(|e| normalize_openrouter_completion_error(&e))?;
         let mut finish_reason = response
             .raw_response
             .choices

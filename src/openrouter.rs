@@ -2,7 +2,6 @@ use crate::config::{Config, ProviderType};
 use crate::llm::{Completion, LLMClient};
 use chrono::{Duration, Utc};
 use eyre::Result;
-use regex::Regex;
 use rig::completion::{Message, ToolDefinition};
 use rig::providers::openrouter;
 use serde::Deserialize;
@@ -15,8 +14,12 @@ const MODELS_URL: &str = "https://openrouter.ai/api/v1/models\
 const DEFAULT_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
 const SMOKE_TEST_TIMEOUT_SECS: u64 = 15;
 const SMOKE_TEST_CALLS_REQUIRED: usize = 2;
+const SMOKE_TEST_MAX_CONCURRENT: usize = 8;
 const FETCH_MODELS_MAX_ATTEMPTS: usize = 3;
 const FETCH_MODELS_BACKOFF_MS: u64 = 1_000;
+
+static PARAMS_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"(\d+(?:\.\d+)?)(b|t)").unwrap());
 
 #[derive(Deserialize)]
 struct ModelsResponse {
@@ -52,8 +55,7 @@ fn parse_total_params_b(model_id: &str) -> u64 {
     // extracts the largest param count from the model id, normalised to billions * 10
     // handles Xb (billions) and Xt (trillions), e.g.:
     //   "120b-a12b" → 1200, "1t" → 10000, "31b" → 310, "qwen3-coder" → 0
-    let re = Regex::new(r"(\d+(?:\.\d+)?)(b|t)").unwrap();
-    re.captures_iter(&model_id.to_lowercase())
+    PARAMS_RE.captures_iter(&model_id.to_lowercase())
         .filter_map(|c| {
             let n = c[1].parse::<f64>().ok()?;
             let multiplier = if &c[2] == "t" { 1000.0 } else { 1.0 };
@@ -242,19 +244,23 @@ async fn probe_candidates_concurrent(
     candidates: &[String],
     batch_label: &str,
 ) -> Vec<bool> {
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(SMOKE_TEST_MAX_CONCURRENT));
     let mut set = tokio::task::JoinSet::new();
     for (idx, model) in candidates.iter().cloned().enumerate() {
         let key = api_key.to_string();
         let label = batch_label.to_string();
+        let sem = std::sync::Arc::clone(&semaphore);
         set.spawn(async move {
+            let _permit = sem.acquire().await.expect("semaphore closed");
             let passed = smoke_test_model(&key, &model, &label).await;
             (idx, passed)
         });
     }
     let mut results = vec![false; candidates.len()];
     while let Some(res) = set.join_next().await {
-        if let Ok((idx, passed)) = res {
-            results[idx] = passed;
+        match res {
+            Ok((idx, passed)) => results[idx] = passed,
+            Err(join_err) => tracing::error!(error = %join_err, "smoke test task panicked"),
         }
     }
     results
@@ -424,7 +430,7 @@ pub async fn resolve_free_models(config: &mut Config) -> Result<()> {
     for (slot, idx) in reviewer_indices.into_iter().enumerate() {
         let model = iter.next().expect("checked above");
         if config.reviewer[idx].name.is_empty() {
-            config.reviewer[idx].name = format!("free_{}", (b'A' + slot as u8) as char);
+            config.reviewer[idx].name = format!("free_{slot}");
         }
         tracing::info!(reviewer = %config.reviewer[idx].name, %model, "resolved experimental openrouter free model");
         config.reviewer[idx].model = model;

@@ -13,6 +13,9 @@ use rig::completion::Message;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use tokio::sync::Semaphore;
+
+const MAX_CONCURRENT_REVIEWERS: usize = 8;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tracing::info;
@@ -31,6 +34,7 @@ pub async fn run_review(
     let system_prompt = mode.system_prompt();
     let initial_message = mode.initial_message(user_prompt);
     let mut handles = Vec::new();
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_REVIEWERS));
 
     let mp = MultiProgress::new();
     if verbose {
@@ -75,7 +79,9 @@ pub async fn run_review(
         let done = done_style.clone();
         let initial_message = initial_message.clone();
         let context = context.clone();
+        let sem = Arc::clone(&semaphore);
         let handle: JoinHandle<(String, Result<String>)> = tokio::spawn(async move {
+            let _permit = sem.acquire().await.expect("semaphore closed");
             let mut config = match agent_config {
                 Ok(config) => config,
                 Err(err) => {
