@@ -88,8 +88,9 @@ pub async fn run_review(
             if !verbose {
                 let progress_pb = pb.clone();
                 config.progress = Some(Arc::new(move |progress: AgentProgress| {
+                    let sub = progress.last_subagent.as_deref().map(|s| format!("\n  ↳ {s}")).unwrap_or_default();
                     progress_pb.set_message(format!(
-                        "reviewing… ({} turns, {} tool calls, {} subagents)",
+                        "reviewing… ({} turns, {} tool calls, {} subagents){sub}",
                         progress.turns, progress.tool_calls, progress.subagents_spawned
                     ));
                 }));

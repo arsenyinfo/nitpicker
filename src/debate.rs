@@ -297,8 +297,9 @@ pub async fn run_debate(
         let start = std::time::Instant::now();
         let actor_pb = pb.clone();
         let actor_progress = (!verbose).then_some(Arc::new(move |progress: AgentProgress| {
+            let sub = progress.last_subagent.as_deref().map(|s| format!("\n  ↳ {s}")).unwrap_or_default();
             actor_pb.set_message(format!(
-                "round {round} — debating… ({} turns, {} tool calls, {} subagents)",
+                "round {round} — debating… ({} turns, {} tool calls, {} subagents){sub}",
                 progress.turns, progress.tool_calls, progress.subagents_spawned
             ));
         })
@@ -340,8 +341,9 @@ pub async fn run_debate(
         let start = std::time::Instant::now();
         let critic_pb = pb.clone();
         let critic_progress = (!verbose).then_some(Arc::new(move |progress: AgentProgress| {
+            let sub = progress.last_subagent.as_deref().map(|s| format!("\n  ↳ {s}")).unwrap_or_default();
             critic_pb.set_message(format!(
-                "round {round} — debating… ({} turns, {} tool calls, {} subagents)",
+                "round {round} — debating… ({} turns, {} tool calls, {} subagents){sub}",
                 progress.turns, progress.tool_calls, progress.subagents_spawned
             ));
         })
