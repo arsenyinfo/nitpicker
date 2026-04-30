@@ -246,6 +246,10 @@ Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timesta
 
 ## Changelog
 
+**0.2.2** — 2026-04-30
+- Session artifacts now capture tool trajectories and final aggregation output for debugging
+- Default CLI output now stays focused on the final synthesized review unless `--verbose` is enabled
+
 **0.2.1** — 2026-04-30
 - First class support for OpenRouter: new provider type, and experimental free auto-selection mode
 - Minor bug fixes (breaking the cycle, temperature params)
