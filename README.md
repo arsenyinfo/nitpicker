@@ -82,6 +82,7 @@ Example `nitpicker.toml`:
 [defaults]
 debate = true          # optional, default: true
 max_turns = 70         # optional, default: 70
+log_trajectories = false # optional, default: false
 
 [aggregator]
 model = "claude-sonnet-4-6"
@@ -107,6 +108,8 @@ Unknown config keys are rejected. For example, use `max_tokens` for output lengt
 
 Debate mode is enabled by default for `nitpicker`, `nitpicker ask`, and `nitpicker pr`. Pass `--no-debate` to use parallel aggregation for a single run. Use `[defaults].max_turns` or `--max-turns` to control the per-agent tool-use loop limit.
 
+Set `[defaults].log_trajectories = true` to save per-agent JSONL traces and a final `aggregation.json` under `~/.nitpicker/sessions/session-<timestamp>-<pid>/`.
+
 ### Provider types
 
 | `provider` | Auth | Notes |
@@ -120,7 +123,7 @@ Debate mode is enabled by default for `nitpicker`, `nitpicker ask`, and `nitpick
 
 ### OpenRouter models
 
-`openrouter` supports both explicit pinned models and experimental free auto-selection.
+`openrouter` supports both explicit pinned models and an experimental free auto-selection mode.
 
 Pinned models are the supported default and the recommended setup:
 
@@ -146,9 +149,9 @@ model = "free"
 provider = "openrouter"
 ```
 
-When `model` is omitted or set to `"free"`, nitpicker runs an experimental best-effort resolver at startup. It fetches candidate OpenRouter free models, probes them with short tool-use smoke tests, and assigns currently working models in reviewer config order.
+When `model` is omitted or set to `"free"`, nitpicker tries to pick a currently working free model at startup.
 
-This mode is convenient, but it is not production-stable. Free OpenRouter availability is inherently transient and may fail due to upstream rate limits, provider routing differences, or timeouts even when a model looked healthy moments earlier.
+This mode is convenient, but it is not production-stable and may fail due to upstream availability, routing differences, or timeouts.
 
 If you want predictable behavior, pin explicit model names instead of relying on free auto-selection.
 
@@ -241,6 +244,8 @@ Two LLM agents take turns exploring the codebase with file/git tools and submitt
 - `reviewer[0]` in config → Actor (review: Reviewer)
 - `reviewer[1]` in config → Critic (review: Validator)
 - `aggregator` → Meta-reviewer
+
+By default, nitpicker prints only the final synthesized result. Use `--verbose` to show intermediate debate output and the saved transcript path.
 
 Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timestamp}.md`.
 
