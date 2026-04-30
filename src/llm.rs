@@ -1,4 +1,4 @@
-use eyre::Result;
+use eyre::{Result, WrapErr};
 use rig::OneOrMany;
 use rig::client::{CompletionClient, ProviderClient};
 use rig::completion::message::ToolCall;
@@ -254,6 +254,12 @@ impl<C: LLMClient> LLMClient for RetryingLLM<C> {
                     }
                     let backoff =
                         jittered_backoff(attempt, policy.base_backoff_ms, policy.max_backoff_ms);
+                    tracing::warn!(
+                        model = %completion.model,
+                        attempt,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "Retrying after error: {err:#}"
+                    );
                     tokio::time::sleep(backoff).await;
                 }
             }
@@ -399,8 +405,11 @@ impl LLMClient for anthropic::Client {
         let model_name = completion.model.clone();
         let mut request: rig::completion::CompletionRequest = completion.into();
         request.model = Some(model_name.clone());
-        let model = self.completion_model(model_name);
-        let response = model.completion(request).await?;
+        let model = self.completion_model(model_name.clone());
+        let response = model
+            .completion(request)
+            .await
+            .wrap_err_with(|| format!("Anthropic completion failed for model '{model_name}'"))?;
         let mut finish_reason = response
             .raw_response
             .stop_reason
@@ -434,8 +443,11 @@ impl LLMClient for gemini::Client {
         let mut request: rig::completion::CompletionRequest = completion.into();
         request.model = Some(model_name.clone());
         request.additional_params = Some(serde_json::to_value(params)?);
-        let model = self.completion_model(model_name);
-        let response = model.completion(request).await?;
+        let model = self.completion_model(model_name.clone());
+        let response = model
+            .completion(request)
+            .await
+            .wrap_err_with(|| format!("Gemini completion failed for model '{model_name}'"))?;
         let mut finish_reason = response
             .raw_response
             .candidates
@@ -463,8 +475,11 @@ impl LLMClient for openai::CompletionsClient {
         let model_name = completion.model.clone();
         let mut request: rig::completion::CompletionRequest = completion.into();
         request.model = Some(model_name.clone());
-        let model = self.completion_model(model_name);
-        let response = model.completion(request).await?;
+        let model = self.completion_model(model_name.clone());
+        let response = model
+            .completion(request)
+            .await
+            .wrap_err_with(|| format!("OpenAI completion failed for model '{model_name}'"))?;
         let mut finish_reason = response
             .raw_response
             .choices
