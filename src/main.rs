@@ -10,9 +10,9 @@ mod debate;
 mod gemini_proxy;
 mod llm;
 mod openrouter;
-mod provider;
 mod pr;
 mod prompts;
+mod provider;
 mod review;
 mod tools;
 
@@ -358,11 +358,12 @@ pub fn detect_diff_context(repo: &Path) -> Result<String> {
         .is_empty();
 
     let has_branch_commits = match base.as_ref() {
-        Some(base) if branch != base.name => {
-            !run_git(repo, &["log", &format!("{}..HEAD", base.revision), "--oneline"])?
-                .trim()
-                .is_empty()
-        }
+        Some(base) if branch != base.name => !run_git(
+            repo,
+            &["log", &format!("{}..HEAD", base.revision), "--oneline"],
+        )?
+        .trim()
+        .is_empty(),
         _ => false,
     };
 

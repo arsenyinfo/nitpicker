@@ -59,8 +59,9 @@ impl Tool for ReadFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_file".to_string(),
-            description: "Read a file and return numbered lines. Use start_line/end_line to limit output for large files."
-                .to_string(),
+            description:
+                "Read a file and return numbered lines. Use start_line/end_line to limit output for large files."
+                    .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

@@ -78,4 +78,3 @@ pub fn build_aggregator_client(
     .with_retry()
     .into_arc())
 }
-

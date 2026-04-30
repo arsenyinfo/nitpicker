@@ -286,7 +286,8 @@ async fn handle_request(
     debug!("Using model: {}", model);
 
     // Transform to Code Assist format
-    let code_assist_req = transform::transform_request(gemini_req, model.clone(), Some(project_id.clone()));
+    let code_assist_req =
+        transform::transform_request(gemini_req, model.clone(), Some(project_id.clone()));
 
     // Build the Code Assist API URL
     let code_assist_url = format!("{}/v1internal:generateContent", CODE_ASSIST_BASE_URL);

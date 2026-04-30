@@ -1,17 +1,18 @@
 use eyre::Result;
 use rig::OneOrMany;
 use rig::client::{CompletionClient, ProviderClient};
+use rig::completion::CompletionError;
 use rig::completion::message::ToolCall;
+use rig::completion::message::ToolChoice;
 use rig::completion::{AssistantContent, CompletionModel, Message};
 use rig::providers::{anthropic, gemini, openai, openrouter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::error::Error;
 use std::future::Future;
-use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::warn;
 
 const MAX_COMPLETION_ATTEMPTS: usize = 4;
 const RATE_LIMIT_MAX_COMPLETION_ATTEMPTS: usize = 8;
@@ -27,7 +28,7 @@ pub struct Completion {
     pub preamble: Option<String>,
     pub history: Vec<Message>,
     pub tools: Vec<rig::completion::ToolDefinition>,
-    pub temperature: Option<f64>,
+    pub tool_choice: Option<ToolChoice>,
     pub max_tokens: Option<u64>,
     pub additional_params: Option<Value>,
 }
@@ -45,11 +46,6 @@ impl Completion {
 
     pub fn history(mut self, history: Vec<Message>) -> Self {
         self.history = history;
-        self
-    }
-
-    pub fn temperature(mut self, temperature: f64) -> Self {
-        self.temperature = Some(temperature);
         self
     }
 
@@ -78,11 +74,11 @@ impl From<Completion> for rig::completion::CompletionRequest {
             preamble: value.preamble,
             documents: Vec::new(),
             tools: value.tools,
-            temperature: value.temperature,
+            temperature: None,
             max_tokens: value.max_tokens,
             additional_params: value.additional_params,
             output_schema: None,
-            tool_choice: None,
+            tool_choice: value.tool_choice,
         }
     }
 }
@@ -192,25 +188,6 @@ impl CompletionResponse {
             .collect::<Vec<_>>()
             .join("\n")
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.tool_calls().is_none() && self.text().is_empty()
-    }
-}
-
-#[derive(Debug)]
-struct EmptyResponseError;
-
-impl fmt::Display for EmptyResponseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "empty response from model (no message or tool call)")
-    }
-}
-
-impl Error for EmptyResponseError {}
-
-fn empty_response_error() -> eyre::Report {
-    EmptyResponseError.into()
 }
 
 pub trait LLMClient: Send + Sync {
@@ -268,16 +245,16 @@ impl<C: LLMClient> LLMClient for RetryingLLM<C> {
             attempt += 1;
             match self.inner.completion(completion.clone()).await {
                 Ok(response) => {
-                    if response.is_empty() {
-                        let err = empty_response_error();
-                        let policy = retry_policy(&err);
-                        if !policy.retry || attempt >= policy.max_attempts {
-                            return Err(err);
+                    if response.text().is_empty() && response.tool_calls().is_none() {
+                        if attempt >= MAX_COMPLETION_ATTEMPTS {
+                            eyre::bail!("model returned empty response after {attempt} attempts");
                         }
-                        let backoff = jittered_backoff(
+                        let backoff = jittered_backoff(attempt, BASE_BACKOFF_MS, MAX_BACKOFF_MS);
+                        warn!(
                             attempt,
-                            policy.base_backoff_ms,
-                            policy.max_backoff_ms,
+                            max_attempts = MAX_COMPLETION_ATTEMPTS,
+                            backoff_ms = backoff.as_millis(),
+                            "retrying after empty model response"
                         );
                         tokio::time::sleep(backoff).await;
                         continue;
@@ -291,6 +268,13 @@ impl<C: LLMClient> LLMClient for RetryingLLM<C> {
                     }
                     let backoff =
                         jittered_backoff(attempt, policy.base_backoff_ms, policy.max_backoff_ms);
+                    warn!(
+                        attempt,
+                        max_attempts = policy.max_attempts,
+                        backoff_ms = backoff.as_millis(),
+                        error = %err,
+                        "retrying model completion after error"
+                    );
                     tokio::time::sleep(backoff).await;
                 }
             }
@@ -315,15 +299,6 @@ fn retry_policy(err: &eyre::Report) -> RetryPolicy {
         };
     }
 
-    if is_empty_response_error(err) {
-        return RetryPolicy {
-            retry: true,
-            max_attempts: MAX_COMPLETION_ATTEMPTS,
-            base_backoff_ms: BASE_BACKOFF_MS,
-            max_backoff_ms: MAX_BACKOFF_MS,
-        };
-    }
-
     if is_non_retryable_client_error(err) {
         return RetryPolicy {
             retry: false,
@@ -344,10 +319,6 @@ fn retry_policy(err: &eyre::Report) -> RetryPolicy {
 fn is_non_retryable_client_error(err: &eyre::Report) -> bool {
     let msg = err.to_string();
     msg.contains(" 400") || msg.contains(" 401") || msg.contains(" 403") || msg.contains(" 404")
-}
-
-fn is_empty_response_error(err: &eyre::Report) -> bool {
-    err.downcast_ref::<EmptyResponseError>().is_some()
 }
 
 fn is_rate_limit_error(err: &eyre::Report) -> bool {
@@ -376,6 +347,50 @@ fn jitter_factor() -> f64 {
     0.5 + scaled
 }
 
+#[derive(Debug, Deserialize)]
+struct OpenRouterErrorEnvelope {
+    error: OpenRouterErrorBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterErrorBody {
+    message: String,
+    code: Option<u16>,
+}
+
+fn normalize_openrouter_completion_error(err: &CompletionError) -> eyre::Report {
+    match err {
+        CompletionError::ResponseError(msg) => normalize_openrouter_response_error(msg),
+        CompletionError::ProviderError(msg) => eyre::eyre!("ProviderError: {msg}"),
+        _ => eyre::eyre!("{err}"),
+    }
+}
+
+fn normalize_openrouter_response_error(msg: &str) -> eyre::Report {
+    if msg.contains("no message or tool call") || msg.contains("no choices") {
+        return eyre::eyre!("empty response from model (no message or tool call)");
+    }
+
+    if let Some(err) = parse_openrouter_error_envelope(msg) {
+        return match err.code {
+            Some(code) => eyre::eyre!(
+                "HttpError: Invalid status code {code} OpenRouter provider error: {}",
+                err.message
+            ),
+            None => eyre::eyre!("ProviderError: {}", err.message),
+        };
+    }
+
+    eyre::eyre!("ResponseError: {msg}")
+}
+
+fn parse_openrouter_error_envelope(msg: &str) -> Option<OpenRouterErrorBody> {
+    let body = msg.split_once("response body:")?.1.trim();
+    serde_json::from_str::<OpenRouterErrorEnvelope>(body)
+        .ok()
+        .map(|envelope| envelope.error)
+}
+
 pub enum LLMProvider {
     Anthropic {
         base_url: Option<String>,
@@ -394,10 +409,13 @@ pub enum LLMProvider {
 impl LLMProvider {
     pub fn client_from_env(&self) -> Result<Box<dyn LLMClientDyn>> {
         match self {
-            LLMProvider::Anthropic { base_url, api_key_env } => {
+            LLMProvider::Anthropic {
+                base_url,
+                api_key_env,
+            } => {
                 let key_env = api_key_env.as_deref().unwrap_or("ANTHROPIC_API_KEY");
-                let api_key = std::env::var(key_env)
-                    .map_err(|_| eyre::eyre!("missing env var {key_env}"))?;
+                let api_key =
+                    std::env::var(key_env).map_err(|_| eyre::eyre!("missing env var {key_env}"))?;
                 let mut builder = anthropic::Client::builder().api_key(api_key);
                 if let Some(url) = base_url {
                     builder = builder.base_url(url);
@@ -405,10 +423,13 @@ impl LLMProvider {
                 Ok(Box::new(builder.build()?))
             }
             LLMProvider::Gemini => Ok(Box::new(gemini::Client::from_env())),
-            LLMProvider::OpenAi { base_url, api_key_env } => {
+            LLMProvider::OpenAi {
+                base_url,
+                api_key_env,
+            } => {
                 let key_env = api_key_env.as_deref().unwrap_or("OPENAI_API_KEY");
-                let api_key = std::env::var(key_env)
-                    .map_err(|_| eyre::eyre!("missing env var {key_env}"))?;
+                let api_key =
+                    std::env::var(key_env).map_err(|_| eyre::eyre!("missing env var {key_env}"))?;
                 let mut builder = openai::CompletionsClient::builder().api_key(&api_key);
                 if let Some(url) = base_url {
                     builder = builder.base_url(url);
@@ -431,26 +452,11 @@ impl LLMClient for openrouter::Client {
         let mut request: rig::completion::CompletionRequest = completion.into();
         request.model = Some(model_name.clone());
         let model = self.completion_model(model_name);
-        let response = model.completion(request).await
-            .map_err(|e| {
-                // Check if this is a CompletionError::ResponseError with empty content.
-                // This happens with free tier models that return no choices or empty messages.
-                // We downcast to the concrete type instead of string-matching.
-                use rig::completion::CompletionError;
-                let is_empty = <dyn std::error::Error>::downcast_ref::<CompletionError>(&e)
-                    .map(|ce| match ce {
-                        CompletionError::ResponseError(msg) => {
-                            msg.contains("no message or tool call") || msg.contains("no choices")
-                        }
-                        _ => false,
-                    })
-                    .unwrap_or(false);
-                if is_empty {
-                    empty_response_error()
-                } else {
-                    eyre::eyre!("{e}")
-                }
-            })?;
+        let response = model.completion(request).await.map_err(|e| {
+            <dyn std::error::Error>::downcast_ref::<CompletionError>(&e)
+                .map(normalize_openrouter_completion_error)
+                .unwrap_or_else(|| eyre::eyre!("{e}"))
+        })?;
         let mut finish_reason = response
             .raw_response
             .choices
@@ -497,16 +503,8 @@ pub fn create_gemini_client_with_proxy(
     Ok(client.with_retry().into_arc())
 }
 
-fn model_supports_sampling_params(model: &str) -> bool {
-    // claude-opus-4-7+ rejects temperature/top_p/top_k with a 400 error
-    !model.starts_with("claude-opus-4-7")
-}
-
 impl LLMClient for anthropic::Client {
-    async fn completion(&self, mut completion: Completion) -> Result<CompletionResponse> {
-        if !model_supports_sampling_params(&completion.model) {
-            completion.temperature = None;
-        }
+    async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
         let model_name = completion.model.clone();
         let mut request: rig::completion::CompletionRequest = completion.into();
         request.model = Some(model_name.clone());
@@ -610,7 +608,6 @@ struct GeminiAdditionalParams {
 impl GeminiAdditionalParams {
     fn from_completion(completion: &Completion) -> Self {
         let config = GenerationConfig {
-            temperature: completion.temperature,
             max_output_tokens: completion.max_tokens.map(|value| value as i32),
         };
         Self {
@@ -621,8 +618,6 @@ impl GeminiAdditionalParams {
 
 #[derive(Debug, Serialize, Default)]
 struct GenerationConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<i32>,
 }

@@ -114,33 +114,49 @@ Debate mode is enabled by default for `nitpicker`, `nitpicker ask`, and `nitpick
 | `anthropic` | `ANTHROPIC_API_KEY` env var (or `api_key_env`) | `base_url` optional |
 | `gemini` | `GEMINI_API_KEY` env var, or `auth = "oauth"` | — |
 | `openai` | `OPENAI_API_KEY` env var (or `api_key_env`) | `base_url` optional |
-| `openrouter` | `OPENROUTER_API_KEY` env var (or `api_key_env`) | omit `model` or set `"free"` to auto-select |
+| `openrouter` | `OPENROUTER_API_KEY` env var (or `api_key_env`) | explicit model names are recommended; `model = "free"` is experimental |
 
 `anthropic_compatible` and `openai_compatible` are accepted as aliases for backward compatibility.
 
 ### OpenRouter models
 
-`openrouter` supports both explicit models and free auto-selection:
+`openrouter` supports both explicit pinned models and experimental free auto-selection.
+
+Pinned models are the supported default and the recommended setup:
 
 ```toml
-# explicit model
+# recommended: explicit model
 [[reviewer]]
 name = "qwen"
 model = "qwen/qwen3-30b-a3b"
 provider = "openrouter"
+```
 
-# auto-select best available free model (omit model or set model = "free")
+Experimental best-effort free auto-selection is also available:
+
+```toml
+# experimental: auto-select a currently available free model
+# omit `model` or set model = "free"
 [[reviewer]]
+provider = "openrouter"
+
+# explicit experimental form
+[[reviewer]]
+model = "free"
 provider = "openrouter"
 ```
 
-When `model` is omitted or set to `"free"`, nitpicker fetches the best available free models at startup — filtered to free, tool-capable, programming-category models, sorted by parameter count. Models are assigned in reviewer config order (first reviewer gets rank-1, second rank-2, and so on). In debate mode, actor always gets the top-ranked model and critic the second.
+When `model` is omitted or set to `"free"`, nitpicker runs an experimental best-effort resolver at startup. It fetches candidate OpenRouter free models, probes them with short tool-use smoke tests, and assigns currently working models in reviewer config order.
+
+This mode is convenient, but it is not production-stable. Free OpenRouter availability is inherently transient and may fail due to upstream rate limits, provider routing differences, or timeouts even when a model looked healthy moments earlier.
+
+If you want predictable behavior, pin explicit model names instead of relying on free auto-selection.
 
 ```bash
 export OPENROUTER_API_KEY="your-key"
 ```
 
-A free OpenRouter account is sufficient — no credit card required, just rate limits.
+A free OpenRouter account is sufficient for the experimental free mode — no credit card required, just rate limits.
 
 ### Gemini OAuth
 

@@ -1,13 +1,11 @@
-use crate::agent::{
-    AgentConfig, AgentDepth, AgentProgress, add_spawn_subagent_tool, run_agent,
-};
+use crate::agent::{AgentConfig, AgentDepth, AgentProgress, add_spawn_subagent_tool, run_agent};
 use crate::config::{Config, ReviewerConfig};
 use crate::llm::{Completion, FinishReason};
+pub use crate::prompts::TaskMode;
 use crate::provider::{
     aggregator_needs_gemini_oauth, build_aggregator_client, build_reviewer_client,
     reviewer_needs_gemini_oauth,
 };
-pub use crate::prompts::TaskMode;
 use crate::tools::{all_tools, floor_char_boundary, is_binary_file};
 use eyre::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -44,10 +42,7 @@ pub async fn run_review(
     let done_style = ProgressStyle::with_template("  {prefix:<12} {msg}").unwrap();
 
     // Check if we need to start the Gemini proxy for any OAuth-enabled reviewer
-    let gemini_proxy = if config
-        .reviewer
-        .iter()
-        .any(reviewer_needs_gemini_oauth)
+    let gemini_proxy = if config.reviewer.iter().any(reviewer_needs_gemini_oauth)
         || aggregator_needs_gemini_oauth(&config.aggregator)
     {
         info!("Starting Gemini proxy for OAuth authentication...");
@@ -155,7 +150,7 @@ pub async fn run_review(
         preamble: Some(mode.aggregator_preamble().to_string()),
         history: Vec::new(),
         tools: Vec::new(),
-        temperature: None,
+        tool_choice: None,
         max_tokens: agg.max_tokens.or(Some(8192)),
         additional_params: None,
     };
