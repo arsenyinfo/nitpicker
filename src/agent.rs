@@ -1,6 +1,7 @@
 use crate::compact::compact_history;
 use crate::llm::{Completion, ConversationUsageWindow, LLMClientDyn};
 use crate::prompts::subagent_system_prompt;
+use crate::session::{SessionWriter, ToolCallRecord, now_unix_ms};
 use crate::tools::{Tool, floor_char_boundary, tool_definitions};
 use eyre::Result;
 use rig::OneOrMany;
@@ -62,6 +63,7 @@ impl AgentDepth {
 
 pub struct AgentConfig {
     pub name: String,
+    pub session_agent: String,
     pub model: String,
     pub max_turns: usize,
     pub compact_threshold: Option<u64>,
@@ -74,6 +76,7 @@ pub struct AgentConfig {
     pub subagent_counter: Arc<AtomicUsize>,
     pub progress: Option<Arc<dyn Fn(AgentProgress) + Send + Sync>>,
     pub project_context: Option<String>,
+    pub session_writer: Option<SessionWriter>,
 }
 
 struct FinishTool {
@@ -95,6 +98,14 @@ struct ToolCallOutcome {
     output: String,
     nested_tool_calls: usize,
     repeated_tool_call_blocked: bool,
+    status: &'static str,
+    spawned_agent: Option<String>,
+}
+
+struct PreparedSubagent {
+    task: String,
+    spawned_agent: String,
+    config: AgentConfig,
 }
 
 impl Tool for FinishTool {
@@ -269,6 +280,8 @@ pub async fn run_agent(
                     output,
                     nested_tool_calls,
                     repeated_tool_call_blocked: _,
+                    status: _,
+                    spawned_agent: _,
                 } = outcome;
                 total_tool_calls += nested_tool_calls;
                 report_progress(&config, turn + 1, total_tool_calls, initial_subagent_count, last_subagent.clone());
@@ -488,34 +501,34 @@ impl Tool for SpawnSubagentTool {
     }
 }
 
-async fn run_subagent(
+fn prepare_subagent(
     parent_config: &AgentConfig,
     args: &Value,
-    tools_map: &HashMap<String, Arc<dyn Tool>>,
-    work_dir: &Path,
     parent_turns: usize,
     parent_tool_calls: usize,
     initial_subagent_count: usize,
-) -> (String, usize) {
+) -> Result<PreparedSubagent> {
     let task = match args.get("task").and_then(|value| value.as_str()) {
-        Some(task) if !task.trim().is_empty() => task,
-        _ => return ("Error: missing task".to_string(), 0),
+        Some(task) if !task.trim().is_empty() => task.to_string(),
+        _ => eyre::bail!("missing task"),
     };
 
     let subagent_id = parent_config
         .subagent_counter
         .fetch_add(1, Ordering::Relaxed)
         + 1;
+    let spawned_agent = format!("subagent-{subagent_id}");
     report_progress(
         parent_config,
         parent_turns,
         parent_tool_calls,
         initial_subagent_count,
-        Some(first_line(task)),
+        Some(first_line(&task)),
     );
     let subagent_level = parent_config.depth.level() + 1;
     let subagent_config = AgentConfig {
         name: format!("{}/subagent-{subagent_id}", parent_config.name),
+        session_agent: spawned_agent.clone(),
         model: parent_config.model.clone(),
         max_turns: parent_config.max_turns,
         compact_threshold: parent_config.compact_threshold,
@@ -530,11 +543,30 @@ async fn run_subagent(
         subagent_counter: Arc::clone(&parent_config.subagent_counter),
         progress: None,
         project_context: parent_config.project_context.clone(),
+        session_writer: parent_config.session_writer.clone(),
     };
 
-    match Box::pin(run_agent(subagent_config, task, tools_map, work_dir)).await {
-        Ok(result) => (result.text, result.tool_calls),
-        Err(err) => (format!("Error: {err}"), 0),
+    Ok(PreparedSubagent {
+        task,
+        spawned_agent,
+        config: subagent_config,
+    })
+}
+
+async fn run_subagent(
+    prepared: PreparedSubagent,
+    tools_map: &HashMap<String, Arc<dyn Tool>>,
+    work_dir: &Path,
+) -> (String, usize, Option<String>) {
+    let PreparedSubagent {
+        task,
+        spawned_agent,
+        config,
+    } = prepared;
+
+    match Box::pin(run_agent(config, &task, tools_map, work_dir)).await {
+        Ok(result) => (result.text, result.tool_calls, Some(spawned_agent)),
+        Err(err) => (format!("Error: {err}"), 0, Some(spawned_agent)),
     }
 }
 
@@ -594,64 +626,171 @@ async fn execute_tool_call(
                 "Warning: tool call cycle of period {cycle_len} detected (e.g. A→B→A→B). You are looping without making progress. Try a different approach or tool."
             )
         };
-        return Ok(ToolCallOutcome {
+        let outcome = ToolCallOutcome {
             output: msg,
             nested_tool_calls: 0,
             repeated_tool_call_blocked: true,
-        });
+            status: "blocked_cycle",
+            spawned_agent: None,
+        };
+        log_tool_call(
+            ctx.config,
+            ctx.turn + 1,
+            tool_name,
+            &args,
+            outcome.status,
+            outcome.spawned_agent.as_deref(),
+        )
+        .await;
+        return Ok(outcome);
     }
 
     if tool_name == "spawn_subagent" {
         if !ctx.config.depth.can_spawn_subagent() {
-            return Ok(ToolCallOutcome {
+            let outcome = ToolCallOutcome {
                 output: "Error: subagent depth limit reached; cannot spawn another subagent"
                     .to_string(),
                 nested_tool_calls: 0,
                 repeated_tool_call_blocked: false,
-            });
+                status: "error",
+                spawned_agent: None,
+            };
+            log_tool_call(
+                ctx.config,
+                ctx.turn + 1,
+                tool_name,
+                &args,
+                outcome.status,
+                outcome.spawned_agent.as_deref(),
+            )
+            .await;
+            return Ok(outcome);
         }
         info!(agent = %ctx.config.name, turn = ctx.turn, "spawning subagent");
-        let (output, nested_tool_calls) = run_subagent(
+        let prepared = match prepare_subagent(
             ctx.config,
             &args,
-            ctx.tools_map,
-            ctx.work_dir,
             ctx.current_turns,
             ctx.total_tool_calls,
             ctx.initial_subagent_count,
-        )
-        .await;
-        return Ok(ToolCallOutcome {
-            output,
-            nested_tool_calls,
-            repeated_tool_call_blocked: false,
-        });
-    }
-
-    match ctx.runtime_tools.get(tool_name) {
-        Some(tool) => match tool.call(args, ctx.work_dir.to_path_buf()).await {
-            Ok(output) => Ok(ToolCallOutcome {
-                output,
-                nested_tool_calls: 0,
-                repeated_tool_call_blocked: false,
-            }),
+        ) {
+            Ok(prepared) => prepared,
             Err(err) => {
-                warn!(agent = %ctx.config.name, tool = %tool_name, error = %err, "tool error");
-                Ok(ToolCallOutcome {
+                let outcome = ToolCallOutcome {
                     output: format!("Error: {err}"),
                     nested_tool_calls: 0,
                     repeated_tool_call_blocked: false,
-                })
+                    status: "error",
+                    spawned_agent: None,
+                };
+                log_tool_call(
+                    ctx.config,
+                    ctx.turn + 1,
+                    tool_name,
+                    &args,
+                    outcome.status,
+                    outcome.spawned_agent.as_deref(),
+                )
+                .await;
+                return Ok(outcome);
+            }
+        };
+        log_tool_call(
+            ctx.config,
+            ctx.turn + 1,
+            tool_name,
+            &args,
+            "started",
+            Some(&prepared.spawned_agent),
+        )
+        .await;
+        let (output, nested_tool_calls, spawned_agent) =
+            run_subagent(prepared, ctx.tools_map, ctx.work_dir).await;
+        let status = if output.starts_with("Error:") {
+            "error"
+        } else {
+            "ok"
+        };
+        let outcome = ToolCallOutcome {
+            output,
+            nested_tool_calls,
+            repeated_tool_call_blocked: false,
+            status,
+            spawned_agent,
+        };
+        return Ok(outcome);
+    }
+
+    let logged_args = args.clone();
+    let outcome = match ctx.runtime_tools.get(tool_name) {
+        Some(tool) => match tool.call(args, ctx.work_dir.to_path_buf()).await {
+            Ok(output) => ToolCallOutcome {
+                output,
+                nested_tool_calls: 0,
+                repeated_tool_call_blocked: false,
+                status: "ok",
+                spawned_agent: None,
+            },
+            Err(err) => {
+                warn!(agent = %ctx.config.name, tool = %tool_name, error = %err, "tool error");
+                ToolCallOutcome {
+                    output: format!("Error: {err}"),
+                    nested_tool_calls: 0,
+                    repeated_tool_call_blocked: false,
+                    status: "error",
+                    spawned_agent: None,
+                }
             }
         },
         None => {
             let msg = format!("Error: unknown tool '{tool_name}'");
             warn!(agent = %ctx.config.name, tool = %tool_name, "unknown tool");
-            Ok(ToolCallOutcome {
+            ToolCallOutcome {
                 output: msg,
                 nested_tool_calls: 0,
                 repeated_tool_call_blocked: false,
-            })
+                status: "error",
+                spawned_agent: None,
+            }
         }
+    };
+
+    log_tool_call(
+        ctx.config,
+        ctx.turn + 1,
+        tool_name,
+        &logged_args,
+        outcome.status,
+        outcome.spawned_agent.as_deref(),
+    )
+    .await;
+
+    Ok(outcome)
+}
+
+async fn log_tool_call(
+    config: &AgentConfig,
+    turn: usize,
+    tool_name: &str,
+    args: &Value,
+    status: &'static str,
+    spawned_agent: Option<&str>,
+) {
+    let Some(session_writer) = config.session_writer.as_ref() else {
+        return;
+    };
+
+    let record = ToolCallRecord {
+        ts_unix_ms: now_unix_ms(),
+        agent: &config.session_agent,
+        depth: config.depth.level(),
+        turn,
+        tool: tool_name,
+        args,
+        status,
+        spawned_agent,
+    };
+    if let Err(err) = session_writer.append_tool_call(&record).await {
+        warn!(tool = %tool_name, error = %err, "failed to write trajectory log");
     }
 }

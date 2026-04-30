@@ -2,6 +2,7 @@ use crate::agent::{AgentConfig, AgentDepth, AgentProgress, add_spawn_subagent_to
 use crate::config::{Config, ReviewerConfig};
 use crate::llm::{Completion, FinishReason};
 pub use crate::prompts::TaskMode;
+use crate::session::{AggregationRecord, SessionLogger, sanitize_path_component};
 use crate::provider::{
     aggregator_needs_gemini_oauth, build_aggregator_client, build_reviewer_client,
     reviewer_needs_gemini_oauth,
@@ -30,6 +31,10 @@ pub async fn run_review(
 ) -> Result<String> {
     let mut tools = all_tools();
     add_spawn_subagent_tool(&mut tools);
+    let session_logger = SessionLogger::maybe_new(config.log_trajectories())?;
+    if let Some(logger) = &session_logger {
+        info!(path = %logger.root().display(), "trajectory logging enabled");
+    }
     let context = build_context(repo).await;
     let system_prompt = mode.system_prompt();
     let initial_message = mode.initial_message(user_prompt);
@@ -60,6 +65,9 @@ pub async fn run_review(
         let repo = repo.to_path_buf();
         let name = reviewer.name.clone();
         let subagent_counter = Arc::new(AtomicUsize::new(0));
+        let session_writer = session_logger.as_ref().map(|logger| {
+            logger.child(format!("reviewer-{}.jsonl", sanitize_path_component(&name)))
+        });
         let agent_config = build_agent_config(
             config,
             reviewer,
@@ -67,6 +75,7 @@ pub async fn run_review(
             max_turns,
             gemini_proxy.as_ref(),
             Arc::clone(&subagent_counter),
+            session_writer,
         );
         info!(reviewer = %name, "spawning agent");
 
@@ -168,7 +177,19 @@ pub async fn run_review(
         return Err(eyre::eyre!("aggregator returned tool calls unexpectedly"));
     }
     pb_agg.finish_with_message("✓ done");
-    Ok(response.text())
+    let text = response.text();
+    if let Some(logger) = &session_logger {
+        logger
+            .write_aggregation(&AggregationRecord {
+                kind: "aggregation",
+                model: &agg.model,
+                text: &text,
+                rounds: None,
+                converged: None,
+            })
+            .await?;
+    }
+    Ok(text)
 }
 
 const MAX_CONTEXT_SIZE: usize = 50_000;
@@ -251,12 +272,14 @@ fn build_agent_config(
     max_turns: usize,
     gemini_proxy: Option<&crate::gemini_proxy::GeminiProxyClient>,
     subagent_counter: Arc<AtomicUsize>,
+    session_writer: Option<crate::session::SessionWriter>,
 ) -> Result<AgentConfig> {
     let client = build_reviewer_client(reviewer, gemini_proxy)?;
     let compact_threshold = config.reviewer_compact_threshold(reviewer)?;
 
     Ok(AgentConfig {
         name: reviewer.name.clone(),
+        session_agent: "root".to_string(),
         model: reviewer.model.clone(),
         max_turns,
         compact_threshold,
@@ -269,5 +292,6 @@ fn build_agent_config(
         subagent_counter,
         progress: None,
         project_context: None,
+        session_writer,
     })
 }

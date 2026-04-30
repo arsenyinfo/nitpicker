@@ -14,6 +14,7 @@ mod pr;
 mod prompts;
 mod provider;
 mod review;
+mod session;
 mod tools;
 
 /// Flags shared between the default review mode and the ask subcommand.
@@ -95,6 +96,7 @@ enum Command {
 const INIT_TEMPLATE: &str = r#"[defaults]
 debate = true
 max_turns = 70
+log_trajectories = false
 
 [aggregator]
 model = "claude-sonnet-4-6"
@@ -163,7 +165,7 @@ async fn main() -> Result<()> {
             let max_turns = config.max_turns(max_turns)?;
 
             if !no_debate && config.default_debate() {
-                debate::run_debate(
+                let report = debate::run_debate(
                     &repo,
                     &topic,
                     &config,
@@ -173,6 +175,7 @@ async fn main() -> Result<()> {
                     debate::DebateMode::Topic,
                 )
                 .await?;
+                println!("{report}");
                 return Ok(());
             }
 
@@ -239,7 +242,7 @@ async fn main() -> Result<()> {
     };
 
     if !args.no_debate && config.default_debate() {
-        debate::run_debate(
+        let report = debate::run_debate(
             &repo,
             &prompt,
             &config,
@@ -249,6 +252,7 @@ async fn main() -> Result<()> {
             debate::DebateMode::Review,
         )
         .await?;
+        println!("{report}");
         Ok(())
     } else {
         let report = review::run_review(

@@ -17,6 +17,7 @@ pub struct DefaultsConfig {
     pub debate: Option<bool>,
     pub max_turns: Option<usize>,
     pub compact_threshold: Option<u64>,
+    pub log_trajectories: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -105,6 +106,13 @@ impl Config {
         }
 
         Ok(threshold)
+    }
+
+    pub fn log_trajectories(&self) -> bool {
+        self.defaults
+            .as_ref()
+            .and_then(|defaults| defaults.log_trajectories)
+            .unwrap_or(false)
     }
 
     pub fn reviewer_compact_threshold(&self, reviewer: &ReviewerConfig) -> Result<Option<u64>> {
