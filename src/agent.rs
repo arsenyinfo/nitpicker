@@ -18,8 +18,7 @@ const MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS: usize = 3;
 const MAX_CYCLE_REPETITIONS: usize = 2;
 const TOOL_CALL_HISTORY_WINDOW: usize = 8;
 const MAX_SUBAGENT_DEPTH: usize = 2;
-const DEFAULT_AGENT_TEMPERATURE: f64 = 0.2;
-const REPEATED_TOOL_CALL_RECOVERY_TEMPERATURE: f64 = 0.6;
+const MAX_CONSECUTIVE_BLOCKED_TOOL_CALLS: usize = 3;
 
 pub struct AgentResult {
     pub text: String,
@@ -35,6 +34,7 @@ pub struct AgentProgress {
     pub turns: usize,
     pub tool_calls: usize,
     pub subagents_spawned: usize,
+    pub last_subagent: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,7 +177,8 @@ pub async fn run_agent(
     let mut empty_response_count = 0usize;
     let mut tool_call_history: VecDeque<String> = VecDeque::new();
     let initial_subagent_count = config.subagent_counter.load(Ordering::Relaxed);
-    let mut boost_next_completion_temperature = false;
+    let mut consecutive_blocked_count = 0usize;
+    let mut last_subagent: Option<String> = None;
 
     for turn in 0..config.max_turns {
         if conversation_usage.should_compact() {
@@ -193,25 +194,14 @@ pub async fn run_agent(
             )
             .await?
             {
-                total_input_tokens = total_input_tokens.saturating_add(compaction_usage.input_tokens);
-                total_output_tokens = total_output_tokens.saturating_add(compaction_usage.output_tokens);
+                total_input_tokens =
+                    total_input_tokens.saturating_add(compaction_usage.input_tokens);
+                total_output_tokens =
+                    total_output_tokens.saturating_add(compaction_usage.output_tokens);
                 total_tokens = total_tokens.saturating_add(compaction_usage.total_tokens);
                 conversation_usage.reset();
             }
         }
-
-        let temperature = if boost_next_completion_temperature {
-            info!(
-                agent = %config.name,
-                turn,
-                temperature = REPEATED_TOOL_CALL_RECOVERY_TEMPERATURE,
-                "temporarily increasing temperature after repeated tool-call block"
-            );
-            REPEATED_TOOL_CALL_RECOVERY_TEMPERATURE
-        } else {
-            DEFAULT_AGENT_TEMPERATURE
-        };
-        boost_next_completion_temperature = false;
 
         let completion = Completion {
             model: config.model.clone(),
@@ -219,7 +209,7 @@ pub async fn run_agent(
             preamble: Some(effective_system_prompt.clone()),
             history: history[..history.len().saturating_sub(1)].to_vec(),
             tools: tool_definitions(&runtime_tools),
-            temperature: Some(temperature),
+            tool_choice: None,
             max_tokens: Some(8192),
             additional_params: None,
         };
@@ -236,7 +226,7 @@ pub async fn run_agent(
             empty_response_count = 0;
             let mut results = Vec::new();
             total_tool_calls += tool_calls.len();
-            report_progress(&config, turn + 1, total_tool_calls, initial_subagent_count);
+            report_progress(&config, turn + 1, total_tool_calls, initial_subagent_count, last_subagent.clone());
             let mut should_terminate = false;
             for call in tool_calls {
                 let tool_name = call.function.name.clone();
@@ -248,6 +238,11 @@ pub async fn run_agent(
                 }
                 let cycle_len = detect_tool_call_cycle(&tool_call_history);
                 should_terminate |= config.terminal_tools.iter().any(|name| name == &tool_name);
+                if tool_name == "spawn_subagent" {
+                    if let Some(task) = args.get("task").and_then(|v| v.as_str()) {
+                        last_subagent = Some(first_line(task));
+                    }
+                }
                 info!(agent = %config.name, tool = %tool_name, args = %args, turn, "tool call");
                 let outcome = execute_tool_call(
                     ToolCallContext {
@@ -266,7 +261,9 @@ pub async fn run_agent(
                 )
                 .await?;
                 if outcome.repeated_tool_call_blocked {
-                    boost_next_completion_temperature = true;
+                    consecutive_blocked_count += 1;
+                } else {
+                    consecutive_blocked_count = 0;
                 }
                 let ToolCallOutcome {
                     output,
@@ -274,7 +271,7 @@ pub async fn run_agent(
                     repeated_tool_call_blocked: _,
                 } = outcome;
                 total_tool_calls += nested_tool_calls;
-                report_progress(&config, turn + 1, total_tool_calls, initial_subagent_count);
+                report_progress(&config, turn + 1, total_tool_calls, initial_subagent_count, last_subagent.clone());
                 let mut output = output;
                 if output.len() > MAX_TOOL_RESULT_BYTES {
                     let boundary = floor_char_boundary(&output, MAX_TOOL_RESULT_BYTES);
@@ -345,12 +342,51 @@ pub async fn run_agent(
                 content: OneOrMany::many(results.into_iter().map(UserContent::ToolResult))
                     .expect("tool results must not be empty"),
             };
+
             history.push(tool_message.clone());
+
+            if consecutive_blocked_count >= MAX_CONSECUTIVE_BLOCKED_TOOL_CALLS {
+                warn!(
+                    agent = %config.name,
+                    turn,
+                    consecutive_blocked_count,
+                    "forcing compaction to break tool-call cycle"
+                );
+                let usage = conversation_usage.usage();
+                let compaction_usage = compact_history(
+                    Arc::clone(&config.client),
+                    &config.model,
+                    &effective_system_prompt,
+                    &mut history,
+                    &mut prompt,
+                    turn + 1,
+                    usage,
+                )
+                .await?;
+                if let Some(cu) = compaction_usage {
+                    total_input_tokens = total_input_tokens.saturating_add(cu.input_tokens);
+                    total_output_tokens = total_output_tokens.saturating_add(cu.output_tokens);
+                    total_tokens = total_tokens.saturating_add(cu.total_tokens);
+                    conversation_usage.reset();
+                }
+                let cycle_break_msg = Message::user(
+                    "Note: you were stuck in a repetitive tool-call loop. \
+                     Avoid repeating the same tool calls. Try a different approach."
+                        .to_string(),
+                );
+                if let Some(last) = history.last_mut() {
+                    *last = cycle_break_msg.clone();
+                }
+                prompt = cycle_break_msg;
+                tool_call_history.clear();
+                consecutive_blocked_count = 0;
+                continue;
+            }
             prompt = tool_message;
         } else {
             tool_call_history.clear();
             let text = response.text();
-            report_progress(&config, turn + 1, total_tool_calls, initial_subagent_count);
+            report_progress(&config, turn + 1, total_tool_calls, initial_subagent_count, last_subagent.clone());
             if text.is_empty() {
                 if let Some(nudge) = &config.empty_response_nudge {
                     empty_response_count += 1;
@@ -399,6 +435,7 @@ fn report_progress(
     turns: usize,
     tool_calls: usize,
     initial_subagent_count: usize,
+    last_subagent: Option<String>,
 ) {
     if let Some(progress) = &config.progress {
         progress(AgentProgress {
@@ -406,6 +443,7 @@ fn report_progress(
             tool_calls,
             subagents_spawned: config.subagent_counter.load(Ordering::Relaxed)
                 - initial_subagent_count,
+            last_subagent,
         });
     }
 }
@@ -424,8 +462,9 @@ impl Tool for SpawnSubagentTool {
     fn definition(&self) -> rig::completion::ToolDefinition {
         rig::completion::ToolDefinition {
             name: "spawn_subagent".to_string(),
-            description: "Delegate a focused investigation to a subagent. Provide a small detailed task with all needed context."
-                .to_string(),
+            description:
+                "Delegate a complex multi-step investigation to a subagent. Only use when the task requires several tool calls (e.g. tracing logic across multiple files). Do NOT use for single file reads or simple lookups — call those tools directly instead."
+                    .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -472,6 +511,7 @@ async fn run_subagent(
         parent_turns,
         parent_tool_calls,
         initial_subagent_count,
+        Some(first_line(task)),
     );
     let subagent_level = parent_config.depth.level() + 1;
     let subagent_config = AgentConfig {
@@ -496,6 +536,10 @@ async fn run_subagent(
         Ok(result) => (result.text, result.tool_calls),
         Err(err) => (format!("Error: {err}"), 0),
     }
+}
+
+fn first_line(s: &str) -> String {
+    s.lines().next().unwrap_or(s).to_string()
 }
 
 /// Returns the cycle period (1, 2, or 3) if the tail of `history` forms a repeated cycle,
@@ -539,13 +583,16 @@ async fn execute_tool_call(
             args = %args,
             turn = ctx.turn,
             cycle_len,
-            next_temperature = REPEATED_TOOL_CALL_RECOVERY_TEMPERATURE,
             "blocking cyclic tool call"
         );
         let msg = if cycle_len == 1 {
-            format!("Warning: repeated identical tool call blocked for {tool_name}. Think twice; try changing the arguments or using a different tool.")
+            format!(
+                "Warning: repeated identical tool call blocked for {tool_name}. Think twice; try changing the arguments or using a different tool."
+            )
         } else {
-            format!("Warning: tool call cycle of period {cycle_len} detected (e.g. A→B→A→B). You are looping without making progress. Try a different approach or tool.")
+            format!(
+                "Warning: tool call cycle of period {cycle_len} detected (e.g. A→B→A→B). You are looping without making progress. Try a different approach or tool."
+            )
         };
         return Ok(ToolCallOutcome {
             output: msg,

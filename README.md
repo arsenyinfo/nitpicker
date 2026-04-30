@@ -109,12 +109,54 @@ Debate mode is enabled by default for `nitpicker`, `nitpicker ask`, and `nitpick
 
 ### Provider types
 
-| `provider` | Auth | Required fields |
+| `provider` | Auth | Notes |
 |---|---|---|
-| `anthropic` | `ANTHROPIC_API_KEY` env var | — |
+| `anthropic` | `ANTHROPIC_API_KEY` env var (or `api_key_env`) | `base_url` optional |
 | `gemini` | `GEMINI_API_KEY` env var, or `auth = "oauth"` | — |
-| `anthropic_compatible` | env var named by `api_key_env` | `base_url`, `api_key_env` |
-| `openai_compatible` | env var named by `api_key_env` | `base_url`, `api_key_env` |
+| `openai` | `OPENAI_API_KEY` env var (or `api_key_env`) | `base_url` optional |
+| `openrouter` | `OPENROUTER_API_KEY` env var (or `api_key_env`) | explicit model names are recommended; `model = "free"` is experimental |
+
+`anthropic_compatible` and `openai_compatible` are accepted as aliases for backward compatibility.
+
+### OpenRouter models
+
+`openrouter` supports both explicit pinned models and experimental free auto-selection.
+
+Pinned models are the supported default and the recommended setup:
+
+```toml
+# recommended: explicit model
+[[reviewer]]
+name = "qwen"
+model = "qwen/qwen3-30b-a3b"
+provider = "openrouter"
+```
+
+Experimental best-effort free auto-selection is also available:
+
+```toml
+# experimental: auto-select a currently available free model
+# omit `model` or set model = "free"
+[[reviewer]]
+provider = "openrouter"
+
+# explicit experimental form
+[[reviewer]]
+model = "free"
+provider = "openrouter"
+```
+
+When `model` is omitted or set to `"free"`, nitpicker runs an experimental best-effort resolver at startup. It fetches candidate OpenRouter free models, probes them with short tool-use smoke tests, and assigns currently working models in reviewer config order.
+
+This mode is convenient, but it is not production-stable. Free OpenRouter availability is inherently transient and may fail due to upstream rate limits, provider routing differences, or timeouts even when a model looked healthy moments earlier.
+
+If you want predictable behavior, pin explicit model names instead of relying on free auto-selection.
+
+```bash
+export OPENROUTER_API_KEY="your-key"
+```
+
+A free OpenRouter account is sufficient for the experimental free mode — no credit card required, just rate limits.
 
 ### Gemini OAuth
 

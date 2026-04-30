@@ -30,8 +30,6 @@ pub struct QuotaContext {
     pub reason: Option<String>,
 }
 
-
-
 /// Send a request with retry/backoff semantics aligned to Gemini CLI.
 /// Retries on 429/5xx and transient network failures.
 /// Honors Retry-After and google.rpc.RetryInfo.
@@ -51,7 +49,10 @@ pub async fn fetch_with_retry(
     let mut attempt = 1;
 
     while attempt <= DEFAULT_MAX_ATTEMPTS {
-        debug!("Retry: attempt {}/{} -> {}", attempt, DEFAULT_MAX_ATTEMPTS, url);
+        debug!(
+            "Retry: attempt {}/{} -> {}",
+            attempt, DEFAULT_MAX_ATTEMPTS, url
+        );
 
         let response = match request_builder.try_clone() {
             Some(rb) => match rb.send().await {
@@ -83,7 +84,10 @@ pub async fn fetch_with_retry(
         let status = response.status();
 
         if !is_retryable_status(status) {
-            debug!("Retry: attempt {} success or non-retryable status: {}", attempt, status);
+            debug!(
+                "Retry: attempt {} success or non-retryable status: {}",
+                attempt, status
+            );
             return Ok(response);
         }
 
@@ -163,7 +167,11 @@ async fn wait_for_retry_cooldown(cooldowns: &Arc<Mutex<HashMap<String, Instant>>
         let remaining = until.saturating_duration_since(Instant::now()).as_millis() as i64;
         if remaining > 0 {
             drop(map);
-            debug!("Retry: cooldown wait {}ms (key={})", remaining, short_key(key));
+            debug!(
+                "Retry: cooldown wait {}ms (key={})",
+                remaining,
+                short_key(key)
+            );
             tokio::time::sleep(Duration::from_millis(remaining as u64)).await;
             let mut map = cooldowns.lock().await;
             if let Some(&current_until) = map.get(key) {
@@ -186,7 +194,11 @@ async fn set_retry_cooldown(
     let mut map = cooldowns.lock().await;
     let current = map.get(key).copied().unwrap_or(Instant::now());
     map.insert(key.to_string(), std::cmp::max(current, next));
-    debug!("Retry: cooldown set {}ms (key={})", delay_ms, short_key(key));
+    debug!(
+        "Retry: cooldown set {}ms (key={})",
+        delay_ms,
+        short_key(key)
+    );
 }
 
 fn is_retryable_status(status: reqwest::StatusCode) -> bool {

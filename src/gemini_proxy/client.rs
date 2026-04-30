@@ -242,7 +242,10 @@ async fn oauth_callback_handler(
     match tokio::time::timeout(tokio::time::Duration::from_secs(30), &mut response_rx).await {
         Ok(Ok(result)) if result == "success" => (
             StatusCode::OK,
-            Html("<h1>Authorization Successful!</h1><p>You can close this window and return to the terminal.</p>".to_string()),
+            Html(
+                "<h1>Authorization Successful!</h1><p>You can close this window and return to the terminal.</p>"
+                    .to_string(),
+            ),
         ),
         Ok(Ok(error_msg)) => (
             StatusCode::INTERNAL_SERVER_ERROR,

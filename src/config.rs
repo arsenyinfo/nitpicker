@@ -22,6 +22,7 @@ pub struct DefaultsConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AggregatorConfig {
+    #[serde(default)]
     pub model: String,
     pub provider: ProviderType,
     pub base_url: Option<String>,
@@ -34,7 +35,9 @@ pub struct AggregatorConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewerConfig {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub model: String,
     pub provider: ProviderType,
     pub base_url: Option<String>,
@@ -46,14 +49,14 @@ pub struct ReviewerConfig {
 
 #[derive(Deserialize)]
 pub enum ProviderType {
-    #[serde(rename = "anthropic")]
+    #[serde(rename = "anthropic", alias = "anthropic_compatible")]
     Anthropic,
     #[serde(rename = "gemini")]
     Gemini,
-    #[serde(rename = "anthropic_compatible")]
-    AnthropicCompatible,
-    #[serde(rename = "openai_compatible")]
-    OpenAiCompatible,
+    #[serde(rename = "openai", alias = "openai_compatible")]
+    OpenAi,
+    #[serde(rename = "openrouter")]
+    OpenRouter,
 }
 
 impl ProviderType {

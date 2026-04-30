@@ -1,13 +1,11 @@
+use crate::agent::{AgentConfig, AgentDepth, AgentProgress, add_spawn_subagent_tool, run_agent};
 use crate::config::{Config, ReviewerConfig};
-use crate::agent::{
-    AgentConfig, AgentDepth, AgentProgress, add_spawn_subagent_tool, run_agent,
-};
 use crate::llm::{Completion, LLMClientDyn};
+pub use crate::prompts::DebateMode;
 use crate::provider::{
     aggregator_needs_gemini_oauth, build_aggregator_client, build_reviewer_client,
     reviewer_needs_gemini_oauth,
 };
-pub use crate::prompts::DebateMode;
 use crate::tools::{Tool, all_tools};
 use eyre::Result;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -118,14 +116,23 @@ async fn run_debate_turn(
         client: request.client,
         depth: AgentDepth::TopLevel,
         terminal_tools: vec!["submit_verdict".to_string()],
-        empty_response_nudge: Some("Please proceed with your analysis and call submit_verdict when you are done.".to_string()),
+        empty_response_nudge: Some(
+            "Please proceed with your analysis and call submit_verdict when you are done."
+                .to_string(),
+        ),
         max_empty_responses: 3,
         subagent_counter,
         progress: request.progress,
         project_context: request.project_context,
     };
 
-    let result = run_agent(config, request.initial_message, &tools_map, request.work_dir).await?;
+    let result = run_agent(
+        config,
+        request.initial_message,
+        &tools_map,
+        request.work_dir,
+    )
+    .await?;
     if let Some(verdict) = verdict_store
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -290,11 +297,13 @@ pub async fn run_debate(
         let start = std::time::Instant::now();
         let actor_pb = pb.clone();
         let actor_progress = (!verbose).then_some(Arc::new(move |progress: AgentProgress| {
+            let sub = progress.last_subagent.as_deref().map(|s| format!("\n  ↳ {s}")).unwrap_or_default();
             actor_pb.set_message(format!(
-                "round {round} — debating… ({} turns, {} tool calls, {} subagents)",
+                "round {round} — debating… ({} turns, {} tool calls, {} subagents){sub}",
                 progress.turns, progress.tool_calls, progress.subagents_spawned
             ));
-        }) as Arc<dyn Fn(AgentProgress) + Send + Sync>);
+        })
+            as Arc<dyn Fn(AgentProgress) + Send + Sync>);
         let (
             verdict,
             turns,
@@ -332,11 +341,13 @@ pub async fn run_debate(
         let start = std::time::Instant::now();
         let critic_pb = pb.clone();
         let critic_progress = (!verbose).then_some(Arc::new(move |progress: AgentProgress| {
+            let sub = progress.last_subagent.as_deref().map(|s| format!("\n  ↳ {s}")).unwrap_or_default();
             critic_pb.set_message(format!(
-                "round {round} — debating… ({} turns, {} tool calls, {} subagents)",
+                "round {round} — debating… ({} turns, {} tool calls, {} subagents){sub}",
                 progress.turns, progress.tool_calls, progress.subagents_spawned
             ));
-        }) as Arc<dyn Fn(AgentProgress) + Send + Sync>);
+        })
+            as Arc<dyn Fn(AgentProgress) + Send + Sync>);
         let (
             verdict,
             turns,
@@ -390,7 +401,7 @@ pub async fn run_debate(
         preamble: Some(mode.meta_preamble().to_string()),
         history: Vec::new(),
         tools: Vec::new(),
-        temperature: None,
+        tool_choice: None,
         max_tokens: agg_cfg.max_tokens.or(Some(8192)),
         additional_params: None,
     };
