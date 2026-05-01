@@ -1,13 +1,12 @@
+use crate::agent::{AgentConfig, AgentDepth, AgentProgress, add_spawn_subagent_tool, run_agent};
 use crate::config::{Config, ReviewerConfig};
-use crate::agent::{
-    AgentConfig, AgentDepth, AgentProgress, add_spawn_subagent_tool, run_agent,
-};
 use crate::llm::{Completion, LLMClientDyn};
+pub use crate::prompts::DebateMode;
+use crate::session::{AggregationRecord, SessionLogger, SessionWriter};
 use crate::provider::{
     aggregator_needs_gemini_oauth, build_aggregator_client, build_reviewer_client,
     reviewer_needs_gemini_oauth,
 };
-pub use crate::prompts::DebateMode;
 use crate::tools::{Tool, all_tools};
 use eyre::Result;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -37,6 +36,7 @@ struct DebateTurnRequest<'a> {
     work_dir: &'a Path,
     progress: Option<Arc<dyn Fn(AgentProgress) + Send + Sync>>,
     project_context: Option<String>,
+    session_writer: Option<SessionWriter>,
 }
 
 struct SubmitVerdictTool {
@@ -111,6 +111,7 @@ async fn run_debate_turn(
     let subagent_counter = Arc::new(AtomicUsize::new(0));
     let config = AgentConfig {
         name: format!("debate-{}", request.model),
+        session_agent: "root".to_string(),
         model: request.model.to_string(),
         max_turns: request.max_turns,
         compact_threshold: request.compact_threshold,
@@ -118,14 +119,24 @@ async fn run_debate_turn(
         client: request.client,
         depth: AgentDepth::TopLevel,
         terminal_tools: vec!["submit_verdict".to_string()],
-        empty_response_nudge: Some("Please proceed with your analysis and call submit_verdict when you are done.".to_string()),
+        empty_response_nudge: Some(
+            "Please proceed with your analysis and call submit_verdict when you are done."
+                .to_string(),
+        ),
         max_empty_responses: 3,
         subagent_counter,
         progress: request.progress,
         project_context: request.project_context,
+        session_writer: request.session_writer,
     };
 
-    let result = run_agent(config, request.initial_message, &tools_map, request.work_dir).await?;
+    let result = run_agent(
+        config,
+        request.initial_message,
+        &tools_map,
+        request.work_dir,
+    )
+    .await?;
     if let Some(verdict) = verdict_store
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -249,6 +260,10 @@ pub async fn run_debate(
     let critic_client = build_client(critic_cfg, gemini_proxy.as_ref())?;
     let actor_compact_threshold = config.reviewer_compact_threshold(actor_cfg)?;
     let critic_compact_threshold = config.reviewer_compact_threshold(critic_cfg)?;
+    let session_logger = SessionLogger::maybe_new(config.log_trajectories())?;
+    if let Some(logger) = &session_logger {
+        info!(path = %logger.root().display(), "trajectory logging enabled");
+    }
 
     let project_context = crate::review::build_context(repo).await;
 
@@ -264,16 +279,18 @@ pub async fn run_debate(
     let skin = MadSkin::default();
 
     // print cast before debate starts
-    print_cast_line(
-        actor_role,
-        &format!("{} · {}", actor_cfg.name, actor_cfg.model),
-    );
-    print_cast_line(
-        critic_role,
-        &format!("{} · {}", critic_cfg.name, critic_cfg.model),
-    );
-    print_cast_line("Meta-review", &agg_cfg.model);
-    println!();
+    if verbose {
+        print_cast_line(
+            actor_role,
+            &format!("{} · {}", actor_cfg.name, actor_cfg.model),
+        );
+        print_cast_line(
+            critic_role,
+            &format!("{} · {}", critic_cfg.name, critic_cfg.model),
+        );
+        print_cast_line("Meta-review", &agg_cfg.model);
+        println!();
+    }
 
     // (role_label, round_number, verdict_text)
     let mut verdicts: Vec<(String, usize, String)> = Vec::new();
@@ -290,11 +307,13 @@ pub async fn run_debate(
         let start = std::time::Instant::now();
         let actor_pb = pb.clone();
         let actor_progress = (!verbose).then_some(Arc::new(move |progress: AgentProgress| {
+            let sub = progress.last_subagent.as_deref().map(|s| format!("\n  ↳ {s}")).unwrap_or_default();
             actor_pb.set_message(format!(
-                "round {round} — debating… ({} turns, {} tool calls, {} subagents)",
+                "round {round} — debating… ({} turns, {} tool calls, {} subagents){sub}",
                 progress.turns, progress.tool_calls, progress.subagents_spawned
             ));
-        }) as Arc<dyn Fn(AgentProgress) + Send + Sync>);
+        })
+            as Arc<dyn Fn(AgentProgress) + Send + Sync>);
         let (
             verdict,
             turns,
@@ -313,6 +332,9 @@ pub async fn run_debate(
             work_dir: repo,
             progress: actor_progress,
             project_context: Some(project_context.clone()),
+            session_writer: session_logger
+                .as_ref()
+                .map(|logger| logger.child(format!("review-{round}.jsonl"))),
         })
         .await?;
         let elapsed = start.elapsed().as_secs();
@@ -320,9 +342,11 @@ pub async fn run_debate(
         pb.finish_with_message(format!(
             "✓ round {round} ({turns} turns, {tool_calls} tool calls, {subagents_spawned} subagents, {total_input_tokens} in, {total_output_tokens} out, {total_tokens} total tokens, {elapsed}s)"
         ));
-        println!();
-        skin.print_text(&verdict.text);
-        println!();
+        if verbose {
+            println!();
+            skin.print_text(&verdict.text);
+            println!();
+        }
         verdicts.push((actor_role.to_string(), round, verdict.text));
 
         let (pb, _) = make_spinner(verbose);
@@ -332,11 +356,13 @@ pub async fn run_debate(
         let start = std::time::Instant::now();
         let critic_pb = pb.clone();
         let critic_progress = (!verbose).then_some(Arc::new(move |progress: AgentProgress| {
+            let sub = progress.last_subagent.as_deref().map(|s| format!("\n  ↳ {s}")).unwrap_or_default();
             critic_pb.set_message(format!(
-                "round {round} — debating… ({} turns, {} tool calls, {} subagents)",
+                "round {round} — debating… ({} turns, {} tool calls, {} subagents){sub}",
                 progress.turns, progress.tool_calls, progress.subagents_spawned
             ));
-        }) as Arc<dyn Fn(AgentProgress) + Send + Sync>);
+        })
+            as Arc<dyn Fn(AgentProgress) + Send + Sync>);
         let (
             verdict,
             turns,
@@ -355,6 +381,9 @@ pub async fn run_debate(
             work_dir: repo,
             progress: critic_progress,
             project_context: Some(project_context.clone()),
+            session_writer: session_logger
+                .as_ref()
+                .map(|logger| logger.child(format!("validate-{round}.jsonl"))),
         })
         .await?;
         let elapsed = start.elapsed().as_secs();
@@ -362,9 +391,11 @@ pub async fn run_debate(
         pb.finish_with_message(format!(
             "✓ round {round} ({turns} turns, {tool_calls} tool calls, {subagents_spawned} subagents, {total_input_tokens} in, {total_output_tokens} out, {total_tokens} total tokens, {elapsed}s)"
         ));
-        println!();
-        skin.print_text(&verdict.text);
-        println!();
+        if verbose {
+            println!();
+            skin.print_text(&verdict.text);
+            println!();
+        }
         let agreed = verdict.agree;
         verdicts.push((critic_role.to_string(), round, verdict.text));
 
@@ -390,7 +421,7 @@ pub async fn run_debate(
         preamble: Some(mode.meta_preamble().to_string()),
         history: Vec::new(),
         tools: Vec::new(),
-        temperature: None,
+        tool_choice: None,
         max_tokens: agg_cfg.max_tokens.or(Some(8192)),
         additional_params: None,
     };
@@ -402,8 +433,21 @@ pub async fn run_debate(
     let meta_text = meta_response.text();
     pb.set_style(done_style);
     pb.finish_with_message("✓ done");
-    println!();
-    skin.print_text(&meta_text);
+    if let Some(logger) = &session_logger {
+        logger
+            .write_aggregation(&AggregationRecord {
+                kind: "aggregation",
+                model: &agg_cfg.model,
+                text: &meta_text,
+                rounds: Some(final_round),
+                converged: Some(converged),
+            })
+            .await?;
+    }
+    if verbose {
+        println!();
+        skin.print_text(&meta_text);
+    }
 
     // write transcript file
     let ts = SystemTime::now()
@@ -439,7 +483,9 @@ pub async fn run_debate(
     transcript.push_str(&format!("---\n\n## Meta-review\n\n{meta_text}\n"));
 
     tokio::fs::write(&transcript_path, &transcript).await?;
-    eprintln!("\nTranscript saved to: {}", transcript_path.display());
+    if verbose {
+        eprintln!("\nTranscript saved to: {}", transcript_path.display());
+    }
 
     Ok(meta_text)
 }

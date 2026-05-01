@@ -2,6 +2,7 @@ use crate::llm::{Completion, LLMClientDyn, TokenUsage};
 use eyre::Result;
 use rig::completion::Message;
 use std::sync::Arc;
+use tracing::warn;
 
 const COMPACTION_MAX_OUTPUT_TOKENS: u64 = 8_192;
 const COMPACTION_MAX_ATTEMPTS: usize = 2;
@@ -19,15 +20,34 @@ pub async fn compact_history(
         return Ok(None);
     }
 
-    let (response, summary) = summarize_history(client, model, system_prompt, history.clone(), turn, usage).await?;
-
-    let continue_msg = Message::user("Continue from where you left off.".to_string());
-    *history = vec![
-        Message::user(format!("compacted conversation summary before turn {turn}:\n\n{summary}")),
-        continue_msg.clone(),
-    ];
-    *prompt = continue_msg;
-    Ok(Some(response.usage))
+    match summarize_history(client, model, system_prompt, history.clone(), turn, usage).await {
+        Ok((response, summary)) => {
+            let continue_msg = Message::user("Continue from where you left off.".to_string());
+            *history = vec![
+                Message::user(format!(
+                    "compacted conversation summary before turn {turn}:\n\n{summary}"
+                )),
+                continue_msg.clone(),
+            ];
+            *prompt = continue_msg;
+            Ok(Some(response.usage))
+        }
+        Err(err) => {
+            warn!("compaction summarization failed ({err}), falling back to hard truncation");
+            // keep roughly the last half of history, starting at a user message
+            let keep = (history.len() / 2).max(2);
+            let from = history.len().saturating_sub(keep);
+            let from = (from..history.len())
+                .find(|&i| matches!(history[i], Message::User { .. }))
+                .unwrap_or_else(|| history.len().saturating_sub(1));
+            *history = history.split_off(from);
+            if history.is_empty() {
+                history.push(Message::user("Continue.".to_string()));
+            }
+            *prompt = history.last().cloned().expect("history is non-empty");
+            Ok(None)
+        }
+    }
 }
 
 async fn summarize_history(
@@ -48,7 +68,7 @@ async fn summarize_history(
                 preamble: Some(system_prompt.to_string()),
                 history: thread.clone(),
                 tools: Vec::new(),
-                temperature: Some(0.2),
+                tool_choice: None,
                 max_tokens: Some(COMPACTION_MAX_OUTPUT_TOKENS),
                 additional_params: None,
             })

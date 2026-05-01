@@ -17,11 +17,13 @@ pub struct DefaultsConfig {
     pub debate: Option<bool>,
     pub max_turns: Option<usize>,
     pub compact_threshold: Option<u64>,
+    pub log_trajectories: Option<bool>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AggregatorConfig {
+    #[serde(default)]
     pub model: String,
     pub provider: ProviderType,
     pub base_url: Option<String>,
@@ -34,7 +36,9 @@ pub struct AggregatorConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewerConfig {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub model: String,
     pub provider: ProviderType,
     pub base_url: Option<String>,
@@ -46,14 +50,14 @@ pub struct ReviewerConfig {
 
 #[derive(Deserialize)]
 pub enum ProviderType {
-    #[serde(rename = "anthropic")]
+    #[serde(rename = "anthropic", alias = "anthropic_compatible")]
     Anthropic,
     #[serde(rename = "gemini")]
     Gemini,
-    #[serde(rename = "anthropic_compatible")]
-    AnthropicCompatible,
-    #[serde(rename = "openai_compatible")]
-    OpenAiCompatible,
+    #[serde(rename = "openai", alias = "openai_compatible")]
+    OpenAi,
+    #[serde(rename = "openrouter")]
+    OpenRouter,
 }
 
 impl ProviderType {
@@ -102,6 +106,13 @@ impl Config {
         }
 
         Ok(threshold)
+    }
+
+    pub fn log_trajectories(&self) -> bool {
+        self.defaults
+            .as_ref()
+            .and_then(|defaults| defaults.log_trajectories)
+            .unwrap_or(false)
     }
 
     pub fn reviewer_compact_threshold(&self, reviewer: &ReviewerConfig) -> Result<Option<u64>> {
