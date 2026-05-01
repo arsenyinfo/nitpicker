@@ -478,7 +478,7 @@ async fn run_review_inner(
         )
         .await?
     } else {
-        let report = review::run_review(
+        review::run_review(
             repo,
             &full_prompt,
             config,
@@ -486,8 +486,7 @@ async fn run_review_inner(
             verbose,
             TaskMode::Review,
         )
-        .await?;
-        report
+        .await?
     };
 
     if !args.no_comment {

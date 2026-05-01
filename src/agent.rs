@@ -100,6 +100,9 @@ struct ToolCallOutcome {
     repeated_tool_call_blocked: bool,
     status: &'static str,
     spawned_agent: Option<String>,
+    subagent_input_tokens: u64,
+    subagent_output_tokens: u64,
+    subagent_total_tokens: u64,
 }
 
 struct PreparedSubagent {
@@ -210,8 +213,8 @@ pub async fn run_agent(
                 total_output_tokens =
                     total_output_tokens.saturating_add(compaction_usage.output_tokens);
                 total_tokens = total_tokens.saturating_add(compaction_usage.total_tokens);
-                conversation_usage.reset();
             }
+            conversation_usage.reset();
         }
 
         let completion = Completion {
@@ -282,8 +285,14 @@ pub async fn run_agent(
                     repeated_tool_call_blocked: _,
                     status: _,
                     spawned_agent: _,
+                    subagent_input_tokens,
+                    subagent_output_tokens,
+                    subagent_total_tokens,
                 } = outcome;
                 total_tool_calls += nested_tool_calls;
+                total_input_tokens = total_input_tokens.saturating_add(subagent_input_tokens);
+                total_output_tokens = total_output_tokens.saturating_add(subagent_output_tokens);
+                total_tokens = total_tokens.saturating_add(subagent_total_tokens);
                 report_progress(&config, turn + 1, total_tool_calls, initial_subagent_count, last_subagent.clone());
                 let mut output = output;
                 if output.len() > MAX_TOOL_RESULT_BYTES {
@@ -380,8 +389,8 @@ pub async fn run_agent(
                     total_input_tokens = total_input_tokens.saturating_add(cu.input_tokens);
                     total_output_tokens = total_output_tokens.saturating_add(cu.output_tokens);
                     total_tokens = total_tokens.saturating_add(cu.total_tokens);
-                    conversation_usage.reset();
                 }
+                conversation_usage.reset();
                 let cycle_break_msg = Message::user(
                     "Note: you were stuck in a repetitive tool-call loop. \
                      Avoid repeating the same tool calls. Try a different approach."
@@ -557,7 +566,7 @@ async fn run_subagent(
     prepared: PreparedSubagent,
     tools_map: &HashMap<String, Arc<dyn Tool>>,
     work_dir: &Path,
-) -> (String, usize, Option<String>) {
+) -> (String, usize, Option<String>, u64, u64, u64) {
     let PreparedSubagent {
         task,
         spawned_agent,
@@ -565,8 +574,15 @@ async fn run_subagent(
     } = prepared;
 
     match Box::pin(run_agent(config, &task, tools_map, work_dir)).await {
-        Ok(result) => (result.text, result.tool_calls, Some(spawned_agent)),
-        Err(err) => (format!("Error: {err}"), 0, Some(spawned_agent)),
+        Ok(result) => (
+            result.text,
+            result.tool_calls,
+            Some(spawned_agent),
+            result.total_input_tokens,
+            result.total_output_tokens,
+            result.total_tokens,
+        ),
+        Err(err) => (format!("Error: {err}"), 0, Some(spawned_agent), 0, 0, 0),
     }
 }
 
@@ -632,6 +648,9 @@ async fn execute_tool_call(
             repeated_tool_call_blocked: true,
             status: "blocked_cycle",
             spawned_agent: None,
+            subagent_input_tokens: 0,
+            subagent_output_tokens: 0,
+            subagent_total_tokens: 0,
         };
         log_tool_call(
             ctx.config,
@@ -654,6 +673,9 @@ async fn execute_tool_call(
                 repeated_tool_call_blocked: false,
                 status: "error",
                 spawned_agent: None,
+                subagent_input_tokens: 0,
+                subagent_output_tokens: 0,
+                subagent_total_tokens: 0,
             };
             log_tool_call(
                 ctx.config,
@@ -682,6 +704,9 @@ async fn execute_tool_call(
                     repeated_tool_call_blocked: false,
                     status: "error",
                     spawned_agent: None,
+                    subagent_input_tokens: 0,
+                    subagent_output_tokens: 0,
+                    subagent_total_tokens: 0,
                 };
                 log_tool_call(
                     ctx.config,
@@ -704,7 +729,7 @@ async fn execute_tool_call(
             Some(&prepared.spawned_agent),
         )
         .await;
-        let (output, nested_tool_calls, spawned_agent) =
+        let (output, nested_tool_calls, spawned_agent, sub_input_tokens, sub_output_tokens, sub_total_tokens) =
             run_subagent(prepared, ctx.tools_map, ctx.work_dir).await;
         let status = if output.starts_with("Error:") {
             "error"
@@ -717,6 +742,9 @@ async fn execute_tool_call(
             repeated_tool_call_blocked: false,
             status,
             spawned_agent,
+            subagent_input_tokens: sub_input_tokens,
+            subagent_output_tokens: sub_output_tokens,
+            subagent_total_tokens: sub_total_tokens,
         };
         return Ok(outcome);
     }
@@ -730,6 +758,9 @@ async fn execute_tool_call(
                 repeated_tool_call_blocked: false,
                 status: "ok",
                 spawned_agent: None,
+                subagent_input_tokens: 0,
+                subagent_output_tokens: 0,
+                subagent_total_tokens: 0,
             },
             Err(err) => {
                 warn!(agent = %ctx.config.name, tool = %tool_name, error = %err, "tool error");
@@ -739,6 +770,9 @@ async fn execute_tool_call(
                     repeated_tool_call_blocked: false,
                     status: "error",
                     spawned_agent: None,
+                    subagent_input_tokens: 0,
+                    subagent_output_tokens: 0,
+                    subagent_total_tokens: 0,
                 }
             }
         },
@@ -751,6 +785,9 @@ async fn execute_tool_call(
                 repeated_tool_call_blocked: false,
                 status: "error",
                 spawned_agent: None,
+                subagent_input_tokens: 0,
+                subagent_output_tokens: 0,
+                subagent_total_tokens: 0,
             }
         }
     };

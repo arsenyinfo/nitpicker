@@ -81,7 +81,7 @@ Example `nitpicker.toml`:
 ```toml
 [defaults]
 debate = true          # optional, default: true
-max_turns = 70         # optional, default: 70
+max_turns = 100        # optional, default: 100
 log_trajectories = false # optional, default: false
 
 [aggregator]
@@ -211,7 +211,7 @@ nitpicker init [--global]
 --analyze [PATH]   analyze existing code instead of reviewing changes
 --no-debate        use parallel aggregation instead of actor-critic debate
 --rounds <N>       maximum debate rounds [default: 5]
---max-turns <N>    maximum tool-use turns per agent or debate turn [default: 70 via config]
+--max-turns <N>    maximum tool-use turns per agent or debate turn [default: 100 via config]
 --gemini-oauth     run Gemini OAuth authentication flow and exit
 -v, --verbose      show info-level logs (hidden by default)
 ```
@@ -250,6 +250,10 @@ By default, nitpicker prints only the final synthesized result. Use `--verbose` 
 Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timestamp}.md`.
 
 ## Changelog
+
+**0.2.3** — 2026-05-01
+- Debate cast lines now respect `NO_COLOR`, `TERM=dumb`, and non-TTY stdout (no stray ANSI escapes when piping)
+- Clippy fixes
 
 **0.2.2** — 2026-04-30
 - Session artifacts now capture tool trajectories and final aggregation output for debugging

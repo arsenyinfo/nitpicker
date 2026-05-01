@@ -57,7 +57,7 @@ gemini_proxy/   local HTTP proxy that translates Gemini API calls to Google Code
 ### Review flow
 
 1. `review.rs` spawns one `tokio::task` per `[[reviewer]]` in config
-2. Each task runs `agent.rs::run_agent` — an agentic loop: call LLM → execute tool calls → feed results back → repeat until the model returns text (default max 70 turns, overrideable via config/CLI)
+2. Each task runs `agent.rs::run_agent` — an agentic loop: call LLM → execute tool calls → feed results back → repeat until the model returns text (default max 100 turns, overrideable via config/CLI)
 3. All reviewer outputs are collected, concatenated, and sent to the aggregator model in a single completion call
 4. The aggregator's response is printed to stdout
 
@@ -144,5 +144,5 @@ Reviewers automatically load project context from `CLAUDE.md` or `AGENTS.md` if 
 - Parallel review execution is capped at 8 concurrent reviewers
 - Tool results are truncated to 50k bytes before being sent to the LLM
 - Git tool output is truncated to 50k chars
-- Agent and debate turn loops default to 70 turns and can be overridden via config or CLI
+- Agent and debate turn loops default to 100 turns and can be overridden via config or CLI
 - Context files (`CLAUDE.md`, `AGENTS.md`) are limited to 50k chars
