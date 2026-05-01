@@ -142,6 +142,12 @@ async fn main() -> Result<()> {
             let max_turns = config.max_turns(max_turns)?;
 
             if !no_debate && config.default_debate() {
+                if config.reviewer.len() < 2 {
+                    eyre::bail!(
+                        "debate mode requires at least 2 reviewers, found {} — add another reviewer or set debate = false in [defaults]",
+                        config.reviewer.len()
+                    );
+                }
                 let report = debate::run_debate(
                     &repo,
                     &topic,
@@ -219,6 +225,12 @@ async fn main() -> Result<()> {
     };
 
     if !args.no_debate && config.default_debate() {
+        if config.reviewer.len() < 2 {
+            eyre::bail!(
+                "debate mode requires at least 2 reviewers, found {} — add another reviewer or set debate = false in [defaults]",
+                config.reviewer.len()
+            );
+        }
         let report = debate::run_debate(
             &repo,
             &prompt,
@@ -289,7 +301,7 @@ async fn run_init(path: PathBuf) -> eyre::Result<()> {
     for d in &detected {
         let key_info = match d.api_key_env {
             Some(env) => env.to_string(),
-            None => d.auth.unwrap_or("oauth").to_string(),
+            None => d.auth.unwrap_or("api_key").to_string(),
         };
         println!("  ✓ {} ({}) via {}", d.name, key_info, d.source);
     }

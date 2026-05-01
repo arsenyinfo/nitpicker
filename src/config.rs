@@ -83,13 +83,6 @@ impl Config {
             eyre::bail!("no reviewers configured");
         }
 
-        if self.default_debate() && self.reviewer.len() < 2 {
-            eyre::bail!(
-                "debate mode requires at least 2 reviewers, found {} — add another reviewer or set debate = false in [defaults]",
-                self.reviewer.len()
-            );
-        }
-
         if let Some(env) = required_env_var_aggregator(&self.aggregator) {
             check_env_var(env)
                 .map_err(|_| eyre::eyre!("[aggregator]: env var {env} is not set"))?;

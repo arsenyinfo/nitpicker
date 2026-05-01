@@ -302,6 +302,9 @@ pub async fn run_agent(
                 total_input_tokens = total_input_tokens.saturating_add(subagent_input_tokens);
                 total_output_tokens = total_output_tokens.saturating_add(subagent_output_tokens);
                 total_tokens = total_tokens.saturating_add(subagent_total_tokens);
+                if tool_name == "spawn_subagent" {
+                    last_subagent = None;
+                }
                 report_progress(&config, turn + 1, total_tool_calls, initial_subagent_count, last_subagent.clone());
                 let mut output = output;
                 if output.len() > MAX_TOOL_RESULT_BYTES {
