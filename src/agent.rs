@@ -111,6 +111,15 @@ struct PreparedSubagent {
     config: AgentConfig,
 }
 
+struct SubagentOutcome {
+    output: String,
+    tool_calls: usize,
+    spawned_agent: Option<String>,
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+}
+
 impl Tool for FinishTool {
     fn name(&self) -> String {
         "finish".to_string()
@@ -566,7 +575,7 @@ async fn run_subagent(
     prepared: PreparedSubagent,
     tools_map: &HashMap<String, Arc<dyn Tool>>,
     work_dir: &Path,
-) -> (String, usize, Option<String>, u64, u64, u64) {
+) -> SubagentOutcome {
     let PreparedSubagent {
         task,
         spawned_agent,
@@ -574,15 +583,22 @@ async fn run_subagent(
     } = prepared;
 
     match Box::pin(run_agent(config, &task, tools_map, work_dir)).await {
-        Ok(result) => (
-            result.text,
-            result.tool_calls,
-            Some(spawned_agent),
-            result.total_input_tokens,
-            result.total_output_tokens,
-            result.total_tokens,
-        ),
-        Err(err) => (format!("Error: {err}"), 0, Some(spawned_agent), 0, 0, 0),
+        Ok(result) => SubagentOutcome {
+            output: result.text,
+            tool_calls: result.tool_calls,
+            spawned_agent: Some(spawned_agent),
+            input_tokens: result.total_input_tokens,
+            output_tokens: result.total_output_tokens,
+            total_tokens: result.total_tokens,
+        },
+        Err(err) => SubagentOutcome {
+            output: format!("Error: {err}"),
+            tool_calls: 0,
+            spawned_agent: Some(spawned_agent),
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+        },
     }
 }
 
@@ -729,22 +745,17 @@ async fn execute_tool_call(
             Some(&prepared.spawned_agent),
         )
         .await;
-        let (output, nested_tool_calls, spawned_agent, sub_input_tokens, sub_output_tokens, sub_total_tokens) =
-            run_subagent(prepared, ctx.tools_map, ctx.work_dir).await;
-        let status = if output.starts_with("Error:") {
-            "error"
-        } else {
-            "ok"
-        };
+        let sub = run_subagent(prepared, ctx.tools_map, ctx.work_dir).await;
+        let status = if sub.output.starts_with("Error:") { "error" } else { "ok" };
         let outcome = ToolCallOutcome {
-            output,
-            nested_tool_calls,
+            output: sub.output,
+            nested_tool_calls: sub.tool_calls,
             repeated_tool_call_blocked: false,
             status,
-            spawned_agent,
-            subagent_input_tokens: sub_input_tokens,
-            subagent_output_tokens: sub_output_tokens,
-            subagent_total_tokens: sub_total_tokens,
+            spawned_agent: sub.spawned_agent,
+            subagent_input_tokens: sub.input_tokens,
+            subagent_output_tokens: sub.output_tokens,
+            subagent_total_tokens: sub.total_tokens,
         };
         return Ok(outcome);
     }
