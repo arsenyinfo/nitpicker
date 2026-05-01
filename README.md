@@ -252,8 +252,7 @@ Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timesta
 ## Changelog
 
 **0.2.3** — 2026-05-01
-- Debate cast lines now respect `NO_COLOR`, `TERM=dumb`, and non-TTY stdout (no stray ANSI escapes when piping)
-- Clippy fixes
+- Better `nitpicker init` experience and minor bug fixes
 
 **0.2.2** — 2026-04-30
 - Session artifacts now capture tool trajectories and final aggregation output for debugging
