@@ -570,10 +570,41 @@ impl LLMClient for gemini::Client {
     }
 }
 
+fn model_needs_max_completion_tokens(model: &str) -> bool {
+    model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+        || model.starts_with("gpt-4o")
+        || model.starts_with("gpt-4.1")
+        || model.starts_with("gpt-4.5")
+        || model.starts_with("gpt-5")
+}
+
+fn merge_json(mut base: Value, extra: Value) -> Value {
+    if let (Some(base_obj), Some(extra_obj)) = (base.as_object_mut(), extra.as_object()) {
+        for (k, v) in extra_obj {
+            base_obj.insert(k.clone(), v.clone());
+        }
+        base
+    } else {
+        extra
+    }
+}
+
 impl LLMClient for openai::CompletionsClient {
     async fn completion(&self, mut completion: Completion) -> Result<CompletionResponse> {
-        if !model_supports_sampling_params(&completion.model) {
-            completion.temperature = None;
+        // Newer OpenAI models (o1, o3, o4-mini, gpt-4o, gpt-5, etc.) reject the legacy
+        // `max_tokens` param and require `max_completion_tokens` instead. Since rig always
+        // serializes `max_tokens`, we move the value into `additional_params` and clear it.
+        if let Some(max) = completion.max_tokens {
+            if model_needs_max_completion_tokens(&completion.model) {
+                let extra = serde_json::json!({ "max_completion_tokens": max });
+                completion.additional_params = Some(match completion.additional_params.take() {
+                    Some(existing) => merge_json(existing, extra),
+                    None => extra,
+                });
+                completion.max_tokens = None;
+            }
         }
         let model_name = completion.model.clone();
         let mut request: rig::completion::CompletionRequest = completion.into();
