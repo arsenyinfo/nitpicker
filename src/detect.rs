@@ -9,7 +9,6 @@ pub struct Detected {
     pub base_url: Option<String>,
     pub api_key_env: Option<&'static str>,
     pub auth: Option<&'static str>,
-    pub priority: u8,
     pub source: &'static str,
     /// true for local servers that accept any non-empty API key value
     pub local_server: bool,
@@ -21,7 +20,25 @@ struct ProviderDef {
     model: &'static str,
     base_url: Option<&'static str>,
     api_key_env: &'static str,
-    priority: u8,
+}
+
+// ordered highest to lowest priority
+const PROVIDER_ORDER: &[&str] = &[
+    "databricks",
+    "openrouter",
+    "anthropic",
+    "gemini",
+    "openai",
+    "kimi",
+    "mistral",
+    "zai",
+    "minimax",
+    "ollama",
+    "lmstudio",
+];
+
+fn priority_index(name: &str) -> usize {
+    PROVIDER_ORDER.iter().position(|&n| n == name).unwrap_or(usize::MAX)
 }
 
 static ANTHROPIC: ProviderDef = ProviderDef {
@@ -30,7 +47,6 @@ static ANTHROPIC: ProviderDef = ProviderDef {
     model: "claude-sonnet-4-6",
     base_url: None,
     api_key_env: "ANTHROPIC_API_KEY",
-    priority: 100,
 };
 static OPENAI: ProviderDef = ProviderDef {
     name: "openai",
@@ -38,7 +54,6 @@ static OPENAI: ProviderDef = ProviderDef {
     model: "gpt-5.5",
     base_url: None,
     api_key_env: "OPENAI_API_KEY",
-    priority: 90,
 };
 static GEMINI_API: ProviderDef = ProviderDef {
     name: "gemini",
@@ -46,7 +61,6 @@ static GEMINI_API: ProviderDef = ProviderDef {
     model: "gemini-3-flash-preview",
     base_url: None,
     api_key_env: "GEMINI_API_KEY",
-    priority: 80,
 };
 static MISTRAL: ProviderDef = ProviderDef {
     name: "mistral",
@@ -54,7 +68,6 @@ static MISTRAL: ProviderDef = ProviderDef {
     model: "mistral-medium-3.5",
     base_url: Some("https://api.mistral.ai/v1"),
     api_key_env: "MISTRAL_API_KEY",
-    priority: 70,
 };
 static OPENROUTER: ProviderDef = ProviderDef {
     name: "openrouter",
@@ -62,7 +75,6 @@ static OPENROUTER: ProviderDef = ProviderDef {
     model: "deepseek/deepseek-v4-pro",
     base_url: None,
     api_key_env: "OPENROUTER_API_KEY",
-    priority: 50,
 };
 static KIMI: ProviderDef = ProviderDef {
     name: "kimi",
@@ -70,7 +82,6 @@ static KIMI: ProviderDef = ProviderDef {
     model: "kimi-for-coding",
     base_url: Some("https://api.kimi.com/coding/"),
     api_key_env: "KIMI_API_KEY",
-    priority: 40,
 };
 static ZAI: ProviderDef = ProviderDef {
     name: "zai",
@@ -78,7 +89,6 @@ static ZAI: ProviderDef = ProviderDef {
     model: "glm-5.1",
     base_url: Some("https://api.z.ai/api/anthropic"),
     api_key_env: "ZAI_API_KEY",
-    priority: 40,
 };
 static MINIMAX: ProviderDef = ProviderDef {
     name: "minimax",
@@ -86,7 +96,6 @@ static MINIMAX: ProviderDef = ProviderDef {
     model: "MiniMax-M2.7",
     base_url: Some("https://api.minimax.io/anthropic"),
     api_key_env: "MINIMAX_API_KEY",
-    priority: 40,
 };
 
 static ENV_PROVIDERS: &[&ProviderDef] = &[
@@ -114,7 +123,6 @@ fn from_def(def: &'static ProviderDef, source: &'static str) -> Detected {
         base_url: def.base_url.map(str::to_string),
         api_key_env: Some(def.api_key_env),
         auth: None,
-        priority: def.priority,
         source,
         local_server: false,
     }
@@ -152,7 +160,6 @@ pub async fn detect_all() -> Vec<Detected> {
             // we note in init output that the user should alias it
             api_key_env: None,
             auth: None,
-            priority: GEMINI_API.priority,
             source: "env var (GOOGLE_AI_API_KEY — alias GEMINI_API_KEY)",
             local_server: false,
         });
@@ -193,7 +200,7 @@ pub async fn detect_all() -> Vec<Detected> {
         }
     }
 
-    detected.sort_by_key(|d| std::cmp::Reverse(d.priority));
+    detected.sort_by_key(|d| priority_index(d.name));
     detected
 }
 
@@ -228,7 +235,6 @@ fn gemini_oauth_detected(source: &'static str) -> Detected {
         base_url: None,
         api_key_env: None,
         auth: Some("oauth"),
-        priority: 75,
         source,
         local_server: false,
     }
@@ -313,7 +319,6 @@ fn ollama_detected(model: String, source: &'static str) -> Detected {
         base_url: Some("http://localhost:11434/v1".to_string()),
         api_key_env: Some("OLLAMA_API_KEY"),
         auth: None,
-        priority: 20,
         source,
         local_server: true,
     }
@@ -367,7 +372,6 @@ fn lmstudio_detected(model: String, source: &'static str) -> Detected {
         base_url: Some("http://localhost:1234/v1".to_string()),
         api_key_env: Some("LMSTUDIO_API_KEY"),
         auth: None,
-        priority: 20,
         source,
         local_server: true,
     }
@@ -410,7 +414,6 @@ fn detect_databricks() -> Option<Detected> {
         base_url: Some(base_url),
         api_key_env: Some("DATABRICKS_TOKEN"),
         auth: None,
-        priority: 45,
         source,
         local_server: false,
     })
