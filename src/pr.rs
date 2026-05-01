@@ -487,7 +487,6 @@ async fn run_review_inner(
             TaskMode::Review,
         )
         .await?;
-        println!("{report}");
         report
     };
 

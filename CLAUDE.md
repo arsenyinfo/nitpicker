@@ -2,6 +2,11 @@
 
 Multi-reviewer code review using LLMs. Spawns parallel agents with different models/prompts, aggregates their feedback into a final verdict.
 
+## Contributor memo
+
+- Before opening a PR, update `README.md` and `CLAUDE.md` for any user-facing or architecture-relevant changes.
+- If you bump the version, add a short summary entry to the changelog in `README.md`.
+
 ## Quick start
 
 ```bash
@@ -62,9 +67,18 @@ gemini_proxy/   local HTTP proxy that translates Gemini API calls to Google Code
 2. Each round: Actor turn → Critic turn. Both have access to all file/git tools plus `submit_verdict(verdict, agree)`
 3. `agree=true` from Critic → convergence, loop ends early
 4. After all rounds: meta-reviewer synthesizes the full dialogue in a single non-agentic completion
-5. Transcript saved to `debate-{ts}.md` (topic) or `review-debate-{ts}.md` (code review)
-6. `DebateMode::Topic` (from `ask`) uses Actor/Critic roles and general debate prompts
-7. `DebateMode::Review` (from default review mode) uses Reviewer/Validator roles and code-review-focused prompts
+5. Default stdout shows only the final synthesized result; `--verbose` also prints the intermediate debate text and transcript path
+6. Transcript saved to the OS temp dir as `debate-{ts}.md` (topic) or `review-debate-{ts}.md` (code review)
+7. `DebateMode::Topic` (from `ask`) uses Actor/Critic roles and general debate prompts
+8. `DebateMode::Review` (from default review mode) uses Reviewer/Validator roles and code-review-focused prompts
+
+### Agent execution (`agent.rs`)
+
+- Each reviewer runs an agentic loop with file/git tools until it returns text or reaches the turn limit
+- Reviewers can delegate deeper investigations via `spawn_subagent`
+- Subagent depth is capped at 2 to bound recursion and cost
+- Subagents return results through a hidden `finish(result)` tool; debate agents use `submit_verdict(verdict, agree)` instead
+- Repetitive tool-call cycles are blocked, and the agent can force a context reset to break out of loops
 
 ### PR flow (`pr.rs`)
 
@@ -89,7 +103,13 @@ Tools return `String`, never `Err` — errors are returned as `"Error: ..."` str
 
 `GitTool` only allows a fixed allowlist of read-only subcommands. Commands are passed directly to `Command::new("git").args(tokens)` — no shell involved.
 
-`GrepTool` recursively searches files, detecting binary files by checking for null bytes in the first 8 KiB.
+`GrepTool` recursively searches files and skips binary files. Context loading for `CLAUDE.md` / `AGENTS.md` also skips binary files.
+
+### Session artifacts (`session.rs`)
+
+- When `[defaults].log_trajectories = true`, nitpicker writes session artifacts under `~/.nitpicker/sessions/session-<timestamp>-<pid>/`
+- Reviewer and debate-turn traces are stored as per-agent JSONL files
+- Final synthesized output is saved as `aggregation.json`
 
 ### Gemini OAuth proxy (`gemini_proxy/`)
 
@@ -121,6 +141,7 @@ Reviewers automatically load project context from `CLAUDE.md` or `AGENTS.md` if 
 ## Key constraints
 
 - Reviewers run concurrently — reviewer code must be `Send + Sync`
+- Parallel review execution is capped at 8 concurrent reviewers
 - Tool results are truncated to 50k bytes before being sent to the LLM
 - Git tool output is truncated to 50k chars
 - Agent and debate turn loops default to 70 turns and can be overridden via config or CLI

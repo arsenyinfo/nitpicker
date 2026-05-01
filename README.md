@@ -82,6 +82,7 @@ Example `nitpicker.toml`:
 [defaults]
 debate = true          # optional, default: true
 max_turns = 70         # optional, default: 70
+log_trajectories = false # optional, default: false
 
 [aggregator]
 model = "claude-sonnet-4-6"
@@ -107,14 +108,58 @@ Unknown config keys are rejected. For example, use `max_tokens` for output lengt
 
 Debate mode is enabled by default for `nitpicker`, `nitpicker ask`, and `nitpicker pr`. Pass `--no-debate` to use parallel aggregation for a single run. Use `[defaults].max_turns` or `--max-turns` to control the per-agent tool-use loop limit.
 
+Set `[defaults].log_trajectories = true` to save per-agent JSONL traces and a final `aggregation.json` under `~/.nitpicker/sessions/session-<timestamp>-<pid>/`.
+
 ### Provider types
 
-| `provider` | Auth | Required fields |
+| `provider` | Auth | Notes |
 |---|---|---|
-| `anthropic` | `ANTHROPIC_API_KEY` env var | — |
+| `anthropic` | `ANTHROPIC_API_KEY` env var (or `api_key_env`) | `base_url` optional |
 | `gemini` | `GEMINI_API_KEY` env var, or `auth = "oauth"` | — |
-| `anthropic_compatible` | env var named by `api_key_env` | `base_url`, `api_key_env` |
-| `openai_compatible` | env var named by `api_key_env` | `base_url`, `api_key_env` |
+| `openai` | `OPENAI_API_KEY` env var (or `api_key_env`) | `base_url` optional |
+| `openrouter` | `OPENROUTER_API_KEY` env var (or `api_key_env`) | explicit model names are recommended; `model = "free"` is experimental |
+
+`anthropic_compatible` and `openai_compatible` are accepted as aliases for backward compatibility.
+
+### OpenRouter models
+
+`openrouter` supports both explicit pinned models and an experimental free auto-selection mode.
+
+Pinned models are the supported default and the recommended setup:
+
+```toml
+# recommended: explicit model
+[[reviewer]]
+name = "qwen"
+model = "qwen/qwen3-30b-a3b"
+provider = "openrouter"
+```
+
+Experimental best-effort free auto-selection is also available:
+
+```toml
+# experimental: auto-select a currently available free model
+# omit `model` or set model = "free"
+[[reviewer]]
+provider = "openrouter"
+
+# explicit experimental form
+[[reviewer]]
+model = "free"
+provider = "openrouter"
+```
+
+When `model` is omitted or set to `"free"`, nitpicker tries to pick a currently working free model at startup.
+
+This mode is convenient, but it is not production-stable and may fail due to upstream availability, routing differences, or timeouts.
+
+If you want predictable behavior, pin explicit model names instead of relying on free auto-selection.
+
+```bash
+export OPENROUTER_API_KEY="your-key"
+```
+
+A free OpenRouter account is sufficient for the experimental free mode — no credit card required, just rate limits.
 
 ### Gemini OAuth
 
@@ -200,9 +245,19 @@ Two LLM agents take turns exploring the codebase with file/git tools and submitt
 - `reviewer[1]` in config → Critic (review: Validator)
 - `aggregator` → Meta-reviewer
 
+By default, nitpicker prints only the final synthesized result. Use `--verbose` to show intermediate debate output and the saved transcript path.
+
 Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timestamp}.md`.
 
 ## Changelog
+
+**0.2.2** — 2026-04-30
+- Session artifacts now capture tool trajectories and final aggregation output for debugging
+- Default CLI output now stays focused on the final synthesized review unless `--verbose` is enabled
+
+**0.2.1** — 2026-04-30
+- First class support for OpenRouter: new provider type, and experimental free auto-selection mode
+- Minor bug fixes (breaking the cycle, temperature params)
 
 **0.2.0** — 2026-04-28
 - PR comments are now included in the review prompt for full context

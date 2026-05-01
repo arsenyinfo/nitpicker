@@ -1,5 +1,4 @@
-const VERIFY_WARNING: &str =
-    "Your opponent may sound confident but still make factual errors or overlook edge cases. \
+const VERIFY_WARNING: &str = "Your opponent may sound confident but still make factual errors or overlook edge cases. \
 Independently verify every claim against the actual code before accepting it.";
 
 const DELEGATION_GUIDANCE: &str = "You should delegate focused investigations with spawn_subagent(task). \
@@ -220,7 +219,7 @@ impl DebateMode {
                 Call submit_verdict with a list of findings. Use this schema exactly (one block per finding, \
                 blank line between blocks):\n\
                 "
-                    .to_string()
+                .to_string()
                     + FINDING_FIELDS
                     + "\n\nIf there are no valid findings, set verdict exactly to: "
                     + NO_FINDINGS
