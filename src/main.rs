@@ -7,6 +7,7 @@ mod agent;
 mod compact;
 mod config;
 mod debate;
+mod detect;
 mod gemini_proxy;
 mod llm;
 mod openrouter;
@@ -93,26 +94,6 @@ enum Command {
     Pr(pr::PrArgs),
 }
 
-const INIT_TEMPLATE: &str = r#"[defaults]
-debate = true
-max_turns = 70
-log_trajectories = false
-
-[aggregator]
-model = "claude-sonnet-4-6"
-provider = "anthropic"
-
-[[reviewer]]
-name = "claude"
-model = "claude-sonnet-4-6"
-provider = "anthropic"
-
-[[reviewer]]
-name = "gemini"
-model = "gemini-3-flash-preview"
-provider = "gemini"
-auth = "oauth"
-"#;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -142,11 +123,7 @@ async fn main() -> Result<()> {
             if path.exists() {
                 eyre::bail!("{} already exists", path.display());
             }
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&path, INIT_TEMPLATE)?;
-            println!("Created {}", path.display());
+            run_init(path).await?;
             return Ok(());
         }
         Some(Command::Ask {
@@ -165,6 +142,12 @@ async fn main() -> Result<()> {
             let max_turns = config.max_turns(max_turns)?;
 
             if !no_debate && config.default_debate() {
+                if config.reviewer.len() < 2 {
+                    eyre::bail!(
+                        "debate mode requires at least 2 reviewers, found {} — add another reviewer or set debate = false in [defaults]",
+                        config.reviewer.len()
+                    );
+                }
                 let report = debate::run_debate(
                     &repo,
                     &topic,
@@ -242,6 +225,12 @@ async fn main() -> Result<()> {
     };
 
     if !args.no_debate && config.default_debate() {
+        if config.reviewer.len() < 2 {
+            eyre::bail!(
+                "debate mode requires at least 2 reviewers, found {} — add another reviewer or set debate = false in [defaults]",
+                config.reviewer.len()
+            );
+        }
         let report = debate::run_debate(
             &repo,
             &prompt,
@@ -270,34 +259,217 @@ async fn main() -> Result<()> {
 }
 
 fn load_config(explicit_path: Option<&Path>, repo: &Path) -> Result<config::Config> {
-    if let Some(path) = explicit_path {
+    let config: config::Config = if let Some(path) = explicit_path {
         let content = std::fs::read_to_string(path)
             .map_err(|e| eyre::eyre!("failed to read config {:?}: {e}", path))?;
-        return toml::from_str(&content).map_err(|e| eyre::eyre!("invalid config: {e}"));
+        toml::from_str(&content).map_err(|e| eyre::eyre!("invalid config: {e}"))?
+    } else if repo.join("nitpicker.toml").exists() {
+        let path = repo.join("nitpicker.toml");
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| eyre::eyre!("failed to read config {:?}: {e}", path))?;
+        toml::from_str(&content).map_err(|e| eyre::eyre!("invalid config: {e}"))?
+    } else if let Some(home) = dirs::home_dir() {
+        let path = home.join(".nitpicker").join("config.toml");
+        if path.exists() {
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| eyre::eyre!("failed to read config {:?}: {e}", path))?;
+            toml::from_str(&content).map_err(|e| eyre::eyre!("invalid config: {e}"))?
+        } else {
+            eyre::bail!("no config found — run `nitpicker init [--global]` to generate one")
+        }
+    } else {
+        eyre::bail!("no config found — run `nitpicker init [--global]` to generate one")
+    };
+    config.validate()?;
+    Ok(config)
+}
+
+async fn run_init(path: PathBuf) -> eyre::Result<()> {
+    println!("Detecting available providers...\n");
+    let detected = detect::detect_all().await;
+
+    if detected.is_empty() {
+        eyre::bail!(
+            "no providers detected — set at least one of: \
+             ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, \
+             OPENROUTER_API_KEY, KIMI_API_KEY, ZAI_API_KEY, MINIMAX_API_KEY, MISTRAL_API_KEY, \
+             DATABRICKS_TOKEN (with DATABRICKS_HOST or ~/.databrickscfg)"
+        );
     }
 
-    let repo_config = repo.join("nitpicker.toml");
-    if repo_config.exists() {
-        let content = std::fs::read_to_string(&repo_config)
-            .map_err(|e| eyre::eyre!("failed to read config {:?}: {e}", repo_config))?;
-        return toml::from_str(&content).map_err(|e| eyre::eyre!("invalid config: {e}"));
+    println!("Detected providers:");
+    for d in &detected {
+        let key_info = match d.api_key_env {
+            Some(env) => env.to_string(),
+            None => d.auth.unwrap_or("api_key").to_string(),
+        };
+        println!("  ✓ {} ({}) via {}", d.name, key_info, d.source);
     }
 
-    if let Some(home) = dirs::home_dir() {
-        let global_config = home.join(".nitpicker").join("config.toml");
-        if global_config.exists() {
-            let content = std::fs::read_to_string(&global_config)
-                .map_err(|e| eyre::eyre!("failed to read config {:?}: {e}", global_config))?;
-            return toml::from_str(&content).map_err(|e| eyre::eyre!("invalid config: {e}"));
+    let config = build_init_config(&detected);
+    let mut toml_str =
+        toml::to_string_pretty(&config).map_err(|e| eyre::eyre!("failed to serialize config: {e}"))?;
+
+    let active_names: std::collections::HashSet<&str> = config
+        .reviewer
+        .iter()
+        .map(|r| r.name.as_str())
+        .chain(std::iter::once(detected[0].name))
+        .collect();
+    let extras: Vec<&detect::Detected> = detected
+        .iter()
+        .filter(|d| !active_names.contains(d.name))
+        .collect();
+    if !extras.is_empty() {
+        toml_str.push_str("\n# Other detected providers — uncomment to add as a reviewer:\n");
+        for d in extras {
+            toml_str.push('\n');
+            toml_str.push_str(&format_commented_reviewer(d));
+            toml_str.push('\n');
         }
     }
 
-    eyre::bail!(
-        "no config found. create one with:\n  \
-         nitpicker init\n\n\
-         or at global location:\n  \
-         ~/.nitpicker/config.toml"
-    )
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, &toml_str)?;
+    println!("\nCreated {}", path.display());
+
+    print_init_hints(&detected);
+    Ok(())
+}
+
+fn format_commented_reviewer(d: &detect::Detected) -> String {
+    let mut lines = vec![
+        "# [[reviewer]]".to_string(),
+        format!("# name = \"{}\"", d.name),
+        format!("# model = \"{}\"", d.model),
+        format!("# provider = \"{}\"", d.provider),
+    ];
+    if let Some(url) = &d.base_url {
+        lines.push(format!("# base_url = \"{url}\""));
+    }
+    if let Some(env) = d.api_key_env {
+        if d.local_server {
+            lines.push(format!("# api_key_env = \"{env}\"  # set to any non-empty value"));
+        } else {
+            lines.push(format!("# api_key_env = \"{env}\""));
+        }
+    }
+    if let Some(auth) = d.auth {
+        lines.push(format!("# auth = \"{auth}\""));
+    }
+    lines.join("\n")
+}
+
+fn build_init_config(detected: &[detect::Detected]) -> config::Config {
+    let non_local_count = detected.iter().filter(|d| !d.local_server).count();
+    let debate = non_local_count >= 2;
+
+    // aggregator: highest priority (list is already sorted)
+    let agg = &detected[0];
+    let aggregator = config::AggregatorConfig {
+        model: agg.model.clone(),
+        provider: parse_provider_type(agg.provider),
+        base_url: agg.base_url.clone(),
+        api_key_env: agg.api_key_env.map(str::to_string),
+        max_tokens: None,
+        auth: agg.auth.map(str::to_string),
+    };
+
+    let reviewer_slots = if debate { 2 } else { 1 };
+    let reviewers = pick_reviewers(detected, reviewer_slots);
+
+    config::Config {
+        defaults: Some(config::DefaultsConfig {
+            debate: Some(debate),
+            max_turns: Some(config::DEFAULT_MAX_TURNS),
+            compact_threshold: Some(100_000),
+            log_trajectories: Some(false),
+        }),
+        aggregator,
+        reviewer: reviewers,
+    }
+}
+
+fn pick_reviewers(detected: &[detect::Detected], count: usize) -> Vec<config::ReviewerConfig> {
+    let mut result = Vec::new();
+    let mut seen_names: std::collections::HashSet<&str> = Default::default();
+
+    // first pass: diverse provider names
+    for d in detected {
+        if result.len() >= count {
+            break;
+        }
+        if seen_names.insert(d.name) {
+            result.push(make_reviewer(d));
+        }
+    }
+
+    // second pass: fill remaining slots with any provider
+    for d in detected {
+        if result.len() >= count {
+            break;
+        }
+        if result.iter().all(|r: &config::ReviewerConfig| r.name != d.name) {
+            result.push(make_reviewer(d));
+        }
+    }
+
+    result
+}
+
+fn make_reviewer(d: &detect::Detected) -> config::ReviewerConfig {
+    config::ReviewerConfig {
+        name: d.name.to_string(),
+        model: d.model.clone(),
+        provider: parse_provider_type(d.provider),
+        base_url: d.base_url.clone(),
+        api_key_env: d.api_key_env.map(str::to_string),
+        compact_threshold: None,
+        auth: d.auth.map(str::to_string),
+    }
+}
+
+fn parse_provider_type(s: &str) -> config::ProviderType {
+    match s {
+        "anthropic" => config::ProviderType::Anthropic,
+        "gemini" => config::ProviderType::Gemini,
+        "openrouter" => config::ProviderType::OpenRouter,
+        _ => config::ProviderType::OpenAi,
+    }
+}
+
+fn print_init_hints(detected: &[detect::Detected]) {
+    let unset: Vec<&detect::Detected> = detected
+        .iter()
+        .filter(|d| {
+            !d.local_server
+                && d.api_key_env
+                    .map(|env| std::env::var(env).is_err())
+                    .unwrap_or(false)
+        })
+        .collect();
+
+    if !unset.is_empty() {
+        println!("\nProviders detected but env vars not yet set:");
+        for d in unset {
+            println!("  export {}=...  # found via {}", d.api_key_env.unwrap(), d.source);
+        }
+    }
+
+    let has_google_ai_key =
+        std::env::var("GOOGLE_AI_API_KEY").is_ok() && std::env::var("GEMINI_API_KEY").is_err();
+    if has_google_ai_key {
+        println!("\n  Note: found GOOGLE_AI_API_KEY — the gemini client reads GEMINI_API_KEY;");
+        println!("  add `export GEMINI_API_KEY=$GOOGLE_AI_API_KEY` to your shell profile.");
+    }
+
+    if detected.iter().any(|d| d.auth == Some("oauth")) {
+        println!(
+            "\n  Gemini OAuth: run `nitpicker --gemini-oauth` to authenticate if not already done."
+        );
+    }
 }
 
 fn init_config_path(global: bool) -> Result<PathBuf> {

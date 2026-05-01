@@ -1,6 +1,6 @@
 use eyre::{Result, WrapErr};
 use rig::OneOrMany;
-use rig::client::{CompletionClient, ProviderClient};
+use rig::client::CompletionClient;
 use rig::completion::CompletionError;
 use rig::completion::message::ToolCall;
 use rig::completion::message::ToolChoice;
@@ -396,6 +396,12 @@ fn parse_openrouter_error_envelope(msg: &str) -> Option<OpenRouterErrorBody> {
         .map(|envelope| envelope.error)
 }
 
+fn is_local_base_url(base_url: Option<&str>) -> bool {
+    base_url
+        .map(|u| u.starts_with("http://localhost") || u.starts_with("http://127.0.0.1"))
+        .unwrap_or(false)
+}
+
 pub enum LLMProvider {
     Anthropic {
         base_url: Option<String>,
@@ -419,22 +425,39 @@ impl LLMProvider {
                 api_key_env,
             } => {
                 let key_env = api_key_env.as_deref().unwrap_or("ANTHROPIC_API_KEY");
-                let api_key =
-                    std::env::var(key_env).map_err(|_| eyre::eyre!("missing env var {key_env}"))?;
+                let api_key = std::env::var(key_env).or_else(|_| {
+                    if is_local_base_url(base_url.as_deref()) {
+                        Ok("local".to_string())
+                    } else {
+                        Err(eyre::eyre!("missing env var {key_env}"))
+                    }
+                })?;
                 let mut builder = anthropic::Client::builder().api_key(api_key);
                 if let Some(url) = base_url {
                     builder = builder.base_url(url);
                 }
                 Ok(Box::new(builder.build()?))
             }
-            LLMProvider::Gemini => Ok(Box::new(gemini::Client::from_env())),
+            LLMProvider::Gemini => {
+                let api_key = std::env::var("GEMINI_API_KEY")
+                    .or_else(|_| std::env::var("GOOGLE_AI_API_KEY"))
+                    .map_err(|_| eyre::eyre!("missing env var GEMINI_API_KEY (or GOOGLE_AI_API_KEY)"))?;
+                let client = gemini::Client::new(api_key)
+                    .map_err(|e| eyre::eyre!("failed to create Gemini client: {e}"))?;
+                Ok(Box::new(client))
+            }
             LLMProvider::OpenAi {
                 base_url,
                 api_key_env,
             } => {
                 let key_env = api_key_env.as_deref().unwrap_or("OPENAI_API_KEY");
-                let api_key =
-                    std::env::var(key_env).map_err(|_| eyre::eyre!("missing env var {key_env}"))?;
+                let api_key = std::env::var(key_env).or_else(|_| {
+                    if is_local_base_url(base_url.as_deref()) {
+                        Ok("local".to_string())
+                    } else {
+                        Err(eyre::eyre!("missing env var {key_env}"))
+                    }
+                })?;
                 let mut builder = openai::CompletionsClient::builder().api_key(&api_key);
                 if let Some(url) = base_url {
                     builder = builder.base_url(url);

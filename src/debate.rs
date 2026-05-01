@@ -9,7 +9,7 @@ use crate::provider::{
 };
 use crate::tools::{Tool, all_tools};
 use eyre::Result;
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rig::completion::Message;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -197,8 +197,19 @@ fn role_color(role: &str) -> &'static str {
     }
 }
 
+fn use_color() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::env::var("TERM").as_deref() != Ok("dumb")
+}
+
 fn colored_role(role: &str) -> String {
-    format!("{}{role}\x1b[0m", role_color(role))
+    if use_color() {
+        format!("{}{role}\x1b[0m", role_color(role))
+    } else {
+        role.to_string()
+    }
 }
 
 fn print_cast_line(role: &str, info: &str) {
@@ -206,17 +217,20 @@ fn print_cast_line(role: &str, info: &str) {
     println!("  {}{pad} {info}", colored_role(role));
 }
 
-fn make_spinner(verbose: bool) -> (ProgressBar, ProgressStyle) {
+fn make_spinner(mp: &MultiProgress) -> (ProgressBar, ProgressStyle) {
     let spinner_style = ProgressStyle::with_template("{spinner:.cyan} {prefix:<12} {msg}")
         .unwrap()
         .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", ""]);
-    let pb = ProgressBar::new_spinner();
-    if verbose {
-        pb.set_draw_target(ProgressDrawTarget::hidden());
-    }
+    let pb = mp.add(ProgressBar::new_spinner());
     pb.set_style(spinner_style.clone());
     pb.enable_steady_tick(Duration::from_millis(80));
     (pb, spinner_style)
+}
+
+fn make_sub_spinner(mp: &MultiProgress, pb: &ProgressBar) -> ProgressBar {
+    let sub = mp.insert_after(pb, ProgressBar::new_spinner());
+    sub.set_style(ProgressStyle::with_template("{msg}").unwrap());
+    sub
 }
 
 fn build_client(
@@ -258,8 +272,8 @@ pub async fn run_debate(
 
     let actor_client = build_client(actor_cfg, gemini_proxy.as_ref())?;
     let critic_client = build_client(critic_cfg, gemini_proxy.as_ref())?;
-    let actor_compact_threshold = config.reviewer_compact_threshold(actor_cfg)?;
-    let critic_compact_threshold = config.reviewer_compact_threshold(critic_cfg)?;
+    let actor_compact_threshold = config.reviewer_compact_threshold(actor_cfg);
+    let critic_compact_threshold = config.reviewer_compact_threshold(critic_cfg);
     let session_logger = SessionLogger::maybe_new(config.log_trajectories())?;
     if let Some(logger) = &session_logger {
         info!(path = %logger.root().display(), "trajectory logging enabled");
@@ -278,19 +292,21 @@ pub async fn run_debate(
     let done_style = ProgressStyle::with_template("  {prefix:<12} {msg}").unwrap();
     let skin = MadSkin::default();
 
-    // print cast before debate starts
+    let mp = MultiProgress::new();
     if verbose {
-        print_cast_line(
-            actor_role,
-            &format!("{} · {}", actor_cfg.name, actor_cfg.model),
-        );
-        print_cast_line(
-            critic_role,
-            &format!("{} · {}", critic_cfg.name, critic_cfg.model),
-        );
-        print_cast_line("Meta-review", &agg_cfg.model);
-        println!();
+        mp.set_draw_target(ProgressDrawTarget::hidden());
     }
+
+    print_cast_line(
+        actor_role,
+        &format!("{} · {}", actor_cfg.name, actor_cfg.model),
+    );
+    print_cast_line(
+        critic_role,
+        &format!("{} · {}", critic_cfg.name, critic_cfg.model),
+    );
+    print_cast_line("Meta-review", &agg_cfg.model);
+    println!();
 
     // (role_label, round_number, verdict_text)
     let mut verdicts: Vec<(String, usize, String)> = Vec::new();
@@ -300,18 +316,24 @@ pub async fn run_debate(
     'debate: for round in 1..=max_rounds {
         final_round = round;
 
-        let (pb, _) = make_spinner(verbose);
+        let (pb, _) = make_spinner(&mp);
         pb.set_prefix(colored_role(actor_role));
         pb.set_message(format!("round {round} — debating…"));
+        let sub_pb = make_sub_spinner(&mp, &pb);
         let msg = build_turn_message(prompt, &verdicts, round, actor_role);
         let start = std::time::Instant::now();
         let actor_pb = pb.clone();
+        let actor_sub_pb = sub_pb.clone();
         let actor_progress = (!verbose).then_some(Arc::new(move |progress: AgentProgress| {
-            let sub = progress.last_subagent.as_deref().map(|s| format!("\n  ↳ {s}")).unwrap_or_default();
             actor_pb.set_message(format!(
-                "round {round} — debating… ({} turns, {} tool calls, {} subagents){sub}",
+                "round {round} — debating… ({} turns, {} tool calls, {} subagents)",
                 progress.turns, progress.tool_calls, progress.subagents_spawned
             ));
+            actor_sub_pb.set_message(
+                progress.last_subagent.as_deref()
+                    .map(|s| format!("    ↳ {s}"))
+                    .unwrap_or_default()
+            );
         })
             as Arc<dyn Fn(AgentProgress) + Send + Sync>);
         let (
@@ -338,6 +360,7 @@ pub async fn run_debate(
         })
         .await?;
         let elapsed = start.elapsed().as_secs();
+        sub_pb.finish_and_clear();
         pb.set_style(done_style.clone());
         pb.finish_with_message(format!(
             "✓ round {round} ({turns} turns, {tool_calls} tool calls, {subagents_spawned} subagents, {total_input_tokens} in, {total_output_tokens} out, {total_tokens} total tokens, {elapsed}s)"
@@ -349,18 +372,24 @@ pub async fn run_debate(
         }
         verdicts.push((actor_role.to_string(), round, verdict.text));
 
-        let (pb, _) = make_spinner(verbose);
+        let (pb, _) = make_spinner(&mp);
         pb.set_prefix(colored_role(critic_role));
         pb.set_message(format!("round {round} — debating…"));
+        let sub_pb = make_sub_spinner(&mp, &pb);
         let msg = build_turn_message(prompt, &verdicts, round, critic_role);
         let start = std::time::Instant::now();
         let critic_pb = pb.clone();
+        let critic_sub_pb = sub_pb.clone();
         let critic_progress = (!verbose).then_some(Arc::new(move |progress: AgentProgress| {
-            let sub = progress.last_subagent.as_deref().map(|s| format!("\n  ↳ {s}")).unwrap_or_default();
             critic_pb.set_message(format!(
-                "round {round} — debating… ({} turns, {} tool calls, {} subagents){sub}",
+                "round {round} — debating… ({} turns, {} tool calls, {} subagents)",
                 progress.turns, progress.tool_calls, progress.subagents_spawned
             ));
+            critic_sub_pb.set_message(
+                progress.last_subagent.as_deref()
+                    .map(|s| format!("    ↳ {s}"))
+                    .unwrap_or_default()
+            );
         })
             as Arc<dyn Fn(AgentProgress) + Send + Sync>);
         let (
@@ -387,6 +416,7 @@ pub async fn run_debate(
         })
         .await?;
         let elapsed = start.elapsed().as_secs();
+        sub_pb.finish_and_clear();
         pb.set_style(done_style.clone());
         pb.finish_with_message(format!(
             "✓ round {round} ({turns} turns, {tool_calls} tool calls, {subagents_spawned} subagents, {total_input_tokens} in, {total_output_tokens} out, {total_tokens} total tokens, {elapsed}s)"
@@ -425,7 +455,7 @@ pub async fn run_debate(
         max_tokens: agg_cfg.max_tokens.or(Some(8192)),
         additional_params: None,
     };
-    let (pb, _) = make_spinner(verbose);
+    let (pb, _) = make_spinner(&mp);
     pb.set_prefix(colored_role("Meta-review"));
     pb.set_message("synthesizing…");
     let meta_response: crate::llm::CompletionResponse =

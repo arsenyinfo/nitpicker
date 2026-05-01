@@ -85,6 +85,9 @@ pub async fn run_review(
         pb.set_message("reviewing…");
         pb.enable_steady_tick(Duration::from_millis(80));
 
+        let sub_pb = mp.insert_after(&pb, ProgressBar::new_spinner());
+        sub_pb.set_style(ProgressStyle::with_template("{msg}").unwrap());
+
         let done = done_style.clone();
         let initial_message = initial_message.clone();
         let context = context.clone();
@@ -96,23 +99,30 @@ pub async fn run_review(
                 Err(err) => {
                     pb.set_style(done.clone());
                     pb.finish_with_message(format!("✗ error: {err}"));
+                    sub_pb.finish_and_clear();
                     return (name, Err(err));
                 }
             };
             config.project_context = Some(context);
             if !verbose {
                 let progress_pb = pb.clone();
+                let progress_sub_pb = sub_pb.clone();
                 config.progress = Some(Arc::new(move |progress: AgentProgress| {
-                    let sub = progress.last_subagent.as_deref().map(|s| format!("\n  ↳ {s}")).unwrap_or_default();
                     progress_pb.set_message(format!(
-                        "reviewing… ({} turns, {} tool calls, {} subagents){sub}",
+                        "reviewing… ({} turns, {} tool calls, {} subagents)",
                         progress.turns, progress.tool_calls, progress.subagents_spawned
                     ));
+                    progress_sub_pb.set_message(
+                        progress.last_subagent.as_deref()
+                            .map(|s| format!("    ↳ {s}"))
+                            .unwrap_or_default(),
+                    );
                 }));
             }
             let start = Instant::now();
             let result = run_agent(config, &initial_message, &tools_map, &repo).await;
             let elapsed = start.elapsed().as_secs();
+            sub_pb.finish_and_clear();
             pb.set_style(done);
             match &result {
                 Ok(r) => pb.finish_with_message(format!(
@@ -275,7 +285,7 @@ fn build_agent_config(
     session_writer: Option<crate::session::SessionWriter>,
 ) -> Result<AgentConfig> {
     let client = build_reviewer_client(reviewer, gemini_proxy)?;
-    let compact_threshold = config.reviewer_compact_threshold(reviewer)?;
+    let compact_threshold = config.reviewer_compact_threshold(reviewer);
 
     Ok(AgentConfig {
         name: reviewer.name.clone(),
