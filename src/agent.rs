@@ -20,6 +20,7 @@ const MAX_CYCLE_REPETITIONS: usize = 2;
 const TOOL_CALL_HISTORY_WINDOW: usize = 8;
 const MAX_SUBAGENT_DEPTH: usize = 2;
 const MAX_CONSECUTIVE_BLOCKED_TOOL_CALLS: usize = 3;
+const FINAL_TURN_WRAP_UP_PROMPT: &str = "Budget is nearly exhausted. Stop investigating and wrap up now with your best final answer based on the evidence you already gathered. Do not call more investigation tools.";
 
 pub struct AgentResult {
     pub text: String,
@@ -171,9 +172,6 @@ pub async fn run_agent(
 ) -> Result<AgentResult> {
     let finish_store = Arc::new(Mutex::new(None));
     let mut runtime_tools = tools_map.clone();
-    if !config.depth.can_spawn_subagent() {
-        runtime_tools.remove("spawn_subagent");
-    }
     if config.depth.is_subagent() {
         let finish_tool = Arc::new(FinishTool {
             result: Arc::clone(&finish_store),
@@ -204,7 +202,13 @@ pub async fn run_agent(
     let mut last_subagent: Option<String> = None;
 
     for turn in 0..config.max_turns {
-        if conversation_usage.should_compact() {
+        let is_final_turn = turn + 1 == config.max_turns;
+        let mut available_tools = runtime_tools.clone();
+        if !config.depth.can_spawn_subagent() || is_final_turn {
+            available_tools.remove("spawn_subagent");
+        }
+
+        if !is_final_turn && conversation_usage.should_compact() {
             let usage_before_compaction = conversation_usage.usage();
             if let Some(compaction_usage) = compact_history(
                 Arc::clone(&config.client),
@@ -226,12 +230,22 @@ pub async fn run_agent(
             conversation_usage.reset();
         }
 
+        if is_final_turn {
+            available_tools.retain(|name, _| {
+                config.terminal_tools.iter().any(|terminal| terminal == name)
+                    || (config.depth.is_subagent() && name == "finish")
+            });
+            let wrap_up_prompt = Message::user(FINAL_TURN_WRAP_UP_PROMPT.to_string());
+            history.push(wrap_up_prompt.clone());
+            prompt = wrap_up_prompt;
+        }
+
         let completion = Completion {
             model: config.model.clone(),
             prompt: prompt.clone(),
             preamble: Some(effective_system_prompt.clone()),
             history: history[..history.len().saturating_sub(1)].to_vec(),
-            tools: tool_definitions(&runtime_tools),
+            tools: tool_definitions(&available_tools),
             tool_choice: None,
             max_tokens: Some(8192),
             additional_params: None,
@@ -270,7 +284,7 @@ pub async fn run_agent(
                 let outcome = execute_tool_call(
                     ToolCallContext {
                         config: &config,
-                        runtime_tools: &runtime_tools,
+                        runtime_tools: &available_tools,
                         tools_map,
                         work_dir,
                         turn,
@@ -379,7 +393,7 @@ pub async fn run_agent(
 
             history.push(tool_message.clone());
 
-            if consecutive_blocked_count >= MAX_CONSECUTIVE_BLOCKED_TOOL_CALLS {
+            if consecutive_blocked_count >= MAX_CONSECUTIVE_BLOCKED_TOOL_CALLS && !is_final_turn {
                 warn!(
                     agent = %config.name,
                     turn,
@@ -424,7 +438,7 @@ pub async fn run_agent(
             if text.is_empty() {
                 if let Some(nudge) = &config.empty_response_nudge {
                     empty_response_count += 1;
-                    if empty_response_count <= config.max_empty_responses {
+                    if empty_response_count <= config.max_empty_responses && !is_final_turn {
                         let nudge = Message::user(nudge.clone());
                         history.push(nudge.clone());
                         prompt = nudge;
@@ -461,7 +475,14 @@ pub async fn run_agent(
         }
     }
 
-    eyre::bail!("agent loop exceeded {} turns", config.max_turns)
+    if config.depth.is_subagent() {
+        eyre::bail!("subagent exhausted {} turns without calling finish", config.max_turns);
+    }
+
+    eyre::bail!(
+        "agent exhausted {} turns without producing a final answer after wrap-up prompt",
+        config.max_turns
+    )
 }
 
 fn report_progress(
@@ -684,7 +705,7 @@ async fn execute_tool_call(
     }
 
     if tool_name == "spawn_subagent" {
-        if !ctx.config.depth.can_spawn_subagent() {
+        if !ctx.config.depth.can_spawn_subagent() || !ctx.runtime_tools.contains_key("spawn_subagent") {
             let outcome = ToolCallOutcome {
                 output: "Error: subagent depth limit reached; cannot spawn another subagent"
                     .to_string(),

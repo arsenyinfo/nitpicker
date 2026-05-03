@@ -251,6 +251,9 @@ Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timesta
 
 ## Changelog
 
+**unreleased yet**
+- Graceful shutdown once turns are exhausted 
+
 **0.2.3** — 2026-05-01
 - Better `nitpicker init` experience and minor bug fixes
 
