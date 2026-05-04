@@ -389,12 +389,11 @@ pub async fn run_pr(args: PrArgs, config: Config) -> Result<()> {
     {
         let (repo_slug, pr_number) = parse_pr_url(u)?;
         let repo_raw = &args.common.repo;
-        if !repo_raw.join(".git").exists() {
-            eyre::bail!("--repo must point to a git repository (missing .git)");
-        }
         let repo = repo_raw.canonicalize()?;
+        let in_place = repo.join(".git").exists()
+            && get_origin_slug(&repo).as_deref() == Some(&repo_slug);
 
-        if get_origin_slug(&repo).as_deref() == Some(&repo_slug) {
+        if in_place {
             // fetch meta first — a failure here leaves the branch untouched
             let meta = fetch_pr_meta(Some(u), &repo)?;
             let branch = get_current_branch(&repo)?;
