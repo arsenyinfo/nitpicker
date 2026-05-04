@@ -96,9 +96,9 @@ impl Tool for ReadFileTool {
             let full_path = work_dir.join(path);
             let full_path = full_path
                 .canonicalize()
-                .map_err(|e| eyre::eyre!("cannot resolve path: {e}"))?;
+                .map_err(|e| eyre::eyre!("cannot resolve path {path:?}: {e}. Only files within {} are accessible.", work_dir.display()))?;
             if !full_path.starts_with(&work_dir) {
-                eyre::bail!("path escapes work directory");
+                eyre::bail!("access denied: {path:?} is outside the allowed workspace ({}). Only project files are accessible.", work_dir.display());
             }
             let content = fs::read_to_string(&full_path).await?;
             let lines = content.lines().collect::<Vec<_>>();
@@ -158,7 +158,7 @@ impl Tool for GlobTool {
                     .components()
                     .any(|c| c == std::path::Component::ParentDir)
             {
-                eyre::bail!("pattern must be relative to work directory");
+                eyre::bail!("access denied: glob pattern {pattern:?} must be relative to the workspace ({}). Absolute paths and parent-directory traversal are not allowed.", work_dir.display());
             }
             let mut results = Vec::new();
             let full_pattern = work_dir.join(pattern);
@@ -220,19 +220,21 @@ impl Tool for GrepTool {
                     let p = work_dir.join(value);
                     // canonicalize to resolve symlinks and `..` before the workspace check
                     p.canonicalize()
-                        .map_err(|e| eyre::eyre!("cannot resolve path: {e}"))
+                        .map_err(|e| eyre::eyre!("cannot resolve path {value:?}: {e}. Only files within {} are accessible.", work_dir.display()))
                 })
                 .transpose()?
                 .unwrap_or_else(|| work_dir.clone());
             if !base_path.starts_with(&work_dir) {
-                eyre::bail!("path escapes work directory");
+                let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+                eyre::bail!("access denied: {path_arg:?} is outside the allowed workspace ({}). Only project files are accessible.", work_dir.display());
             }
             let file_glob = args
                 .get("file_glob")
                 .and_then(|value| value.as_str())
                 .map(glob_to_regex)
                 .transpose()?;
-            let regex = Regex::new(pattern)?;
+            let regex = Regex::new(pattern)
+                .map_err(|e| eyre::eyre!("invalid regex {pattern:?}: {e}"))?;
             let mut results = Vec::new();
             if base_path.is_file() {
                 if let Err(e) = search_file(&base_path, &regex, &work_dir, &mut results).await {
@@ -346,7 +348,8 @@ fn glob_to_regex(pattern: &str) -> Result<Regex> {
             other => escaped.push(other),
         }
     }
-    Ok(Regex::new(&format!("^{}$", escaped))?)
+    Regex::new(&format!("^{}$", escaped))
+        .map_err(|e| eyre::eyre!("invalid file_glob {pattern:?}: {e}"))
 }
 
 /// Check if a file is binary by reading the first 8 KiB and checking for null bytes.
