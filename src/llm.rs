@@ -467,7 +467,13 @@ impl LLMProvider {
             LLMProvider::OpenRouter { api_key_env } => {
                 let api_key = std::env::var(api_key_env)
                     .map_err(|_| eyre::eyre!("missing env var {api_key_env}"))?;
-                let client = openrouter::Client::new(&api_key)?;
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert("HTTP-Referer", "https://github.com/arsenyinfo/nitpicker".parse()?);
+                headers.insert("X-OpenRouter-Title", "nitpicker".parse()?);
+                let client = openrouter::Client::builder()
+                    .api_key(&api_key)
+                    .http_headers(headers)
+                    .build()?;
                 Ok(Box::new(client))
             }
         }
