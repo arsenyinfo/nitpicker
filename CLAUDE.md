@@ -36,6 +36,10 @@ cargo run -- pr
 # Review a remote PR by URL
 cargo run -- pr https://github.com/owner/repo/pull/42
 
+# Reflect on saved sessions
+cargo run -- reflect
+cargo run -- reflect --n 10
+
 # Gemini OAuth (first-time setup)
 cargo run -- --gemini-oauth
 ```
@@ -51,6 +55,7 @@ agent.rs        agentic tool-use loop for a single reviewer
 llm.rs          LLM client trait, per-provider impls, retry wrapper
 tools.rs        tool definitions: read_file, glob, grep, git
 pr.rs           GitHub PR subcommand: fetch metadata via gh, review, post comment
+reflect.rs      Reflect subcommand: analyze saved session trajectories and synthesize improvements
 gemini_proxy/   local HTTP proxy that translates Gemini API calls to Google Code Assist
 ```
 
@@ -89,6 +94,14 @@ gemini_proxy/   local HTTP proxy that translates Gemini API calls to Google Code
 5. Review runs via `debate::run_debate` by default, or `review::run_review` with `--no-debate`
 6. Unless `--no-comment`, result is posted back via `gh pr comment`
 7. `TempDir` drops at the end, cleaning up the clone
+
+### Reflect flow (`reflect.rs`)
+
+1. Load recent session directories from `~/.nitpicker/sessions` or explicit `--session` paths
+2. Parse per-agent JSONL tool traces and `aggregation.json` into typed session records
+3. Format each session into a compact markdown summary of agents, tool activity, and final verdict
+4. Run one analysis task per session using the first reviewer model
+5. Synthesize the per-session analyses into a final report using the second reviewer model when available, otherwise reuse the first
 
 ### LLM abstraction (`llm.rs`)
 
@@ -146,3 +159,4 @@ Reviewers automatically load project context from `CLAUDE.md` or `AGENTS.md` if 
 - Git tool output is truncated to 50k chars
 - Agent and debate turn loops default to 100 turns and can be overridden via config or CLI
 - Context files (`CLAUDE.md`, `AGENTS.md`) are limited to 50k chars
+- Prefer `match` over `if let` for better exhaustiveness checking, even if it requires a `_ => unreachable!()` arm

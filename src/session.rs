@@ -1,5 +1,5 @@
 use eyre::{Result, WrapErr};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,28 +12,28 @@ pub struct SessionLogger {
     root: Arc<PathBuf>,
 }
 
-#[derive(Serialize)]
-pub struct AggregationRecord<'a> {
-    pub kind: &'a str,
-    pub model: &'a str,
-    pub text: &'a str,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AggregationRecord {
+    pub kind: String,
+    pub model: String,
+    pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rounds: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub converged: Option<bool>,
 }
 
-#[derive(Serialize)]
-pub struct ToolCallRecord<'a> {
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ToolCallRecord {
     pub ts_unix_ms: u128,
-    pub agent: &'a str,
+    pub agent: String,
     pub depth: usize,
     pub turn: usize,
-    pub tool: &'a str,
-    pub args: &'a Value,
-    pub status: &'a str,
+    pub tool: String,
+    pub args: Value,
+    pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub spawned_agent: Option<&'a str>,
+    pub spawned_agent: Option<String>,
 }
 
 impl SessionLogger {
@@ -70,7 +70,7 @@ impl SessionLogger {
         }
     }
 
-    pub async fn write_aggregation(&self, record: &AggregationRecord<'_>) -> Result<()> {
+    pub async fn write_aggregation(&self, record: &AggregationRecord) -> Result<()> {
         let path = self.root.join("aggregation.json");
         let body = serde_json::to_vec_pretty(record)?;
         tokio::fs::write(&path, body)
@@ -87,7 +87,7 @@ pub struct SessionWriter {
 }
 
 impl SessionWriter {
-    pub async fn append_tool_call(&self, record: &ToolCallRecord<'_>) -> Result<()> {
+    pub async fn append_tool_call(&self, record: &ToolCallRecord) -> Result<()> {
         let path = self.root.join(&self.relative_path);
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)

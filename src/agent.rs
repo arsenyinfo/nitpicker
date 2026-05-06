@@ -854,13 +854,13 @@ async fn log_tool_call(
 
     let record = ToolCallRecord {
         ts_unix_ms: now_unix_ms(),
-        agent: &config.session_agent,
+        agent: config.session_agent.clone(),
         depth: config.depth.level(),
         turn,
-        tool: tool_name,
-        args,
-        status,
-        spawned_agent,
+        tool: tool_name.to_string(),
+        args: args.clone(),
+        status: status.to_string(),
+        spawned_agent: spawned_agent.map(str::to_string),
     };
     if let Err(err) = session_writer.append_tool_call(&record).await {
         warn!(tool = %tool_name, error = %err, "failed to write trajectory log");
