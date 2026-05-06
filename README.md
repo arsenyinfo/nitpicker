@@ -256,9 +256,6 @@ Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timesta
 - Session trajectory logging plus internal `reflect` analysis tooling
 - `pr` can review a URL from a non-git cwd
 
-**unreleased yet**
-- Graceful shutdown once turns are exhausted 
-
 **0.2.3** — 2026-05-01
 - Better `nitpicker init` experience and minor bug fixes
 
