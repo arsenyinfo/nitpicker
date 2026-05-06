@@ -251,6 +251,11 @@ Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timesta
 
 ## Changelog
 
+**0.3.0** — 2026-05-06
+- Smarter `init` provider detection and config generation
+- Session trajectory logging plus internal `reflect` analysis tooling
+- `pr` can review a URL from a non-git cwd
+
 **unreleased yet**
 - Graceful shutdown once turns are exhausted 
 
