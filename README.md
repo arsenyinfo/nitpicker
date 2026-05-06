@@ -252,8 +252,8 @@ Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timesta
 ## Changelog
 
 **0.3.1** — 2026-05-06
-- Sharper tool descriptions and more self-describing tool outputs for better agent navigation
-- Review and debate prompts now encourage a quick working plan, earlier bounded subagent delegation, and stricter evidence-based validation
+- Better tool guidance and self-describing tool outputs
+- Review prompts now encourage short plans, earlier subagent delegation, and stricter evidence checks
 
 **0.3.0** — 2026-05-06
 - Smarter `init` provider detection and config generation
