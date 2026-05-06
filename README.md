@@ -60,18 +60,6 @@ nitpicker ask --rounds 3 "should we split this module?"
 nitpicker ask --max-turns 40 "should we split this module?"
 ```
 
-### Reflect
-
-```bash
-nitpicker reflect
-nitpicker reflect --n 10
-nitpicker reflect --sessions-dir ~/.nitpicker/sessions
-nitpicker reflect --session ~/.nitpicker/sessions/session-123 --session ~/.nitpicker/sessions/session-456
-nitpicker reflect --output reflect-report.md
-```
-
-Analyzes saved session artifacts under `~/.nitpicker/sessions/` to identify recurring agent friction points and suggest prompt or tool improvements.
-
 ## Configuration
 
 Configuration is loaded from (first match wins):
@@ -211,7 +199,6 @@ This opens a browser, completes the OAuth flow, and saves the token to `~/.nitpi
 nitpicker [OPTIONS]
 nitpicker ask [--no-debate] [--rounds N] [--max-turns N] [OPTIONS] <topic>
 nitpicker pr [URL] [--no-comment] [--no-debate] [--rounds N] [--max-turns N] [OPTIONS]
-nitpicker reflect [--session PATH ... | --sessions-dir PATH] [--n N] [--output PATH] [--repo .] [--config PATH]
 nitpicker init [--global]
 ```
 
@@ -250,19 +237,6 @@ nitpicker ask [--no-debate] [--rounds N] [--max-turns N] [--repo .] [--config PA
 
  Runs agents on a free-form question instead of a code diff. By default, two agents take turns as Actor/Critic before a meta-reviewer concludes. Pass `--no-debate` to switch to the parallel reviewer plus aggregator flow.
 
-### Reflect subcommand
-
-```
-nitpicker reflect [--session PATH ... | --sessions-dir PATH] [--n N] [--output PATH] [--repo .] [--config PATH]
-```
-
-Loads recent saved sessions, formats each trajectory into a compact markdown summary, runs a per-session analysis pass, then synthesizes the overall patterns into one report.
-
-- By default, reads the most recent 20 sessions from `~/.nitpicker/sessions`
-- `--session` targets explicit session directories and overrides `--sessions-dir`
-- `--output` writes the synthesized report to a file instead of stdout
-- Uses the same config loading and OpenRouter free-model resolution path as the other commands
-
 ### Debate mode (default)
 
 Two LLM agents take turns exploring the codebase with file/git tools and submitting verdicts. The Critic can signal agreement (`agree=true`) to end early. A meta-reviewer synthesizes the dialogue.
@@ -279,7 +253,6 @@ Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timesta
 
 **unreleased yet**
 - Graceful shutdown once turns are exhausted 
-- Add `reflect` subcommand to analyze saved session trajectories and synthesize recurring friction points
 
 **0.2.3** — 2026-05-01
 - Better `nitpicker init` experience and minor bug fixes

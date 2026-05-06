@@ -95,18 +95,12 @@ enum Command {
     Pr(pr::PrArgs),
     /// Reflect on past nitpicker sessions to identify patterns and friction points
     Reflect {
-        /// Specific session directories to analyze (overrides --sessions-dir)
-        #[arg(long = "session", num_args = 1..)]
-        sessions: Vec<PathBuf>,
         /// Directory containing sessions (default: ~/.nitpicker/sessions)
         #[arg(long)]
         sessions_dir: Option<PathBuf>,
         /// Number of most recent sessions to analyze
         #[arg(long, default_value = "20")]
         n: usize,
-        /// Write report to file instead of stdout
-        #[arg(long)]
-        output: Option<PathBuf>,
     },
 }
 
@@ -195,18 +189,14 @@ async fn main() -> Result<()> {
             return pr::run_pr(pr_args, config).await;
         }
         Some(Command::Reflect {
-            sessions,
             sessions_dir,
             n,
-            output,
         }) => {
             let repo = args.common.repo.canonicalize()?;
             let config = load_resolved_config(args.common.config.as_deref(), &repo).await?;
             return reflect::run_reflect(reflect::ReflectArgs {
-                sessions,
                 sessions_dir,
                 n,
-                output,
                 repo,
                 config,
             })

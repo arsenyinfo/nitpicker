@@ -252,28 +252,22 @@ async fn synthesize(
 }
 
 pub struct ReflectArgs {
-    pub sessions: Vec<PathBuf>,
     pub sessions_dir: Option<PathBuf>,
     pub n: usize,
-    pub output: Option<PathBuf>,
     pub repo: PathBuf,
     pub config: Config,
 }
 
 pub async fn run_reflect(args: ReflectArgs) -> Result<()> {
-    let session_paths: Vec<PathBuf> = if !args.sessions.is_empty() {
-        args.sessions
-    } else {
-        let dir = match args.sessions_dir {
-            Some(d) => d,
-            None => {
-                let home = dirs::home_dir()
-                    .ok_or_else(|| eyre::eyre!("failed to resolve home directory"))?;
-                home.join(".nitpicker").join("sessions")
-            }
-        };
-        discover_sessions(&dir, args.n)?
+    let dir = match args.sessions_dir {
+        Some(d) => d,
+        None => {
+            let home = dirs::home_dir()
+                .ok_or_else(|| eyre::eyre!("failed to resolve home directory"))?;
+            home.join(".nitpicker").join("sessions")
+        }
     };
+    let session_paths: Vec<PathBuf> = discover_sessions(&dir, args.n)?;
 
     if session_paths.is_empty() {
         eyre::bail!("no sessions found");
@@ -363,13 +357,7 @@ pub async fn run_reflect(args: ReflectArgs) -> Result<()> {
     info!("synthesizing with {}…", reduce_model);
     let report = synthesize(analyses, reduce_model.clone(), Arc::clone(&reduce_client), &args.repo).await?;
 
-    match args.output {
-        Some(path) => {
-            std::fs::write(&path, &report)?;
-            info!("report saved to {}", path.display());
-        }
-        None => println!("{report}"),
-    }
+    println!("{report}");
 
     Ok(())
 }
