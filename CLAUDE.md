@@ -80,6 +80,7 @@ gemini_proxy/   local HTTP proxy that translates Gemini API calls to Google Code
 ### Agent execution (`agent.rs`)
 
 - Each reviewer runs an agentic loop with file/git tools until it returns text or reaches the turn limit
+- Review prompts encourage a quick local map, a short working plan, and an early wave of subagents for bounded disjoint investigations
 - Reviewers can delegate deeper investigations via `spawn_subagent`
 - Subagent depth is capped at 2 to bound recursion and cost
 - Subagents return results through a hidden `finish(result)` tool; debate agents use `submit_verdict(verdict, agree)` instead
@@ -117,6 +118,8 @@ Tools return `String`, never `Err` — errors are returned as `"Error: ..."` str
 `GitTool` only allows a fixed allowlist of read-only subcommands. Commands are passed directly to `Command::new("git").args(tokens)` — no shell involved.
 
 `GrepTool` recursively searches files and skips binary files. Context loading for `CLAUDE.md` / `AGENTS.md` also skips binary files.
+
+Tool outputs are intentionally a bit self-describing: `read_file` includes file/range headers, `glob`/`grep` return explicit no-match messages, and truncation messages say when output is partial.
 
 ### Session artifacts (`session.rs`)
 

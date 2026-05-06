@@ -322,9 +322,13 @@ pub async fn run_agent(
                 report_progress(&config, turn + 1, total_tool_calls, initial_subagent_count, last_subagent.clone());
                 let mut output = output;
                 if output.len() > MAX_TOOL_RESULT_BYTES {
+                    let original_len = output.len();
                     let boundary = floor_char_boundary(&output, MAX_TOOL_RESULT_BYTES);
                     output.truncate(boundary);
-                    output.push_str("\n... truncated (>50k bytes)");
+                    output.push_str(&format!(
+                        "\n... truncated after 50,000 chars; {} chars omitted",
+                        original_len.saturating_sub(boundary)
+                    ));
                 }
                 results.push(ToolResult {
                     id: call.id.clone(),

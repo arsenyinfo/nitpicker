@@ -1,12 +1,15 @@
-const VERIFY_WARNING: &str = "Your opponent may sound confident but still make factual errors or overlook edge cases. \
+const VERIFY_WARNING: &str =
+    "Your opponent may sound confident but still make factual errors or overlook edge cases. \
 Independently verify every claim against the actual code before accepting it.";
 
-const DELEGATION_GUIDANCE: &str = "Always first a high-level map of the relevant code first: change intent, affected files, nearby modules, and major components involved. \
-Use local tools first for quick triage and delegate with spawn_subagent(task) for bounded multi-step investigations that would interrupt synthesis if done locally. \
+const DELEGATION_GUIDANCE: &str = "Always first build a quick high-level map of the relevant code: change intent, affected files, nearby modules, and major components involved. \
+Then write a short working plan covering scope, knowledge gaps, local checks, and candidate delegations. \
+After that initial map, prefer spawn_subagent(task) for bounded investigations that follow separate questions, touch different filesets, or would take multiple tool calls to resolve locally. \
+Use local tools for quick triage and synthesis, but do not try to personally exhaust every branch of the investigation. \
 Use parallel subagents to reduce latency when the investigations are clearly disjoint. \
-It is good to spawn a small batch of subagents in one turn when they cover distinct components, filesets, or review criteria. \
+It is good to spawn a small early batch of subagents in one turn when they cover distinct components, filesets, or review criteria. Good delegation targets include tracing one call path, validating one suspected issue, checking tests separately from implementation, or investigating a focused security or performance concern. \
 Do not spawn overlapping or near-duplicate subagents that are likely to reread the same files for the same question. \
-After a wave of subagents returns, refine your understanding of what is established before spawning more.";
+After a wave of subagents returns, refine your understanding of what is established, update the plan, and only then spawn more.";
 
 const NO_FINDINGS: &str = "No findings. Great job! 🎉";
 
@@ -68,7 +71,11 @@ impl TaskMode {
                 an improbable chain of conditions, drop it.\n\
                 - Skip nitpicks and pure style. No speculative improvements.\n\n\
                 Start with the changes or target path specified in the user message, then explore \
-                surrounding context as needed.\n\n\
+                surrounding context as needed. First make a quick map of the relevant code, then a \
+                short working plan: scope, knowledge gaps, local checks, and candidate delegations. \
+                Close independent knowledge gaps early, especially with subagents when they are \
+                bounded and disjoint. Revise the plan after the first evidence wave instead of committing \
+                to your first theory.\n\n\
                 For each finding, use this schema exactly (one block per finding, blank line between blocks):\n\
                 "
                 .to_string()
@@ -211,7 +218,8 @@ impl DebateMode {
                 In follow-up turns, treat the critic's challenges as evidence. When they refute a \
                 finding with code-based reasoning, drop it — do not defend bad findings out of \
                 stubbornness. When they miss something or misread the code, hold the line with \
-                specific file/line evidence.\n\n\
+                specific file/line evidence. Cite concrete paths and line numbers whenever the tools \
+                provide them.\n\n\
                 Your output is a structured list of issues, not a narrative. Strict rules:\n\
                 - Only flag problems in the current (post-change) code. Do not narrate improvements \
                 the diff made.\n\
@@ -272,10 +280,14 @@ impl DebateMode {
                 resolve it one way or the other — confirm or reject. Do not let findings carry lingering \
                 uncertainty into the final output.\n\n\
                 Also actively look for important issues the reviewer missed. Agreeing without reading the \
-                code is a failure of your role. Classify each reviewed issue as confirmed or rejected, \
-                with evidence. Only call submit_verdict(agree=true) when every finding is confirmed AND \
-                you have checked for missed issues. Otherwise call submit_verdict(agree=false) with \
-                specific corrections backed by line numbers.\n\n"
+                code is a failure of your role. For each response, do one of three things for every \
+                material claim: confirm it with evidence, dispute it with counter-evidence, or name the \
+                exact missing evidence needed to resolve it. Cite concrete paths and line numbers whenever \
+                the tools provide them. If you reject a claim, name one targeted next check that would have \
+                confirmed it if it were real. Classify each reviewed issue as confirmed or rejected, \
+                with evidence. Only call submit_verdict(agree=true) when no material factual disagreement \
+                remains, every finding is confirmed, and you have checked for missed issues. Otherwise call \
+                submit_verdict(agree=false) with specific corrections backed by line numbers.\n\n"
                     .to_string()
                     + DELEGATION_GUIDANCE
                     + "\n\n"

@@ -60,14 +60,25 @@ impl Tool for ReadFileTool {
         ToolDefinition {
             name: "read_file".to_string(),
             description:
-                "Read a file and return numbered lines. Use start_line/end_line to limit output for large files."
+                "Read a text file inside the workspace and return numbered lines. Use this after glob or grep to inspect specific files; prefer start_line/end_line for focused reads."
                     .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string" },
-                    "start_line": { "type": "integer", "minimum": 1 },
-                    "end_line": { "type": "integer", "minimum": 1 }
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative file path to read."
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "First line to include. Omit to start at line 1."
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Last line to include. Omit to read to the end of the file."
+                    }
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -105,7 +116,12 @@ impl Tool for ReadFileTool {
             let total = lines.len();
             let start = start_line.max(1).min(total.max(1));
             let end = end_line.unwrap_or(total).max(start).min(total);
-            let mut output = String::new();
+            let relative = full_path
+                .strip_prefix(&work_dir)
+                .unwrap_or(&full_path)
+                .display()
+                .to_string();
+            let mut output = format!("File: {relative}\nLines: {start}-{end} of {total}\n\n");
             for (idx, line) in lines.iter().enumerate() {
                 let line_num = idx + 1;
                 if line_num < start || line_num > end {
@@ -129,12 +145,15 @@ impl Tool for GlobTool {
         ToolDefinition {
             name: "glob".to_string(),
             description:
-                "Find files by glob pattern relative to the work directory (max 200 results)."
+                "Find workspace-relative file paths by glob pattern. Use this when you know the file name or extension pattern but not the exact path; returns at most 200 matches."
                     .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "pattern": { "type": "string" }
+                    "pattern": {
+                        "type": "string",
+                        "description": "Workspace-relative glob such as 'src/**/*.rs' or '**/*.toml'."
+                    }
                 },
                 "required": ["pattern"],
                 "additionalProperties": false
@@ -173,6 +192,9 @@ impl Tool for GlobTool {
                     break;
                 }
             }
+            if results.is_empty() {
+                return Ok(format!("No files matched pattern: {pattern}"));
+            }
             Ok(results.join("\n"))
         })
     }
@@ -188,14 +210,23 @@ impl Tool for GrepTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "grep".to_string(),
-            description: "Search files by regex. Returns matches as path:line:content (max 100). Use file_glob to filter file names."
+            description: "Search text files for a regex and return path:line:content matches. Use this to locate relevant code before calling read_file; optionally limit by path or file_glob, and expect at most 100 matches."
                 .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "pattern": { "type": "string" },
-                    "path": { "type": "string" },
-                    "file_glob": { "type": "string" }
+                    "pattern": {
+                        "type": "string",
+                        "description": "Regular expression to search for in file contents."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Optional workspace-relative file or directory to search within."
+                    },
+                    "file_glob": {
+                        "type": "string",
+                        "description": "Optional filename filter such as '*.rs'; matched against file names, not full paths."
+                    }
                 },
                 "required": ["pattern"],
                 "additionalProperties": false
@@ -236,9 +267,11 @@ impl Tool for GrepTool {
             let regex = Regex::new(pattern)
                 .map_err(|e| eyre::eyre!("invalid regex {pattern:?}: {e}"))?;
             let mut results = Vec::new();
+            let mut skipped_files = 0usize;
             if base_path.is_file() {
                 if let Err(e) = search_file(&base_path, &regex, &work_dir, &mut results).await {
                     warn!("skipping file {}: {e}", base_path.display());
+                    skipped_files += 1;
                 }
             } else {
                 let mut stack = vec![base_path];
@@ -277,6 +310,7 @@ impl Tool for GrepTool {
                                 Ok(_) => {}
                                 Err(e) => {
                                     warn!("skipping file {}: {e}", entry_path.display());
+                                    skipped_files += 1;
                                 }
                             }
                             if results.len() >= 100 {
@@ -292,7 +326,20 @@ impl Tool for GrepTool {
                     }
                 }
             }
-            Ok(results.join("\n"))
+            if results.is_empty() {
+                let mut output = format!("No matches for regex: {pattern}");
+                if skipped_files > 0 {
+                    output.push_str(&format!("\nSkipped unreadable files: {skipped_files}"));
+                }
+                return Ok(output);
+            }
+            let mut output = format!("Matches: {}\n", results.len());
+            if skipped_files > 0 {
+                output.push_str(&format!("Skipped unreadable files: {skipped_files}\n"));
+            }
+            output.push('\n');
+            output.push_str(&results.join("\n"));
+            Ok(output)
         })
     }
 }
@@ -372,11 +419,15 @@ impl Tool for GitTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "git".to_string(),
-            description: "Run read-only git commands (allowlisted subcommands only).".to_string(),
+            description: "Run an allowlisted read-only git command for review context, such as diff, log, show, blame, or status. Use this for repository history or patch context, not for general file search."
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string" }
+                    "command": {
+                        "type": "string",
+                        "description": "Read-only git command to run, for example 'diff --stat HEAD~1' or 'log --oneline -n 20'."
+                    }
                 },
                 "required": ["command"],
                 "additionalProperties": false
@@ -420,9 +471,13 @@ impl Tool for GitTool {
                 .await?;
             let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
             if stdout.len() > 50_000 {
+                let original_len = stdout.len();
                 let boundary = floor_char_boundary(&stdout, 50_000);
                 stdout.truncate(boundary);
-                stdout.push_str("\n... truncated (50k chars)");
+                stdout.push_str(&format!(
+                    "\n... truncated after 50,000 chars; {} chars omitted",
+                    original_len.saturating_sub(boundary)
+                ));
             }
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
