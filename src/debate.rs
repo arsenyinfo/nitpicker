@@ -466,9 +466,9 @@ pub async fn run_debate(
     if let Some(logger) = &session_logger {
         logger
             .write_aggregation(&AggregationRecord {
-                kind: "aggregation",
-                model: &agg_cfg.model,
-                text: &meta_text,
+                kind: "aggregation".to_string(),
+                model: agg_cfg.model.clone(),
+                text: meta_text.clone(),
                 rounds: Some(final_round),
                 converged: Some(converged),
             })

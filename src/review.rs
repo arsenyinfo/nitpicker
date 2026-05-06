@@ -191,9 +191,9 @@ pub async fn run_review(
     if let Some(logger) = &session_logger {
         logger
             .write_aggregation(&AggregationRecord {
-                kind: "aggregation",
-                model: &agg.model,
-                text: &text,
+                kind: "aggregation".to_string(),
+                model: agg.model.clone(),
+                text: text.clone(),
                 rounds: None,
                 converged: None,
             })

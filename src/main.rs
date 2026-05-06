@@ -14,6 +14,7 @@ mod openrouter;
 mod pr;
 mod prompts;
 mod provider;
+mod reflect;
 mod review;
 mod session;
 mod tools;
@@ -92,6 +93,15 @@ enum Command {
     },
     /// Review a GitHub PR (current branch's PR or a remote PR by URL)
     Pr(pr::PrArgs),
+    /// Reflect on past nitpicker sessions to identify patterns and friction points
+    Reflect {
+        /// Directory containing sessions (default: ~/.nitpicker/sessions)
+        #[arg(long)]
+        sessions_dir: Option<PathBuf>,
+        /// Number of most recent sessions to analyze
+        #[arg(long, default_value = "20")]
+        n: usize,
+    },
 }
 
 
@@ -102,7 +112,8 @@ async fn main() -> Result<()> {
     let verbose = args.common.verbose
         || matches!(&args.command, Some(Command::Ask { common, .. }) if common.verbose)
         || matches!(&args.command, Some(Command::Pr(a)) if a.common.verbose);
-    let default_level = if verbose { "info" } else { "warn" };
+    let is_reflect = matches!(&args.command, Some(Command::Reflect { .. }));
+    let default_level = if verbose || is_reflect { "info" } else { "warn" };
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
     tracing_subscriber::fmt()
@@ -137,8 +148,7 @@ async fn main() -> Result<()> {
             if !repo.join(".git").is_dir() {
                 eyre::bail!("--repo must point to a git repository (missing .git)");
             }
-            let mut config = load_config(common.config.as_deref(), &repo)?;
-            openrouter::resolve_free_models(&mut config).await?;
+            let config = load_resolved_config(common.config.as_deref(), &repo).await?;
             let max_turns = config.max_turns(max_turns)?;
 
             if !no_debate && config.default_debate() {
@@ -175,9 +185,22 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Command::Pr(pr_args)) => {
-            let mut config = load_config(pr_args.common.config.as_deref(), &pr_args.common.repo)?;
-            openrouter::resolve_free_models(&mut config).await?;
+            let config = load_resolved_config(pr_args.common.config.as_deref(), &pr_args.common.repo).await?;
             return pr::run_pr(pr_args, config).await;
+        }
+        Some(Command::Reflect {
+            sessions_dir,
+            n,
+        }) => {
+            let repo = args.common.repo.canonicalize()?;
+            let config = load_resolved_config(args.common.config.as_deref(), &repo).await?;
+            return reflect::run_reflect(reflect::ReflectArgs {
+                sessions_dir,
+                n,
+                repo,
+                config,
+            })
+            .await;
         }
         None => {}
     }
@@ -205,8 +228,7 @@ async fn main() -> Result<()> {
         eyre::bail!("--repo must point to a git repository (missing .git)");
     }
 
-    let mut config = load_config(args.common.config.as_deref(), &repo)?;
-    openrouter::resolve_free_models(&mut config).await?;
+    let config = load_resolved_config(args.common.config.as_deref(), &repo).await?;
     let max_turns = config.max_turns(args.max_turns)?;
 
     let prompt = if let Some(path) = args.analyze {
@@ -281,6 +303,12 @@ fn load_config(explicit_path: Option<&Path>, repo: &Path) -> Result<config::Conf
         eyre::bail!("no config found — run `nitpicker init [--global]` to generate one")
     };
     config.validate()?;
+    Ok(config)
+}
+
+async fn load_resolved_config(explicit_path: Option<&Path>, repo: &Path) -> Result<config::Config> {
+    let mut config = load_config(explicit_path, repo)?;
+    openrouter::resolve_free_models(&mut config).await?;
     Ok(config)
 }
 

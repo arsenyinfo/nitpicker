@@ -1,11 +1,12 @@
 const VERIFY_WARNING: &str = "Your opponent may sound confident but still make factual errors or overlook edge cases. \
 Independently verify every claim against the actual code before accepting it.";
 
-const DELEGATION_GUIDANCE: &str = "You should delegate focused investigations with spawn_subagent(task). \
-Each task should be a single concrete question or lookup — one component, one concept, one perspective. \
-When you have multiple independent questions, spawn them all at once in a single turn rather than sequentially. \
-Keep the parent agent focused on synthesis and final judgment; use subagents for bounded digging. \
-Prefer many narrow parallel subagents over one broad multi-part task.";
+const DELEGATION_GUIDANCE: &str = "Always first a high-level map of the relevant code first: change intent, affected files, nearby modules, and major components involved. \
+Use local tools first for quick triage and delegate with spawn_subagent(task) for bounded multi-step investigations that would interrupt synthesis if done locally. \
+Use parallel subagents to reduce latency when the investigations are clearly disjoint. \
+It is good to spawn a small batch of subagents in one turn when they cover distinct components, filesets, or review criteria. \
+Do not spawn overlapping or near-duplicate subagents that are likely to reread the same files for the same question. \
+After a wave of subagents returns, refine your understanding of what is established before spawning more.";
 
 const NO_FINDINGS: &str = "No findings. Great job! 🎉";
 
@@ -346,6 +347,7 @@ pub fn subagent_system_prompt() -> &'static str {
     When you need multiple independent pieces of information, call all relevant tools simultaneously \
     in a single turn rather than sequentially — this is faster and avoids wasting context. \
     Keep your final result concise, evidence-based, and grounded in the code. \
-    Include file paths and line numbers when relevant. \
+    Structure the result as: scope, conclusion, core files, key evidence.
+    Name any remaining uncertainty briefly instead of broadening the task on your own. \
     Do not ask follow-up questions. When you are done, call finish with your final result."
 }
