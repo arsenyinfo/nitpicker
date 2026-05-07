@@ -232,7 +232,10 @@ pub async fn run_agent(
 
         if is_final_turn {
             available_tools.retain(|name, _| {
-                config.terminal_tools.iter().any(|terminal| terminal == name)
+                config
+                    .terminal_tools
+                    .iter()
+                    .any(|terminal| terminal == name)
                     || (config.depth.is_subagent() && name == "finish")
             });
             let wrap_up_prompt = Message::user(FINAL_TURN_WRAP_UP_PROMPT.to_string());
@@ -263,7 +266,13 @@ pub async fn run_agent(
             empty_response_count = 0;
             let mut results = Vec::new();
             total_tool_calls += tool_calls.len();
-            report_progress(&config, turn + 1, total_tool_calls, initial_subagent_count, last_subagent.clone());
+            report_progress(
+                &config,
+                turn + 1,
+                total_tool_calls,
+                initial_subagent_count,
+                last_subagent.clone(),
+            );
             let mut should_terminate = false;
             for call in tool_calls {
                 let tool_name = call.function.name.clone();
@@ -319,7 +328,13 @@ pub async fn run_agent(
                 if tool_name == "spawn_subagent" {
                     last_subagent = None;
                 }
-                report_progress(&config, turn + 1, total_tool_calls, initial_subagent_count, last_subagent.clone());
+                report_progress(
+                    &config,
+                    turn + 1,
+                    total_tool_calls,
+                    initial_subagent_count,
+                    last_subagent.clone(),
+                );
                 let mut output = output;
                 if output.len() > MAX_TOOL_RESULT_BYTES {
                     let original_len = output.len();
@@ -438,7 +453,13 @@ pub async fn run_agent(
         } else {
             tool_call_history.clear();
             let text = response.text();
-            report_progress(&config, turn + 1, total_tool_calls, initial_subagent_count, last_subagent.clone());
+            report_progress(
+                &config,
+                turn + 1,
+                total_tool_calls,
+                initial_subagent_count,
+                last_subagent.clone(),
+            );
             if text.is_empty() {
                 if let Some(nudge) = &config.empty_response_nudge {
                     empty_response_count += 1;
@@ -480,7 +501,10 @@ pub async fn run_agent(
     }
 
     if config.depth.is_subagent() {
-        eyre::bail!("subagent exhausted {} turns without calling finish", config.max_turns);
+        eyre::bail!(
+            "subagent exhausted {} turns without calling finish",
+            config.max_turns
+        );
     }
 
     eyre::bail!(
@@ -522,8 +546,17 @@ impl Tool for SpawnSubagentTool {
         rig::completion::ToolDefinition {
             name: "spawn_subagent".to_string(),
             description:
-                "Delegate a complex multi-step investigation to a subagent. Only use when the task requires several tool calls (e.g. tracing logic across multiple files). Do NOT use for single file reads or simple lookups — call those tools directly instead."
-                    .to_string(),
+                "Delegate a complex multi-step investigation to a subagent. Only use when the task requires several tool calls (e.g. tracing logic across multiple files). Do NOT use for single file reads or simple lookups — call those tools directly instead.
+
+                Example of correct usage:
+                - Trace the usage of X across the codebase to gather evidence about how it's used in different contexts, report the findings that are relevant to performance.
+                - Verify if input of X is always sanitized.
+                - Explore the feature engineering code to find potential sources of data leakage, and report any suspicious patterns you find.
+
+                Example of incorrect usage:
+                - Read file X at lines 100-150 to check if function Y is called (too simple, should call file-reading tool directly).
+                - Find all the usages of function Y across the codebase (use grep instead);
+                - Review all the changes from the security, performance, and correctness perspective (too complex and underspecified, should break down into multiple sub-tasks).".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -709,7 +742,9 @@ async fn execute_tool_call(
     }
 
     if tool_name == "spawn_subagent" {
-        if !ctx.config.depth.can_spawn_subagent() || !ctx.runtime_tools.contains_key("spawn_subagent") {
+        if !ctx.config.depth.can_spawn_subagent()
+            || !ctx.runtime_tools.contains_key("spawn_subagent")
+        {
             let outcome = ToolCallOutcome {
                 output: "Error: subagent depth limit reached; cannot spawn another subagent"
                     .to_string(),
@@ -774,7 +809,11 @@ async fn execute_tool_call(
         )
         .await;
         let sub = run_subagent(prepared, ctx.tools_map, ctx.work_dir).await;
-        let status = if sub.output.starts_with("Error:") { "error" } else { "ok" };
+        let status = if sub.output.starts_with("Error:") {
+            "error"
+        } else {
+            "ok"
+        };
         let outcome = ToolCallOutcome {
             output: sub.output,
             nested_tool_calls: sub.tool_calls,

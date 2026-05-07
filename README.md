@@ -251,7 +251,7 @@ Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timesta
 
 ## Changelog
 
-**0.3.1** — 2026-05-06
+**0.3.1** — 2026-05-07
 - Better tool guidance and self-describing tool outputs
 - Review prompts now encourage short plans, earlier subagent delegation, and stricter evidence checks
 
