@@ -256,7 +256,6 @@ Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timesta
 - Review prompts now encourage short plans, earlier subagent delegation, and stricter evidence checks
 
 **0.3.0** — 2026-05-06
-- Smarter `init` provider detection and config generation
 - Session trajectory logging plus internal `reflect` analysis tooling
 - Minor fixes, including graceful shutdown once turns are exhausted and allowing `pr` to review a URL from a non-git cwd
 
