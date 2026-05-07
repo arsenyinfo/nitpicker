@@ -3,7 +3,7 @@ use crate::config::Config;
 use crate::llm::{Completion, LLMClientDyn};
 use crate::provider::build_reviewer_client;
 use crate::session::{AggregationRecord, ToolCallRecord};
-use crate::tools::{all_tools, floor_char_boundary};
+use crate::tools::{floor_char_boundary, reflect_tools};
 use eyre::Result;
 use rig::completion::Message;
 use std::path::{Path, PathBuf};
@@ -221,7 +221,7 @@ async fn synthesize(
         .collect::<Vec<_>>()
         .join("\n\n---\n\n");
 
-    let tools_map = all_tools();
+    let tools_map = reflect_tools();
     let config = AgentConfig {
         name: "synthesizer".to_string(),
         session_agent: "synthesizer".to_string(),
