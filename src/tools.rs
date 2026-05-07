@@ -45,6 +45,15 @@ pub fn all_tools() -> HashMap<String, Arc<dyn Tool>> {
     tools.into_iter().map(|tool| (tool.name(), tool)).collect()
 }
 
+pub fn reflect_tools() -> HashMap<String, Arc<dyn Tool>> {
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(ReadFileTool),
+        Arc::new(GlobTool),
+        Arc::new(GrepTool),
+    ];
+    tools.into_iter().map(|tool| (tool.name(), tool)).collect()
+}
+
 pub fn tool_definitions(tools: &HashMap<String, Arc<dyn Tool>>) -> Vec<ToolDefinition> {
     tools.values().map(|tool| tool.definition()).collect()
 }
