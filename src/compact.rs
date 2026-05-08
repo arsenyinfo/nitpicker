@@ -2,10 +2,8 @@ use crate::llm::{Completion, LLMClientDyn, TokenUsage};
 use eyre::Result;
 use rig::completion::Message;
 use std::sync::Arc;
-use tracing::warn;
 
 const COMPACTION_MAX_OUTPUT_TOKENS: u64 = 8_192;
-const COMPACTION_MAX_ATTEMPTS: usize = 2;
 
 pub async fn compact_history(
     client: Arc<dyn LLMClientDyn>,
@@ -32,21 +30,7 @@ pub async fn compact_history(
             *prompt = continue_msg;
             Ok(Some(response.usage))
         }
-        Err(err) => {
-            warn!("compaction summarization failed ({err}), falling back to hard truncation");
-            // keep roughly the last half of history, starting at a user message
-            let keep = (history.len() / 2).max(2);
-            let from = history.len().saturating_sub(keep);
-            let from = (from..history.len())
-                .find(|&i| matches!(history[i], Message::User { .. }))
-                .unwrap_or_else(|| history.len().saturating_sub(1));
-            *history = history.split_off(from);
-            if history.is_empty() {
-                history.push(Message::user("Continue.".to_string()));
-            }
-            *prompt = history.last().cloned().expect("history is non-empty");
-            Ok(None)
-        }
+        Err(err) => Err(err),
     }
 }
 
@@ -58,36 +42,54 @@ async fn summarize_history(
     turn: usize,
     usage: TokenUsage,
 ) -> Result<(crate::llm::CompletionResponse, String)> {
-    let mut last_text = None;
+    let compaction_prompt = build_compaction_prompt(turn, usage);
 
-    for attempt in 1..=COMPACTION_MAX_ATTEMPTS {
-        let response = client
-            .completion(Completion {
-                model: model.to_string(),
-                prompt: Message::user(build_compaction_prompt(turn, usage, attempt)),
-                preamble: Some(system_prompt.to_string()),
-                history: thread.clone(),
-                tools: Vec::new(),
-                tool_choice: None,
-                max_tokens: Some(COMPACTION_MAX_OUTPUT_TOKENS),
-                additional_params: None,
-            })
-            .await?;
+    let response = client
+        .completion(Completion {
+            model: model.to_string(),
+            prompt: Message::user(compaction_prompt.clone()),
+            preamble: Some(system_prompt.to_string()),
+            history: thread.clone(),
+            tools: Vec::new(),
+            tool_choice: None,
+            max_tokens: Some(COMPACTION_MAX_OUTPUT_TOKENS),
+            additional_params: None,
+        })
+        .await?;
 
-        let text = response.text();
-        if let Some(summary) = extract_tag(&text, "summary") {
-            return Ok((response, summary));
-        }
-        last_text = Some(text);
+    let text = response.text();
+    if let Some(summary) = extract_tag(&text, "summary") {
+        return Ok((response, summary));
     }
 
-    Err(eyre::eyre!(
-        "compaction output missing <summary> block after {COMPACTION_MAX_ATTEMPTS} attempts: {}",
-        last_text.unwrap_or_default()
-    ))
+    // follow up with a correction so the model can self-fix
+    let mut followup_history = thread;
+    followup_history.push(Message::user(compaction_prompt));
+    followup_history.push(response.message());
+
+    let correction = "Your response is missing the required <summary>...</summary> block. \
+        Reply with ONLY the tagged summary block and nothing else outside the tags.";
+
+    let response = client
+        .completion(Completion {
+            model: model.to_string(),
+            prompt: Message::user(correction.to_string()),
+            preamble: Some(system_prompt.to_string()),
+            history: followup_history,
+            tools: Vec::new(),
+            tool_choice: None,
+            max_tokens: Some(COMPACTION_MAX_OUTPUT_TOKENS),
+            additional_params: None,
+        })
+        .await?;
+
+    let text = response.text();
+    extract_tag(&text, "summary")
+        .map(|summary| (response, summary))
+        .ok_or_else(|| eyre::eyre!("compaction output missing <summary> block after correction: {text}"))
 }
 
-fn build_compaction_prompt(turn: usize, usage: TokenUsage, attempt: usize) -> String {
+fn build_compaction_prompt(turn: usize, usage: TokenUsage) -> String {
     format!(
         "You are an expert software engineer summarizing a code exploration and review session \
 to free up context window space.\n\n\
@@ -122,10 +124,8 @@ or specific files that still need to be examined.]\n\
 </summary>\n\
 This compaction is happening before turn {turn}. Usage since the previous compaction: \
 {} input, {} output, {} total tokens.\n\
-CRITICAL: This is attempt {attempt} of {COMPACTION_MAX_ATTEMPTS}. Return EXACTLY ONE \
-tagged block starting with <summary> and ending with </summary>. Do not include any \
-text, pleasantries, or explanations outside of these tags. If a prior attempt failed, \
-ensure you output ONLY the XML tags this time.",
+Return EXACTLY ONE tagged block starting with <summary> and ending with </summary>. \
+Do not include any text, pleasantries, or explanations outside of these tags.",
         usage.input_tokens, usage.output_tokens, usage.total_tokens
     )
 }

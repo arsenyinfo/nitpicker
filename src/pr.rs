@@ -488,7 +488,9 @@ async fn run_review_inner(
         .await?
     };
 
-    if !args.no_comment {
+    if args.no_comment {
+        println!("{report}");
+    } else {
         post_comment(url_for_gh, repo, &format!("{report}{FOOTER}"))?;
     }
 
