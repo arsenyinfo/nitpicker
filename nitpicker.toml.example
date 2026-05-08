@@ -9,27 +9,6 @@ model = "claude-sonnet-4-6"
 provider = "anthropic"
 # api_key_env = "ANTHROPIC_API_KEY"  # default; override if needed
 
-# [[reviewer]]
-# name = "anthropic"
-# model = "claude-sonnet-4-6"
-# provider = "anthropic"
-
-# [[reviewer]]
-# name = "gemini"
-# model = "gemini-2.5-flash"
-# provider = "gemini"
-
-# [[reviewer]]
-# name = "openai"
-# model = "gpt-4o"
-# provider = "openai"
-
-# OpenRouter with explicit model
-# [[reviewer]]
-# name = "openrouter"
-# model = "google/gemma-3-27b-it:free"
-# provider = "openrouter"
-
 # OpenRouter with automatic free-model selection (omit model field)
 [[reviewer]]
 name = "openrouter-auto"
@@ -38,3 +17,26 @@ provider = "openrouter"
 [[reviewer]]
 name = "openrouter-auto-2"
 provider = "openrouter"
+
+# [[reviewer]]
+# name = "anthropic"
+# model = "claude-sonnet-4-6"
+# provider = "anthropic"
+
+# Gemini OAuth example
+# [[reviewer]]
+# name = "gemini"
+# model = "gemini-3-flash-preview"
+# provider = "gemini"
+# auth = "oauth"
+
+# [[reviewer]]
+# name = "openai"
+# model = "gpt-5.5"
+# provider = "openai"
+
+# OpenRouter with explicit model
+# [[reviewer]]
+# name = "openrouter"
+# model = "minimax/minimax-m2.7"
+# provider = "openrouter"
