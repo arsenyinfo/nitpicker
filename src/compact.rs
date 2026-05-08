@@ -1,4 +1,5 @@
 use crate::llm::{Completion, LLMClientDyn, TokenUsage};
+use rig::completion::message::ToolChoice;
 use eyre::Result;
 use rig::completion::Message;
 use std::sync::Arc;
@@ -51,7 +52,7 @@ async fn summarize_history(
             preamble: Some(system_prompt.to_string()),
             history: thread.clone(),
             tools: Vec::new(),
-            tool_choice: None,
+            tool_choice: Some(ToolChoice::None),
             max_tokens: Some(COMPACTION_MAX_OUTPUT_TOKENS),
             additional_params: None,
         })
@@ -77,7 +78,7 @@ async fn summarize_history(
             preamble: Some(system_prompt.to_string()),
             history: followup_history,
             tools: Vec::new(),
-            tool_choice: None,
+            tool_choice: Some(ToolChoice::None),
             max_tokens: Some(COMPACTION_MAX_OUTPUT_TOKENS),
             additional_params: None,
         })
