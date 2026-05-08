@@ -8,13 +8,15 @@ use serde::Deserialize;
 use serde_json::json;
 use std::time::Instant;
 
-const MODELS_URL: &str = "https://openrouter.ai/api/v1/models\
-    ?supported_parameters=tools%2Ctemperature\
-    &categories=programming";
+const MODELS_URL: &str =
+    "https://openrouter.ai/api/v1/models?supported_parameters=tools%2Ctemperature";
+const RANKINGS_URL: &str =
+    "https://openrouter.ai/api/frontend/models?order=top-weekly&category=programming";
+// ranking API is not part of the official openrouter API and may be unreliable
 const DEFAULT_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
 const SMOKE_TEST_TIMEOUT_SECS: u64 = 15;
 const SMOKE_TEST_CALLS_REQUIRED: usize = 2;
-const SMOKE_TEST_MAX_CONCURRENT: usize = 8;
+const SMOKE_TEST_BATCH_SIZE: usize = 3;
 const FETCH_MODELS_MAX_ATTEMPTS: usize = 3;
 const FETCH_MODELS_BACKOFF_MS: u64 = 1_000;
 
@@ -26,8 +28,8 @@ struct ModelsResponse {
     data: Vec<ModelInfo>,
 }
 
-// 200k+ context is a reasonable proxy for a capable free model
-const MIN_CONTEXT_LENGTH: u64 = 200_000;
+const MIN_CONTEXT_LENGTH: u64 = 128_000;
+const FREE_COMPACT_THRESHOLD: u64 = 100_000;
 
 #[derive(Deserialize)]
 struct ModelInfo {
@@ -44,6 +46,16 @@ struct ModelPricing {
     completion: String,
 }
 
+#[derive(Deserialize)]
+struct RankingsResponse {
+    data: Vec<RankedModel>,
+}
+
+#[derive(Deserialize)]
+struct RankedModel {
+    slug: String,
+}
+
 impl ModelPricing {
     fn is_free(&self) -> bool {
         self.prompt.parse::<f64>().unwrap_or(1.0) == 0.0
@@ -55,7 +67,8 @@ fn parse_total_params_b(model_id: &str) -> u64 {
     // extracts the largest param count from the model id, normalised to billions * 10
     // handles Xb (billions) and Xt (trillions), e.g.:
     //   "120b-a12b" → 1200, "1t" → 10000, "31b" → 310, "qwen3-coder" → 0
-    PARAMS_RE.captures_iter(&model_id.to_lowercase())
+    PARAMS_RE
+        .captures_iter(&model_id.to_lowercase())
         .filter_map(|c| {
             let n = c[1].parse::<f64>().ok()?;
             let multiplier = if &c[2] == "t" { 1000.0 } else { 1.0 };
@@ -99,44 +112,106 @@ async fn fetch_models(api_key: &str, needed: usize) -> Result<Vec<String>> {
     Err(last_err)
 }
 
+async fn fetch_model_list(
+    client: &reqwest::Client,
+    api_key: &str,
+    url: &str,
+) -> Result<ModelsResponse> {
+    let response = client
+        .get(url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .send()
+        .await
+        .map_err(|e| eyre::eyre!("failed to fetch OpenRouter models from {url}: {e}"))?;
+    if !response.status().is_success() {
+        eyre::bail!(
+            "OpenRouter models API returned {} for {url}",
+            response.status()
+        );
+    }
+    response
+        .json()
+        .await
+        .map_err(|e| eyre::eyre!("failed to parse OpenRouter models response: {e}"))
+}
+
+async fn fetch_programming_ranks(
+    client: &reqwest::Client,
+) -> std::collections::HashMap<String, usize> {
+    let result = async {
+        let response = client.get(RANKINGS_URL).send().await?;
+        if !response.status().is_success() {
+            eyre::bail!("rankings API returned {}", response.status());
+        }
+        let body: RankingsResponse = response.json().await?;
+        Ok::<_, eyre::Report>(body)
+    }
+    .await;
+
+    match result {
+        Ok(body) => {
+            let ranks: std::collections::HashMap<String, usize> = body
+                .data
+                .into_iter()
+                .enumerate()
+                .map(|(rank, m)| (m.slug, rank))
+                .collect();
+            tracing::info!(
+                count = ranks.len(),
+                "openrouter programming rankings fetched"
+            );
+            ranks
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to fetch programming rankings, falling back to context/params sort");
+            Default::default()
+        }
+    }
+}
+
 async fn try_fetch_models(
     client: &reqwest::Client,
     api_key: &str,
     needed: usize,
 ) -> Result<Vec<String>> {
-    let response = client
-        .get(MODELS_URL)
-        .header("Authorization", format!("Bearer {api_key}"))
-        .send()
-        .await
-        .map_err(|e| eyre::eyre!("failed to fetch OpenRouter free models: {e}"))?;
+    let (all_result, rank_map) = tokio::join!(
+        fetch_model_list(client, api_key, MODELS_URL),
+        fetch_programming_ranks(client),
+    );
 
-    if !response.status().is_success() {
-        eyre::bail!("OpenRouter models API returned {}", response.status());
-    }
-
-    let body: ModelsResponse = response
-        .json()
-        .await
-        .map_err(|e| eyre::eyre!("failed to parse OpenRouter models response: {e}"))?;
-
-    let mut models: Vec<ModelInfo> = body
+    let all_body = all_result?;
+    let mut models: Vec<ModelInfo> = all_body
         .data
         .into_iter()
         .filter(|m| m.pricing.is_free())
         .filter(|m| m.context_length.unwrap_or(0) >= MIN_CONTEXT_LENGTH)
         .filter(|m| !expires_within_24h(m.expiration_date.as_deref()))
         .collect();
+
     models.sort_by_key(|m| {
+        let base_id = m.id.strip_suffix(":free").unwrap_or(&m.id);
+        let rank = rank_map.get(base_id).copied().unwrap_or(usize::MAX);
         (
+            rank,
             std::cmp::Reverse(parse_total_params_b(&m.id)),
             std::cmp::Reverse(m.context_length.unwrap_or(0)),
             std::cmp::Reverse(m.created.unwrap_or(0)),
         )
     });
-    let models: Vec<String> = models.into_iter().map(|m| m.id).collect();
+    let ranked_summary = models
+        .iter()
+        .map(|m| {
+            let base_id = m.id.strip_suffix(":free").unwrap_or(&m.id);
+            match rank_map.get(base_id) {
+                Some(rank) => format!("{}(#{})", m.id, rank + 1),
+                None => format!("{}(?)", m.id),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    tracing::info!(candidates = %ranked_summary, "experimental openrouter free candidate models");
 
-    tracing::info!(candidates = %models.join(", "), "experimental openrouter free candidate models");
+    let models: Vec<String> = models.into_iter().map(|m| m.id).collect();
 
     if models.len() < needed {
         eyre::bail!(
@@ -167,8 +242,26 @@ fn smoke_test_tool() -> ToolDefinition {
     }
 }
 
+fn build_openrouter_client(api_key: &str) -> Result<openrouter::Client> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "HTTP-Referer",
+        "https://github.com/arsenyinfo/nitpicker".parse()?,
+    );
+    headers.insert("X-OpenRouter-Title", "nitpicker".parse()?);
+    headers.insert(
+        "X-OpenRouter-Categories",
+        "cli-agent,programming-app".parse()?,
+    );
+    openrouter::Client::builder()
+        .api_key(api_key)
+        .http_headers(headers)
+        .build()
+        .map_err(|e| eyre::eyre!("failed to build openrouter client: {e}"))
+}
+
 async fn smoke_test_call(api_key: &str, model: &str, slot_label: &str, attempt: usize) -> bool {
-    let client = match openrouter::Client::new(api_key) {
+    let client = match build_openrouter_client(api_key) {
         Ok(client) => client,
         Err(err) => {
             tracing::warn!(slot = slot_label, %model, attempt, error = %err, "openrouter smoke test client init failed");
@@ -237,33 +330,41 @@ async fn smoke_test_model(api_key: &str, model: &str, slot_label: &str) -> bool 
     true
 }
 
-/// Runs smoke tests for all candidates concurrently under a single API key.
-/// Returns a bool per candidate (same index) indicating whether it passed.
-async fn probe_candidates_concurrent(
+/// Probes candidates in batches of SMOKE_TEST_BATCH_SIZE, returning indices of the first
+/// `needed` passing models. Stops as soon as enough are found.
+async fn probe_candidates(
     api_key: &str,
     candidates: &[String],
-    batch_label: &str,
-) -> Vec<bool> {
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(SMOKE_TEST_MAX_CONCURRENT));
-    let mut set = tokio::task::JoinSet::new();
-    for (idx, model) in candidates.iter().cloned().enumerate() {
-        let key = api_key.to_string();
-        let label = batch_label.to_string();
-        let sem = std::sync::Arc::clone(&semaphore);
-        set.spawn(async move {
-            let _permit = sem.acquire().await.expect("semaphore closed");
-            let passed = smoke_test_model(&key, &model, &label).await;
-            (idx, passed)
-        });
-    }
-    let mut results = vec![false; candidates.len()];
-    while let Some(res) = set.join_next().await {
-        match res {
-            Ok((idx, passed)) => results[idx] = passed,
-            Err(join_err) => tracing::error!(error = %join_err, "smoke test task panicked"),
+    slot_label: &str,
+    needed: usize,
+) -> Vec<usize> {
+    let mut found = Vec::new();
+    let indexed: Vec<(usize, &String)> = candidates.iter().enumerate().collect();
+    for chunk in indexed.chunks(SMOKE_TEST_BATCH_SIZE) {
+        let handles: Vec<_> = chunk
+            .iter()
+            .map(|&(idx, model)| {
+                let key = api_key.to_string();
+                let model = model.to_string();
+                let label = slot_label.to_string();
+                tokio::spawn(async move {
+                    let passed = smoke_test_model(&key, &model, &label).await;
+                    (idx, passed)
+                })
+            })
+            .collect();
+        for handle in handles {
+            match handle.await {
+                Ok((idx, true)) => found.push(idx),
+                Ok(_) => {}
+                Err(e) => tracing::error!(error = %e, "smoke test task panicked"),
+            }
+        }
+        if found.len() >= needed {
+            break;
         }
     }
-    results
+    found
 }
 
 async fn select_reviewer_models(
@@ -275,14 +376,14 @@ async fn select_reviewer_models(
         return Ok((Vec::new(), candidates));
     }
 
-    // probe all candidates concurrently for each distinct api key
+    // probe in batches per unique key; probe enough for all reviewer slots in case of overlap
     let unique_keys: std::collections::HashSet<&str> =
         slot_api_keys.iter().map(String::as_str).collect();
-    let mut key_results: std::collections::HashMap<&str, Vec<bool>> = Default::default();
-    for key in unique_keys {
-        key_results.insert(
+    let mut key_passing: std::collections::HashMap<&str, Vec<usize>> = Default::default();
+    for &key in &unique_keys {
+        key_passing.insert(
             key,
-            probe_candidates_concurrent(key, &candidates, "reviewer_probe").await,
+            probe_candidates(key, &candidates, "reviewer_probe", reviewer_count).await,
         );
     }
 
@@ -292,16 +393,11 @@ async fn select_reviewer_models(
 
     for (slot, slot_key) in slot_api_keys.iter().enumerate().take(reviewer_count) {
         let slot_label = format!("free_slot_{}", slot + 1);
-        let results = key_results.get(slot_key.as_str()).expect("key was probed");
+        let passing = key_passing.get(slot_key.as_str()).expect("key was probed");
 
-        let winner = results
-            .iter()
-            .enumerate()
-            .find(|&(ref idx, &passed)| passed && !assigned.contains(idx));
-
-        let Some((winner_idx, _)) = winner else {
+        let Some(&winner_idx) = passing.iter().find(|&&idx| !assigned.contains(&idx)) else {
             eyre::bail!(
-                "No usable OpenRouter experimental free model found for {} after concurrent smoke tests of {} candidates",
+                "No usable OpenRouter experimental free model found for {} after smoke tests of {} candidates",
                 slot_label,
                 candidates.len()
             );
@@ -326,15 +422,10 @@ async fn select_aggregator_model(
     candidates: &[String],
     reviewer_models: &[String],
 ) -> Result<String> {
-    let results = probe_candidates_concurrent(api_key, candidates, "aggregator_probe").await;
+    let passing = probe_candidates(api_key, candidates, "aggregator_probe", 1).await;
 
-    if let Some(model) = candidates
-        .iter()
-        .zip(results.iter())
-        .find(|&(_, &passed)| passed)
-        .map(|(m, _)| m.clone())
-    {
-        return Ok(model);
+    if let Some(&idx) = passing.first() {
+        return Ok(candidates[idx].clone());
     }
 
     if let Some(model) = reviewer_models.first() {
@@ -346,7 +437,7 @@ async fn select_aggregator_model(
     }
 
     eyre::bail!(
-        "No usable OpenRouter experimental free model found for aggregator after concurrent smoke tests of {} candidates",
+        "No usable OpenRouter experimental free model found for aggregator after smoke tests of {} candidates",
         candidates.len()
     )
 }
@@ -432,6 +523,12 @@ pub async fn resolve_free_models(config: &mut Config) -> Result<()> {
         if config.reviewer[idx].name.is_empty() {
             config.reviewer[idx].name = format!("free_{slot}");
         }
+        let threshold = config.reviewer[idx]
+            .compact_threshold
+            .or_else(|| config.default_compact_threshold())
+            .unwrap_or(0)
+            .max(FREE_COMPACT_THRESHOLD);
+        config.reviewer[idx].compact_threshold = Some(threshold);
         tracing::info!(reviewer = %config.reviewer[idx].name, %model, "resolved experimental openrouter free model");
         config.reviewer[idx].model = model;
     }

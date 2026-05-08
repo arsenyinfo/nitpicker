@@ -1,0 +1,40 @@
+[defaults]
+debate = true
+max_turns = 100
+# log_trajectories = true
+# compact_threshold = 120000
+
+[aggregator]
+model = "claude-sonnet-4-6"
+provider = "anthropic"
+# api_key_env = "ANTHROPIC_API_KEY"  # default; override if needed
+
+# [[reviewer]]
+# name = "anthropic"
+# model = "claude-sonnet-4-6"
+# provider = "anthropic"
+
+# [[reviewer]]
+# name = "gemini"
+# model = "gemini-2.5-flash"
+# provider = "gemini"
+
+# [[reviewer]]
+# name = "openai"
+# model = "gpt-4o"
+# provider = "openai"
+
+# OpenRouter with explicit model
+# [[reviewer]]
+# name = "openrouter"
+# model = "google/gemma-3-27b-it:free"
+# provider = "openrouter"
+
+# OpenRouter with automatic free-model selection (omit model field)
+[[reviewer]]
+name = "openrouter-auto"
+provider = "openrouter"
+
+[[reviewer]]
+name = "openrouter-auto-2"
+provider = "openrouter"

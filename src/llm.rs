@@ -470,6 +470,7 @@ impl LLMProvider {
                 let mut headers = reqwest::header::HeaderMap::new();
                 headers.insert("HTTP-Referer", "https://github.com/arsenyinfo/nitpicker".parse()?);
                 headers.insert("X-OpenRouter-Title", "nitpicker".parse()?);
+                headers.insert("X-OpenRouter-Categories", "cli-agent,programming-app".parse()?);
                 let client = openrouter::Client::builder()
                     .api_key(&api_key)
                     .http_headers(headers)
