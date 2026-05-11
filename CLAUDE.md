@@ -42,6 +42,9 @@ cargo run -- reflect --n 10
 
 # Gemini OAuth (first-time setup)
 cargo run -- --gemini-oauth
+
+# Generate config preferring OpenRouter experimental free models
+cargo run -- init --free
 ```
 
 ## Architecture
@@ -146,6 +149,8 @@ Config hierarchy (first wins):
 3. `~/.nitpicker/config.toml` (global)
 
 Reviewers automatically load project context from `CLAUDE.md` or `AGENTS.md` if present in the repo root.
+
+`nitpicker init --free` prefers OpenRouter in the generated config and writes `model = "free"` for OpenRouter slots when `OPENROUTER_API_KEY` is set. When the generated config uses two reviewer slots, it emits two OpenRouter free reviewers so both slots get free-model auto-selection. If the key is missing, init warns and falls back to the normal provider order.
 
 ## Adding a new provider
 

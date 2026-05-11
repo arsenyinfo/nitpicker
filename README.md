@@ -72,6 +72,9 @@ Configuration is loaded from (first match wins):
 # create a config in current directory
 nitpicker init
 
+# prefer OpenRouter experimental free models when OPENROUTER_API_KEY is set
+nitpicker init --free
+
 # create a global config at ~/.nitpicker/config.toml
 nitpicker init --global
 ```
@@ -199,7 +202,7 @@ This opens a browser, completes the OAuth flow, and saves the token to `~/.nitpi
 nitpicker [OPTIONS]
 nitpicker ask [--no-debate] [--rounds N] [--max-turns N] [OPTIONS] <topic>
 nitpicker pr [URL] [--no-comment] [--no-debate] [--rounds N] [--max-turns N] [OPTIONS]
-nitpicker init [--global]
+nitpicker init [--global] [--free]
 ```
 
 ### Review (default)
@@ -250,6 +253,9 @@ By default, nitpicker prints only the final synthesized result. Use `--verbose` 
 Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timestamp}.md`.
 
 ## Changelog
+
+**0.3.3** — 2026-05-11: 
+- init --free flag for OpenRouter free model auto-selection
 
 **0.3.2** — 2026-05-11
 - More reliable support for free OpenRouter models

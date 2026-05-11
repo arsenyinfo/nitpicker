@@ -83,12 +83,23 @@ impl Config {
             eyre::bail!("no reviewers configured");
         }
 
+        validate_free_model(
+            "[aggregator]",
+            &self.aggregator.provider,
+            &self.aggregator.model,
+        )?;
+
         if let Some(env) = required_env_var_aggregator(&self.aggregator) {
             check_env_var(env)
                 .map_err(|_| eyre::eyre!("[aggregator]: env var {env} is not set"))?;
         }
 
         for reviewer in &self.reviewer {
+            let reviewer_label = match reviewer.name.is_empty() {
+                true => "reviewer <unnamed>".to_string(),
+                false => format!("reviewer {}", reviewer.name),
+            };
+            validate_free_model(&reviewer_label, &reviewer.provider, &reviewer.model)?;
             if let Some(env) = required_env_var_reviewer(reviewer) {
                 check_env_var(env).map_err(|_| {
                     eyre::eyre!("reviewer {}: env var {env} is not set", reviewer.name)
@@ -149,8 +160,18 @@ impl Config {
     }
 
     pub fn reviewer_compact_threshold(&self, reviewer: &ReviewerConfig) -> Option<u64> {
-        reviewer.compact_threshold.or(self.default_compact_threshold())
+        reviewer
+            .compact_threshold
+            .or(self.default_compact_threshold())
     }
+}
+
+fn validate_free_model(label: &str, provider: &ProviderType, model: &str) -> Result<()> {
+    if model == "free" && !matches!(provider, ProviderType::OpenRouter) {
+        eyre::bail!("{label}: model = \"free\" is only supported with provider = \"openrouter\"");
+    }
+
+    Ok(())
 }
 
 fn check_env_var(name: &str) -> Result<(), std::env::VarError> {

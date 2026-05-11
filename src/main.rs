@@ -74,6 +74,10 @@ enum Command {
         /// Write to ~/.nitpicker/config.toml instead of ./nitpicker.toml
         #[arg(long)]
         global: bool,
+
+        /// Prefer OpenRouter experimental free models in the generated config
+        #[arg(long)]
+        free: bool,
     },
     /// Ask multiple LLM agents a free-form question about the codebase
     Ask {
@@ -104,7 +108,6 @@ enum Command {
     },
 }
 
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -113,7 +116,11 @@ async fn main() -> Result<()> {
         || matches!(&args.command, Some(Command::Ask { common, .. }) if common.verbose)
         || matches!(&args.command, Some(Command::Pr(a)) if a.common.verbose);
     let is_reflect = matches!(&args.command, Some(Command::Reflect { .. }));
-    let default_level = if verbose || is_reflect { "info" } else { "warn" };
+    let default_level = if verbose || is_reflect {
+        "info"
+    } else {
+        "warn"
+    };
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
     tracing_subscriber::fmt()
@@ -129,12 +136,12 @@ async fn main() -> Result<()> {
         .init();
 
     match args.command {
-        Some(Command::Init { global }) => {
+        Some(Command::Init { global, free }) => {
             let path = init_config_path(global)?;
             if path.exists() {
                 eyre::bail!("{} already exists", path.display());
             }
-            run_init(path).await?;
+            run_init(path, free).await?;
             return Ok(());
         }
         Some(Command::Ask {
@@ -188,13 +195,12 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Command::Pr(pr_args)) => {
-            let config = load_resolved_config(pr_args.common.config.as_deref(), &pr_args.common.repo).await?;
+            let config =
+                load_resolved_config(pr_args.common.config.as_deref(), &pr_args.common.repo)
+                    .await?;
             return pr::run_pr(pr_args, config).await;
         }
-        Some(Command::Reflect {
-            sessions_dir,
-            n,
-        }) => {
+        Some(Command::Reflect { sessions_dir, n }) => {
             let repo = args.common.repo.canonicalize()?;
             let config = load_resolved_config(args.common.config.as_deref(), &repo).await?;
             return reflect::run_reflect(reflect::ReflectArgs {
@@ -318,7 +324,7 @@ async fn load_resolved_config(explicit_path: Option<&Path>, repo: &Path) -> Resu
     Ok(config)
 }
 
-async fn run_init(path: PathBuf) -> eyre::Result<()> {
+async fn run_init(path: PathBuf, prefer_free: bool) -> eyre::Result<()> {
     println!("Detecting available providers...\n");
     let detected = detect::detect_all().await;
 
@@ -340,15 +346,23 @@ async fn run_init(path: PathBuf) -> eyre::Result<()> {
         println!("  ✓ {} ({}) via {}", d.name, key_info, d.source);
     }
 
-    let config = build_init_config(&detected);
-    let mut toml_str =
-        toml::to_string_pretty(&config).map_err(|e| eyre::eyre!("failed to serialize config: {e}"))?;
+    let use_openrouter_free = should_prefer_openrouter_free(&detected, prefer_free);
+    if prefer_free && !use_openrouter_free {
+        println!(
+            "\nWarning: `--free` prefers OpenRouter free models, but OPENROUTER_API_KEY is not set; using the normal provider order."
+        );
+    }
+
+    let prioritized = prioritize_init_detected(&detected, use_openrouter_free);
+    let config = build_init_config(&prioritized, use_openrouter_free);
+    let mut toml_str = toml::to_string_pretty(&config)
+        .map_err(|e| eyre::eyre!("failed to serialize config: {e}"))?;
 
     let active_names: std::collections::HashSet<&str> = config
         .reviewer
         .iter()
         .map(|r| r.name.as_str())
-        .chain(std::iter::once(detected[0].name))
+        .chain(std::iter::once(prioritized[0].name))
         .collect();
     let extras: Vec<&detect::Detected> = detected
         .iter()
@@ -385,7 +399,9 @@ fn format_commented_reviewer(d: &detect::Detected) -> String {
     }
     if let Some(env) = d.api_key_env {
         if d.local_server {
-            lines.push(format!("# api_key_env = \"{env}\"  # set to any non-empty value"));
+            lines.push(format!(
+                "# api_key_env = \"{env}\"  # set to any non-empty value"
+            ));
         } else {
             lines.push(format!("# api_key_env = \"{env}\""));
         }
@@ -396,14 +412,17 @@ fn format_commented_reviewer(d: &detect::Detected) -> String {
     lines.join("\n")
 }
 
-fn build_init_config(detected: &[detect::Detected]) -> config::Config {
+fn build_init_config(
+    detected: &[&detect::Detected],
+    prefer_openrouter_free: bool,
+) -> config::Config {
     let non_local_count = detected.iter().filter(|d| !d.local_server).count();
     let debate = non_local_count >= 2;
 
     // aggregator: highest priority (list is already sorted)
-    let agg = &detected[0];
+    let agg = detected[0];
     let aggregator = config::AggregatorConfig {
-        model: agg.model.clone(),
+        model: init_model_for_detected(agg, prefer_openrouter_free),
         provider: parse_provider_type(agg.provider),
         base_url: agg.base_url.clone(),
         api_key_env: agg.api_key_env.map(str::to_string),
@@ -412,7 +431,7 @@ fn build_init_config(detected: &[detect::Detected]) -> config::Config {
     };
 
     let reviewer_slots = if debate { 2 } else { 1 };
-    let reviewers = pick_reviewers(detected, reviewer_slots);
+    let reviewers = pick_reviewers(detected, reviewer_slots, prefer_openrouter_free);
 
     config::Config {
         defaults: Some(config::DefaultsConfig {
@@ -426,7 +445,21 @@ fn build_init_config(detected: &[detect::Detected]) -> config::Config {
     }
 }
 
-fn pick_reviewers(detected: &[detect::Detected], count: usize) -> Vec<config::ReviewerConfig> {
+fn pick_reviewers(
+    detected: &[&detect::Detected],
+    count: usize,
+    prefer_openrouter_free: bool,
+) -> Vec<config::ReviewerConfig> {
+    if prefer_openrouter_free {
+        return detected
+            .first()
+            .into_iter()
+            .cycle()
+            .take(count)
+            .map(|d| make_reviewer(d, prefer_openrouter_free))
+            .collect();
+    }
+
     let mut result = Vec::new();
     let mut seen_names: std::collections::HashSet<&str> = Default::default();
 
@@ -436,7 +469,7 @@ fn pick_reviewers(detected: &[detect::Detected], count: usize) -> Vec<config::Re
             break;
         }
         if seen_names.insert(d.name) {
-            result.push(make_reviewer(d));
+            result.push(make_reviewer(d, prefer_openrouter_free));
         }
     }
 
@@ -445,24 +478,55 @@ fn pick_reviewers(detected: &[detect::Detected], count: usize) -> Vec<config::Re
         if result.len() >= count {
             break;
         }
-        if result.iter().all(|r: &config::ReviewerConfig| r.name != d.name) {
-            result.push(make_reviewer(d));
+        if result
+            .iter()
+            .all(|r: &config::ReviewerConfig| r.name != d.name)
+        {
+            result.push(make_reviewer(d, prefer_openrouter_free));
         }
     }
 
     result
 }
 
-fn make_reviewer(d: &detect::Detected) -> config::ReviewerConfig {
+fn make_reviewer(d: &detect::Detected, prefer_openrouter_free: bool) -> config::ReviewerConfig {
     config::ReviewerConfig {
         name: d.name.to_string(),
-        model: d.model.clone(),
+        model: init_model_for_detected(d, prefer_openrouter_free),
         provider: parse_provider_type(d.provider),
         base_url: d.base_url.clone(),
         api_key_env: d.api_key_env.map(str::to_string),
         compact_threshold: None,
         auth: d.auth.map(str::to_string),
     }
+}
+
+fn should_prefer_openrouter_free(detected: &[detect::Detected], prefer_free: bool) -> bool {
+    if !prefer_free {
+        return false;
+    }
+
+    let has_openrouter = detected.iter().any(|d| d.name == "openrouter");
+    has_openrouter && std::env::var("OPENROUTER_API_KEY").is_ok()
+}
+
+fn prioritize_init_detected(
+    detected: &[detect::Detected],
+    prefer_openrouter_free: bool,
+) -> Vec<&detect::Detected> {
+    let mut prioritized: Vec<&detect::Detected> = detected.iter().collect();
+    if prefer_openrouter_free {
+        prioritized.sort_by_key(|d| if d.name == "openrouter" { 0 } else { 1 });
+    }
+    prioritized
+}
+
+fn init_model_for_detected(d: &detect::Detected, prefer_openrouter_free: bool) -> String {
+    if prefer_openrouter_free && d.name == "openrouter" {
+        return "free".to_string();
+    }
+
+    d.model.clone()
 }
 
 fn parse_provider_type(s: &str) -> config::ProviderType {
@@ -488,7 +552,11 @@ fn print_init_hints(detected: &[detect::Detected]) {
     if !unset.is_empty() {
         println!("\nProviders detected but env vars not yet set:");
         for d in unset {
-            println!("  export {}=...  # found via {}", d.api_key_env.unwrap(), d.source);
+            println!(
+                "  export {}=...  # found via {}",
+                d.api_key_env.unwrap(),
+                d.source
+            );
         }
     }
 
