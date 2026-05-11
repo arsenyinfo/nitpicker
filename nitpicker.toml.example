@@ -1,8 +1,8 @@
 [defaults]
 debate = true
-max_turns = 100
-# log_trajectories = true
-# compact_threshold = 120000
+max_turns = 200
+log_trajectories = true
+compact_threshold = 120000
 
 [aggregator]
 model = "claude-sonnet-4-6"
@@ -11,11 +11,11 @@ provider = "anthropic"
 
 # OpenRouter with automatic free-model selection (omit model field)
 [[reviewer]]
-name = "openrouter-auto"
+name = "openrouter-free-a"
 provider = "openrouter"
 
 [[reviewer]]
-name = "openrouter-auto-2"
+name = "openrouter-free-b"
 provider = "openrouter"
 
 # [[reviewer]]
