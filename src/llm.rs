@@ -115,11 +115,7 @@ impl TokenUsage {
         }
     }
 
-    pub fn record(&mut self, usage: TokenUsage) {
-        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
-        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
-        self.total_tokens = self.total_tokens.saturating_add(usage.total_tokens);
-    }
+
 }
 
 #[derive(Debug, Clone, Default)]
@@ -147,7 +143,10 @@ impl ConversationUsageWindow {
     }
 
     pub fn record(&mut self, usage: TokenUsage) {
-        self.usage.record(usage);
+        // input_tokens from each API response is the full context size for that call,
+        // not just the new tokens — replace rather than accumulate so should_compact()
+        // compares against the actual current context size
+        self.usage = usage;
     }
 
     pub fn reset(&mut self) {
@@ -467,17 +466,22 @@ impl LLMProvider {
             LLMProvider::OpenRouter { api_key_env } => {
                 let api_key = std::env::var(api_key_env)
                     .map_err(|_| eyre::eyre!("missing env var {api_key_env}"))?;
-                let mut headers = reqwest::header::HeaderMap::new();
-                headers.insert("HTTP-Referer", "https://github.com/arsenyinfo/nitpicker".parse()?);
-                headers.insert("X-OpenRouter-Title", "nitpicker".parse()?);
                 let client = openrouter::Client::builder()
                     .api_key(&api_key)
-                    .http_headers(headers)
+                    .http_headers(openrouter_headers()?)
                     .build()?;
                 Ok(Box::new(client))
             }
         }
     }
+}
+
+pub fn openrouter_headers() -> Result<reqwest::header::HeaderMap> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("HTTP-Referer", "https://github.com/arsenyinfo/nitpicker".parse()?);
+    headers.insert("X-OpenRouter-Title", "nitpicker".parse()?);
+    headers.insert("X-OpenRouter-Categories", "cli-agent,programming-app".parse()?);
+    Ok(headers)
 }
 
 impl LLMClient for openrouter::Client {

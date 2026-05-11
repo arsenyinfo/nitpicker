@@ -465,7 +465,7 @@ async fn run_review_inner(
     let full_prompt = build_pr_prompt(meta, comments, &diff_context, args.prompt.as_deref());
     let max_turns = config.max_turns(args.max_turns)?;
 
-    let report = if !args.no_debate && config.default_debate() {
+    let (report, transcript_path) = if !args.no_debate && config.default_debate() {
         debate::run_debate(
             repo,
             &full_prompt,
@@ -477,7 +477,7 @@ async fn run_review_inner(
         )
         .await?
     } else {
-        review::run_review(
+        let report = review::run_review(
             repo,
             &full_prompt,
             config,
@@ -485,11 +485,16 @@ async fn run_review_inner(
             verbose,
             TaskMode::Review,
         )
-        .await?
+        .await?;
+        (report, std::path::PathBuf::new())
     };
 
+    println!("{report}");
     if !args.no_comment {
         post_comment(url_for_gh, repo, &format!("{report}{FOOTER}"))?;
+    }
+    if verbose && !transcript_path.as_os_str().is_empty() {
+        eprintln!("\nTranscript saved to: {}", transcript_path.display());
     }
 
     Ok(())

@@ -34,6 +34,8 @@ pub struct ToolCallRecord {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spawned_agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
 }
 
 impl SessionLogger {

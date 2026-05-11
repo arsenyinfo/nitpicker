@@ -2,3 +2,5 @@
 .env
 .claude/
 .nitpicker-sessions/
+sessions/   # for debugging 3rd party sessions
+nitpicker.toml

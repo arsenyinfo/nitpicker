@@ -107,6 +107,9 @@ fn format_session(session: &SessionData) -> String {
         if let Some(sp) = &r.spawned_agent {
             lines.push(format!("{indent}  → spawned: {sp}"));
         }
+        if let Some(result) = &r.result {
+            lines.push(format!("{indent}  → result: {}", truncate(result, 2000)));
+        }
     }
 
     let mut result = lines.join("\n");

@@ -8,6 +8,7 @@ use crate::provider::{
     reviewer_needs_gemini_oauth,
 };
 use crate::tools::{Tool, all_tools};
+use tracing::warn;
 use eyre::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rig::completion::Message;
@@ -130,13 +131,16 @@ async fn run_debate_turn(
         session_writer: request.session_writer,
     };
 
-    let result = run_agent(
-        config,
-        request.initial_message,
-        &tools_map,
-        request.work_dir,
-    )
-    .await?;
+    let result = match run_agent(config, request.initial_message, &tools_map, request.work_dir).await {
+        Ok(r) => r,
+        Err(err) => {
+            warn!(model = request.model, error = %err, "debate agent failed");
+            return Ok((
+                DebateVerdict { text: format!("*Agent failed: {err}*"), agree: false },
+                0, 0, 0, 0, 0, 0,
+            ));
+        }
+    };
     if let Some(verdict) = verdict_store
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -248,7 +252,7 @@ pub async fn run_debate(
     max_turns: usize,
     verbose: bool,
     mode: DebateMode,
-) -> Result<String> {
+) -> Result<(String, std::path::PathBuf)> {
     if config.reviewer.len() < 2 {
         eyre::bail!(
             "debate requires at least 2 reviewers in config (actor = reviewer[0], critic = reviewer[1])"
@@ -474,11 +478,6 @@ pub async fn run_debate(
             })
             .await?;
     }
-    if verbose {
-        println!();
-        skin.print_text(&meta_text);
-    }
-
     // write transcript file
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -513,9 +512,6 @@ pub async fn run_debate(
     transcript.push_str(&format!("---\n\n## Meta-review\n\n{meta_text}\n"));
 
     tokio::fs::write(&transcript_path, &transcript).await?;
-    if verbose {
-        eprintln!("\nTranscript saved to: {}", transcript_path.display());
-    }
 
-    Ok(meta_text)
+    Ok((meta_text, transcript_path))
 }

@@ -1,0 +1,42 @@
+[defaults]
+debate = true
+max_turns = 200
+log_trajectories = true
+compact_threshold = 120000
+
+[aggregator]
+model = "claude-sonnet-4-6"
+provider = "anthropic"
+# api_key_env = "ANTHROPIC_API_KEY"  # default; override if needed
+
+# OpenRouter with automatic free-model selection (omit model field)
+[[reviewer]]
+name = "openrouter-free-a"
+provider = "openrouter"
+
+[[reviewer]]
+name = "openrouter-free-b"
+provider = "openrouter"
+
+# [[reviewer]]
+# name = "anthropic"
+# model = "claude-sonnet-4-6"
+# provider = "anthropic"
+
+# Gemini OAuth example
+# [[reviewer]]
+# name = "gemini"
+# model = "gemini-3-flash-preview"
+# provider = "gemini"
+# auth = "oauth"
+
+# [[reviewer]]
+# name = "openai"
+# model = "gpt-5.5"
+# provider = "openai"
+
+# OpenRouter with explicit model
+# [[reviewer]]
+# name = "openrouter"
+# model = "minimax/minimax-m2.7"
+# provider = "openrouter"
