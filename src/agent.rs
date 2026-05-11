@@ -1,4 +1,4 @@
-use crate::compact::compact_history;
+use crate::compact::{CompactionOutcome, compact_history};
 use crate::llm::{Completion, ConversationUsageWindow, LLMClientDyn};
 use crate::prompts::subagent_system_prompt;
 use crate::session::{SessionWriter, ToolCallRecord, now_unix_ms};
@@ -210,7 +210,16 @@ pub async fn run_agent(
 
         if !is_final_turn && conversation_usage.should_compact() {
             let usage_before_compaction = conversation_usage.usage();
-            if let Some(compaction_usage) = compact_history(
+            info!(
+                agent = %config.name,
+                turn,
+                compact_threshold = config.compact_threshold,
+                window_input_tokens = usage_before_compaction.input_tokens,
+                window_output_tokens = usage_before_compaction.output_tokens,
+                window_total_tokens = usage_before_compaction.total_tokens,
+                "compaction triggered"
+            );
+            let compaction = compact_history(
                 Arc::clone(&config.client),
                 &config.model,
                 &effective_system_prompt,
@@ -219,15 +228,14 @@ pub async fn run_agent(
                 turn + 1,
                 usage_before_compaction,
             )
-            .await?
-            {
-                total_input_tokens =
-                    total_input_tokens.saturating_add(compaction_usage.input_tokens);
-                total_output_tokens =
-                    total_output_tokens.saturating_add(compaction_usage.output_tokens);
-                total_tokens = total_tokens.saturating_add(compaction_usage.total_tokens);
+            .await?;
+            if let Some(ref c) = compaction {
+                total_input_tokens = total_input_tokens.saturating_add(c.usage.input_tokens);
+                total_output_tokens = total_output_tokens.saturating_add(c.usage.output_tokens);
+                total_tokens = total_tokens.saturating_add(c.usage.total_tokens);
             }
             conversation_usage.reset();
+            log_compaction(&config, turn, "threshold", compaction.as_ref()).await;
         }
 
         if is_final_turn {
@@ -361,9 +369,9 @@ pub async fn run_agent(
                     info!(
                         agent = %config.name,
                         turn,
-                        input_tokens = response.usage.input_tokens,
-                        output_tokens = response.usage.output_tokens,
-                        total_tokens = response.usage.total_tokens,
+                        response_input_tokens = response.usage.input_tokens,
+                        response_output_tokens = response.usage.output_tokens,
+                        response_total_tokens = response.usage.total_tokens,
                         total_input_tokens,
                         total_output_tokens,
                         total_tokens_so_far = total_tokens,
@@ -420,7 +428,7 @@ pub async fn run_agent(
                     "forcing compaction to break tool-call cycle"
                 );
                 let usage = conversation_usage.usage();
-                let compaction_usage = compact_history(
+                let compaction = compact_history(
                     Arc::clone(&config.client),
                     &config.model,
                     &effective_system_prompt,
@@ -430,12 +438,13 @@ pub async fn run_agent(
                     usage,
                 )
                 .await?;
-                if let Some(cu) = compaction_usage {
-                    total_input_tokens = total_input_tokens.saturating_add(cu.input_tokens);
-                    total_output_tokens = total_output_tokens.saturating_add(cu.output_tokens);
-                    total_tokens = total_tokens.saturating_add(cu.total_tokens);
+                if let Some(ref c) = compaction {
+                    total_input_tokens = total_input_tokens.saturating_add(c.usage.input_tokens);
+                    total_output_tokens = total_output_tokens.saturating_add(c.usage.output_tokens);
+                    total_tokens = total_tokens.saturating_add(c.usage.total_tokens);
                 }
                 conversation_usage.reset();
+                log_compaction(&config, turn, "cycle_break", compaction.as_ref()).await;
                 let cycle_break_msg = Message::user(
                     "Note: you were stuck in a repetitive tool-call loop. \
                      Avoid repeating the same tool calls. Try a different approach."
@@ -478,9 +487,9 @@ pub async fn run_agent(
             info!(
                 agent = %config.name,
                 turn,
-                input_tokens = response.usage.input_tokens,
-                output_tokens = response.usage.output_tokens,
-                total_tokens = response.usage.total_tokens,
+                response_input_tokens = response.usage.input_tokens,
+                response_output_tokens = response.usage.output_tokens,
+                response_total_tokens = response.usage.total_tokens,
                 total_input_tokens,
                 total_output_tokens,
                 total_tokens_so_far = total_tokens,
@@ -736,6 +745,7 @@ async fn execute_tool_call(
             &args,
             outcome.status,
             outcome.spawned_agent.as_deref(),
+            None,
         )
         .await;
         return Ok(outcome);
@@ -763,6 +773,7 @@ async fn execute_tool_call(
                 &args,
                 outcome.status,
                 outcome.spawned_agent.as_deref(),
+                None,
             )
             .await;
             return Ok(outcome);
@@ -794,6 +805,7 @@ async fn execute_tool_call(
                     &args,
                     outcome.status,
                     outcome.spawned_agent.as_deref(),
+                    None,
                 )
                 .await;
                 return Ok(outcome);
@@ -806,6 +818,7 @@ async fn execute_tool_call(
             &args,
             "started",
             Some(&prepared.spawned_agent),
+            None,
         )
         .await;
         let sub = run_subagent(prepared, ctx.tools_map, ctx.work_dir).await;
@@ -877,6 +890,7 @@ async fn execute_tool_call(
         &logged_args,
         outcome.status,
         outcome.spawned_agent.as_deref(),
+        None,
     )
     .await;
 
@@ -890,6 +904,7 @@ async fn log_tool_call(
     args: &Value,
     status: &'static str,
     spawned_agent: Option<&str>,
+    result: Option<&str>,
 ) {
     let Some(session_writer) = config.session_writer.as_ref() else {
         return;
@@ -904,8 +919,28 @@ async fn log_tool_call(
         args: args.clone(),
         status: status.to_string(),
         spawned_agent: spawned_agent.map(str::to_string),
+        result: result.map(str::to_string),
     };
     if let Err(err) = session_writer.append_tool_call(&record).await {
         warn!(tool = %tool_name, error = %err, "failed to write trajectory log");
     }
+}
+
+async fn log_compaction(
+    config: &AgentConfig,
+    turn: usize,
+    reason: &'static str,
+    outcome: Option<&CompactionOutcome>,
+) {
+    let result = outcome.map(|value| value.summary.as_str());
+    log_tool_call(
+        config,
+        turn,
+        "compact",
+        &json!({ "reason": reason }),
+        "ok",
+        None,
+        result,
+    )
+    .await;
 }

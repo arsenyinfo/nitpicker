@@ -1,5 +1,5 @@
 use crate::config::{Config, ProviderType};
-use crate::llm::{Completion, LLMClient};
+use crate::llm::{Completion, LLMClient, openrouter_headers};
 use chrono::{Duration, Utc};
 use eyre::Result;
 use rig::completion::{Message, ToolDefinition};
@@ -29,7 +29,7 @@ struct ModelsResponse {
 }
 
 const MIN_CONTEXT_LENGTH: u64 = 128_000;
-const FREE_COMPACT_THRESHOLD: u64 = 100_000;
+const COMPACT_HEADROOM: u64 = 25_000;
 
 #[derive(Deserialize)]
 struct ModelInfo {
@@ -89,7 +89,7 @@ fn expires_within_24h(expiration_date: Option<&str>) -> bool {
     expires_dt <= Utc::now() + Duration::hours(24)
 }
 
-async fn fetch_models(api_key: &str, needed: usize) -> Result<Vec<String>> {
+async fn fetch_models(api_key: &str, needed: usize) -> Result<Vec<(String, u64)>> {
     let client = reqwest::Client::new();
     let mut last_err: eyre::Report = eyre::eyre!("no attempts made");
 
@@ -173,7 +173,7 @@ async fn try_fetch_models(
     client: &reqwest::Client,
     api_key: &str,
     needed: usize,
-) -> Result<Vec<String>> {
+) -> Result<Vec<(String, u64)>> {
     let (all_result, rank_map) = tokio::join!(
         fetch_model_list(client, api_key, MODELS_URL),
         fetch_programming_ranks(client),
@@ -211,7 +211,10 @@ async fn try_fetch_models(
         .join(", ");
     tracing::info!(candidates = %ranked_summary, "experimental openrouter free candidate models");
 
-    let models: Vec<String> = models.into_iter().map(|m| m.id).collect();
+    let models: Vec<(String, u64)> = models
+        .into_iter()
+        .map(|m| (m.id, m.context_length.unwrap_or(MIN_CONTEXT_LENGTH)))
+        .collect();
 
     if models.len() < needed {
         eyre::bail!(
@@ -243,19 +246,9 @@ fn smoke_test_tool() -> ToolDefinition {
 }
 
 fn build_openrouter_client(api_key: &str) -> Result<openrouter::Client> {
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        "HTTP-Referer",
-        "https://github.com/arsenyinfo/nitpicker".parse()?,
-    );
-    headers.insert("X-OpenRouter-Title", "nitpicker".parse()?);
-    headers.insert(
-        "X-OpenRouter-Categories",
-        "cli-agent,programming-app".parse()?,
-    );
     openrouter::Client::builder()
         .api_key(api_key)
-        .http_headers(headers)
+        .http_headers(openrouter_headers()?)
         .build()
         .map_err(|e| eyre::eyre!("failed to build openrouter client: {e}"))
 }
@@ -334,18 +327,18 @@ async fn smoke_test_model(api_key: &str, model: &str, slot_label: &str) -> bool 
 /// `needed` passing models. Stops as soon as enough are found.
 async fn probe_candidates(
     api_key: &str,
-    candidates: &[String],
+    candidates: &[(String, u64)],
     slot_label: &str,
     needed: usize,
 ) -> Vec<usize> {
     let mut found = Vec::new();
-    let indexed: Vec<(usize, &String)> = candidates.iter().enumerate().collect();
+    let indexed: Vec<(usize, &(String, u64))> = candidates.iter().enumerate().collect();
     for chunk in indexed.chunks(SMOKE_TEST_BATCH_SIZE) {
         let handles: Vec<_> = chunk
             .iter()
-            .map(|&(idx, model)| {
+            .map(|&(idx, (model_id, _))| {
                 let key = api_key.to_string();
-                let model = model.to_string();
+                let model = model_id.to_string();
                 let label = slot_label.to_string();
                 tokio::spawn(async move {
                     let passed = smoke_test_model(&key, &model, &label).await;
@@ -369,9 +362,9 @@ async fn probe_candidates(
 
 async fn select_reviewer_models(
     slot_api_keys: &[String],
-    candidates: Vec<String>,
+    candidates: Vec<(String, u64)>,
     reviewer_count: usize,
-) -> Result<(Vec<String>, Vec<String>)> {
+) -> Result<(Vec<(String, u64)>, Vec<(String, u64)>)> {
     if reviewer_count == 0 {
         return Ok((Vec::new(), candidates));
     }
@@ -419,16 +412,16 @@ async fn select_reviewer_models(
 
 async fn select_aggregator_model(
     api_key: &str,
-    candidates: &[String],
-    reviewer_models: &[String],
+    candidates: &[(String, u64)],
+    reviewer_models: &[(String, u64)],
 ) -> Result<String> {
     let passing = probe_candidates(api_key, candidates, "aggregator_probe", 1).await;
 
     if let Some(&idx) = passing.first() {
-        return Ok(candidates[idx].clone());
+        return Ok(candidates[idx].0.clone());
     }
 
-    if let Some(model) = reviewer_models.first() {
+    if let Some((model, _)) = reviewer_models.first() {
         tracing::info!(
             model = %model,
             "reusing first reviewer model for experimental openrouter free aggregator"
@@ -519,17 +512,30 @@ pub async fn resolve_free_models(config: &mut Config) -> Result<()> {
     let mut iter = reviewer_models.into_iter();
 
     for (slot, idx) in reviewer_indices.into_iter().enumerate() {
-        let model = iter.next().expect("checked above");
+        let (model, context_length) = iter.next().expect("checked above");
         if config.reviewer[idx].name.is_empty() {
             config.reviewer[idx].name = format!("free_{slot}");
         }
-        let threshold = config.reviewer[idx]
+        let model_threshold = context_length.saturating_sub(COMPACT_HEADROOM);
+        let configured = config.reviewer[idx]
             .compact_threshold
-            .or_else(|| config.default_compact_threshold())
-            .unwrap_or(0)
-            .max(FREE_COMPACT_THRESHOLD);
+            .or_else(|| config.default_compact_threshold());
+        let threshold = match configured {
+            Some(t) if t > model_threshold => {
+                tracing::warn!(
+                    reviewer = %config.reviewer[idx].name,
+                    configured = t,
+                    capped = model_threshold,
+                    context_length,
+                    "compact_threshold exceeds free model context window, capping"
+                );
+                model_threshold
+            }
+            Some(t) => t,
+            None => model_threshold,
+        };
         config.reviewer[idx].compact_threshold = Some(threshold);
-        tracing::info!(reviewer = %config.reviewer[idx].name, %model, "resolved experimental openrouter free model");
+        tracing::info!(reviewer = %config.reviewer[idx].name, %model, context_length, "resolved experimental openrouter free model");
         config.reviewer[idx].model = model;
     }
 
