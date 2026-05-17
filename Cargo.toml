@@ -1,6 +1,6 @@
 [package]
 name = "nitpicker"
-version = "0.3.3"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
 default-run = "nitpicker"
@@ -17,7 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "time", "sync", "net"] }
-rig-core = "0.35.0"
+rig-core = "0.37"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 eyre = "0.6"
@@ -26,7 +26,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 glob = "0.3"
 indicatif = "0.18"
-termimad = "0.31"
+termimad = "0.34"
 regex = "1"
 toml = "1"
 
@@ -36,8 +36,8 @@ reqwest = { version = "0.13", features = ["json", "form"] }
 oauth2 = "5"
 dirs = "6"
 chrono = { version = "0.4", features = ["serde"] }
-sha2 = "0.10"
-rand = "0.9"
+sha2 = "0.11"
+rand = "0.10"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 url = "2"

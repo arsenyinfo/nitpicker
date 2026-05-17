@@ -1,7 +1,7 @@
 use eyre::Result;
 use glob::glob;
 use regex::Regex;
-use rig::completion::ToolDefinition;
+use rig_core::completion::ToolDefinition;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

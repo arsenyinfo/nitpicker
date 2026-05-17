@@ -1,6 +1,6 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use eyre::Result;
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use url::Url;

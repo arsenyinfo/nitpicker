@@ -2,16 +2,15 @@ use crate::agent::{AgentConfig, AgentDepth, AgentProgress, add_spawn_subagent_to
 use crate::config::{Config, ReviewerConfig};
 use crate::llm::{Completion, LLMClientDyn};
 pub use crate::prompts::DebateMode;
-use crate::session::{AggregationRecord, SessionLogger, SessionWriter};
 use crate::provider::{
     aggregator_needs_gemini_oauth, build_aggregator_client, build_reviewer_client,
     reviewer_needs_gemini_oauth,
 };
+use crate::session::{AggregationRecord, SessionLogger, SessionWriter};
 use crate::tools::{Tool, all_tools};
-use tracing::warn;
 use eyre::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use rig::completion::Message;
+use rig_core::completion::Message;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -21,6 +20,23 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use termimad::MadSkin;
 use tracing::info;
+use tracing::warn;
+
+struct ModelLabel {
+    alias: String, // short name used in agent name / logs
+    full: String,  // full identifier used in cast line and transcript
+}
+
+impl ModelLabel {
+    fn plain(model: &str) -> Self {
+        Self { alias: model.to_string(), full: model.to_string() }
+    }
+
+    fn alloy(models: impl Iterator<Item = impl AsRef<str>>) -> Self {
+        let joined = models.map(|m| m.as_ref().to_string()).collect::<Vec<_>>().join(" + ");
+        Self { alias: "alloy".to_string(), full: format!("Alloy ({joined})") }
+    }
+}
 
 struct DebateVerdict {
     text: String,
@@ -49,8 +65,8 @@ impl Tool for SubmitVerdictTool {
         "submit_verdict".to_string()
     }
 
-    fn definition(&self) -> rig::completion::ToolDefinition {
-        rig::completion::ToolDefinition {
+    fn definition(&self) -> rig_core::completion::ToolDefinition {
+        rig_core::completion::ToolDefinition {
             name: "submit_verdict".to_string(),
             description: "Submit your final position for this round. \
                 Set agree=true if you fully agree with the opponent's latest position (convergence)."
@@ -131,13 +147,28 @@ async fn run_debate_turn(
         session_writer: request.session_writer,
     };
 
-    let result = match run_agent(config, request.initial_message, &tools_map, request.work_dir).await {
+    let result = match run_agent(
+        config,
+        request.initial_message,
+        &tools_map,
+        request.work_dir,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(err) => {
             warn!(model = request.model, error = %err, "debate agent failed");
             return Ok((
-                DebateVerdict { text: format!("*Agent failed: {err}*"), agree: false },
-                0, 0, 0, 0, 0, 0,
+                DebateVerdict {
+                    text: format!("*Agent failed: {err}*"),
+                    agree: false,
+                },
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
             ));
         }
     };
@@ -252,6 +283,7 @@ pub async fn run_debate(
     max_turns: usize,
     verbose: bool,
     mode: DebateMode,
+    alloy: bool,
 ) -> Result<(String, std::path::PathBuf)> {
     if config.reviewer.len() < 2 {
         eyre::bail!(
@@ -263,9 +295,7 @@ pub async fn run_debate(
     let critic_cfg = &config.reviewer[1];
     let agg_cfg = &config.aggregator;
 
-    let needs_oauth = [actor_cfg, critic_cfg]
-        .iter()
-        .any(|reviewer| reviewer_needs_gemini_oauth(reviewer))
+    let needs_oauth = config.reviewer.iter().any(reviewer_needs_gemini_oauth)
         || aggregator_needs_gemini_oauth(agg_cfg);
     let gemini_proxy = if needs_oauth {
         info!("Starting Gemini proxy for OAuth authentication...");
@@ -274,10 +304,34 @@ pub async fn run_debate(
         None
     };
 
-    let actor_client = build_client(actor_cfg, gemini_proxy.as_ref())?;
-    let critic_client = build_client(critic_cfg, gemini_proxy.as_ref())?;
-    let actor_compact_threshold = config.reviewer_compact_threshold(actor_cfg);
-    let critic_compact_threshold = config.reviewer_compact_threshold(critic_cfg);
+    let actor_client: Arc<dyn LLMClientDyn>;
+    let critic_client: Arc<dyn LLMClientDyn>;
+    let actor_label: ModelLabel;
+    let critic_label: ModelLabel;
+    let actor_compact_threshold: Option<u64>;
+    let critic_compact_threshold: Option<u64>;
+
+    if alloy {
+        let mut slots = Vec::new();
+        for r in &config.reviewer {
+            slots.push((build_client(r, gemini_proxy.as_ref())?, r.model.clone()));
+        }
+        let shared: Arc<dyn LLMClientDyn> = Arc::new(crate::llm::AlloyClient::new(slots)?);
+        actor_client = Arc::clone(&shared);
+        critic_client = shared;
+        let label = ModelLabel::alloy(config.reviewer.iter().map(|r| r.model.as_str()));
+        actor_label = ModelLabel { alias: label.alias.clone(), full: label.full.clone() };
+        critic_label = label;
+        actor_compact_threshold = config.reviewer_compact_threshold(actor_cfg);
+        critic_compact_threshold = config.reviewer_compact_threshold(critic_cfg);
+    } else {
+        actor_client = build_client(actor_cfg, gemini_proxy.as_ref())?;
+        critic_client = build_client(critic_cfg, gemini_proxy.as_ref())?;
+        actor_label = ModelLabel::plain(&actor_cfg.model);
+        critic_label = ModelLabel::plain(&critic_cfg.model);
+        actor_compact_threshold = config.reviewer_compact_threshold(actor_cfg);
+        critic_compact_threshold = config.reviewer_compact_threshold(critic_cfg);
+    }
     let session_logger = SessionLogger::maybe_new(config.log_trajectories())?;
     if let Some(logger) = &session_logger {
         info!(path = %logger.root().display(), "trajectory logging enabled");
@@ -301,14 +355,13 @@ pub async fn run_debate(
         mp.set_draw_target(ProgressDrawTarget::hidden());
     }
 
-    print_cast_line(
-        actor_role,
-        &format!("{} · {}", actor_cfg.name, actor_cfg.model),
-    );
-    print_cast_line(
-        critic_role,
-        &format!("{} · {}", critic_cfg.name, critic_cfg.model),
-    );
+    if alloy {
+        print_cast_line(actor_role, &actor_label.full);
+        print_cast_line(critic_role, &critic_label.full);
+    } else {
+        print_cast_line(actor_role, &format!("{} · {}", actor_cfg.name, actor_label.full));
+        print_cast_line(critic_role, &format!("{} · {}", critic_cfg.name, critic_label.full));
+    }
     print_cast_line("Meta-review", &agg_cfg.model);
     println!();
 
@@ -334,9 +387,11 @@ pub async fn run_debate(
                 progress.turns, progress.tool_calls, progress.subagents_spawned
             ));
             actor_sub_pb.set_message(
-                progress.last_subagent.as_deref()
+                progress
+                    .last_subagent
+                    .as_deref()
                     .map(|s| format!("    ↳ {s}"))
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
             );
         })
             as Arc<dyn Fn(AgentProgress) + Send + Sync>);
@@ -351,7 +406,7 @@ pub async fn run_debate(
         ) = run_debate_turn(DebateTurnRequest {
             client: Arc::clone(&actor_client),
             compact_threshold: actor_compact_threshold,
-            model: &actor_cfg.model,
+            model: &actor_label.alias,
             system_prompt: &actor_system,
             initial_message: &msg,
             max_turns,
@@ -390,9 +445,11 @@ pub async fn run_debate(
                 progress.turns, progress.tool_calls, progress.subagents_spawned
             ));
             critic_sub_pb.set_message(
-                progress.last_subagent.as_deref()
+                progress
+                    .last_subagent
+                    .as_deref()
                     .map(|s| format!("    ↳ {s}"))
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
             );
         })
             as Arc<dyn Fn(AgentProgress) + Send + Sync>);
@@ -407,7 +464,7 @@ pub async fn run_debate(
         ) = run_debate_turn(DebateTurnRequest {
             client: Arc::clone(&critic_client),
             compact_threshold: critic_compact_threshold,
-            model: &critic_cfg.model,
+            model: &critic_label.alias,
             system_prompt: &critic_system,
             initial_message: &msg,
             max_turns,
@@ -501,8 +558,8 @@ pub async fn run_debate(
         **Date:** {}\n\
         **Convergence:** {convergence_status}\n\
         **Rounds:** {final_round}\n\n---\n\n",
-        actor_cfg.model,
-        critic_cfg.model,
+        actor_label.full,
+        critic_label.full,
         agg_cfg.model,
         now.format("%Y-%m-%d %H:%M:%S"),
     );

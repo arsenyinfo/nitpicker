@@ -58,6 +58,10 @@ struct Args {
     #[arg(long)]
     no_debate: bool,
 
+    /// Mix all reviewer models into a shared pool; each LLM call picks one at random
+    #[arg(long)]
+    alloy: bool,
+
     /// Maximum debate rounds
     #[arg(long, default_value = "5")]
     rounds: usize,
@@ -88,6 +92,9 @@ enum Command {
         /// Disable actor-critic debate and use parallel aggregation instead
         #[arg(long)]
         no_debate: bool,
+        /// Mix all reviewer models into a shared pool; each LLM call picks one at random
+        #[arg(long)]
+        alloy: bool,
         /// Maximum debate rounds
         #[arg(long, default_value = "5")]
         rounds: usize,
@@ -148,6 +155,7 @@ async fn main() -> Result<()> {
             common,
             topic,
             no_debate,
+            alloy,
             rounds,
             max_turns,
         }) => {
@@ -157,6 +165,12 @@ async fn main() -> Result<()> {
             }
             let config = load_resolved_config(common.config.as_deref(), &repo).await?;
             let max_turns = config.max_turns(max_turns)?;
+            let use_alloy = alloy || config.default_alloy();
+            config.validate_alloy(use_alloy)?;
+
+            if use_alloy && no_debate {
+                eprintln!("warning: --alloy has no effect with --no-debate");
+            }
 
             if !no_debate && config.default_debate() {
                 if config.reviewer.len() < 2 {
@@ -173,6 +187,7 @@ async fn main() -> Result<()> {
                     max_turns,
                     common.verbose,
                     debate::DebateMode::Topic,
+                    use_alloy,
                 )
                 .await?;
                 println!("{report}");
@@ -255,6 +270,12 @@ async fn main() -> Result<()> {
         }
     };
 
+    let use_alloy = args.alloy || config.default_alloy();
+    config.validate_alloy(use_alloy)?;
+    if use_alloy && args.no_debate {
+        eprintln!("warning: --alloy has no effect with --no-debate");
+    }
+
     if !args.no_debate && config.default_debate() {
         if config.reviewer.len() < 2 {
             eyre::bail!(
@@ -270,6 +291,7 @@ async fn main() -> Result<()> {
             max_turns,
             args.common.verbose,
             debate::DebateMode::Review,
+            use_alloy,
         )
         .await?;
         println!("{report}");
@@ -436,6 +458,7 @@ fn build_init_config(
     config::Config {
         defaults: Some(config::DefaultsConfig {
             debate: Some(debate),
+            alloy: None,
             max_turns: Some(config::DEFAULT_MAX_TURNS),
             compact_threshold: Some(100_000),
             log_trajectories: Some(false),

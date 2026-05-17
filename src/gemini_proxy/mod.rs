@@ -51,7 +51,7 @@ pub fn build_gemini_user_agent(model: &str) -> String {
 /// Create a short request-scoped activity id for backend tracing.
 /// Mirrors Gemini CLI behavior (short random string, not full UUID).
 pub fn create_activity_request_id() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
     let chars: String = (0..8)
         .map(|_| {
