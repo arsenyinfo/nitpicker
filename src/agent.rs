@@ -4,9 +4,9 @@ use crate::prompts::subagent_system_prompt;
 use crate::session::{SessionWriter, ToolCallRecord, now_unix_ms};
 use crate::tools::{Tool, floor_char_boundary, tool_definitions};
 use eyre::Result;
-use rig::OneOrMany;
-use rig::completion::Message;
-use rig::completion::message::{ToolResult, ToolResultContent, UserContent};
+use rig_core::OneOrMany;
+use rig_core::completion::Message;
+use rig_core::completion::message::{ToolResult, ToolResultContent, UserContent};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -126,8 +126,8 @@ impl Tool for FinishTool {
         "finish".to_string()
     }
 
-    fn definition(&self) -> rig::completion::ToolDefinition {
-        rig::completion::ToolDefinition {
+    fn definition(&self) -> rig_core::completion::ToolDefinition {
+        rig_core::completion::ToolDefinition {
             name: "finish".to_string(),
             description:
                 "Finish the assigned subtask and return the final result to the parent agent."
@@ -267,6 +267,7 @@ pub async fn run_agent(
         total_output_tokens = total_output_tokens.saturating_add(response.usage.output_tokens);
         total_tokens = total_tokens.saturating_add(response.usage.total_tokens);
         conversation_usage.record(response.usage);
+        let selected_model = response.selected_model.clone();
         let assistant_message = response.message();
         history.push(assistant_message.clone());
 
@@ -297,7 +298,10 @@ pub async fn run_agent(
                         last_subagent = Some(first_line(task));
                     }
                 }
-                info!(agent = %config.name, tool = %tool_name, args = %args, turn, "tool call");
+                match &selected_model {
+                    Some(m) => info!(agent = %config.name, tool = %tool_name, args = %args, turn, model = %m, "tool call"),
+                    None => info!(agent = %config.name, tool = %tool_name, args = %args, turn, "tool call"),
+                }
                 let outcome = execute_tool_call(
                     ToolCallContext {
                         config: &config,
@@ -551,8 +555,8 @@ impl Tool for SpawnSubagentTool {
         "spawn_subagent".to_string()
     }
 
-    fn definition(&self) -> rig::completion::ToolDefinition {
-        rig::completion::ToolDefinition {
+    fn definition(&self) -> rig_core::completion::ToolDefinition {
+        rig_core::completion::ToolDefinition {
             name: "spawn_subagent".to_string(),
             description:
                 "Delegate a complex multi-step investigation to a subagent. Only use when the task requires several tool calls (e.g. tracing logic across multiple files). Do NOT use for single file reads or simple lookups — call those tools directly instead.

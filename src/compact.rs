@@ -1,7 +1,7 @@
 use crate::llm::{Completion, CompletionResponse, LLMClientDyn, TokenUsage};
 use eyre::Result;
-use rig::completion::message::{ToolChoice, ToolResultContent, UserContent};
-use rig::completion::{AssistantContent, Message};
+use rig_core::completion::message::{ToolChoice, ToolResultContent, UserContent};
+use rig_core::completion::{AssistantContent, Message};
 use std::sync::Arc;
 use tracing::{info, warn};
 

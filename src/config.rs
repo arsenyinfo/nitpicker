@@ -18,6 +18,8 @@ pub struct DefaultsConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debate: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub alloy: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compact_threshold: Option<u64>,
@@ -83,6 +85,8 @@ impl Config {
             eyre::bail!("no reviewers configured");
         }
 
+        self.validate_alloy(self.default_alloy())?;
+
         validate_free_model(
             "[aggregator]",
             &self.aggregator.provider,
@@ -125,6 +129,20 @@ impl Config {
             .as_ref()
             .and_then(|d| d.debate)
             .unwrap_or(true)
+    }
+
+    pub fn validate_alloy(&self, alloy: bool) -> Result<()> {
+        if alloy && self.reviewer.len() < 2 {
+            eyre::bail!("--alloy requires at least 2 reviewers, found {}", self.reviewer.len());
+        }
+        Ok(())
+    }
+
+    pub fn default_alloy(&self) -> bool {
+        self.defaults
+            .as_ref()
+            .and_then(|d| d.alloy)
+            .unwrap_or(false)
     }
 
     pub fn max_turns(&self, override_max_turns: Option<usize>) -> Result<usize> {

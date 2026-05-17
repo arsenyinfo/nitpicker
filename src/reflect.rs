@@ -5,7 +5,7 @@ use crate::provider::build_reviewer_client;
 use crate::session::{AggregationRecord, ToolCallRecord};
 use crate::tools::{floor_char_boundary, reflect_tools};
 use eyre::Result;
-use rig::completion::Message;
+use rig_core::completion::Message;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;

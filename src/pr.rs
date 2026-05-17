@@ -12,7 +12,7 @@ use std::process::Command;
 fn lock_path(repo: &Path) -> PathBuf {
     let canonical = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
     let hash = sha2::Sha256::digest(canonical.as_os_str().as_encoded_bytes());
-    let hash_hex = format!("{:x}", hash);
+    let hash_hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
     std::env::temp_dir().join(format!("nitpicker-pr-review-{hash_hex}.lock"))
 }
 
@@ -86,6 +86,8 @@ pub struct PrArgs {
     pub prompt: Option<String>,
     #[arg(long)]
     pub no_debate: bool,
+    #[arg(long)]
+    pub alloy: bool,
     #[arg(long, default_value = "5")]
     pub rounds: usize,
     #[arg(long, value_parser = crate::parse_positive_usize)]
@@ -465,6 +467,11 @@ async fn run_review_inner(
     let full_prompt = build_pr_prompt(meta, comments, &diff_context, args.prompt.as_deref());
     let max_turns = config.max_turns(args.max_turns)?;
 
+    let use_alloy = args.alloy || config.default_alloy();
+    config.validate_alloy(use_alloy)?;
+    if use_alloy && args.no_debate {
+        eprintln!("warning: --alloy has no effect with --no-debate");
+    }
     let (report, transcript_path) = if !args.no_debate && config.default_debate() {
         debate::run_debate(
             repo,
@@ -474,6 +481,7 @@ async fn run_review_inner(
             max_turns,
             verbose,
             DebateMode::Review,
+            use_alloy,
         )
         .await?
     } else {

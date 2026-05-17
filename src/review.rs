@@ -10,7 +10,7 @@ use crate::provider::{
 use crate::tools::{all_tools, floor_char_boundary, is_binary_file};
 use eyre::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use rig::completion::Message;
+use rig_core::completion::Message;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;

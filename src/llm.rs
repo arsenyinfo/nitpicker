@@ -1,11 +1,11 @@
 use eyre::{Result, WrapErr};
-use rig::OneOrMany;
-use rig::client::CompletionClient;
-use rig::completion::CompletionError;
-use rig::completion::message::ToolCall;
-use rig::completion::message::ToolChoice;
-use rig::completion::{AssistantContent, CompletionModel, Message};
-use rig::providers::{anthropic, gemini, openai, openrouter};
+use rig_core::OneOrMany;
+use rig_core::client::CompletionClient;
+use rig_core::completion::CompletionError;
+use rig_core::completion::message::ToolCall;
+use rig_core::completion::message::ToolChoice;
+use rig_core::completion::{AssistantContent, CompletionModel, Message};
+use rig_core::providers::{anthropic, gemini, openai, openrouter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::future::Future;
@@ -27,7 +27,7 @@ pub struct Completion {
     pub prompt: Message,
     pub preamble: Option<String>,
     pub history: Vec<Message>,
-    pub tools: Vec<rig::completion::ToolDefinition>,
+    pub tools: Vec<rig_core::completion::ToolDefinition>,
     pub tool_choice: Option<ToolChoice>,
     pub max_tokens: Option<u64>,
     pub additional_params: Option<Value>,
@@ -39,7 +39,7 @@ impl Completion {
         self
     }
 
-    pub fn tools(mut self, tools: Vec<rig::completion::ToolDefinition>) -> Self {
+    pub fn tools(mut self, tools: Vec<rig_core::completion::ToolDefinition>) -> Self {
         self.tools = tools;
         self
     }
@@ -60,14 +60,14 @@ impl Completion {
     }
 }
 
-impl From<Completion> for rig::completion::CompletionRequest {
+impl From<Completion> for rig_core::completion::CompletionRequest {
     fn from(value: Completion) -> Self {
         let chat_history = value
             .history
             .into_iter()
             .chain(std::iter::once(value.prompt))
             .collect::<Vec<_>>();
-        rig::completion::CompletionRequest {
+        rig_core::completion::CompletionRequest {
             model: None,
             chat_history: OneOrMany::many(chat_history)
                 .expect("completion request must include at least one message"),
@@ -97,6 +97,7 @@ pub struct CompletionResponse {
     pub choice: OneOrMany<AssistantContent>,
     pub finish_reason: FinishReason,
     pub usage: TokenUsage,
+    pub selected_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
@@ -250,6 +251,7 @@ impl<C: LLMClient> LLMClient for RetryingLLM<C> {
                         }
                         let backoff = jittered_backoff(attempt, BASE_BACKOFF_MS, MAX_BACKOFF_MS);
                         warn!(
+                            model = %completion.model,
                             attempt,
                             max_attempts = MAX_COMPLETION_ATTEMPTS,
                             backoff_ms = backoff.as_millis(),
@@ -279,6 +281,44 @@ impl<C: LLMClient> LLMClient for RetryingLLM<C> {
                 }
             }
         }
+    }
+}
+
+/// randomly alternates between models within a single agentic loop — see https://xbow.com/blog/alloy-agents
+///
+/// inner clients must already be wrapped with retry (e.g. via `.with_retry()`); AlloyClient does not add retry itself
+pub struct AlloyClient {
+    slots: Vec<(Arc<dyn LLMClientDyn>, String)>,
+}
+
+impl AlloyClient {
+    pub fn new(slots: Vec<(Arc<dyn LLMClientDyn>, String)>) -> Result<Self> {
+        if slots.is_empty() {
+            eyre::bail!("AlloyClient requires at least one slot");
+        }
+        Ok(Self { slots })
+    }
+
+    fn pick_idx(&self) -> usize {
+        use rand::RngExt;
+        rand::rng().random_range(0..self.slots.len())
+    }
+}
+
+impl LLMClientDyn for AlloyClient {
+    fn completion(
+        &self,
+        mut completion: Completion,
+    ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse>> + Send + '_>> {
+        let (client, model) = &self.slots[self.pick_idx()];
+        completion.model = model.clone();
+        let client = Arc::clone(client);
+        let model = model.clone();
+        Box::pin(async move {
+            let mut response = client.completion(completion).await?;
+            response.selected_model = Some(model);
+            Ok(response)
+        })
     }
 }
 
@@ -487,9 +527,9 @@ pub fn openrouter_headers() -> Result<reqwest::header::HeaderMap> {
 impl LLMClient for openrouter::Client {
     async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
         let model_name = completion.model.clone();
-        let mut request: rig::completion::CompletionRequest = completion.into();
+        let mut request: rig_core::completion::CompletionRequest = completion.into();
         request.model = Some(model_name.clone());
-        let model = self.completion_model(model_name);
+        let model = self.completion_model(&model_name);
         let response = model
             .completion(request)
             .await
@@ -522,6 +562,7 @@ impl LLMClient for openrouter::Client {
             choice: response.choice,
             finish_reason,
             usage,
+            selected_model: Some(model_name),
         })
     }
 }
@@ -543,7 +584,7 @@ pub fn create_gemini_client_with_proxy(
 impl LLMClient for anthropic::Client {
     async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
         let model_name = completion.model.clone();
-        let mut request: rig::completion::CompletionRequest = completion.into();
+        let mut request: rig_core::completion::CompletionRequest = completion.into();
         request.model = Some(model_name.clone());
         let model = self.completion_model(model_name.clone());
         let response = model
@@ -572,6 +613,7 @@ impl LLMClient for anthropic::Client {
             choice: response.choice,
             finish_reason,
             usage: TokenUsage::new(response.usage.input_tokens, response.usage.output_tokens),
+            selected_model: Some(model_name),
         })
     }
 }
@@ -580,7 +622,7 @@ impl LLMClient for gemini::Client {
     async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
         let model_name = completion.model.clone();
         let params = GeminiAdditionalParams::from_completion(&completion);
-        let mut request: rig::completion::CompletionRequest = completion.into();
+        let mut request: rig_core::completion::CompletionRequest = completion.into();
         request.model = Some(model_name.clone());
         request.additional_params = Some(serde_json::to_value(params)?);
         let model = self.completion_model(model_name.clone());
@@ -606,6 +648,7 @@ impl LLMClient for gemini::Client {
             choice: response.choice,
             finish_reason,
             usage: TokenUsage::new(response.usage.input_tokens, response.usage.output_tokens),
+            selected_model: Some(model_name),
         })
     }
 }
@@ -647,7 +690,7 @@ impl LLMClient for openai::CompletionsClient {
             }
         }
         let model_name = completion.model.clone();
-        let mut request: rig::completion::CompletionRequest = completion.into();
+        let mut request: rig_core::completion::CompletionRequest = completion.into();
         request.model = Some(model_name.clone());
         let model = self.completion_model(model_name.clone());
         let response = model
@@ -676,6 +719,7 @@ impl LLMClient for openai::CompletionsClient {
             choice: response.choice,
             finish_reason,
             usage: TokenUsage::new(response.usage.input_tokens, response.usage.output_tokens),
+            selected_model: Some(model_name),
         })
     }
 }
