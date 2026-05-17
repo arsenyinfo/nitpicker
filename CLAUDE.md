@@ -45,6 +45,10 @@ cargo run -- --gemini-oauth
 
 # Generate config preferring OpenRouter experimental free models
 cargo run -- init --free
+
+# Alloy mode: pool all reviewer models into one shared random-selection client
+cargo run -- --alloy
+cargo run -- ask --alloy "should we use eyre or thiserror?"
 ```
 
 ## Architecture
@@ -80,6 +84,8 @@ gemini_proxy/   local HTTP proxy that translates Gemini API calls to Google Code
 7. `DebateMode::Topic` (from `ask`) uses Actor/Critic roles and general debate prompts
 8. `DebateMode::Review` (from default review mode) uses Reviewer/Validator roles and code-review-focused prompts
 
+**Alloy mode** (`--alloy` / `defaults.alloy = true`): instead of pinning actor and critic to `reviewer[0]`/`reviewer[1]`, builds an `AlloyClient` that randomly selects from all configured reviewer models each turn. Requires ≥ 2 reviewers.
+
 ### Agent execution (`agent.rs`)
 
 - Each reviewer runs an agentic loop with file/git tools until it returns text or reaches the turn limit
@@ -111,6 +117,7 @@ gemini_proxy/   local HTTP proxy that translates Gemini API calls to Google Code
 
 - `LLMClient` trait: one method, `completion(Completion) -> Result<CompletionResponse>`
 - Per-provider impls: `anthropic::Client`, `gemini::Client`, `openai::CompletionsClient`
+- `AlloyClient` wraps a vec of `(Arc<dyn LLMClientDyn>, model_name)` slots and picks one at random per call (XBOW Alloy technique)
 - `RetryingLLM<C>` wraps any client with jittered exponential backoff (4 attempts, 250ms–5s). Skips retry on 4xx errors.
 - Always wrap clients with `.with_retry()` — the OAuth Gemini path is no exception
 

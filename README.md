@@ -255,7 +255,7 @@ Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timesta
 ## Changelog
 
 **0.4.0** — 2026-05-17
-- Alloy mode (`--alloy` / `defaults.alloy = true`): pools all reviewer models into a shared random-selection pool so every debate turn can draw from any configured model (XBOW Alloy technique)
+- Alloy mode (`--alloy` / `defaults.alloy = true`): pools all reviewer models into a shared random-selection pool so every debate turn can draw from any configured model (based on [XBOW technique](https://xbow.com/blog/alloy-agents))
 
 **0.3.3** — 2026-05-11: 
 - init --free flag for OpenRouter free model auto-selection
