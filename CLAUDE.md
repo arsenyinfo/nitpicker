@@ -149,7 +149,7 @@ The token is read via the `keyring` crate (Secret Service on Linux, Keychain on 
 
 This auth path is explicitly disallowed by AG2 ToS Section 6 ("using the Service in connection with products not provided by us") and Google is actively suspending paid accounts for third-party OAuth bridges — keep it framed as research only in any user-facing copy.
 
-The legacy `auth = "oauth"` (browser PKCE flow with file-backed token storage) was removed in 0.4.1 — the proxy was retargeted at AG2 endpoints whose matching client_secret is not public, so the flow could not complete. The config validator now rejects `auth = "oauth"` with a migration hint to `agy-keyring` or `GEMINI_API_KEY`.
+The legacy `auth = "oauth"` (browser PKCE flow with file-backed token storage) was removed in 0.5.0 — the proxy was retargeted at AG2 endpoints whose matching client_secret is not public, so the flow could not complete. The config validator now rejects `auth = "oauth"` with a migration hint to `agy-keyring` or `GEMINI_API_KEY`.
 
 ## Configuration
 

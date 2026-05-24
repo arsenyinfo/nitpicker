@@ -247,9 +247,9 @@ Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timesta
 
 ## Changelog
 
-**0.4.1** — 2026-05-24
+**0.5.0** — 2026-05-24
 - Added `auth = "agy-keyring"` for the Gemini provider: reads the Antigravity (`agy`) CLI OAuth token from the system keyring and routes through AG2's CloudCode SSE endpoint. Treat as research only — AG2 ToS Section 6 prohibits third-party OAuth clients and Google has been actively suspending paid accounts for this pattern in 2026. See README warning before using.
-- Removed the legacy `auth = "oauth"` browser flow and the `nitpicker --gemini-oauth` CLI flag. The flow had been broken since the proxy was retargeted at AG2 (the matching AG2 client_secret is not public, so token exchange could not complete) — billed `GEMINI_API_KEY` is the supported path for non-research Gemini use.
+- **Breaking:** removed the legacy `auth = "oauth"` browser flow and the `nitpicker --gemini-oauth` CLI flag. The flow had been broken since the proxy was retargeted at AG2 (the matching AG2 client_secret is not public, so token exchange could not complete). The config validator now rejects `auth = "oauth"` with a migration hint to `agy-keyring` or `GEMINI_API_KEY`.
 
 **0.4.0** — 2026-05-17
 - Alloy mode (`--alloy` / `defaults.alloy = true`): pools all reviewer models into a shared random-selection pool so every debate turn can draw from any configured model (based on [XBOW technique](https://xbow.com/blog/alloy-agents))
