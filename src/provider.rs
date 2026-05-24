@@ -1,11 +1,11 @@
-use crate::config::{AggregatorConfig, ProviderType, ReviewerConfig};
-use crate::gemini_proxy::GeminiProxyClient;
+use crate::config::{AggregatorConfig, Config, ProviderType, ReviewerConfig};
+use crate::gemini_proxy::{GeminiProxyClient, ProxyAuthMode};
 use crate::llm::{LLMClient, LLMClientDyn, LLMProvider, WithRetryExt};
 use eyre::Result;
 use std::sync::Arc;
 
 pub fn needs_gemini_oauth(provider: &ProviderType, auth: Option<&str>) -> bool {
-    provider.is_gemini() && auth == Some("oauth")
+    provider.is_gemini() && ProxyAuthMode::from_config(auth).is_some()
 }
 
 pub fn reviewer_needs_gemini_oauth(reviewer: &ReviewerConfig) -> bool {
@@ -14,6 +14,29 @@ pub fn reviewer_needs_gemini_oauth(reviewer: &ReviewerConfig) -> bool {
 
 pub fn aggregator_needs_gemini_oauth(agg: &AggregatorConfig) -> bool {
     needs_gemini_oauth(&agg.provider, agg.auth.as_deref())
+}
+
+pub fn gemini_proxy_auth_mode(config: &Config) -> Option<ProxyAuthMode> {
+    let reviewer_modes = config
+        .reviewer
+        .iter()
+        .filter(|reviewer| reviewer.provider.is_gemini())
+        .filter_map(|reviewer| ProxyAuthMode::from_config(reviewer.auth.as_deref()));
+    let aggregator_mode = match config.aggregator.provider.is_gemini() {
+        true => ProxyAuthMode::from_config(config.aggregator.auth.as_deref()),
+        false => None,
+    };
+
+    reviewer_modes
+        .chain(aggregator_mode)
+        .fold(None, |acc, mode| {
+            Some(match (acc, mode) {
+                (_, ProxyAuthMode::AgyKeyring) | (Some(ProxyAuthMode::AgyKeyring), _) => {
+                    ProxyAuthMode::AgyKeyring
+                }
+                _ => ProxyAuthMode::OAuthFile,
+            })
+        })
 }
 
 pub fn provider_from_config(

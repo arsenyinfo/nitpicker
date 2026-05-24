@@ -13,8 +13,8 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
 use super::{
-    CODE_ASSIST_BASE_URL,
-    oauth::refresh_access_token,
+    antigravity_platform, code_assist_base_url,
+    oauth::{has_oauth_client_secret, refresh_access_token},
     retry::{RetryState, fetch_with_retry},
     token::{TokenData, TokenStore},
     transform,
@@ -32,6 +32,13 @@ pub struct ProxyState {
 #[derive(Debug, Serialize)]
 struct LoadCodeAssistRequest {
     metadata: ClientMetadata,
+}
+
+#[derive(Debug, Serialize)]
+struct FetchAvailableModelsRequest {
+    project: String,
+    #[serde(rename = "requestId")]
+    request_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,7 +69,7 @@ pub async fn run_proxy_internal(
     state: Arc<ProxyState>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<()> {
-    // Try to initialize project by calling loadCodeAssist
+    // try to initialize project by calling loadCodeAssist
     match get_valid_token(&state).await {
         Ok(token) => {
             if let Err(e) = init_project(&state, &token).await {
@@ -97,13 +104,13 @@ async fn init_project(state: &ProxyState, token: &TokenData) -> Result<()> {
 
     let request = LoadCodeAssistRequest {
         metadata: ClientMetadata {
-            ide_type: "IDE_UNSPECIFIED".to_string(),
-            platform: "PLATFORM_UNSPECIFIED".to_string(),
+            ide_type: "ANTIGRAVITY".to_string(),
+            platform: antigravity_platform(),
             plugin_type: "GEMINI".to_string(),
         },
     };
 
-    let url = format!("{}/v1internal:loadCodeAssist", CODE_ASSIST_BASE_URL);
+    let url = format!("{}/v1internal:loadCodeAssist", code_assist_base_url());
 
     let response = state
         .http_client
@@ -120,11 +127,16 @@ async fn init_project(state: &ProxyState, token: &TokenData) -> Result<()> {
         .header(header::CONTENT_TYPE, "application/json")
         .header(
             header::HeaderName::from_static("x-goog-api-client"),
-            "gl-node/22.17.0",
+            "google-api-go-client/0.5",
         )
         .header(
             header::HeaderName::from_static("client-metadata"),
-            "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
+            // ideType=ANTIGRAVITY identifies as the AG2 native CLI; platform follows
+            // the binary's MACOS/LINUX/WINDOWS convention.
+            &format!(
+                "ideType=ANTIGRAVITY,platform={},pluginType=GEMINI",
+                antigravity_platform()
+            ),
         )
         .json(&request)
         .send()
@@ -135,20 +147,109 @@ async fn init_project(state: &ProxyState, token: &TokenData) -> Result<()> {
         eyre::bail!("loadCodeAssist failed: {}", text);
     }
 
-    let load_response: LoadCodeAssistResponse = response.json().await?;
+    let raw = response.text().await?;
+    let load_response: LoadCodeAssistResponse = serde_json::from_str(&raw)
+        .map_err(|e| eyre::eyre!("Failed to parse loadCodeAssist response: {e}\nbody: {raw}"))?;
 
     if let Some(project) = load_response.cloudaicompanion_project {
         info!("Got managed project: {}", project);
         if let Some(ref tier) = load_response.paid_tier {
             info!("Paid tier: {} ({})", tier.name, tier.id);
         }
+        if let Err(e) = fetch_available_models(state, token, &project).await {
+            error!("Failed to fetch available models: {:#}", e);
+        }
         let mut project_lock = state.project_id.write().await;
         *project_lock = Some(project);
     } else {
-        error!("No cloudaicompanionProject in loadCodeAssist response");
+        error!(
+            "No cloudaicompanionProject in loadCodeAssist response. raw body: {}",
+            raw
+        );
     }
 
     Ok(())
+}
+
+async fn fetch_available_models(
+    state: &ProxyState,
+    token: &TokenData,
+    project: &str,
+) -> Result<()> {
+    let request = FetchAvailableModelsRequest {
+        project: project.to_string(),
+        request_id: uuid::Uuid::new_v4().to_string(),
+    };
+    let url = format!("{}/v1internal:fetchAvailableModels", code_assist_base_url());
+
+    let response = state
+        .http_client
+        .post(&url)
+        .header(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", token.access_token))
+                .map(|mut value| {
+                    value.set_sensitive(true);
+                    value
+                })
+                .map_err(|_| eyre::eyre!("Token contains invalid header characters"))?,
+        )
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json")
+        .header(
+            header::USER_AGENT,
+            super::build_gemini_user_agent("fetchAvailableModels"),
+        )
+        .header(
+            header::HeaderName::from_static("x-goog-api-client"),
+            "google-api-go-client/0.5",
+        )
+        .header(
+            header::HeaderName::from_static("client-metadata"),
+            &format!(
+                "ideType=ANTIGRAVITY,platform={},pluginType=GEMINI",
+                antigravity_platform()
+            ),
+        )
+        .json(&request)
+        .send()
+        .await?;
+
+    let status = response.status();
+    let raw = response.text().await?;
+    if !status.is_success() {
+        eyre::bail!("fetchAvailableModels failed: status={status} body={raw}");
+    }
+
+    let json: serde_json::Value = serde_json::from_str(&raw)?;
+    info!("Available models: {}", summarize_available_models(&json));
+    Ok(())
+}
+
+fn summarize_available_models(json: &serde_json::Value) -> String {
+    let default_agent = json
+        .get("defaultAgentModelId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<none>");
+    let tiered = json
+        .get("tieredModelIds")
+        .map(serde_json::Value::to_string)
+        .unwrap_or_else(|| "<none>".to_string());
+    let mut model_ids = json
+        .get("models")
+        .and_then(serde_json::Value::as_object)
+        .map(|models| models.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    model_ids.sort();
+    let total = model_ids.len();
+    let preview = model_ids
+        .into_iter()
+        .take(30)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "defaultAgentModelId={default_agent}, tieredModelIds={tiered}, models({total})=[{preview}]"
+    )
 }
 
 async fn root_handler() -> impl IntoResponse {
@@ -217,13 +318,13 @@ async fn handle_v1(
 async fn handle_request(
     state: Arc<ProxyState>,
     path: String,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     body: Bytes,
     _version: &str,
 ) -> impl IntoResponse {
     debug!("Received request for path: {}", path);
 
-    // Get or refresh token
+    // get or refresh token
     let token = match get_valid_token(&state).await {
         Ok(token) => token,
         Err(e) => {
@@ -236,7 +337,7 @@ async fn handle_request(
         }
     };
 
-    // Initialize project if not already done
+    // initialize project if not already done
     let project_id = {
         let project_guard = state.project_id.read().await;
         project_guard.clone()
@@ -245,7 +346,7 @@ async fn handle_request(
     let project_id = match project_id {
         Some(p) => p,
         None => {
-            // Try to initialize project
+            // try to initialize project
             if let Err(e) = init_project(&state, &token).await {
                 error!("Failed to initialize project: {}", e);
                 return (
@@ -268,7 +369,7 @@ async fn handle_request(
         }
     };
 
-    // Parse the incoming Gemini request
+    // parse the incoming Gemini request
     let gemini_req: transform::GeminiRequest = match serde_json::from_slice(&body) {
         Ok(req) => req,
         Err(e) => {
@@ -281,18 +382,22 @@ async fn handle_request(
         }
     };
 
-    // Extract model from path
+    // extract model from path
     let model = transform::extract_model_from_path(&path);
     debug!("Using model: {}", model);
 
-    // Transform to Code Assist format
+    // transform to Code Assist format
     let code_assist_req =
         transform::transform_request(gemini_req, model.clone(), Some(project_id.clone()));
 
-    // Build the Code Assist API URL
-    let code_assist_url = format!("{}/v1internal:generateContent", CODE_ASSIST_BASE_URL);
+    // build the Code Assist API URL. agy's real chat traffic uses SSE even for
+    // print mode; the non-streaming endpoint returns 403 for AG2 tokens.
+    let code_assist_url = format!(
+        "{}/v1internal:streamGenerateContent?alt=sse",
+        code_assist_base_url()
+    );
 
-    // Prepare headers
+    // prepare headers
     let mut request_headers = HeaderMap::new();
     let auth_value = match HeaderValue::from_str(&format!("Bearer {}", token.access_token)) {
         Ok(mut v) => {
@@ -311,16 +416,16 @@ async fn handle_request(
     );
     request_headers.insert(
         header::HeaderName::from_static("x-goog-api-client"),
-        HeaderValue::from_static("gl-node/22.17.0"),
+        HeaderValue::from_static("google-api-go-client/0.5"),
     );
-    request_headers.insert(
-        header::HeaderName::from_static("client-metadata"),
-        HeaderValue::from_static(
-            "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
-        ),
+    let client_metadata = format!(
+        "ideType=ANTIGRAVITY,platform={},pluginType=GEMINI",
+        antigravity_platform()
     );
-
-    // Set User-Agent with model to match gemini-cli format
+    if let Ok(v) = HeaderValue::from_str(&client_metadata) {
+        request_headers.insert(header::HeaderName::from_static("client-metadata"), v);
+    }
+    // set User-Agent with model to match gemini-cli format
     let user_agent = super::build_gemini_user_agent(&model);
     request_headers.insert(
         header::USER_AGENT,
@@ -328,19 +433,19 @@ async fn handle_request(
             .unwrap_or_else(|_| HeaderValue::from_static("GeminiCLI/0.0.0 (unknown; unknown)")),
     );
 
-    // Request-scoped identifier for backend tracing
+    // request-scoped identifier for backend tracing
     request_headers.insert(
         header::HeaderName::from_static("x-activity-request-id"),
         HeaderValue::from_str(&super::create_activity_request_id())
             .unwrap_or_else(|_| HeaderValue::from_static("00000000")),
     );
 
-    // Copy accept header from original request if present
-    if let Some(value) = headers.get("accept") {
-        request_headers.insert(header::ACCEPT, value.clone());
-    }
+    request_headers.insert(
+        header::ACCEPT,
+        HeaderValue::from_static("text/event-stream"),
+    );
 
-    // Log the actual request for debugging
+    // log the actual request for debugging
     let request_body = serde_json::to_string(&code_assist_req).unwrap_or_default();
     debug!("Request URL: {}", code_assist_url);
     let mut logged_headers = request_headers.clone();
@@ -352,7 +457,7 @@ async fn handle_request(
 
     debug!("Forwarding request to Code Assist API");
 
-    // Send request to Code Assist API with retry logic
+    // send request to Code Assist API with retry logic
     let request_builder = state
         .http_client
         .post(&code_assist_url)
@@ -370,10 +475,16 @@ async fn handle_request(
     {
         Ok(resp) => resp,
         Err(e) => {
-            error!("Failed to forward request after retries: {}", e);
+            // fail-hard: surface the full eyre/reqwest error chain (TLS, DNS, reset, etc.).
+            error!("Failed to forward request: {:#}", e);
+            let detail = e
+                .chain()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(" -> ");
             return (
                 StatusCode::BAD_GATEWAY,
-                format!("Failed to connect to Code Assist API: {}", e),
+                format!("Failed to connect to Code Assist API: {detail}"),
             )
                 .into_response();
         }
@@ -382,74 +493,82 @@ async fn handle_request(
     let status = response.status();
     let response_headers = response.headers().clone();
 
-    match response.text().await {
-        Ok(body) => {
-            debug!("Received response from Code Assist API: status={}", status);
+    let body = match response.text().await {
+        Ok(b) => b,
+        Err(e) => {
+            error!("Failed to read response body: {:#}", e);
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to read upstream response: {e}"),
+            )
+                .into_response();
+        }
+    };
 
-            // Parse and transform response
-            match serde_json::from_str::<serde_json::Value>(&body) {
-                Ok(json) => {
-                    // Code Assist sometimes returns HTTP 4xx with an internal error code of 5xx,
-                    // which are transient server-side failures. Remap them to 500 so the caller's
-                    // retry logic treats them correctly.
-                    let effective_status = if status.is_client_error() {
-                        let inner_code = json
-                            .get("error")
-                            .and_then(|e| e.get("code"))
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("");
-                        if inner_code.starts_with('5') {
-                            error!(
-                                "Code Assist returned {} with internal code {}, remapping to 500",
-                                status, inner_code
-                            );
-                            StatusCode::INTERNAL_SERVER_ERROR
-                        } else {
-                            status
-                        }
-                    } else {
-                        status
-                    };
+    debug!("Received response from Code Assist API: status={}", status);
 
-                    // Transform response if needed
-                    match transform::transform_response(json) {
-                        Ok(transformed) => {
-                            let mut builder = Response::builder().status(effective_status);
-
-                            // Copy relevant headers
-                            for (key, value) in response_headers.iter() {
-                                if key.as_str().starts_with("content-") || key.as_str() == "x-goog"
-                                {
-                                    builder = builder.header(key.as_str(), value.as_bytes());
-                                }
-                            }
-
-                            match builder.body(Body::from(transformed.to_string())) {
-                                Ok(response) => response.into_response(),
-                                Err(e) => {
-                                    error!("Failed to build response: {}", e);
-                                    (
-                                        StatusCode::INTERNAL_SERVER_ERROR,
-                                        "Failed to build response",
-                                    )
-                                        .into_response()
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to transform response: {}", e);
-                            (status, "Upstream response could not be transformed").into_response()
-                        }
-                    }
-                }
-                Err(_) => (status, "Upstream response was not JSON").into_response(),
+    // fail-hard: on any non-2xx, return upstream status + body verbatim so the
+    // caller sees the exact Google error (code, status, message). No remapping,
+    // no transform.
+    if !status.is_success() {
+        error!(
+            "Code Assist API non-success: status={} body={}",
+            status, body
+        );
+        let mut builder = Response::builder().status(status);
+        for (key, value) in response_headers.iter() {
+            if key.as_str().starts_with("content-") {
+                builder = builder.header(key.as_str(), value.as_bytes());
             }
         }
+        return builder
+            .body(Body::from(body))
+            .map(IntoResponse::into_response)
+            .unwrap_or_else(|e| {
+                error!("Failed to build error pass-through response: {}", e);
+                (StatusCode::BAD_GATEWAY, "proxy build failure").into_response()
+            });
+    }
+
+    let json: serde_json::Value = match transform::transform_stream_response(&body) {
+        Ok(j) => j,
+        Err(stream_err) => match serde_json::from_str(&body) {
+            Ok(j) => j,
+            Err(json_err) => {
+                error!(
+                    "Upstream 2xx body was neither SSE nor JSON: stream={:#} json={} body={}",
+                    stream_err, json_err, body
+                );
+                return (StatusCode::BAD_GATEWAY, body).into_response();
+            }
+        },
+    };
+
+    let transformed = match transform::transform_response(json) {
+        Ok(t) => t,
         Err(e) => {
-            error!("Failed to read response body: {}", e);
-            (StatusCode::BAD_GATEWAY, "Failed to read response").into_response()
+            error!("Failed to transform response: {:#}", e);
+            return (status, format!("transform failed: {e:#}")).into_response();
+        }
+    };
+
+    let mut builder = Response::builder().status(status);
+    for (key, value) in response_headers.iter() {
+        if key.as_str().starts_with("content-") || key.as_str() == "x-goog" {
+            builder = builder.header(key.as_str(), value.as_bytes());
         }
     }
+    builder
+        .body(Body::from(transformed.to_string()))
+        .map(IntoResponse::into_response)
+        .unwrap_or_else(|e| {
+            error!("Failed to build response: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to build response",
+            )
+                .into_response()
+        })
 }
 
 async fn get_valid_token(state: &ProxyState) -> Result<TokenData> {
@@ -472,6 +591,13 @@ async fn get_valid_token(state: &ProxyState) -> Result<TokenData> {
         return Ok(token);
     }
 
+    if state.token_store.refresh_managed_externally() && !has_oauth_client_secret() {
+        eyre::bail!(
+            "{} is expired; run `agy` to refresh it or set GEMINI_OAUTH_CLIENT_SECRET",
+            state.token_store.source_name()
+        );
+    }
+
     let refresh_token = token
         .refresh_token
         .clone()
@@ -488,8 +614,12 @@ async fn get_valid_token(state: &ProxyState) -> Result<TokenData> {
         token_type: refreshed.token_type,
     };
 
-    state.token_store.save(&token)?;
-    info!("Token refreshed successfully");
+    if state.token_store.refresh_managed_externally() {
+        info!("Token refreshed in memory; external token store was not modified");
+    } else {
+        state.token_store.save(&token)?;
+        info!("Token refreshed successfully");
+    }
 
     Ok(token)
 }

@@ -1,5 +1,6 @@
 use crate::gemini_proxy::{
-    oauth::{build_authorization_url, exchange_code_for_token, generate_pkce_challenge},
+    ProxyAuthMode,
+    oauth::{build_authorization_url, exchange_code_for_token, generate_pkce_challenge, has_oauth_client_secret},
     proxy::{ProxyState, run_proxy_internal},
     token::{TokenData, TokenStore},
 };
@@ -28,17 +29,48 @@ pub struct GeminiProxyClient {
 
 impl GeminiProxyClient {
     pub async fn new() -> Result<Self> {
-        let token_store = TokenStore::new()?;
+        Self::new_with_auth(ProxyAuthMode::OAuthFile).await
+    }
 
-        // Check if we need to authenticate
-        if let Ok(Some(token)) = token_store.load() {
-            if token.is_expired() && !token.is_refreshable() {
-                info!("Token expired and not refreshable, triggering authentication...");
+    pub async fn new_with_auth(auth_mode: ProxyAuthMode) -> Result<Self> {
+        let token_store = match auth_mode {
+            ProxyAuthMode::OAuthFile => TokenStore::new()?,
+            ProxyAuthMode::AgyKeyring => TokenStore::new_agy_keyring(),
+        };
+
+        match token_store.load()? {
+            Some(token) => {
+                if token.is_expired()
+                    && token_store.refresh_managed_externally()
+                    && !has_oauth_client_secret()
+                {
+                    eyre::bail!(
+                        "{} is expired; run `agy` to refresh it or set GEMINI_OAUTH_CLIENT_SECRET",
+                        token_store.source_name()
+                    );
+                }
+                if token.is_expired() && !token.is_refreshable() {
+                    if token_store.refresh_managed_externally() {
+                        eyre::bail!(
+                            "{} is expired and has no refresh token; run `agy` to refresh it",
+                            token_store.source_name()
+                        );
+                    } else {
+                        info!("Token expired and not refreshable, triggering authentication...");
+                        authenticate_interactive(&token_store).await?;
+                    }
+                }
+            }
+            None if token_store.refresh_managed_externally() => {
+                eyre::bail!(
+                    "{} not found; run `agy` once to populate the system keyring",
+                    token_store.source_name()
+                );
+            }
+            None => {
+                info!("No token found, triggering authentication...");
                 authenticate_interactive(&token_store).await?;
             }
-        } else {
-            info!("No token found, triggering authentication...");
-            authenticate_interactive(&token_store).await?;
         }
 
         // Bind a listener now so the port is held; pass it to the server task

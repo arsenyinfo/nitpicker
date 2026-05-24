@@ -2,10 +2,7 @@ use crate::agent::{AgentConfig, AgentDepth, AgentProgress, add_spawn_subagent_to
 use crate::config::{Config, ReviewerConfig};
 use crate::llm::{Completion, LLMClientDyn};
 pub use crate::prompts::DebateMode;
-use crate::provider::{
-    aggregator_needs_gemini_oauth, build_aggregator_client, build_reviewer_client,
-    reviewer_needs_gemini_oauth,
-};
+use crate::provider::{build_aggregator_client, build_reviewer_client, gemini_proxy_auth_mode};
 use crate::session::{AggregationRecord, SessionLogger, SessionWriter};
 use crate::tools::{Tool, all_tools};
 use eyre::Result;
@@ -29,12 +26,21 @@ struct ModelLabel {
 
 impl ModelLabel {
     fn plain(model: &str) -> Self {
-        Self { alias: model.to_string(), full: model.to_string() }
+        Self {
+            alias: model.to_string(),
+            full: model.to_string(),
+        }
     }
 
     fn alloy(models: impl Iterator<Item = impl AsRef<str>>) -> Self {
-        let joined = models.map(|m| m.as_ref().to_string()).collect::<Vec<_>>().join(" + ");
-        Self { alias: "alloy".to_string(), full: format!("Alloy ({joined})") }
+        let joined = models
+            .map(|m| m.as_ref().to_string())
+            .collect::<Vec<_>>()
+            .join(" + ");
+        Self {
+            alias: "alloy".to_string(),
+            full: format!("Alloy ({joined})"),
+        }
     }
 }
 
@@ -157,10 +163,10 @@ async fn run_debate_turn(
     {
         Ok(r) => r,
         Err(err) => {
-            warn!(model = request.model, error = %err, "debate agent failed");
+            warn!(model = request.model, error = ?err, "debate agent failed");
             return Ok((
                 DebateVerdict {
-                    text: format!("*Agent failed: {err}*"),
+                    text: format!("*Agent failed: {err:#}*"),
                     agree: false,
                 },
                 0,
@@ -295,13 +301,12 @@ pub async fn run_debate(
     let critic_cfg = &config.reviewer[1];
     let agg_cfg = &config.aggregator;
 
-    let needs_oauth = config.reviewer.iter().any(reviewer_needs_gemini_oauth)
-        || aggregator_needs_gemini_oauth(agg_cfg);
-    let gemini_proxy = if needs_oauth {
-        info!("Starting Gemini proxy for OAuth authentication...");
-        Some(crate::gemini_proxy::GeminiProxyClient::new().await?)
-    } else {
-        None
+    let gemini_proxy = match gemini_proxy_auth_mode(config) {
+        Some(auth_mode) => {
+            info!(?auth_mode, "Starting Gemini proxy");
+            Some(crate::gemini_proxy::GeminiProxyClient::new_with_auth(auth_mode).await?)
+        }
+        None => None,
     };
 
     let actor_client: Arc<dyn LLMClientDyn>;
@@ -320,7 +325,10 @@ pub async fn run_debate(
         actor_client = Arc::clone(&shared);
         critic_client = shared;
         let label = ModelLabel::alloy(config.reviewer.iter().map(|r| r.model.as_str()));
-        actor_label = ModelLabel { alias: label.alias.clone(), full: label.full.clone() };
+        actor_label = ModelLabel {
+            alias: label.alias.clone(),
+            full: label.full.clone(),
+        };
         critic_label = label;
         actor_compact_threshold = config.reviewer_compact_threshold(actor_cfg);
         critic_compact_threshold = config.reviewer_compact_threshold(critic_cfg);
@@ -359,8 +367,14 @@ pub async fn run_debate(
         print_cast_line(actor_role, &actor_label.full);
         print_cast_line(critic_role, &critic_label.full);
     } else {
-        print_cast_line(actor_role, &format!("{} · {}", actor_cfg.name, actor_label.full));
-        print_cast_line(critic_role, &format!("{} · {}", critic_cfg.name, critic_label.full));
+        print_cast_line(
+            actor_role,
+            &format!("{} · {}", actor_cfg.name, actor_label.full),
+        );
+        print_cast_line(
+            critic_role,
+            &format!("{} · {}", critic_cfg.name, critic_label.full),
+        );
     }
     print_cast_line("Meta-review", &agg_cfg.model);
     println!();

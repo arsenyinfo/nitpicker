@@ -118,7 +118,7 @@ Set `[defaults].log_trajectories = true` to save per-agent JSONL traces and a fi
 | `provider` | Auth | Notes |
 |---|---|---|
 | `anthropic` | `ANTHROPIC_API_KEY` env var (or `api_key_env`) | `base_url` optional |
-| `gemini` | `GEMINI_API_KEY` env var, or `auth = "oauth"` | — |
+| `gemini` | `GEMINI_API_KEY` env var, `auth = "oauth"`, or `auth = "agy-keyring"` | `agy-keyring` reuses Antigravity CLI OAuth from the system keyring |
 | `openai` | `OPENAI_API_KEY` env var (or `api_key_env`) | `base_url` optional |
 | `openrouter` | `OPENROUTER_API_KEY` env var (or `api_key_env`) | explicit model names are recommended; `model = "free"` is experimental |
 
@@ -164,7 +164,7 @@ export OPENROUTER_API_KEY="your-key"
 
 A free OpenRouter account is sufficient for the experimental free mode — no credit card required, just rate limits.
 
-### Gemini OAuth
+### Gemini OAuth / Antigravity Keyring
 
 > [!WARNING]
 > Google has stated that using Gemini CLI OAuth with third-party software is a
@@ -173,22 +173,26 @@ A free OpenRouter account is sufficient for the experimental free mode — no cr
 > assume there is real risk and use this at your own discretion.
 > See: https://github.com/google-gemini/gemini-cli/discussions/22970
 
-Gemini can be used via Google Code Assist OAuth (for free or with subscription, limits apply) — no API key needed, just a Google account. This approach mimics the auth of [Gemini CLI](https://geminicli.com/), so no guarantees on reliability.
+Gemini can be used through the local Google Code Assist proxy — no API key needed, just a Google account. The preferred debug path is `auth = "agy-keyring"`, which reads the native Antigravity (`agy`) CLI token from the system keyring (`service=gemini`, `account=antigravity`) and sends requests to the CloudCode streaming endpoint.
+
+Run `agy` once and complete its login before using this mode. On unsupported keyring backends, set `NITPICKER_AGY_TOKEN_COMMAND` to a command that prints the raw `go-keyring-base64:` payload. `NITPICKER_ANTIGRAVITY_PLATFORM` can override the auto-detected platform enum if needed.
+
+AG2 model IDs come from `fetchAvailableModels`; examples currently include `gemini-3.1-pro-low`, `gemini-3-flash-agent`, and `gemini-3.5-flash-low`.
 
 ```toml
 [aggregator]
-model = "gemini-3-flash-preview"
+model = "gemini-3.5-flash-low"
 provider = "gemini"
-auth = "oauth"
+auth = "agy-keyring"
 
 [[reviewer]]
 name = "gemini"
-model = "gemini-3.1-pro-preview"
+model = "gemini-3.1-pro-low"
 provider = "gemini"
-auth = "oauth"
+auth = "agy-keyring"
 ```
 
-Authenticate once before reviewing:
+The older `auth = "oauth"` mode uses nitpicker's own browser OAuth flow and stores the token at `~/.nitpicker/gemini-token.json`. It is experimental for AG2 because the matching installed-app client secret is not known; prefer `agy-keyring` unless you are explicitly testing OAuth client credentials. Authenticate once before reviewing with that mode:
 
 ```bash
 nitpicker --gemini-oauth

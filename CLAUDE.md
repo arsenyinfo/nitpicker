@@ -139,14 +139,17 @@ Tool outputs are intentionally a bit self-describing: `read_file` includes file/
 
 ### Gemini OAuth proxy (`gemini_proxy/`)
 
-When `auth = "oauth"` is set for a Gemini reviewer/aggregator, nitpicker:
+When `auth = "oauth"` or `auth = "agy-keyring"` is set for a Gemini reviewer/aggregator, nitpicker:
 1. Runs a local axum HTTP server on a random port
 2. Translates incoming Gemini API requests to Google Code Assist API format
-3. Attaches a valid OAuth Bearer token (refreshed automatically)
+3. Attaches a valid OAuth Bearer token
+4. Sends chat through `v1internal:streamGenerateContent?alt=sse` and folds SSE chunks back into Gemini-style JSON
 
-The OAuth client credentials in `mod.rs` are Google's public installed-app credentials — intentionally public, same pattern as `gcloud` CLI.
+`auth = "agy-keyring"` is the preferred AG2 path. It reads the native Antigravity CLI token from the system keyring (`service=gemini`, `account=antigravity`), decodes the `go-keyring-base64:` payload, and relies on `agy` to refresh it. On macOS it can fall back to `security find-generic-password -s gemini -a antigravity -w`; `NITPICKER_AGY_TOKEN_COMMAND` can supply the raw keyring payload on unsupported systems. It also calls `fetchAvailableModels`; use returned AG2 model IDs such as `gemini-3.1-pro-low`, `gemini-3-flash-agent`, or `gemini-3.5-flash-low`.
 
-Token stored at `~/.nitpicker/gemini-token.json` with `0o600` permissions.
+`auth = "oauth"` uses nitpicker's own browser OAuth flow. The AG2 client secret is not known, so this path is experimental unless `GEMINI_OAUTH_CLIENT_ID` / `GEMINI_OAUTH_CLIENT_SECRET` are supplied.
+
+The `oauth` token is stored at `~/.nitpicker/gemini-token.json` with `0o600` permissions.
 
 ## Configuration
 

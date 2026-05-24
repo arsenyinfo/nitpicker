@@ -43,3 +43,4 @@ uuid = { version = "1", features = ["v4"] }
 url = "2"
 webbrowser = "1"
 tempfile = "3"
+keyring = "3"

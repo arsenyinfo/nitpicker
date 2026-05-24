@@ -56,6 +56,12 @@ pub struct TokenResponse {
     pub token_type: String,
 }
 
+pub fn has_oauth_client_secret() -> bool {
+    std::env::var("GEMINI_OAUTH_CLIENT_SECRET")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(!super::CLIENT_SECRET.is_empty())
+}
+
 pub async fn exchange_code_for_token(
     code: &str,
     code_verifier: &str,
@@ -69,7 +75,9 @@ pub async fn exchange_code_for_token(
     let client_secret = std::env::var("GEMINI_OAUTH_CLIENT_SECRET")
         .unwrap_or_else(|_| super::CLIENT_SECRET.to_string());
     params.insert("client_id", client_id.as_str());
-    params.insert("client_secret", client_secret.as_str());
+    if !client_secret.is_empty() {
+        params.insert("client_secret", client_secret.as_str());
+    }
     params.insert("code", code);
     params.insert("code_verifier", code_verifier);
     params.insert("grant_type", "authorization_code");
@@ -99,7 +107,9 @@ pub async fn refresh_access_token(refresh_token: &str) -> Result<TokenResponse> 
     let client_secret = std::env::var("GEMINI_OAUTH_CLIENT_SECRET")
         .unwrap_or_else(|_| super::CLIENT_SECRET.to_string());
     params.insert("client_id", client_id.as_str());
-    params.insert("client_secret", client_secret.as_str());
+    if !client_secret.is_empty() {
+        params.insert("client_secret", client_secret.as_str());
+    }
     params.insert("refresh_token", refresh_token);
     params.insert("grant_type", "refresh_token");
 

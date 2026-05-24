@@ -210,9 +210,7 @@ fn is_local_server(base_url: Option<&str>) -> bool {
 }
 
 fn required_env_var_reviewer(reviewer: &ReviewerConfig) -> Option<&str> {
-    if matches!(reviewer.provider, ProviderType::Gemini)
-        && reviewer.auth.as_deref() == Some("oauth")
-    {
+    if matches!(reviewer.provider, ProviderType::Gemini) && is_gemini_proxy_auth(&reviewer.auth) {
         return None;
     }
     if is_local_server(reviewer.base_url.as_deref()) {
@@ -225,7 +223,7 @@ fn required_env_var_reviewer(reviewer: &ReviewerConfig) -> Option<&str> {
 }
 
 fn required_env_var_aggregator(agg: &AggregatorConfig) -> Option<&str> {
-    if matches!(agg.provider, ProviderType::Gemini) && agg.auth.as_deref() == Some("oauth") {
+    if matches!(agg.provider, ProviderType::Gemini) && is_gemini_proxy_auth(&agg.auth) {
         return None;
     }
     if is_local_server(agg.base_url.as_deref()) {
@@ -235,6 +233,10 @@ fn required_env_var_aggregator(agg: &AggregatorConfig) -> Option<&str> {
         return Some(env.as_str());
     }
     default_env_var(&agg.provider)
+}
+
+fn is_gemini_proxy_auth(auth: &Option<String>) -> bool {
+    matches!(auth.as_deref(), Some("oauth" | "agy-keyring"))
 }
 
 fn default_env_var(provider: &ProviderType) -> Option<&'static str> {
