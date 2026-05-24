@@ -175,7 +175,7 @@ A free OpenRouter account is sufficient for the experimental free mode — no cr
 
 Gemini can be used through the local Google Code Assist proxy — no API key needed, just a Google account. The preferred debug path is `auth = "agy-keyring"`, which reads the native Antigravity (`agy`) CLI token from the system keyring (`service=gemini`, `account=antigravity`) and sends requests to the CloudCode streaming endpoint.
 
-Run `agy` once and complete its login before using this mode. On unsupported keyring backends, set `NITPICKER_AGY_TOKEN_COMMAND` to a command that prints the raw `go-keyring-base64:` payload. `NITPICKER_ANTIGRAVITY_PLATFORM` can override the auto-detected platform enum if needed.
+Run `agy` once and complete its login before using this mode. The token is read directly via the `keyring` crate (Secret Service on Linux, Keychain on macOS, Credential Manager on Windows). `NITPICKER_ANTIGRAVITY_PLATFORM` can override the auto-detected platform enum if needed.
 
 AG2 model IDs come from `fetchAvailableModels`; examples currently include `gemini-3.1-pro-low`, `gemini-3-flash-agent`, and `gemini-3.5-flash-low`.
 

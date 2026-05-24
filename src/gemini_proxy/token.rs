@@ -1,9 +1,7 @@
 use chrono::{DateTime, Utc};
-use eyre::Result;
+use eyre::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::process::Command;
-use tracing::debug;
 
 const AGY_KEYRING_SERVICE: &str = "gemini";
 const AGY_KEYRING_ACCOUNT: &str = "antigravity";
@@ -122,98 +120,16 @@ struct AgyKeyringToken {
 }
 
 fn load_agy_keyring_token() -> Result<Option<TokenData>> {
-    if let Some(raw) = load_agy_token_from_command()? {
-        return parse_agy_token_payload(&raw).map(Some);
-    }
+    let entry = keyring::Entry::new(AGY_KEYRING_SERVICE, AGY_KEYRING_ACCOUNT)
+        .wrap_err("failed to initialize Antigravity keyring entry")?;
 
-    if let Some(raw) = load_agy_token_from_keyring() {
-        return parse_agy_token_payload(&raw).map(Some);
-    }
-
-    match load_agy_token_from_platform_command()? {
-        Some(raw) => parse_agy_token_payload(&raw).map(Some),
-        None => Ok(None),
-    }
-}
-
-fn load_agy_token_from_command() -> Result<Option<String>> {
-    let command = match std::env::var("NITPICKER_AGY_TOKEN_COMMAND") {
-        Ok(value) if !value.trim().is_empty() => value,
-        _ => return Ok(None),
+    let raw = match entry.get_password() {
+        Ok(password) => password,
+        Err(keyring::Error::NoEntry) => return Ok(None),
+        Err(err) => return Err(err).wrap_err("failed to read Antigravity keyring token"),
     };
 
-    let output = shell_command(&command).output()?;
-    if !output.status.success() {
-        eyre::bail!("NITPICKER_AGY_TOKEN_COMMAND failed with status {}", output.status);
-    }
-
-    Ok(Some(String::from_utf8(output.stdout)?.trim().to_string()))
-}
-
-fn shell_command(command: &str) -> Command {
-    #[cfg(windows)]
-    {
-        let mut process = Command::new("cmd");
-        process.args(["/C", command]);
-        process
-    }
-
-    #[cfg(not(windows))]
-    {
-        let mut process = Command::new("sh");
-        process.args(["-c", command]);
-        process
-    }
-}
-
-fn load_agy_token_from_keyring() -> Option<String> {
-    let entry = match keyring::Entry::new(AGY_KEYRING_SERVICE, AGY_KEYRING_ACCOUNT) {
-        Ok(entry) => entry,
-        Err(err) => {
-            debug!(error = %err, "failed to initialize Antigravity keyring entry");
-            return None;
-        }
-    };
-
-    match entry.get_password() {
-        Ok(password) => Some(password),
-        Err(err) => {
-            debug!(error = %err, "failed to read Antigravity keyring token");
-            None
-        }
-    }
-}
-
-fn load_agy_token_from_platform_command() -> Result<Option<String>> {
-    #[cfg(target_os = "macos")]
-    {
-        return load_agy_token_from_macos_security();
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        Ok(None)
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn load_agy_token_from_macos_security() -> Result<Option<String>> {
-    let output = Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            AGY_KEYRING_SERVICE,
-            "-a",
-            AGY_KEYRING_ACCOUNT,
-            "-w",
-        ])
-        .output()?;
-
-    if !output.status.success() {
-        return Ok(None);
-    }
-
-    Ok(Some(String::from_utf8(output.stdout)?.trim().to_string()))
+    parse_agy_token_payload(&raw).map(Some)
 }
 
 fn parse_agy_token_payload(raw: &str) -> Result<TokenData> {

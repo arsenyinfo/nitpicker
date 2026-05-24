@@ -145,7 +145,7 @@ When `auth = "oauth"` or `auth = "agy-keyring"` is set for a Gemini reviewer/agg
 3. Attaches a valid OAuth Bearer token
 4. Sends chat through `v1internal:streamGenerateContent?alt=sse` and folds SSE chunks back into Gemini-style JSON
 
-`auth = "agy-keyring"` is the preferred AG2 path. It reads the native Antigravity CLI token from the system keyring (`service=gemini`, `account=antigravity`), decodes the `go-keyring-base64:` payload, and relies on `agy` to refresh it. On macOS it can fall back to `security find-generic-password -s gemini -a antigravity -w`; `NITPICKER_AGY_TOKEN_COMMAND` can supply the raw keyring payload on unsupported systems. It also calls `fetchAvailableModels`; use returned AG2 model IDs such as `gemini-3.1-pro-low`, `gemini-3-flash-agent`, or `gemini-3.5-flash-low`.
+`auth = "agy-keyring"` is the preferred AG2 path. It reads the native Antigravity CLI token from the system keyring (`service=gemini`, `account=antigravity`) via the `keyring` crate (Secret Service on Linux, Keychain on macOS, Credential Manager on Windows), decodes the optional `go-keyring-base64:` payload, and relies on `agy` to refresh it. It also calls `fetchAvailableModels`; use returned AG2 model IDs such as `gemini-3.1-pro-low`, `gemini-3-flash-agent`, or `gemini-3.5-flash-low`.
 
 `auth = "oauth"` uses nitpicker's own browser OAuth flow. The AG2 client secret is not known, so this path is experimental unless `GEMINI_OAUTH_CLIENT_ID` / `GEMINI_OAUTH_CLIENT_SECRET` are supplied.
 
