@@ -118,7 +118,7 @@ Set `[defaults].log_trajectories = true` to save per-agent JSONL traces and a fi
 | `provider` | Auth | Notes |
 |---|---|---|
 | `anthropic` | `ANTHROPIC_API_KEY` env var (or `api_key_env`) | `base_url` optional |
-| `gemini` | `GEMINI_API_KEY` env var, `auth = "oauth"`, or `auth = "agy-keyring"` | `agy-keyring` reuses Antigravity CLI OAuth from the system keyring — research only, [see warning](#gemini-oauth--antigravity-keyring) |
+| `gemini` | `GEMINI_API_KEY` env var, or `auth = "agy-keyring"` | `agy-keyring` reuses the Antigravity CLI OAuth token from the system keyring — research only, [see warning](#antigravity-keyring-research-only) |
 | `openai` | `OPENAI_API_KEY` env var (or `api_key_env`) | `base_url` optional |
 | `openrouter` | `OPENROUTER_API_KEY` env var (or `api_key_env`) | explicit model names are recommended; `model = "free"` is experimental |
 
@@ -164,11 +164,11 @@ export OPENROUTER_API_KEY="your-key"
 
 A free OpenRouter account is sufficient for the experimental free mode — no credit card required, just rate limits.
 
-### Gemini OAuth / Antigravity Keyring
+### Antigravity Keyring (research only)
 
 > [!CAUTION]
 > **Research only — do not use on a Google account you care about.**
-> AG2's [Additional Terms of Service](https://antigravity.google/terms) Section 6 prohibits "using the Service in connection with products not provided by us", which directly covers reusing the `agy` OAuth token from a third-party client like nitpicker. Google has been actively enforcing this in 2026: paid AI Ultra subscribers have received account suspensions, often without warning, for using third-party AG2 OAuth bridges (OpenClaw, OpenCode, Pi Agent). Detection appears aggressive — even light testing has triggered bans. The older `auth = "oauth"` path falls under the same policy posture as the [Gemini CLI OAuth discussion](https://github.com/google-gemini/gemini-cli/discussions/22970).
+> AG2's [Additional Terms of Service](https://antigravity.google/terms) Section 6 prohibits "using the Service in connection with products not provided by us", which directly covers reusing the `agy` OAuth token from a third-party client like nitpicker. Google has been actively enforcing this in 2026: paid AI Ultra subscribers have received account suspensions, often without warning, for using third-party AG2 OAuth bridges (OpenClaw, OpenCode, Pi Agent). Detection appears aggressive — even light testing has triggered bans. The earlier `gemini-cli` OAuth path was discouraged on similar grounds ([discussion](https://github.com/google-gemini/gemini-cli/discussions/22970)).
 > If you want billed Gemini access without this risk, set `GEMINI_API_KEY` and drop the `auth` line.
 
 AG2 is Google's current agentic IDE, succeeding both the older Gemini CLI OAuth path and the earlier AG1 preview. The `gemini-3.x` family ships only through AG2's CloudCode backend, so `auth = "agy-keyring"` exists purely as a research path to compare those models against the rest of the reviewer pool, with full awareness of the ToS posture above.
@@ -190,14 +190,6 @@ provider = "gemini"
 auth = "agy-keyring"
 ```
 
-The older `auth = "oauth"` mode uses nitpicker's own browser OAuth flow and stores the token at `~/.nitpicker/gemini-token.json`. It is experimental for AG2 because the matching installed-app client secret is not known; prefer `agy-keyring` unless you are explicitly testing OAuth client credentials. Authenticate once before reviewing with that mode:
-
-```bash
-nitpicker --gemini-oauth
-```
-
-This opens a browser, completes the OAuth flow, and saves the token to `~/.nitpicker/gemini-token.json`. The token is refreshed automatically on subsequent runs.
-
 ## CLI reference
 
 ```
@@ -217,7 +209,6 @@ nitpicker init [--global] [--free]
 --no-debate        use parallel aggregation instead of actor-critic debate
 --rounds <N>       maximum debate rounds [default: 5]
 --max-turns <N>    maximum tool-use turns per agent or debate turn [default: 100 via config]
---gemini-oauth     run Gemini OAuth authentication flow and exit
 -v, --verbose      show info-level logs (hidden by default)
 ```
 
@@ -257,7 +248,8 @@ Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timesta
 ## Changelog
 
 **0.4.1** — 2026-05-24
-- `auth = "agy-keyring"` for the Gemini provider: reads the Antigravity (`agy`) CLI OAuth token from the system keyring and routes through AG2's CloudCode SSE endpoint. Treat as research only — AG2 ToS Section 6 prohibits third-party OAuth clients and Google has been actively suspending paid accounts for this pattern in 2026. See README warning before using.
+- Added `auth = "agy-keyring"` for the Gemini provider: reads the Antigravity (`agy`) CLI OAuth token from the system keyring and routes through AG2's CloudCode SSE endpoint. Treat as research only — AG2 ToS Section 6 prohibits third-party OAuth clients and Google has been actively suspending paid accounts for this pattern in 2026. See README warning before using.
+- Removed the legacy `auth = "oauth"` browser flow and the `nitpicker --gemini-oauth` CLI flag. The flow had been broken since the proxy was retargeted at AG2 (the matching AG2 client_secret is not public, so token exchange could not complete) — billed `GEMINI_API_KEY` is the supported path for non-research Gemini use.
 
 **0.4.0** — 2026-05-17
 - Alloy mode (`--alloy` / `defaults.alloy = true`): pools all reviewer models into a shared random-selection pool so every debate turn can draw from any configured model (based on [XBOW technique](https://xbow.com/blog/alloy-agents))

@@ -1,36 +1,16 @@
 pub mod client;
-pub mod oauth;
 pub mod proxy;
 pub mod retry;
 pub mod token;
 pub mod transform;
 
-pub use client::{AuthStatus, GeminiProxyClient};
+pub use client::GeminiProxyClient;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProxyAuthMode {
-    OAuthFile,
-    AgyKeyring,
-}
-
-impl ProxyAuthMode {
-    pub fn from_config(auth: Option<&str>) -> Option<Self> {
-        match auth {
-            Some("oauth") => Some(Self::OAuthFile),
-            Some("agy-keyring") => Some(Self::AgyKeyring),
-            _ => None,
-        }
-    }
-}
-
-// google OAuth endpoints for Gemini Code Assist.
 // the AG2 native CLI ships pointing at `daily-cloudcode-pa.googleapis.com` and
 // the stable host appears to reject the AG2 client_id at the edge, so daily
 // is the default. override via `NITPICKER_CODE_ASSIST_HOST=stable` or a URL.
 pub const CODE_ASSIST_BASE_URL_STABLE: &str = "https://cloudcode-pa.googleapis.com";
 pub const CODE_ASSIST_BASE_URL_DAILY: &str = "https://daily-cloudcode-pa.googleapis.com";
-pub const OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
-pub const OAUTH_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 
 /// resolve the Code Assist base URL, honoring `NITPICKER_CODE_ASSIST_HOST`
 /// (accepts `stable`, `daily`, or a full https URL).
@@ -41,23 +21,6 @@ pub fn code_assist_base_url() -> String {
         Some(other) => other.to_string(),
     }
 }
-
-// public OAuth client credentials for the Antigravity native CLI. the matching
-// secret for AG2's current installed-app client is still unknown; `agy-keyring`
-// mode bypasses this by reusing agy's own keyring token.
-pub const CLIENT_ID: &str =
-    "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
-pub const CLIENT_SECRET: &str = "";
-
-// scopes intentionally minimal. the binary additionally references
-// `auth/aicode` / `auth/cclog`, but Google's scope registry rejects them for
-// the loopback OAuth flow ("Unregistered scope(s) in the request"), so we keep
-// only the universally allowed ones.
-pub const SCOPES: &[&str] = &[
-    "https://www.googleapis.com/auth/cloud-platform",
-    "https://www.googleapis.com/auth/userinfo.email",
-    "https://www.googleapis.com/auth/userinfo.profile",
-];
 
 /// antigravity native CLI version (matches `agy changelog`'s topmost entry).
 /// override via `NITPICKER_ANTIGRAVITY_CLI_VERSION`.

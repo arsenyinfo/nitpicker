@@ -2,7 +2,7 @@ use crate::agent::{AgentConfig, AgentDepth, AgentProgress, add_spawn_subagent_to
 use crate::config::{Config, ReviewerConfig};
 use crate::llm::{Completion, FinishReason};
 pub use crate::prompts::TaskMode;
-use crate::provider::{build_aggregator_client, build_reviewer_client, gemini_proxy_auth_mode};
+use crate::provider::{build_aggregator_client, build_reviewer_client, config_needs_gemini_proxy};
 use crate::session::{AggregationRecord, SessionLogger, sanitize_path_component};
 use crate::tools::{all_tools, floor_char_boundary, is_binary_file};
 use eyre::Result;
@@ -47,12 +47,12 @@ pub async fn run_review(
         .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", ""]);
     let done_style = ProgressStyle::with_template("  {prefix:<12} {msg}").unwrap();
 
-    let gemini_proxy = match gemini_proxy_auth_mode(config) {
-        Some(auth_mode) => {
-            info!(?auth_mode, "Starting Gemini proxy");
-            Some(crate::gemini_proxy::GeminiProxyClient::new_with_auth(auth_mode).await?)
+    let gemini_proxy = match config_needs_gemini_proxy(config) {
+        true => {
+            info!("Starting Gemini proxy (agy-keyring)");
+            Some(crate::gemini_proxy::GeminiProxyClient::new().await?)
         }
-        None => None,
+        false => None,
     };
 
     for reviewer in &config.reviewer {

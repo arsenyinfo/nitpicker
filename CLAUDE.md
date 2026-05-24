@@ -137,19 +137,19 @@ Tool outputs are intentionally a bit self-describing: `read_file` includes file/
 - Reviewer and debate-turn traces are stored as per-agent JSONL files
 - Final synthesized output is saved as `aggregation.json`
 
-### Gemini OAuth proxy (`gemini_proxy/`)
+### Gemini AG2 proxy (`gemini_proxy/`)
 
-When `auth = "oauth"` or `auth = "agy-keyring"` is set for a Gemini reviewer/aggregator, nitpicker:
+When `auth = "agy-keyring"` is set for a Gemini reviewer/aggregator, nitpicker:
 1. Runs a local axum HTTP server on a random port
 2. Translates incoming Gemini API requests to Google Code Assist API format
-3. Attaches a valid OAuth Bearer token
+3. Attaches the Antigravity OAuth Bearer token read from the system keyring
 4. Sends chat through `v1internal:streamGenerateContent?alt=sse` and folds SSE chunks back into Gemini-style JSON
 
-`auth = "agy-keyring"` is the AG2 research path. It reads the native Antigravity CLI token from the system keyring (`service=gemini`, `account=antigravity`) via the `keyring` crate (Secret Service on Linux, Keychain on macOS, Credential Manager on Windows), decodes the optional `go-keyring-base64:` payload, and relies on `agy` to refresh it. It also calls `fetchAvailableModels`; tested AG2 model IDs are `gemini-3.1-pro-low` and `gemini-3.5-flash-low` (others like `gemini-3-flash-agent` should work but are untested). This auth path is explicitly disallowed by AG2 ToS Section 6 ("using the Service in connection with products not provided by us") and Google is actively suspending paid accounts for third-party OAuth bridges — keep it framed as research only.
+The token is read via the `keyring` crate (Secret Service on Linux, Keychain on macOS, Credential Manager on Windows) at `service=gemini`, `account=antigravity`, decoding the optional `go-keyring-base64:` wrapper. Refresh is delegated to `agy` — if the token is expired the proxy bails with "run `agy` to refresh it". `fetchAvailableModels` is called on proxy startup to discover available model IDs; tested AG2 models are `gemini-3.1-pro-low` and `gemini-3.5-flash-low` (others like `gemini-3-flash-agent` should work but are untested).
 
-`auth = "oauth"` uses nitpicker's own browser OAuth flow. The AG2 client secret is not known, so this path is experimental unless `GEMINI_OAUTH_CLIENT_ID` / `GEMINI_OAUTH_CLIENT_SECRET` are supplied.
+This auth path is explicitly disallowed by AG2 ToS Section 6 ("using the Service in connection with products not provided by us") and Google is actively suspending paid accounts for third-party OAuth bridges — keep it framed as research only in any user-facing copy.
 
-The `oauth` token is stored at `~/.nitpicker/gemini-token.json` with `0o600` permissions.
+The legacy `auth = "oauth"` (browser PKCE flow with file-backed token storage) was removed in 0.4.1 — the proxy was retargeted at AG2 endpoints whose matching client_secret is not public, so the flow could not complete. The config validator now rejects `auth = "oauth"` with a migration hint to `agy-keyring` or `GEMINI_API_KEY`.
 
 ## Configuration
 

@@ -14,7 +14,6 @@ use tracing::{debug, error, info};
 
 use super::{
     antigravity_platform, code_assist_base_url,
-    oauth::{has_oauth_client_secret, refresh_access_token},
     retry::{RetryState, fetch_with_retry},
     token::{TokenData, TokenStore},
     transform,
@@ -268,17 +267,10 @@ async fn health_handler(State(state): State<Arc<ProxyState>>) -> impl IntoRespon
     match state.token_store.load() {
         Ok(Some(token)) => {
             if token.is_expired() {
-                if token.is_refreshable() {
-                    (
-                        StatusCode::OK,
-                        format!("Token expired but refreshable - {}", project_status),
-                    )
-                } else {
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!("Token expired - login required - {}", project_status),
-                    )
-                }
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Token expired - run `agy` to refresh - {}", project_status),
+                )
             } else {
                 (
                     StatusCode::OK,
@@ -572,53 +564,15 @@ async fn handle_request(
 }
 
 async fn get_valid_token(state: &ProxyState) -> Result<TokenData> {
-    let mut token = state
-        .token_store
-        .load()?
-        .ok_or_else(|| eyre::eyre!("No token found"))?;
-
-    if !token.is_expired() {
-        return Ok(token);
-    }
-
+    // serialize concurrent loads so we don't hammer the keyring on a burst of requests.
     let _guard = state.token_refresh_lock.lock().await;
-    token = state
+    let token = state
         .token_store
         .load()?
-        .ok_or_else(|| eyre::eyre!("No token found"))?;
+        .ok_or_else(|| eyre::eyre!("Antigravity keyring token not found; run `agy` once"))?;
 
-    if !token.is_expired() {
-        return Ok(token);
-    }
-
-    if state.token_store.refresh_managed_externally() && !has_oauth_client_secret() {
-        eyre::bail!(
-            "{} is expired; run `agy` to refresh it or set GEMINI_OAUTH_CLIENT_SECRET",
-            state.token_store.source_name()
-        );
-    }
-
-    let refresh_token = token
-        .refresh_token
-        .clone()
-        .ok_or_else(|| eyre::eyre!("Token expired and no refresh token available"))?;
-    info!("Token expired, refreshing...");
-    let refreshed = refresh_access_token(&refresh_token).await?;
-
-    token = TokenData {
-        access_token: refreshed.access_token,
-        refresh_token: refreshed
-            .refresh_token
-            .or_else(|| token.refresh_token.clone()),
-        expires_at: chrono::Utc::now() + chrono::Duration::seconds(refreshed.expires_in),
-        token_type: refreshed.token_type,
-    };
-
-    if state.token_store.refresh_managed_externally() {
-        info!("Token refreshed in memory; external token store was not modified");
-    } else {
-        state.token_store.save(&token)?;
-        info!("Token refreshed successfully");
+    if token.is_expired() {
+        eyre::bail!("Antigravity keyring token is expired; run `agy` to refresh it");
     }
 
     Ok(token)

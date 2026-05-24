@@ -2,7 +2,7 @@ use crate::agent::{AgentConfig, AgentDepth, AgentProgress, add_spawn_subagent_to
 use crate::config::{Config, ReviewerConfig};
 use crate::llm::{Completion, LLMClientDyn};
 pub use crate::prompts::DebateMode;
-use crate::provider::{build_aggregator_client, build_reviewer_client, gemini_proxy_auth_mode};
+use crate::provider::{build_aggregator_client, build_reviewer_client, config_needs_gemini_proxy};
 use crate::session::{AggregationRecord, SessionLogger, SessionWriter};
 use crate::tools::{Tool, all_tools};
 use eyre::Result;
@@ -301,12 +301,12 @@ pub async fn run_debate(
     let critic_cfg = &config.reviewer[1];
     let agg_cfg = &config.aggregator;
 
-    let gemini_proxy = match gemini_proxy_auth_mode(config) {
-        Some(auth_mode) => {
-            info!(?auth_mode, "Starting Gemini proxy");
-            Some(crate::gemini_proxy::GeminiProxyClient::new_with_auth(auth_mode).await?)
+    let gemini_proxy = match config_needs_gemini_proxy(config) {
+        true => {
+            info!("Starting Gemini proxy (agy-keyring)");
+            Some(crate::gemini_proxy::GeminiProxyClient::new().await?)
         }
-        None => None,
+        false => None,
     };
 
     let actor_client: Arc<dyn LLMClientDyn>;

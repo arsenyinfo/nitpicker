@@ -47,9 +47,6 @@ struct Args {
     )]
     prompt: Option<String>,
 
-    #[arg(long = "gemini-oauth")]
-    gemini_oauth: bool,
-
     /// Analyze existing code instead of reviewing changes
     #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
     analyze: Option<PathBuf>,
@@ -227,24 +224,6 @@ async fn main() -> Result<()> {
             .await;
         }
         None => {}
-    }
-
-    if args.gemini_oauth {
-        println!("Starting Gemini OAuth authentication flow...");
-        let proxy_client = gemini_proxy::GeminiProxyClient::new().await?;
-        match proxy_client.check_auth_status()? {
-            gemini_proxy::AuthStatus::Valid => {
-                println!("✓ Authentication successful! Token is valid.");
-            }
-            gemini_proxy::AuthStatus::ExpiredButRefreshable => {
-                println!("⚠ Token expired but can be refreshed on next use.");
-            }
-            _ => {
-                println!("✗ Authentication failed.");
-                std::process::exit(1);
-            }
-        }
-        return Ok(());
     }
 
     let repo = args.common.repo.canonicalize()?;
@@ -590,11 +569,6 @@ fn print_init_hints(detected: &[detect::Detected]) {
         println!("  add `export GEMINI_API_KEY=$GOOGLE_AI_API_KEY` to your shell profile.");
     }
 
-    if detected.iter().any(|d| d.auth == Some("oauth")) {
-        println!(
-            "\n  Gemini OAuth: run `nitpicker --gemini-oauth` to authenticate if not already done."
-        );
-    }
 }
 
 fn init_config_path(global: bool) -> Result<PathBuf> {
