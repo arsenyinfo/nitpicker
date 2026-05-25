@@ -183,3 +183,108 @@ pub fn transform_response(code_assist_response: Value) -> Result<Value> {
 
     Ok(response)
 }
+
+pub fn transform_stream_response(body: &str) -> Result<Value> {
+    let events = parse_sse_events(body)?;
+    if events.is_empty() {
+        eyre::bail!("upstream SSE response did not contain JSON data events");
+    }
+
+    let mut response = serde_json::Map::new();
+    let mut candidate = serde_json::Map::new();
+    let mut content = serde_json::Map::new();
+    let mut parts = Vec::new();
+
+    for event in events {
+        let Some(event_response) = event.get("response").unwrap_or(&event).as_object() else {
+            continue;
+        };
+
+        for (key, value) in event_response {
+            if key != "candidates" {
+                response.insert(key.clone(), value.clone());
+            }
+        }
+
+        let Some(event_candidate) = event_response
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|candidates| candidates.first())
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+
+        for (key, value) in event_candidate {
+            if key != "content" {
+                candidate.insert(key.clone(), value.clone());
+            }
+        }
+
+        let Some(event_content) = event_candidate.get("content").and_then(Value::as_object) else {
+            continue;
+        };
+
+        for (key, value) in event_content {
+            if key != "parts" {
+                content.insert(key.clone(), value.clone());
+            }
+        }
+
+        if let Some(event_parts) = event_content.get("parts").and_then(Value::as_array) {
+            parts.extend(event_parts.iter().cloned());
+        }
+    }
+
+    if !parts.is_empty() {
+        content.insert("parts".to_string(), Value::Array(parts));
+    }
+    if !content.is_empty() {
+        candidate.insert("content".to_string(), Value::Object(content));
+    }
+    if !candidate.is_empty() {
+        response.insert(
+            "candidates".to_string(),
+            Value::Array(vec![Value::Object(candidate)]),
+        );
+    }
+
+    Ok(Value::Object(response))
+}
+
+fn parse_sse_events(body: &str) -> Result<Vec<Value>> {
+    let mut events = Vec::new();
+    let mut data = String::new();
+
+    for line in body.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            flush_sse_event(&mut events, &mut data)?;
+            continue;
+        }
+
+        let Some(chunk) = line.strip_prefix("data:") else {
+            continue;
+        };
+        if !data.is_empty() {
+            data.push('\n');
+        }
+        data.push_str(chunk.trim_start());
+    }
+
+    flush_sse_event(&mut events, &mut data)?;
+    Ok(events)
+}
+
+fn flush_sse_event(events: &mut Vec<Value>, data: &mut String) -> Result<()> {
+    let trimmed = data.trim();
+    if trimmed.is_empty() {
+        data.clear();
+        return Ok(());
+    }
+    if trimmed != "[DONE]" {
+        events.push(serde_json::from_str(trimmed)?);
+    }
+    data.clear();
+    Ok(())
+}

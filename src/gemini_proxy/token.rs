@@ -1,68 +1,70 @@
 use chrono::{DateTime, Utc};
-use eyre::Result;
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use eyre::{Context, Result};
+use serde::Deserialize;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+const AGY_KEYRING_SERVICE: &str = "gemini";
+const AGY_KEYRING_ACCOUNT: &str = "antigravity";
+
+#[derive(Debug, Clone)]
 pub struct TokenData {
     pub access_token: String,
-    pub refresh_token: Option<String>,
     pub expires_at: DateTime<Utc>,
-    pub token_type: String,
 }
 
 impl TokenData {
     pub fn is_expired(&self) -> bool {
         Utc::now() + chrono::Duration::seconds(60) >= self.expires_at
     }
-
-    pub fn is_refreshable(&self) -> bool {
-        self.refresh_token.is_some()
-    }
 }
 
 #[derive(Clone)]
-pub struct TokenStore {
-    path: PathBuf,
-}
+pub struct TokenStore;
 
 impl TokenStore {
-    pub fn new() -> Result<Self> {
-        let home_dir =
-            dirs::home_dir().ok_or_else(|| eyre::eyre!("Could not find home directory"))?;
-        let app_dir = home_dir.join(".nitpicker");
-        std::fs::create_dir_all(&app_dir)?;
-
-        let path = app_dir.join("gemini-token.json");
-        Ok(Self { path })
+    pub fn new_agy_keyring() -> Self {
+        Self
     }
 
     pub fn load(&self) -> Result<Option<TokenData>> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-
-        let contents = std::fs::read_to_string(&self.path)?;
-        let token: TokenData = serde_json::from_str(&contents)?;
-        Ok(Some(token))
+        load_agy_keyring_token()
     }
+}
 
-    pub fn save(&self, token: &TokenData) -> Result<()> {
-        let contents = serde_json::to_string_pretty(token)?;
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&self.path)?;
-            file.write_all(contents.as_bytes())?;
-        }
-        #[cfg(not(unix))]
-        std::fs::write(&self.path, &contents)?;
-        Ok(())
-    }
+#[derive(Debug, Deserialize)]
+struct AgyKeyringPayload {
+    token: AgyKeyringToken,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgyKeyringToken {
+    access_token: String,
+    expiry: DateTime<Utc>,
+}
+
+fn load_agy_keyring_token() -> Result<Option<TokenData>> {
+    let entry = keyring::Entry::new(AGY_KEYRING_SERVICE, AGY_KEYRING_ACCOUNT)
+        .wrap_err("failed to initialize Antigravity keyring entry")?;
+
+    let raw = match entry.get_password() {
+        Ok(password) => password,
+        Err(keyring::Error::NoEntry) => return Ok(None),
+        Err(err) => return Err(err).wrap_err("failed to read Antigravity keyring token"),
+    };
+
+    parse_agy_token_payload(&raw).map(Some)
+}
+
+fn parse_agy_token_payload(raw: &str) -> Result<TokenData> {
+    let encoded = raw
+        .strip_prefix("go-keyring-base64:")
+        .map(str::as_bytes)
+        .map(|encoded| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded))
+        .transpose()?
+        .unwrap_or_else(|| raw.as_bytes().to_vec());
+    let payload: AgyKeyringPayload = serde_json::from_slice(&encoded)?;
+
+    Ok(TokenData {
+        access_token: payload.token.access_token,
+        expires_at: payload.token.expiry,
+    })
 }

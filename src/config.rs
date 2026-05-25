@@ -98,12 +98,15 @@ impl Config {
                 .map_err(|_| eyre::eyre!("[aggregator]: env var {env} is not set"))?;
         }
 
+        validate_gemini_auth("[aggregator]", &self.aggregator.provider, &self.aggregator.auth)?;
+
         for reviewer in &self.reviewer {
             let reviewer_label = match reviewer.name.is_empty() {
                 true => "reviewer <unnamed>".to_string(),
                 false => format!("reviewer {}", reviewer.name),
             };
             validate_free_model(&reviewer_label, &reviewer.provider, &reviewer.model)?;
+            validate_gemini_auth(&reviewer_label, &reviewer.provider, &reviewer.auth)?;
             if let Some(env) = required_env_var_reviewer(reviewer) {
                 check_env_var(env).map_err(|_| {
                     eyre::eyre!("reviewer {}: env var {env} is not set", reviewer.name)
@@ -192,6 +195,26 @@ fn validate_free_model(label: &str, provider: &ProviderType, model: &str) -> Res
     Ok(())
 }
 
+fn validate_gemini_auth(
+    label: &str,
+    provider: &ProviderType,
+    auth: &Option<String>,
+) -> Result<()> {
+    match (provider, auth.as_deref()) {
+        (ProviderType::Gemini, Some("oauth")) => {
+            eyre::bail!(
+                "{label}: auth = \"oauth\" has been removed — use auth = \"agy-keyring\" (see README) or unset `auth` to use GEMINI_API_KEY"
+            );
+        }
+        (ProviderType::Gemini, Some(other)) if other != "agy-keyring" => {
+            eyre::bail!(
+                "{label}: unknown auth value \"{other}\" — expected \"agy-keyring\" or unset"
+            );
+        }
+        _ => Ok(()),
+    }
+}
+
 fn check_env_var(name: &str) -> Result<(), std::env::VarError> {
     // gemini accepts either GEMINI_API_KEY or GOOGLE_AI_API_KEY
     if name == "GEMINI_API_KEY" {
@@ -210,9 +233,7 @@ fn is_local_server(base_url: Option<&str>) -> bool {
 }
 
 fn required_env_var_reviewer(reviewer: &ReviewerConfig) -> Option<&str> {
-    if matches!(reviewer.provider, ProviderType::Gemini)
-        && reviewer.auth.as_deref() == Some("oauth")
-    {
+    if matches!(reviewer.provider, ProviderType::Gemini) && is_gemini_proxy_auth(&reviewer.auth) {
         return None;
     }
     if is_local_server(reviewer.base_url.as_deref()) {
@@ -225,7 +246,7 @@ fn required_env_var_reviewer(reviewer: &ReviewerConfig) -> Option<&str> {
 }
 
 fn required_env_var_aggregator(agg: &AggregatorConfig) -> Option<&str> {
-    if matches!(agg.provider, ProviderType::Gemini) && agg.auth.as_deref() == Some("oauth") {
+    if matches!(agg.provider, ProviderType::Gemini) && is_gemini_proxy_auth(&agg.auth) {
         return None;
     }
     if is_local_server(agg.base_url.as_deref()) {
@@ -235,6 +256,10 @@ fn required_env_var_aggregator(agg: &AggregatorConfig) -> Option<&str> {
         return Some(env.as_str());
     }
     default_env_var(&agg.provider)
+}
+
+fn is_gemini_proxy_auth(auth: &Option<String>) -> bool {
+    matches!(auth.as_deref(), Some("agy-keyring"))
 }
 
 fn default_env_var(provider: &ProviderType) -> Option<&'static str> {

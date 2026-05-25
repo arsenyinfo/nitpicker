@@ -2,6 +2,8 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+const AGY_KEYRING_AUTH: &str = "agy-keyring";
+
 pub struct Detected {
     pub name: &'static str,
     pub provider: &'static str,
@@ -165,10 +167,10 @@ pub async fn detect_all() -> Vec<Detected> {
         });
     }
 
-    // gemini oauth from opencode or gcloud
+    // agy keyring token (Antigravity CLI) — research-only path, see README warning
     if !detected.iter().any(|d| d.name == "gemini") {
-        if let Some(oauth) = detect_gemini_oauth() {
-            detected.push(oauth);
+        if let Some(d) = detect_agy_keyring() {
+            detected.push(d);
         }
     }
 
@@ -204,39 +206,20 @@ pub async fn detect_all() -> Vec<Detected> {
     detected
 }
 
-fn detect_gemini_oauth() -> Option<Detected> {
-    if let Some(path) = opencode_auth_path() {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(auth) = serde_json::from_str::<HashMap<String, OpencodeEntry>>(&content) {
-                if matches!(auth.get("google"), Some(e) if e.auth_type == "oauth") {
-                    return Some(gemini_oauth_detected("opencode (google oauth)"));
-                }
-            }
-        }
-    }
-
-    if let Some(home) = dirs::home_dir() {
-        if home
-            .join(".config/gcloud/application_default_credentials.json")
-            .exists()
-        {
-            return Some(gemini_oauth_detected("gcloud ADC"));
-        }
-    }
-
-    None
-}
-
-fn gemini_oauth_detected(source: &'static str) -> Detected {
-    Detected {
-        name: "gemini",
-        provider: "gemini",
-        model: "gemini-3-flash-preview".to_string(),
-        base_url: None,
-        api_key_env: None,
-        auth: Some("oauth"),
-        source,
-        local_server: false,
+fn detect_agy_keyring() -> Option<Detected> {
+    let entry = keyring::Entry::new("gemini", "antigravity").ok()?;
+    match entry.get_password() {
+        Ok(_) => Some(Detected {
+            name: "gemini",
+            provider: "gemini",
+            model: "gemini-3.1-pro-low".to_string(),
+            base_url: None,
+            api_key_env: None,
+            auth: Some(AGY_KEYRING_AUTH),
+            source: "antigravity keyring (research only — see README)",
+            local_server: false,
+        }),
+        Err(_) => None,
     }
 }
 

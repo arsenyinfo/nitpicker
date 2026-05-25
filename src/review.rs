@@ -2,11 +2,8 @@ use crate::agent::{AgentConfig, AgentDepth, AgentProgress, add_spawn_subagent_to
 use crate::config::{Config, ReviewerConfig};
 use crate::llm::{Completion, FinishReason};
 pub use crate::prompts::TaskMode;
+use crate::provider::{build_aggregator_client, build_reviewer_client, config_needs_gemini_proxy};
 use crate::session::{AggregationRecord, SessionLogger, sanitize_path_component};
-use crate::provider::{
-    aggregator_needs_gemini_oauth, build_aggregator_client, build_reviewer_client,
-    reviewer_needs_gemini_oauth,
-};
 use crate::tools::{all_tools, floor_char_boundary, is_binary_file};
 use eyre::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -50,14 +47,12 @@ pub async fn run_review(
         .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", ""]);
     let done_style = ProgressStyle::with_template("  {prefix:<12} {msg}").unwrap();
 
-    // Check if we need to start the Gemini proxy for any OAuth-enabled reviewer
-    let gemini_proxy = if config.reviewer.iter().any(reviewer_needs_gemini_oauth)
-        || aggregator_needs_gemini_oauth(&config.aggregator)
-    {
-        info!("Starting Gemini proxy for OAuth authentication...");
-        Some(crate::gemini_proxy::GeminiProxyClient::new().await?)
-    } else {
-        None
+    let gemini_proxy = match config_needs_gemini_proxy(config) {
+        true => {
+            info!("Starting Gemini proxy (agy-keyring)");
+            Some(crate::gemini_proxy::GeminiProxyClient::new().await?)
+        }
+        false => None,
     };
 
     for reviewer in &config.reviewer {
@@ -113,7 +108,9 @@ pub async fn run_review(
                         progress.turns, progress.tool_calls, progress.subagents_spawned
                     ));
                     progress_sub_pb.set_message(
-                        progress.last_subagent.as_deref()
+                        progress
+                            .last_subagent
+                            .as_deref()
                             .map(|s| format!("    ↳ {s}"))
                             .unwrap_or_default(),
                     );
@@ -149,12 +146,12 @@ pub async fn run_review(
                 info!(reviewer = %name, "review completed");
             }
             Ok((name, Err(err))) => {
-                rendered.push(format!("## {name} review\n\n*Failed: {err}*"));
-                info!(reviewer = %name, error = %err, "review failed");
+                rendered.push(format!("## {name} review\n\n*Failed: {err:#}*"));
+                info!(reviewer = %name, error = ?err, "review failed");
             }
             Err(err) => {
-                rendered.push(format!("## reviewer failed\n\n*Failed: {err}*"));
-                info!(error = %err, "reviewer task failed");
+                rendered.push(format!("## reviewer failed\n\n*Failed: {err:#}*"));
+                info!(error = ?err, "reviewer task failed");
             }
         }
     }
