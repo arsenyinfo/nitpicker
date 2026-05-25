@@ -1,6 +1,6 @@
 [package]
 name = "nitpicker"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.85"
 default-run = "nitpicker"
@@ -42,3 +42,6 @@ uuid = { version = "1", features = ["v4"] }
 url = "2"
 tempfile = "3"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

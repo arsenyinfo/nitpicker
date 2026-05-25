@@ -49,6 +49,8 @@ nitpicker pr
 nitpicker pr https://github.com/owner/repo/pull/42
 nitpicker pr --no-comment
 nitpicker pr https://github.com/owner/repo/pull/42 --no-comment
+# force a fresh temp clone even when the URL points to your current repo
+nitpicker pr https://github.com/owner/repo/pull/42 --clone
 ```
 
 ### Ask
@@ -246,6 +248,10 @@ By default, nitpicker prints only the final synthesized result. Use `--verbose` 
 Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timestamp}.md`.
 
 ## Changelog
+
+**0.5.1** — 2026-05-25
+- `pr` checkout safety: skip checkout when already on PR head, new `--clone` flag to force a fresh temp clone, lock now acquired before any git mutation and works correctly on macOS
+- Temp-clone PR review uses partial clone (`--filter=blob:none`) so the diff base is always reachable
 
 **0.5.0** — 2026-05-24
 - Added `auth = "agy-keyring"` for the Gemini provider: reads the Antigravity (`agy`) CLI OAuth token from the system keyring and routes through AG2's CloudCode SSE endpoint. Treat as research only — AG2 ToS Section 6 prohibits third-party OAuth clients and Google has been actively suspending paid accounts for this pattern in 2026. See README warning before using.

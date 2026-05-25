@@ -180,11 +180,13 @@ async fn main() -> Result<()> {
                     &repo,
                     &topic,
                     &config,
-                    rounds,
-                    max_turns,
-                    common.verbose,
-                    debate::DebateMode::Topic,
-                    use_alloy,
+                    debate::DebateOptions {
+                        max_rounds: rounds,
+                        max_turns,
+                        verbose: common.verbose,
+                        mode: debate::DebateMode::Topic,
+                        alloy: use_alloy,
+                    },
                 )
                 .await?;
                 println!("{report}");
@@ -266,11 +268,13 @@ async fn main() -> Result<()> {
             &repo,
             &prompt,
             &config,
-            args.rounds,
-            max_turns,
-            args.common.verbose,
-            debate::DebateMode::Review,
-            use_alloy,
+            debate::DebateOptions {
+                max_rounds: args.rounds,
+                max_turns,
+                verbose: args.common.verbose,
+                mode: debate::DebateMode::Review,
+                alloy: use_alloy,
+            },
         )
         .await?;
         println!("{report}");
