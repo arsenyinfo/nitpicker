@@ -281,16 +281,27 @@ fn build_client(
     build_reviewer_client(reviewer, gemini_proxy)
 }
 
+pub struct DebateOptions {
+    pub max_rounds: usize,
+    pub max_turns: usize,
+    pub verbose: bool,
+    pub mode: DebateMode,
+    pub alloy: bool,
+}
+
 pub async fn run_debate(
     repo: &Path,
     prompt: &str,
     config: &Config,
-    max_rounds: usize,
-    max_turns: usize,
-    verbose: bool,
-    mode: DebateMode,
-    alloy: bool,
+    opts: DebateOptions,
 ) -> Result<(String, std::path::PathBuf)> {
+    let DebateOptions {
+        max_rounds,
+        max_turns,
+        verbose,
+        mode,
+        alloy,
+    } = opts;
     if config.reviewer.len() < 2 {
         eyre::bail!(
             "debate requires at least 2 reviewers in config (actor = reviewer[0], critic = reviewer[1])"

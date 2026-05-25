@@ -58,10 +58,16 @@ impl PrLock {
 fn is_process_running(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        std::path::Path::new("/proc")
-            .join(pid.to_string())
-            .join("stat")
-            .exists()
+        // kill(pid, 0) does no signaling — only validates pid lookup and permissions.
+        // 0 => exists and we can signal it. EPERM => exists but we can't (still running).
+        // ESRCH => no such process. anything else: assume still running (safer than racing).
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        match (rc, std::io::Error::last_os_error().raw_os_error()) {
+            (0, _) => true,
+            (_, Some(e)) if e == libc::EPERM => true,
+            (_, Some(e)) if e == libc::ESRCH => false,
+            _ => true,
+        }
     }
     #[cfg(not(unix))]
     {
@@ -95,13 +101,17 @@ pub struct PrArgs {
     /// Skip posting review as a PR comment
     #[arg(long)]
     pub no_comment: bool,
+    /// Always review in a fresh temp clone, even if the current repo matches the PR's origin
+    #[arg(long)]
+    pub clone: bool,
 }
 
 #[derive(Deserialize)]
 struct PrMeta {
     title: String,
     body: String,
-    commits: Vec<serde_json::Value>,
+    #[serde(rename = "headRefOid")]
+    head_ref_oid: String,
 }
 
 #[derive(Deserialize)]
@@ -127,7 +137,7 @@ pub fn check_gh() -> Result<()> {
 
 fn fetch_pr_meta(url: Option<&str>, repo: &Path) -> Result<PrMeta> {
     let mut cmd = Command::new("gh");
-    cmd.args(["pr", "view", "--json", "title,body,commits"])
+    cmd.args(["pr", "view", "--json", "title,body,headRefOid"])
         .current_dir(repo);
     if let Some(u) = url {
         cmd.arg(u);
@@ -221,6 +231,19 @@ fn get_origin_slug(repo: &Path) -> Option<String> {
     slug_from_remote_url(&String::from_utf8_lossy(&out.stdout))
 }
 
+fn get_head_commit(repo: &Path) -> Result<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .wrap_err("failed to get HEAD commit")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        eyre::bail!("git rev-parse HEAD failed: {}", stderr.trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 fn get_current_branch(repo: &Path) -> Result<String> {
     // symbolic-ref succeeds for attached HEAD, fails for detached
     let out = Command::new("git")
@@ -244,27 +267,61 @@ fn get_current_branch(repo: &Path) -> Result<String> {
 }
 
 fn restore_branch(repo: &Path, branch: &str) {
-    match Command::new("git")
-        .args(["checkout", branch])
+    let result = Command::new("git")
+        .args(["switch", "--", branch])
+        .current_dir(repo)
+        .output();
+    let detail = match result {
+        Ok(out) if out.status.success() => return,
+        Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        Err(e) => e.to_string(),
+    };
+    eprintln!(
+        "warning: could not restore branch '{branch}' in {repo}; run `git switch -- {branch}` to recover ({detail})",
+        repo = repo.display(),
+    );
+}
+
+fn assert_clean_working_tree(repo: &Path) -> Result<()> {
+    let out = Command::new("git")
+        .args(["status", "--porcelain"])
         .current_dir(repo)
         .output()
-    {
-        Ok(out) if out.status.success() => {}
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            eprintln!(
-                "warning: failed to restore branch '{branch}': {}",
-                stderr.trim()
-            );
-        }
-        Err(e) => eprintln!("warning: failed to restore branch '{branch}': {e}"),
+        .wrap_err("failed to run git status")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        eyre::bail!("git status failed: {}", stderr.trim());
     }
+    let porcelain = String::from_utf8_lossy(&out.stdout);
+    if !porcelain.trim().is_empty() {
+        eyre::bail!(
+            "working tree has uncommitted changes; commit or stash before running `nitpicker pr` against a different PR:\n{}",
+            porcelain.trim_end()
+        );
+    }
+    Ok(())
+}
+
+/// Refreshes remote-tracking branches so `detect_base_branch` doesn't operate on stale state.
+fn refresh_remote_branches(repo: &Path) -> Result<()> {
+    let out = Command::new("git")
+        .args(["fetch", "origin", "--prune"])
+        .current_dir(repo)
+        .output()
+        .wrap_err("failed to refresh remote branches")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        eyre::bail!("git fetch origin failed: {}", stderr.trim());
+    }
+    Ok(())
 }
 
 /// Fetches the PR head and checks it out as a local branch `nitpicker/pr-{pr_number}`.
 /// Uses a namespaced name to avoid colliding with or deleting any user-owned branch.
 /// Always fetches so the review is always against the actual PR head, not stale local state.
 fn checkout_pr_branch(repo: &Path, pr_number: u32) -> Result<()> {
+    assert_clean_working_tree(repo)?;
+
     let refspec = format!("refs/pull/{pr_number}/head");
     let out = Command::new("git")
         .args(["fetch", "origin", &refspec])
@@ -280,7 +337,7 @@ fn checkout_pr_branch(repo: &Path, pr_number: u32) -> Result<()> {
     let branch = format!("nitpicker/pr-{pr_number}");
 
     if get_current_branch(repo).ok().as_deref() == Some(branch.as_str()) {
-        // already on our tracking branch — fast-forward only, so uncommitted changes cause a safe failure
+        // already on our tracking branch — fast-forward only
         let out = Command::new("git")
             .args(["merge", "--ff-only", "FETCH_HEAD"])
             .current_dir(repo)
@@ -288,10 +345,7 @@ fn checkout_pr_branch(repo: &Path, pr_number: u32) -> Result<()> {
             .wrap_err("failed to fast-forward PR branch")?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            eyre::bail!(
-                "could not fast-forward to PR head: {}\nMake sure your working tree is clean before reviewing a PR.",
-                stderr.trim()
-            );
+            eyre::bail!("could not fast-forward to PR head: {}", stderr.trim());
         }
         return Ok(());
     }
@@ -303,26 +357,23 @@ fn checkout_pr_branch(repo: &Path, pr_number: u32) -> Result<()> {
         .output();
 
     let out = Command::new("git")
-        .args(["checkout", "-b", &branch, "FETCH_HEAD"])
+        .args(["switch", "-c", &branch, "--no-track", "FETCH_HEAD"])
         .current_dir(repo)
         .output()
         .wrap_err("failed to checkout PR branch")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        eyre::bail!(
-            "git checkout failed: {}\nMake sure your working tree is clean before reviewing a PR.",
-            stderr.trim()
-        );
+        eyre::bail!("git switch failed: {}", stderr.trim());
     }
     Ok(())
 }
 
-fn clone_pr(repo_slug: &str, pr_number: u32, pr_commit_count: usize, dir: &Path) -> Result<()> {
+fn clone_pr(repo_slug: &str, pr_number: u32, dir: &Path) -> Result<()> {
     let clone_url = format!("https://github.com/{repo_slug}.git");
-    // use a generous depth: PR commits + buffer for base branch reachability and merge commits
-    let depth = std::cmp::max(50, pr_commit_count * 2 + 20).to_string();
+    // partial clone: full commit/tree history (so merge-base with the PR is always reachable),
+    // blobs fetched lazily on demand. Avoids the shallow-depth merge-base gap.
     let out = Command::new("git")
-        .args(["clone", "--depth", &depth, &clone_url, "."])
+        .args(["clone", "--filter=blob:none", &clone_url, "."])
         .current_dir(dir)
         .output()
         .wrap_err("failed to run git clone")?;
@@ -377,59 +428,119 @@ fn build_pr_prompt(
     parts.join("\n\n")
 }
 
+enum PrFlow {
+    /// no URL — review current branch against its PR, no checkout needed
+    CurrentBranch,
+    /// URL points to a PR in the user's own repo and `--clone` was not set
+    InPlace { url: String, pr_number: u32 },
+    /// URL points elsewhere, or `--clone` forces a fresh clone
+    TempClone {
+        url: String,
+        slug: String,
+        pr_number: u32,
+    },
+}
+
 pub async fn run_pr(args: PrArgs, config: Config) -> Result<()> {
     check_gh()?;
 
     let verbose = args.common.verbose;
-    let _tmpdir_guard: Option<tempfile::TempDir>;
+    let user_repo = args
+        .common
+        .repo
+        .canonicalize()
+        .wrap_err("failed to canonicalize --repo path")?;
+    let user_has_git = user_repo.join(".git").exists();
 
-    // original_branch is set when we checkout a PR branch in the user's own repo
-    // so we can restore it after the review
-    let original_branch: Option<(PathBuf, String)>;
-
-    let (repo, url_for_gh, meta): (PathBuf, Option<String>, PrMeta) = if let Some(ref u) = args.url
-    {
-        let (repo_slug, pr_number) = parse_pr_url(u)?;
-        let repo_raw = &args.common.repo;
-        let repo = repo_raw.canonicalize()?;
-        let in_place = repo.join(".git").exists()
-            && get_origin_slug(&repo).as_deref() == Some(&repo_slug);
-
-        if in_place {
-            // fetch meta first — a failure here leaves the branch untouched
-            let meta = fetch_pr_meta(Some(u), &repo)?;
-            let branch = get_current_branch(&repo)?;
-            checkout_pr_branch(&repo, pr_number).inspect_err(|_e| {
-                restore_branch(&repo, &branch);
-            })?;
-            original_branch = Some((repo.clone(), branch));
-            _tmpdir_guard = None;
-            (repo, Some(u.clone()), meta)
-        } else {
-            // different repo — clone into a temp dir
-            let cwd = std::env::current_dir().wrap_err("failed to get current directory")?;
-            let meta = fetch_pr_meta(Some(u), &cwd)?;
-            let pr_commit_count = meta.commits.len();
-            let tmpdir = tempfile::TempDir::new().wrap_err("failed to create temp dir")?;
-            let path = tmpdir.path().to_path_buf();
-            clone_pr(&repo_slug, pr_number, pr_commit_count, &path)?;
-            _tmpdir_guard = Some(tmpdir);
-            original_branch = None;
-            (path, Some(u.clone()), meta)
+    let flow = match args.url.as_deref() {
+        None => {
+            if !user_has_git {
+                eyre::bail!("--repo must point to a git repository (missing .git)");
+            }
+            PrFlow::CurrentBranch
         }
-    } else {
-        _tmpdir_guard = None;
-        original_branch = None;
-        let repo_raw = &args.common.repo;
-        if !repo_raw.join(".git").exists() {
-            eyre::bail!("--repo must point to a git repository (missing .git)");
+        Some(u) => {
+            let (slug, pr_number) = parse_pr_url(u)?;
+            let in_place = !args.clone
+                && user_has_git
+                && get_origin_slug(&user_repo).as_deref() == Some(&slug);
+            match in_place {
+                true => PrFlow::InPlace {
+                    url: u.to_string(),
+                    pr_number,
+                },
+                false => PrFlow::TempClone {
+                    url: u.to_string(),
+                    slug,
+                    pr_number,
+                },
+            }
         }
-        let repo = repo_raw.canonicalize()?;
-        let meta = fetch_pr_meta(None, &repo)?;
-        (repo, None, meta)
     };
 
-    let _lock = PrLock::acquire(&repo)?;
+    // Acquire the lock BEFORE any git mutation when we'll touch the user's working tree.
+    // Temp clones use a fresh, unique temp dir per process, so concurrent runs don't conflict.
+    let _lock = match &flow {
+        PrFlow::InPlace { .. } | PrFlow::CurrentBranch => Some(PrLock::acquire(&user_repo)?),
+        PrFlow::TempClone { .. } => None,
+    };
+
+    let _tmpdir_guard: Option<tempfile::TempDir>;
+    // set when we switch branches in the user's own repo so we can restore on the way out
+    let original_branch: Option<(PathBuf, String)>;
+
+    let (repo, url_for_gh, meta): (PathBuf, Option<String>, PrMeta) = match flow {
+        PrFlow::InPlace { url, pr_number } => {
+            // fetch meta first — a failure here leaves the branch untouched
+            let meta = fetch_pr_meta(Some(&url), &user_repo)?;
+            // refresh remote-tracking branches so the diff is computed against an up-to-date base
+            if let Err(e) = refresh_remote_branches(&user_repo) {
+                eprintln!("warning: {e:#}");
+            }
+            // if HEAD already matches the PR head, skip the fetch+checkout dance
+            let head_matches = get_head_commit(&user_repo)
+                .ok()
+                .is_some_and(|sha| sha == meta.head_ref_oid);
+            match head_matches {
+                true => {
+                    original_branch = None;
+                }
+                false => {
+                    let branch = get_current_branch(&user_repo)?;
+                    checkout_pr_branch(&user_repo, pr_number).inspect_err(|_e| {
+                        restore_branch(&user_repo, &branch);
+                    })?;
+                    original_branch = Some((user_repo.clone(), branch));
+                }
+            }
+            _tmpdir_guard = None;
+            (user_repo, Some(url), meta)
+        }
+        PrFlow::TempClone {
+            url,
+            slug,
+            pr_number,
+        } => {
+            let cwd = std::env::current_dir().wrap_err("failed to get current directory")?;
+            let meta = fetch_pr_meta(Some(&url), &cwd)?;
+            let tmpdir = tempfile::TempDir::new().wrap_err("failed to create temp dir")?;
+            let path = tmpdir.path().to_path_buf();
+            clone_pr(&slug, pr_number, &path)?;
+            _tmpdir_guard = Some(tmpdir);
+            original_branch = None;
+            (path, Some(url), meta)
+        }
+        PrFlow::CurrentBranch => {
+            let meta = fetch_pr_meta(None, &user_repo)?;
+            // refresh remote-tracking branches so the diff is computed against an up-to-date base
+            if let Err(e) = refresh_remote_branches(&user_repo) {
+                eprintln!("warning: {e:#}");
+            }
+            _tmpdir_guard = None;
+            original_branch = None;
+            (user_repo, None, meta)
+        }
+    };
 
     let comments = fetch_pr_comments(url_for_gh.as_deref(), &repo)?;
 
@@ -477,11 +588,13 @@ async fn run_review_inner(
             repo,
             &full_prompt,
             config,
-            args.rounds,
-            max_turns,
-            verbose,
-            DebateMode::Review,
-            use_alloy,
+            debate::DebateOptions {
+                max_rounds: args.rounds,
+                max_turns,
+                verbose,
+                mode: DebateMode::Review,
+                alloy: use_alloy,
+            },
         )
         .await?
     } else {

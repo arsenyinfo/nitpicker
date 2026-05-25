@@ -145,20 +145,20 @@ async fn run_compaction(
             trigger_usage: usage,
         }),
         None => {
-            let correction_mode = correction_mode(&input);
-            run_corrections(
-                client,
-                model,
-                system_prompt,
-                &input,
-                usage,
+            let attempt = InitialAttempt {
                 prompt,
                 response,
-                correction_mode,
-            )
-            .await
+                correction_mode: correction_mode(&input),
+            };
+            run_corrections(client, model, system_prompt, &input, usage, attempt).await
         }
     }
+}
+
+struct InitialAttempt {
+    prompt: String,
+    response: CompletionResponse,
+    correction_mode: CorrectionMode,
 }
 
 async fn run_corrections(
@@ -167,10 +167,13 @@ async fn run_corrections(
     system_prompt: &str,
     input: &CompactionInput<'_>,
     trigger_usage: TokenUsage,
-    original_prompt: String,
-    initial_response: CompletionResponse,
-    correction_mode: CorrectionMode,
+    attempt: InitialAttempt,
 ) -> Result<CompactionOutcome> {
+    let InitialAttempt {
+        prompt: original_prompt,
+        response: initial_response,
+        correction_mode,
+    } = attempt;
     let correction = correction_prompt(&correction_mode);
     let mut history = correction_history(input, original_prompt, initial_response.message());
     let mut previous = initial_response;

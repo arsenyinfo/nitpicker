@@ -98,12 +98,12 @@ gemini_proxy/   local HTTP proxy that translates Gemini API calls to Google Code
 ### PR flow (`pr.rs`)
 
 1. `check_gh()` verifies the `gh` CLI is available
-2. If a URL is provided: `parse_pr_url` extracts repo slug and PR number → `clone_pr` clones into a `tempfile::TempDir` at a shallow depth and checks out the PR branch with `gh pr checkout`
-3. `fetch_pr_meta` retrieves title, body, and commit list via `gh pr view --json`
-4. `build_pr_prompt` assembles the review prompt from PR title + body + diff context + optional `--prompt`
-5. Review runs via `debate::run_debate` by default, or `review::run_review` with `--no-debate`
-6. Unless `--no-comment`, result is posted back via `gh pr comment`
-7. `TempDir` drops at the end, cleaning up the clone
+2. `PrFlow` enum picks the path: `CurrentBranch` (no URL), `InPlace` (URL + origin matches + no `--clone`), or `TempClone`. `PrLock` is acquired BEFORE any git mutation for the first two; `TempClone` is lock-free (unique temp dir per process). Liveness uses `libc::kill(pid, 0)`.
+3. In-place: refresh remote-tracking branches, skip checkout if `HEAD == headRefOid`, otherwise require a clean working tree and `git switch -c` to a namespaced `nitpicker/pr-N` from `FETCH_HEAD`. Restored on exit via `git switch --`.
+4. Temp clone: `git clone --filter=blob:none` (partial clone, so merge-base is reachable) then fetch + switch to the PR head; `TempDir` drops at the end.
+5. `fetch_pr_meta` retrieves title, body, and `headRefOid` via `gh pr view --json`; `fetch_pr_comments` pulls issue-level comments separately.
+6. `build_pr_prompt` assembles the review prompt from PR title + body + PR comments + diff context + optional `--prompt`.
+7. Review runs via `debate::run_debate` by default, or `review::run_review` with `--no-debate`. Unless `--no-comment`, result is posted back via `gh pr comment`.
 
 ### Reflect flow (`reflect.rs`)
 
