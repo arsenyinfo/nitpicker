@@ -24,13 +24,21 @@ impl PrLock {
     fn acquire(repo: &Path) -> Result<Self> {
         let path = lock_path(repo);
 
+        // Treat the lock as stale (and remove it) when:
+        //   - the holding pid is no longer alive, OR
+        //   - the file is unreadable / empty / non-numeric — which happens when a previous
+        //     process was killed between create_new() and writeln!(pid), leaving a 0-byte
+        //     file that would otherwise deadlock all future invocations.
         if path.exists() {
-            if let Ok(contents) = fs::read_to_string(&path) {
-                if let Ok(pid) = contents.trim().parse::<u32>() {
-                    if !is_process_running(pid) {
-                        let _ = fs::remove_file(&path);
-                    }
-                }
+            let stale = match fs::read_to_string(&path) {
+                Ok(contents) => match contents.trim().parse::<u32>() {
+                    Ok(pid) => !is_process_running(pid),
+                    Err(_) => true,
+                },
+                Err(_) => true,
+            };
+            if stale {
+                let _ = fs::remove_file(&path);
             }
         }
 
@@ -303,6 +311,7 @@ fn assert_clean_working_tree(repo: &Path) -> Result<()> {
 }
 
 /// Refreshes remote-tracking branches so `detect_base_branch` doesn't operate on stale state.
+/// Fatal: if origin can't be fetched, the diff base would be stale and the review unreliable.
 fn refresh_remote_branches(repo: &Path) -> Result<()> {
     let out = Command::new("git")
         .args(["fetch", "origin", "--prune"])
@@ -311,7 +320,10 @@ fn refresh_remote_branches(repo: &Path) -> Result<()> {
         .wrap_err("failed to refresh remote branches")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        eyre::bail!("git fetch origin failed: {}", stderr.trim());
+        eyre::bail!(
+            "git fetch origin failed: {}\nReview would run against a stale base branch. Fix the remote or pass `--clone` to review in a fresh temp clone.",
+            stderr.trim()
+        );
     }
     Ok(())
 }
@@ -494,9 +506,7 @@ pub async fn run_pr(args: PrArgs, config: Config) -> Result<()> {
             // fetch meta first — a failure here leaves the branch untouched
             let meta = fetch_pr_meta(Some(&url), &user_repo)?;
             // refresh remote-tracking branches so the diff is computed against an up-to-date base
-            if let Err(e) = refresh_remote_branches(&user_repo) {
-                eprintln!("warning: {e:#}");
-            }
+            refresh_remote_branches(&user_repo)?;
             // if HEAD already matches the PR head, skip the fetch+checkout dance
             let head_matches = get_head_commit(&user_repo)
                 .ok()
@@ -533,9 +543,7 @@ pub async fn run_pr(args: PrArgs, config: Config) -> Result<()> {
         PrFlow::CurrentBranch => {
             let meta = fetch_pr_meta(None, &user_repo)?;
             // refresh remote-tracking branches so the diff is computed against an up-to-date base
-            if let Err(e) = refresh_remote_branches(&user_repo) {
-                eprintln!("warning: {e:#}");
-            }
+            refresh_remote_branches(&user_repo)?;
             _tmpdir_guard = None;
             original_branch = None;
             (user_repo, None, meta)
