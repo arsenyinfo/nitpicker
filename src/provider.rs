@@ -21,6 +21,31 @@ pub fn config_needs_gemini_proxy(config: &Config) -> bool {
         || config.reviewer.iter().any(reviewer_needs_gemini_proxy)
 }
 
+fn is_azure_ad_auth(auth: Option<&str>) -> bool {
+    matches!(auth, Some("azure-ad"))
+}
+
+/// Build a refreshing Azure AD client (feature `azure`). The config validator already rejects
+/// `auth = "azure-ad"` when the feature is absent, so the disabled arm is defensive.
+fn build_azure_ad_client(
+    provider: &ProviderType,
+    base_url: Option<&str>,
+    scope: Option<&str>,
+    credentials: Option<&str>,
+) -> Result<Arc<dyn LLMClientDyn>> {
+    #[cfg(feature = "azure")]
+    {
+        Ok(crate::azure::build_azure_client(provider, base_url, scope, credentials)?
+            .with_retry()
+            .into_arc())
+    }
+    #[cfg(not(feature = "azure"))]
+    {
+        let _ = (provider, base_url, scope, credentials);
+        eyre::bail!("auth = \"azure-ad\" requires building nitpicker with `--features azure`")
+    }
+}
+
 pub fn provider_from_config(
     provider: &ProviderType,
     base_url: Option<&str>,
@@ -53,6 +78,15 @@ pub fn build_reviewer_client(
         return crate::llm::create_gemini_client_with_proxy(&proxy_url);
     }
 
+    if is_azure_ad_auth(reviewer.auth.as_deref()) {
+        return build_azure_ad_client(
+            &reviewer.provider,
+            reviewer.base_url.as_deref(),
+            reviewer.azure_scope.as_deref(),
+            reviewer.azure_credentials.as_deref(),
+        );
+    }
+
     Ok(provider_from_config(
         &reviewer.provider,
         reviewer.base_url.as_deref(),
@@ -72,6 +106,15 @@ pub fn build_aggregator_client(
             .map(|p| p.base_url())
             .ok_or_else(|| eyre::eyre!("Gemini proxy required but not available"))?;
         return crate::llm::create_gemini_client_with_proxy(&proxy_url);
+    }
+
+    if is_azure_ad_auth(agg.auth.as_deref()) {
+        return build_azure_ad_client(
+            &agg.provider,
+            agg.base_url.as_deref(),
+            agg.azure_scope.as_deref(),
+            agg.azure_credentials.as_deref(),
+        );
     }
 
     Ok(provider_from_config(

@@ -1,6 +1,6 @@
 [package]
 name = "nitpicker"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.85"
 default-run = "nitpicker"
@@ -42,6 +42,14 @@ uuid = { version = "1", features = ["v4"] }
 url = "2"
 tempfile = "3"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
+# Azure AD (Entra ID) auth for Foundry-hosted models — opt-in, see `azure` feature below
+azure_identity = { version = "1", optional = true }
+azure_core = { version = "1", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[features]
+# Enables `auth = "azure-ad"` for OpenAI/Anthropic providers (Azure AI Foundry).
+# Off by default: pulls in the Azure SDK (requires Rust 1.88+). Build with `--features azure`.
+azure = ["dep:azure_identity", "dep:azure_core"]

@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
 
 mod agent;
+#[cfg(feature = "azure")]
+mod azure;
 mod compact;
 mod config;
 mod debate;
@@ -433,6 +435,8 @@ fn build_init_config(
         api_key_env: agg.api_key_env.map(str::to_string),
         max_tokens: None,
         auth: agg.auth.map(str::to_string),
+        azure_scope: None,
+        azure_credentials: None,
     };
 
     let reviewer_slots = if debate { 2 } else { 1 };
@@ -504,6 +508,8 @@ fn make_reviewer(d: &detect::Detected, prefer_openrouter_free: bool) -> config::
         api_key_env: d.api_key_env.map(str::to_string),
         compact_threshold: None,
         auth: d.auth.map(str::to_string),
+        azure_scope: None,
+        azure_credentials: None,
     }
 }
 

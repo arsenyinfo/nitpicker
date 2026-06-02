@@ -64,6 +64,7 @@ tools.rs        tool definitions: read_file, glob, grep, git
 pr.rs           GitHub PR subcommand: fetch metadata via gh, review, post comment
 reflect.rs      Reflect subcommand: analyze saved session trajectories and synthesize improvements
 gemini_proxy/   local HTTP proxy that translates Gemini API calls to Google Code Assist
+azure.rs        Azure AD token auth for Foundry-hosted OpenAI/Anthropic (feature `azure`, off by default)
 ```
 
 ### Review flow
@@ -120,6 +121,13 @@ gemini_proxy/   local HTTP proxy that translates Gemini API calls to Google Code
 - `AlloyClient` wraps a vec of `(Arc<dyn LLMClientDyn>, model_name)` slots and picks one at random per call (XBOW Alloy technique)
 - `RetryingLLM<C>` wraps any client with jittered exponential backoff (4 attempts, 250ms–5s). Skips retry on 4xx errors.
 - Always wrap clients with `.with_retry()` — the OAuth Gemini path is no exception
+- `AzureAdClient` (in `azure.rs`, feature `azure`) is a refreshing decorator: it acquires an AAD bearer token via the Azure SDK and rebuilds the inner rig client just before the token expires. Built in `provider.rs` when `auth = "azure-ad"`, then wrapped with `.with_retry()` like every other client. Since 401 is non-retryable, it also force-refreshes once on a 401.
+
+### Azure AD auth (`azure.rs`)
+
+- Gated behind the off-by-default `azure` cargo feature (pulls in `azure_identity`/`azure_core`, requires Rust 1.88+). The whole module compiles out when the feature is off; `provider.rs` and the config validator bail with a `--features azure` hint if `auth = "azure-ad"` is configured without it.
+- For Foundry, `provider = "openai"` (base_url `.../openai/v1`) sends the token via the OpenAI client's Bearer auth; `provider = "anthropic"` (base_url `.../anthropic`) injects `Authorization: Bearer` through rig's `.http_headers()` since that client otherwise hardcodes `x-api-key`.
+- Credential chain selected by `azure_credentials` (`dev`/`prod`/auto, falling back to the `AZURE_TOKEN_CREDENTIALS` env var); scope via `azure_scope` (default `https://cognitiveservices.azure.com/.default`). Each reviewer/aggregator owns its own client and caches the token until ~60s before expiry.
 
 ### Tools (`tools.rs`)
 

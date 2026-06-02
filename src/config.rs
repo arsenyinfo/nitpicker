@@ -41,6 +41,12 @@ pub struct AggregatorConfig {
     pub max_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth: Option<String>,
+    /// AAD scope for `auth = "azure-ad"` (defaults to the Cognitive Services scope).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub azure_scope: Option<String>,
+    /// Azure credential chain selector for `auth = "azure-ad"`: `"dev"`, `"prod"`, or unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub azure_credentials: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -59,6 +65,12 @@ pub struct ReviewerConfig {
     pub compact_threshold: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth: Option<String>,
+    /// AAD scope for `auth = "azure-ad"` (defaults to the Cognitive Services scope).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub azure_scope: Option<String>,
+    /// Azure credential chain selector for `auth = "azure-ad"`: `"dev"`, `"prod"`, or unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub azure_credentials: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -98,7 +110,7 @@ impl Config {
                 .map_err(|_| eyre::eyre!("[aggregator]: env var {env} is not set"))?;
         }
 
-        validate_gemini_auth("[aggregator]", &self.aggregator.provider, &self.aggregator.auth)?;
+        validate_auth("[aggregator]", &self.aggregator.provider, &self.aggregator.auth)?;
 
         for reviewer in &self.reviewer {
             let reviewer_label = match reviewer.name.is_empty() {
@@ -106,7 +118,7 @@ impl Config {
                 false => format!("reviewer {}", reviewer.name),
             };
             validate_free_model(&reviewer_label, &reviewer.provider, &reviewer.model)?;
-            validate_gemini_auth(&reviewer_label, &reviewer.provider, &reviewer.auth)?;
+            validate_auth(&reviewer_label, &reviewer.provider, &reviewer.auth)?;
             if let Some(env) = required_env_var_reviewer(reviewer) {
                 check_env_var(env).map_err(|_| {
                     eyre::eyre!("reviewer {}: env var {env} is not set", reviewer.name)
@@ -195,11 +207,7 @@ fn validate_free_model(label: &str, provider: &ProviderType, model: &str) -> Res
     Ok(())
 }
 
-fn validate_gemini_auth(
-    label: &str,
-    provider: &ProviderType,
-    auth: &Option<String>,
-) -> Result<()> {
+fn validate_auth(label: &str, provider: &ProviderType, auth: &Option<String>) -> Result<()> {
     match (provider, auth.as_deref()) {
         (ProviderType::Gemini, Some("oauth")) => {
             eyre::bail!(
@@ -209,6 +217,22 @@ fn validate_gemini_auth(
         (ProviderType::Gemini, Some(other)) if other != "agy-keyring" => {
             eyre::bail!(
                 "{label}: unknown auth value \"{other}\" — expected \"agy-keyring\" or unset"
+            );
+        }
+        // Azure AD is only meaningful for the OpenAI/Anthropic Foundry passthrough endpoints,
+        // and only works when the `azure` feature was compiled in.
+        (ProviderType::OpenAi | ProviderType::Anthropic, Some("azure-ad")) => {
+            if cfg!(feature = "azure") {
+                Ok(())
+            } else {
+                eyre::bail!(
+                    "{label}: auth = \"azure-ad\" requires building nitpicker with `--features azure`"
+                );
+            }
+        }
+        (_, Some("azure-ad")) => {
+            eyre::bail!(
+                "{label}: auth = \"azure-ad\" is only supported with provider \"openai\" or \"anthropic\""
             );
         }
         _ => Ok(()),
@@ -236,6 +260,9 @@ fn required_env_var_reviewer(reviewer: &ReviewerConfig) -> Option<&str> {
     if matches!(reviewer.provider, ProviderType::Gemini) && is_gemini_proxy_auth(&reviewer.auth) {
         return None;
     }
+    if is_azure_ad_auth(&reviewer.auth) {
+        return None;
+    }
     if is_local_server(reviewer.base_url.as_deref()) {
         return None;
     }
@@ -247,6 +274,9 @@ fn required_env_var_reviewer(reviewer: &ReviewerConfig) -> Option<&str> {
 
 fn required_env_var_aggregator(agg: &AggregatorConfig) -> Option<&str> {
     if matches!(agg.provider, ProviderType::Gemini) && is_gemini_proxy_auth(&agg.auth) {
+        return None;
+    }
+    if is_azure_ad_auth(&agg.auth) {
         return None;
     }
     if is_local_server(agg.base_url.as_deref()) {
@@ -262,11 +292,58 @@ fn is_gemini_proxy_auth(auth: &Option<String>) -> bool {
     matches!(auth.as_deref(), Some("agy-keyring"))
 }
 
+fn is_azure_ad_auth(auth: &Option<String>) -> bool {
+    matches!(auth.as_deref(), Some("azure-ad"))
+}
+
 fn default_env_var(provider: &ProviderType) -> Option<&'static str> {
     match provider {
         ProviderType::Anthropic => Some("ANTHROPIC_API_KEY"),
         ProviderType::Gemini => Some("GEMINI_API_KEY"),
         ProviderType::OpenAi => Some("OPENAI_API_KEY"),
         ProviderType::OpenRouter => Some("OPENROUTER_API_KEY"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn azure_ad_auth_detection() {
+        assert!(is_azure_ad_auth(&Some("azure-ad".to_string())));
+        assert!(!is_azure_ad_auth(&Some("agy-keyring".to_string())));
+        assert!(!is_azure_ad_auth(&None));
+    }
+
+    #[test]
+    fn validate_auth_rejects_azure_ad_on_unsupported_providers() {
+        let auth = Some("azure-ad".to_string());
+        assert!(validate_auth("[t]", &ProviderType::Gemini, &auth).is_err());
+        assert!(validate_auth("[t]", &ProviderType::OpenRouter, &auth).is_err());
+    }
+
+    #[test]
+    fn validate_auth_azure_ad_on_supported_providers() {
+        let auth = Some("azure-ad".to_string());
+        let openai = validate_auth("[t]", &ProviderType::OpenAi, &auth);
+        let anthropic = validate_auth("[t]", &ProviderType::Anthropic, &auth);
+        // Accepted only when compiled with the `azure` feature; otherwise validation fails fast
+        // with a build hint.
+        if cfg!(feature = "azure") {
+            assert!(openai.is_ok());
+            assert!(anthropic.is_ok());
+        } else {
+            assert!(openai.is_err());
+            assert!(anthropic.is_err());
+        }
+    }
+
+    #[test]
+    fn validate_auth_allows_unset_and_known_values() {
+        assert!(validate_auth("[t]", &ProviderType::OpenAi, &None).is_ok());
+        assert!(
+            validate_auth("[t]", &ProviderType::Gemini, &Some("agy-keyring".to_string())).is_ok()
+        );
     }
 }

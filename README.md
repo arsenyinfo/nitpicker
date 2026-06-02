@@ -119,12 +119,14 @@ Set `[defaults].log_trajectories = true` to save per-agent JSONL traces and a fi
 
 | `provider` | Auth | Notes |
 |---|---|---|
-| `anthropic` | `ANTHROPIC_API_KEY` env var (or `api_key_env`) | `base_url` optional |
+| `anthropic` | `ANTHROPIC_API_KEY` env var (or `api_key_env`), or `auth = "azure-ad"` | `base_url` optional |
 | `gemini` | `GEMINI_API_KEY` env var, or `auth = "agy-keyring"` | `agy-keyring` reuses the Antigravity CLI OAuth token from the system keyring — research only, [see warning](#antigravity-keyring-research-only) |
-| `openai` | `OPENAI_API_KEY` env var (or `api_key_env`) | `base_url` optional |
+| `openai` | `OPENAI_API_KEY` env var (or `api_key_env`), or `auth = "azure-ad"` | `base_url` optional |
 | `openrouter` | `OPENROUTER_API_KEY` env var (or `api_key_env`) | explicit model names are recommended; `model = "free"` is experimental |
 
 `anthropic_compatible` and `openai_compatible` are accepted as aliases for backward compatibility.
+
+`auth = "azure-ad"` authenticates with a refreshing Azure AD (Entra ID) token instead of a static key — for OpenAI and Anthropic models hosted on Azure AI Foundry. Requires a build with the `azure` feature, [see below](#azure-ad-azure-ai-foundry).
 
 ### OpenRouter models
 
@@ -192,6 +194,46 @@ provider = "gemini"
 auth = "agy-keyring"
 ```
 
+### Azure AD (Azure AI Foundry)
+
+Call OpenAI and Anthropic models hosted on [Azure AI Foundry](https://ai.azure.com) using a short-lived Azure AD (Entra ID) token instead of a static key. nitpicker acquires the token via the Azure SDK and transparently refreshes it (rebuilding the client before the token expires), so long reviews and debates don't die mid-run — the equivalent of the Python SDK's `azure_ad_token_provider`.
+
+This path requires a build with the `azure` feature (off by default, since it pulls in the Azure SDK and needs Rust 1.88+):
+
+```bash
+cargo build --release --features azure
+# or: cargo install --features azure ...
+```
+
+Set `auth = "azure-ad"` on an `openai` or `anthropic` reviewer/aggregator and point `base_url` at your Foundry endpoint:
+
+```toml
+[[reviewer]]
+name = "gpt"
+provider = "openai"                                                  # OpenAI models → /openai/v1
+base_url = "https://<resource>.services.ai.azure.com/openai/v1"
+model = "gpt-4o"                                                     # your Foundry deployment / model
+auth = "azure-ad"
+
+[[reviewer]]
+name = "claude"
+provider = "anthropic"                                               # Anthropic models → /anthropic
+base_url = "https://<resource>.services.ai.azure.com/anthropic"
+model = "claude-sonnet-4-5"
+auth = "azure-ad"
+azure_credentials = "dev"                                            # optional, see below
+```
+
+Optional per-reviewer/aggregator fields:
+
+- `azure_scope` — AAD token scope. Defaults to `https://cognitiveservices.azure.com/.default`.
+- `azure_credentials` — selects the credential chain, mirroring the Azure SDK's `AZURE_TOKEN_CREDENTIALS`:
+  - `"dev"` — developer tools only (`az login`, Azure Developer CLI). Use on a VM to prioritize `az` over a system-assigned managed identity.
+  - `"prod"` — env service principal (`AZURE_TENANT_ID`/`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET`), then managed identity.
+  - unset / `"auto"` — env service principal → managed identity → developer tools, in that order.
+
+  If unset, the `AZURE_TOKEN_CREDENTIALS` env var is honored as a fallback.
+
 ## CLI reference
 
 ```
@@ -248,6 +290,9 @@ By default, nitpicker prints only the final synthesized result. Use `--verbose` 
 Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timestamp}.md`.
 
 ## Changelog
+
+**0.6.0** — 2026-06-02
+- Added `auth = "azure-ad"` for the `openai` and `anthropic` providers: authenticate to Azure AI Foundry-hosted models with a refreshing Azure AD (Entra ID) bearer token instead of a static key. Token acquisition uses the Azure SDK (`DefaultAzureCredential`-style chain) and is transparently refreshed before expiry. New optional config fields `azure_scope` and `azure_credentials` (the latter mirrors `AZURE_TOKEN_CREDENTIALS`: `dev`/`prod`/auto). Gated behind the off-by-default `azure` cargo feature (build with `--features azure`; requires Rust 1.88+). See [Azure AD section](#azure-ad-azure-ai-foundry).
 
 **0.5.1** — 2026-05-25
 - `pr` checkout safety: skip checkout when already on PR head, new `--clone` flag to force a fresh temp clone, lock now acquired before any git mutation and works correctly on macOS
