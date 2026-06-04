@@ -265,12 +265,18 @@ fn now_unix() -> i64 {
 }
 
 fn is_unauthorized(err: &eyre::Report) -> bool {
-    // The status/`unauthorized` text lives in the wrapped source (rig surfaces the raw response
-    // body as `ProviderError`, and `llm.rs` wraps it with `.wrap_err_with(...)`), so we must walk
-    // the whole chain — `err.to_string()` would only render the top-level context. `{err:#}` is the
-    // alternate Display that joins the full chain.
+    // The status lives in the wrapped source (rig surfaces the raw response body as `ProviderError`,
+    // and `llm.rs` wraps it with `.wrap_err_with(...)`), so we must walk the whole chain —
+    // `err.to_string()` would only render the top-level context. `{err:#}` is the alternate Display
+    // that joins the full chain.
+    //
+    // Key on the numeric 401 only, NOT the bare word "unauthorized": a 403 (e.g. an RBAC/deployment
+    // denial whose body reads "Unauthorized to use this deployment") must not trigger a refresh —
+    // re-minting the same identity's token can't fix a permissions error, it just wastes a token
+    // fetch + a retried completion. Mirrors `is_non_retryable_client_error` in llm.rs, which keys on
+    // " 401". Genuine 401 bodies carry the numeric status (e.g. `{"statusCode": 401, ...}`).
     let msg = format!("{err:#}").to_ascii_lowercase();
-    msg.contains(" 401") || msg.contains("401 ") || msg.contains("unauthorized")
+    msg.contains(" 401") || msg.contains("401 ")
 }
 
 #[cfg(test)]
@@ -297,6 +303,17 @@ mod tests {
     #[test]
     fn is_unauthorized_false_for_unrelated_error() {
         let err = wrapped_provider_error(r#"{"statusCode": 500, "message": "boom"}"#);
+        assert!(!is_unauthorized(&err));
+    }
+
+    #[test]
+    fn is_unauthorized_false_for_403_with_unauthorized_text() {
+        // A 403 (deployment/RBAC denial) whose body literally says "unauthorized" must not be
+        // mistaken for a 401 — refreshing the token can't fix a permissions error, so triggering a
+        // refresh-and-retry would just waste a token fetch before the real 403 propagates.
+        let err = wrapped_provider_error(
+            r#"{"statusCode": 403, "message": "Unauthorized to use this deployment"}"#,
+        );
         assert!(!is_unauthorized(&err));
     }
 }

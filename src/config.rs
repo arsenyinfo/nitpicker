@@ -105,11 +105,9 @@ impl Config {
             &self.aggregator.model,
         )?;
 
-        if let Some(env) = required_env_var_aggregator(&self.aggregator) {
-            check_env_var(env)
-                .map_err(|_| eyre::eyre!("[aggregator]: env var {env} is not set"))?;
-        }
-
+        // Validate `auth` before the env-var check (matching the reviewer loop below): an unknown
+        // auth value like the typo `azure_ad` should surface its own clear error rather than being
+        // masked by a missing-API-key error when the provider key happens to be unset.
         validate_auth(
             "[aggregator]",
             &self.aggregator.provider,
@@ -117,6 +115,11 @@ impl Config {
             self.aggregator.base_url.as_deref(),
             self.aggregator.azure_credentials.as_deref(),
         )?;
+
+        if let Some(env) = required_env_var_aggregator(&self.aggregator) {
+            check_env_var(env)
+                .map_err(|_| eyre::eyre!("[aggregator]: env var {env} is not set"))?;
+        }
 
         for reviewer in &self.reviewer {
             let reviewer_label = match reviewer.name.is_empty() {
