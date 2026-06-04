@@ -279,13 +279,31 @@ fn validate_azure_fields(
             "{label}: auth = \"azure-ad\" requires a non-empty `base_url` (the Azure Foundry endpoint)"
         );
     }
-    if let Some(mode) = azure_credentials {
-        let normalized = mode.trim().to_ascii_lowercase();
-        if !normalized.is_empty() && !matches!(normalized.as_str(), "dev" | "prod" | "auto") {
-            eyre::bail!(
-                "{label}: unknown azure_credentials value \"{mode}\" — expected \"dev\", \"prod\", or unset (\"auto\")"
-            );
+    // Validate whichever credential mode the runtime would actually use. `build_credential_chain`
+    // resolves explicit config first, then the `AZURE_TOKEN_CREDENTIALS` env var — so a bogus env
+    // value (with `azure_credentials` unset) would otherwise pass config validation and only fail
+    // at the first LLM call. Mirror that fallback here so it fails fast too.
+    match azure_credentials {
+        Some(mode) => validate_azure_credentials_mode(label, "azure_credentials", mode)?,
+        None => {
+            if let Ok(env_mode) = std::env::var("AZURE_TOKEN_CREDENTIALS") {
+                validate_azure_credentials_mode(label, "AZURE_TOKEN_CREDENTIALS", &env_mode)?;
+            }
         }
+    }
+    Ok(())
+}
+
+/// Reject an unknown Azure credential-chain selector. Empty/whitespace is allowed: the runtime
+/// (`build_credential_chain`) treats it as unset and falls back to `"auto"`. `source` names where
+/// the value came from so the error points at the right place (the `azure_credentials` config field
+/// vs the `AZURE_TOKEN_CREDENTIALS` env var).
+fn validate_azure_credentials_mode(label: &str, source: &str, mode: &str) -> Result<()> {
+    let normalized = mode.trim().to_ascii_lowercase();
+    if !normalized.is_empty() && !matches!(normalized.as_str(), "dev" | "prod" | "auto") {
+        eyre::bail!(
+            "{label}: unknown {source} value \"{mode}\" — expected \"dev\", \"prod\", or unset (\"auto\")"
+        );
     }
     Ok(())
 }
@@ -425,6 +443,24 @@ mod tests {
         assert!(validate_auth("[t]", &ProviderType::OpenAi, &auth, None, None).is_err());
         assert!(validate_auth("[t]", &ProviderType::OpenAi, &auth, Some(""), None).is_err());
         assert!(validate_auth("[t]", &ProviderType::OpenAi, &auth, Some(FOUNDRY_URL), None).is_ok());
+    }
+
+    #[test]
+    fn validate_azure_credentials_mode_rejects_unknown_only() {
+        // Known modes pass (case/whitespace normalized like the runtime chain builder).
+        assert!(validate_azure_credentials_mode("[t]", "azure_credentials", "dev").is_ok());
+        assert!(validate_azure_credentials_mode("[t]", "azure_credentials", "PROD").is_ok());
+        assert!(validate_azure_credentials_mode("[t]", "azure_credentials", "auto").is_ok());
+        // Empty/whitespace is treated as unset (runtime falls back to "auto"), so it's allowed.
+        assert!(validate_azure_credentials_mode("[t]", "azure_credentials", "").is_ok());
+        assert!(validate_azure_credentials_mode("[t]", "azure_credentials", "   ").is_ok());
+        // A bogus value is rejected, and the message names the source so a config with no
+        // `azure_credentials` field but a bad env var points the user at the env var.
+        let err = validate_azure_credentials_mode("[t]", "AZURE_TOKEN_CREDENTIALS", "bogus")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("AZURE_TOKEN_CREDENTIALS"), "got: {err}");
+        assert!(err.contains("bogus"), "got: {err}");
     }
 
     #[cfg(feature = "azure")]

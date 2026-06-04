@@ -82,11 +82,23 @@ impl AzureAdClient {
         Ok(client)
     }
 
-    /// Acquire a fresh token, rebuild the rig client, and replace the cache. Takes the lock itself,
-    /// so it's used on the 401 fallback path where no lock is already held.
-    async fn refresh(&self) -> Result<Arc<dyn LLMClientDyn>> {
+    /// Refresh after a 401 and replace the cache. Unlike `ensure_client`, this can't gate on
+    /// expiry — the token was rejected *despite* our clock thinking it valid (revoked or lapsed
+    /// early), so re-checking expiry would wrongly conclude "still fresh" and hand back the same
+    /// bad client. Instead it gates on client identity: `stale` is the client that just 401'd, and
+    /// if a concurrent 401 already rebuilt the cached client, this caller reuses that one rather
+    /// than firing a redundant token fetch. The lock is held across `build_fresh`, so a burst of
+    /// concurrent 401s triggers exactly one fetch (the rest short-circuit on the changed pointer).
+    async fn refresh(&self, stale: &Arc<dyn LLMClientDyn>) -> Result<Arc<dyn LLMClientDyn>> {
+        let mut guard = self.cache.lock().await;
+        if let Some(cached) = guard.as_ref() {
+            if !Arc::ptr_eq(&cached.client, stale) {
+                // Another concurrent 401 already refreshed since `stale` was handed out — reuse it.
+                return Ok(Arc::clone(&cached.client));
+            }
+        }
         let (client, cached) = self.build_fresh().await?;
-        *self.cache.lock().await = Some(cached);
+        *guard = Some(cached);
         Ok(client)
     }
 
@@ -112,7 +124,7 @@ impl LLMClient for AzureAdClient {
             // Force a single refresh-and-retry rather than surfacing a 401 (which the outer
             // RetryingLLM treats as non-retryable).
             Err(err) if is_unauthorized(&err) => {
-                let client = self.refresh().await?;
+                let client = self.refresh(&client).await?;
                 client.completion(completion).await
             }
             Err(err) => Err(err),
@@ -137,7 +149,7 @@ pub fn build_azure_client(
             eyre::eyre!("auth = \"azure-ad\" requires `base_url` (the Azure Foundry endpoint)")
         })?
         .to_string();
-    let scope = scope.unwrap_or(DEFAULT_SCOPE).to_string();
+    let scope = resolve_scope(scope);
     let credentials = build_credential_chain(credentials)?;
 
     let rebuild: RebuildFn = match provider {
@@ -188,6 +200,19 @@ pub fn build_azure_client(
         rebuild,
         cache: Mutex::new(None),
     })
+}
+
+/// Resolve the AAD scope, treating an empty/whitespace `azure_scope` as unset so it falls back to
+/// [`DEFAULT_SCOPE`]. A plain `unwrap_or` wouldn't substitute for `Some("")`/`Some("  ")`, so an
+/// empty scope would otherwise reach `get_token` and fail only at the first LLM call. The field has
+/// a documented default, so defaulting an empty value is more useful than rejecting it at config
+/// time (cf. the mandatory `base_url`, which is rejected when empty).
+fn resolve_scope(scope: Option<&str>) -> String {
+    scope
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_SCOPE)
+        .to_string()
 }
 
 /// Build the ordered credential chain for the requested mode. Mirrors the Azure SDK's
@@ -324,5 +349,51 @@ mod tests {
             r#"{"statusCode": 403, "message": "Unauthorized to use this deployment"}"#,
         );
         assert!(!is_unauthorized(&err));
+    }
+
+    #[test]
+    fn resolve_scope_falls_back_on_empty_or_whitespace() {
+        // `azure_scope` is a defaulted field: empty/whitespace means "unset", so fall back to the
+        // documented default rather than letting an empty scope reach `get_token` and fail late.
+        assert_eq!(resolve_scope(None), DEFAULT_SCOPE);
+        assert_eq!(resolve_scope(Some("")), DEFAULT_SCOPE);
+        assert_eq!(resolve_scope(Some("   ")), DEFAULT_SCOPE);
+        let custom = "https://example.com/.default";
+        assert_eq!(resolve_scope(Some(custom)), custom);
+        // surrounding whitespace on a real scope is trimmed off
+        assert_eq!(resolve_scope(Some("  https://example.com/.default  ")), custom);
+    }
+
+    /// A no-op client used only to populate the cache for the refresh-dedup test; its `completion`
+    /// is never invoked on the short-circuit path under test.
+    struct DummyClient;
+    impl LLMClient for DummyClient {
+        async fn completion(&self, _completion: Completion) -> Result<CompletionResponse> {
+            eyre::bail!("dummy client should not be called")
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_reuses_cache_when_another_call_already_refreshed() {
+        // Simulate the concurrent-401 race: the cache already holds a freshly-rebuilt client, and a
+        // slower caller arrives carrying the *stale* client it had 401'd on. Because the cached
+        // client no longer matches `stale`, `refresh` must hand it back without a token fetch — so
+        // `rebuild` (which would do network I/O) must never fire.
+        let cached_client: Arc<dyn LLMClientDyn> = DummyClient.into_arc();
+        let stale_client: Arc<dyn LLMClientDyn> = DummyClient.into_arc();
+        let rebuild: RebuildFn =
+            Box::new(|_: &str| panic!("rebuild must not run when another refresh already won"));
+        let client = AzureAdClient {
+            credentials: Vec::new(),
+            scope: DEFAULT_SCOPE.to_string(),
+            rebuild,
+            cache: Mutex::new(Some(Cached {
+                client: Arc::clone(&cached_client),
+                expires_at_unix: now_unix() + 3600,
+            })),
+        };
+
+        let returned = client.refresh(&stale_client).await.unwrap();
+        assert!(Arc::ptr_eq(&returned, &cached_client));
     }
 }
