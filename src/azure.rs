@@ -55,7 +55,7 @@ impl AzureAdClient {
                         token.expires_on.unix_timestamp(),
                     ));
                 }
-                Err(err) => errors.push(err.to_string()),
+                Err(err) => errors.push(format_error_chain(&err)),
             }
         }
         eyre::bail!(
@@ -143,12 +143,7 @@ pub fn build_azure_client(
     scope: Option<&str>,
     credentials: Option<&str>,
 ) -> Result<AzureAdClient> {
-    let base_url = base_url
-        .filter(|u| !u.is_empty())
-        .ok_or_else(|| {
-            eyre::eyre!("auth = \"azure-ad\" requires `base_url` (the Azure Foundry endpoint)")
-        })?
-        .to_string();
+    let base_url = resolve_base_url(base_url)?;
     let scope = resolve_scope(scope);
     let credentials = build_credential_chain(credentials)?;
 
@@ -202,6 +197,21 @@ pub fn build_azure_client(
     })
 }
 
+/// Resolve and validate the Foundry `base_url`, trimming surrounding whitespace. The config
+/// validator (`validate_azure_fields`) trims before its emptiness check, so a whitespace-padded URL
+/// passes validation; trimming here too keeps the two in step and stops the padded value from
+/// reaching rig's `.base_url()` verbatim (which would build a malformed endpoint). Empty/whitespace
+/// is rejected — unlike `azure_scope`, the endpoint has no default to fall back to.
+fn resolve_base_url(base_url: Option<&str>) -> Result<String> {
+    base_url
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            eyre::eyre!("auth = \"azure-ad\" requires `base_url` (the Azure Foundry endpoint)")
+        })
+}
+
 /// Resolve the AAD scope, treating an empty/whitespace `azure_scope` as unset so it falls back to
 /// [`DEFAULT_SCOPE`]. A plain `unwrap_or` wouldn't substitute for `Some("")`/`Some("  ")`, so an
 /// empty scope would otherwise reach `get_token` and fail only at the first LLM call. The field has
@@ -213,6 +223,22 @@ fn resolve_scope(scope: Option<&str>) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or(DEFAULT_SCOPE)
         .to_string()
+}
+
+/// Render an error together with its `source()` chain. The Azure SDK's error type's `Display` ignores
+/// the alternate (`{:#}`) flag and prints only the top frame — unlike `eyre::Report`, whose `{:#}`
+/// joins the chain — so a plain `to_string()` (or even `{err:#}`) would drop the underlying HTTP
+/// status / AAD error code when a credential fails. Walk `source()` by hand to keep that detail in
+/// the joined "no credential could obtain a token" message.
+fn format_error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
 }
 
 /// Build the ordered credential chain for the requested mode. Mirrors the Azure SDK's
@@ -362,6 +388,49 @@ mod tests {
         assert_eq!(resolve_scope(Some(custom)), custom);
         // surrounding whitespace on a real scope is trimmed off
         assert_eq!(resolve_scope(Some("  https://example.com/.default  ")), custom);
+    }
+
+    #[test]
+    fn resolve_base_url_trims_and_rejects_empty() {
+        // A padded URL passes config validation (which trims too); the runtime must trim it as well
+        // so rig never receives the untrimmed string and builds a malformed endpoint.
+        let url = "https://res.services.ai.azure.com/openai/v1";
+        assert_eq!(resolve_base_url(Some(url)).unwrap(), url);
+        assert_eq!(resolve_base_url(Some("  https://res.services.ai.azure.com/openai/v1  ")).unwrap(), url);
+        // No default for the endpoint — empty/whitespace/unset is a hard error.
+        assert!(resolve_base_url(None).is_err());
+        assert!(resolve_base_url(Some("")).is_err());
+        assert!(resolve_base_url(Some("   ")).is_err());
+    }
+
+    #[test]
+    fn format_error_chain_joins_sources() {
+        // The Azure SDK error's Display prints only the top frame; `format_error_chain` must append
+        // each `source()` so a credential failure's underlying cause survives into the bail message.
+        #[derive(Debug)]
+        struct Inner;
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("az login required")
+            }
+        }
+        impl std::error::Error for Inner {}
+
+        #[derive(Debug)]
+        struct Outer(Inner);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("credential failed")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        assert_eq!(format_error_chain(&Outer(Inner)), "credential failed: az login required");
+        assert_eq!(format_error_chain(&Inner), "az login required");
     }
 
     /// A no-op client used only to populate the cache for the refresh-dedup test; its `completion`

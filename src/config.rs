@@ -399,9 +399,12 @@ mod tests {
     #[test]
     fn validate_auth_azure_ad_on_supported_providers() {
         let auth = Some("azure-ad".to_string());
-        let openai = validate_auth("[t]", &ProviderType::OpenAi, &auth, Some(FOUNDRY_URL), None);
+        // Pass an explicit credential mode so the assertion can't depend on an ambient
+        // `AZURE_TOKEN_CREDENTIALS` (which `None` would make `validate_azure_fields` read).
+        let creds = Some("auto");
+        let openai = validate_auth("[t]", &ProviderType::OpenAi, &auth, Some(FOUNDRY_URL), creds);
         let anthropic =
-            validate_auth("[t]", &ProviderType::Anthropic, &auth, Some(FOUNDRY_URL), None);
+            validate_auth("[t]", &ProviderType::Anthropic, &auth, Some(FOUNDRY_URL), creds);
         // Accepted only when compiled with the `azure` feature; otherwise validation fails fast
         // with a build hint.
         if cfg!(feature = "azure") {
@@ -440,9 +443,15 @@ mod tests {
     #[test]
     fn validate_auth_azure_ad_requires_base_url() {
         let auth = Some("azure-ad".to_string());
+        // The two error cases bail on `base_url` before any credential check, so they're already
+        // env-independent; the ok case passes an explicit mode so it doesn't read the ambient
+        // `AZURE_TOKEN_CREDENTIALS` (which a `None` here would).
         assert!(validate_auth("[t]", &ProviderType::OpenAi, &auth, None, None).is_err());
         assert!(validate_auth("[t]", &ProviderType::OpenAi, &auth, Some(""), None).is_err());
-        assert!(validate_auth("[t]", &ProviderType::OpenAi, &auth, Some(FOUNDRY_URL), None).is_ok());
+        assert!(
+            validate_auth("[t]", &ProviderType::OpenAi, &auth, Some(FOUNDRY_URL), Some("auto"))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -470,7 +479,11 @@ mod tests {
         let ok = |creds| {
             validate_auth("[t]", &ProviderType::OpenAi, &auth, Some(FOUNDRY_URL), creds).is_ok()
         };
-        assert!(ok(None));
+        // Use explicit modes only — `None` would make validation read the ambient
+        // `AZURE_TOKEN_CREDENTIALS`, so a developer/CI with a bogus value set would fail spuriously.
+        // The "unset falls back to auto" behavior is covered hermetically by
+        // `validate_azure_credentials_mode_rejects_unknown_only` (empty string is accepted).
+        assert!(ok(Some("auto")));
         assert!(ok(Some("dev")));
         assert!(ok(Some("PROD"))); // case/whitespace normalized like the runtime chain builder
         assert!(ok(Some("auto")));
