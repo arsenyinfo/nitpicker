@@ -17,7 +17,7 @@ use rig_core::providers::{anthropic, openai};
 use tokio::sync::Mutex;
 
 use crate::config::ProviderType;
-use crate::llm::{Completion, CompletionResponse, LLMClient, LLMClientDyn};
+use crate::llm::{Completion, CompletionResponse, LLMClient, LLMClientDyn, mentions_http_status};
 
 /// Default AAD scope for Azure AI Foundry / Cognitive Services.
 pub const DEFAULT_SCOPE: &str = "https://cognitiveservices.azure.com/.default";
@@ -273,10 +273,11 @@ fn is_unauthorized(err: &eyre::Report) -> bool {
     // Key on the numeric 401 only, NOT the bare word "unauthorized": a 403 (e.g. an RBAC/deployment
     // denial whose body reads "Unauthorized to use this deployment") must not trigger a refresh —
     // re-minting the same identity's token can't fix a permissions error, it just wastes a token
-    // fetch + a retried completion. Mirrors `is_non_retryable_client_error` in llm.rs, which keys on
-    // " 401". Genuine 401 bodies carry the numeric status (e.g. `{"statusCode": 401, ...}`).
-    let msg = format!("{err:#}").to_ascii_lowercase();
-    msg.contains(" 401") || msg.contains("401 ")
+    // fetch + a retried completion. `mentions_http_status` matches the status across the JSON/HTTP
+    // shapings it can take in a raw body (`: 401`, `:401`, `401,`, `"401"`, ...), shared with the
+    // `llm.rs` retry classifiers so the two paths agree on what a 401 looks like.
+    let msg = format!("{err:#}");
+    mentions_http_status(&msg, 401)
 }
 
 #[cfg(test)]
@@ -304,6 +305,14 @@ mod tests {
     fn is_unauthorized_false_for_unrelated_error() {
         let err = wrapped_provider_error(r#"{"statusCode": 500, "message": "boom"}"#);
         assert!(!is_unauthorized(&err));
+    }
+
+    #[test]
+    fn is_unauthorized_detects_compact_json_status() {
+        // A compact 401 body (no space after the colon) must still trigger the refresh-and-retry —
+        // `:401,` slips past a plain `" 401"` substring check.
+        let err = wrapped_provider_error(r#"{"statusCode":401,"message":"token expired"}"#);
+        assert!(is_unauthorized(&err));
     }
 
     #[test]

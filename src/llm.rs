@@ -356,23 +356,44 @@ fn retry_policy(err: &eyre::Report) -> RetryPolicy {
     }
 }
 
+/// True if `status` (an HTTP status code) appears in `msg` as a standalone number — i.e. not part
+/// of a longer digit run. Matches the many JSON/HTTP shapings the status can take in a raw provider
+/// body: `" 401"`, `":401"`, `"401,"`, `"\"401\""`, `"401 Unauthorized"`, etc., but not `"4010"` or
+/// `"x14017"`. Provider errors surface the status only inside the raw response body, whose
+/// punctuation varies (spaced `"statusCode": 401` vs compact `"statusCode":401`), so plain
+/// space-delimited substring checks are too brittle.
+pub(crate) fn mentions_http_status(msg: &str, status: u16) -> bool {
+    let needle = status.to_string();
+    let bytes = msg.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = msg[from..].find(&needle) {
+        let start = from + rel;
+        let end = start + needle.len();
+        let prev_digit = start > 0 && bytes[start - 1].is_ascii_digit();
+        let next_digit = end < bytes.len() && bytes[end].is_ascii_digit();
+        if !prev_digit && !next_digit {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
 fn is_non_retryable_client_error(err: &eyre::Report) -> bool {
     // Walk the whole chain: provider clients map non-2xx to a `ProviderError` carrying the raw
     // response body, then `.wrap_err_with(...)` adds a top-level context. `err.to_string()` renders
     // only that context, so the status code would be invisible; `{err:#}` joins the full chain.
     let msg = format!("{err:#}");
-    msg.contains(" 400")
-        || msg.contains(" 401")
-        || msg.contains(" 402")
-        || msg.contains(" 403")
-        || msg.contains(" 404")
+    [400, 401, 402, 403, 404]
+        .iter()
+        .any(|&status| mentions_http_status(&msg, status))
 }
 
 fn is_rate_limit_error(err: &eyre::Report) -> bool {
     // Same reasoning as `is_non_retryable_client_error`: walk the full chain so a 429 carried in a
     // wrapped `ProviderError` body still maps to the rate-limit backoff policy.
     let msg = format!("{err:#}").to_ascii_lowercase();
-    msg.contains(" 429")
+    mentions_http_status(&msg, 429)
         || msg.contains("rate limit")
         || msg.contains("too many requests")
         || msg.contains("tokens per minute")
@@ -796,5 +817,23 @@ mod tests {
     fn rate_limit_detects_429_in_wrapped_source() {
         let err = wrapped_provider_error(r#"{"statusCode": 429, "message": "Too Many Requests"}"#);
         assert!(is_rate_limit_error(&err));
+    }
+
+    #[test]
+    fn classifiers_detect_compact_json_status() {
+        // Compact bodies (no space after the colon) must still classify — `:401,` / `:429,` would
+        // slip past a plain `" 401"` / `" 429"` substring check.
+        let unauthorized = wrapped_provider_error(r#"{"statusCode":401,"message":"nope"}"#);
+        assert!(is_non_retryable_client_error(&unauthorized));
+        let throttled = wrapped_provider_error(r#"{"statusCode":429,"message":"slow down"}"#);
+        assert!(is_rate_limit_error(&throttled));
+    }
+
+    #[test]
+    fn mentions_http_status_requires_standalone_number() {
+        assert!(mentions_http_status(r#"{"code":401}"#, 401)); // bounded by punctuation
+        assert!(mentions_http_status("got 401 unauthorized", 401)); // bounded by spaces
+        assert!(!mentions_http_status("request id 4017 failed", 401)); // part of a longer run
+        assert!(!mentions_http_status("token count 1401", 401)); // trailing digits
     }
 }
