@@ -228,7 +228,7 @@ Optional per-reviewer/aggregator fields:
 
 - `azure_scope` — AAD token scope. Defaults to `https://cognitiveservices.azure.com/.default`.
 - `azure_credentials` — selects the credential chain, mirroring the Azure SDK's `AZURE_TOKEN_CREDENTIALS`:
-  - `"dev"` — developer tools only (`az login`, Azure Developer CLI). Use on a VM to prioritize `az` over a system-assigned managed identity.
+  - `"dev"` — developer tools only (`az login`, Azure Developer CLI), excluding managed identity. Use on a VM where you want `az login` instead of a system-assigned managed identity.
   - `"prod"` — env service principal (`AZURE_TENANT_ID`/`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET`), then managed identity.
   - unset / `"auto"` — env service principal → managed identity → developer tools, in that order.
 
@@ -293,6 +293,7 @@ Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timesta
 
 **0.6.0** — 2026-06-02
 - Added `auth = "azure-ad"` for the `openai` and `anthropic` providers: authenticate to Azure AI Foundry-hosted models with a refreshing Azure AD (Entra ID) bearer token instead of a static key. Token acquisition uses the Azure SDK (`DefaultAzureCredential`-style chain) and is transparently refreshed before expiry. New optional config fields `azure_scope` and `azure_credentials` (the latter mirrors `AZURE_TOKEN_CREDENTIALS`: `dev`/`prod`/auto). Gated behind the off-by-default `azure` cargo feature (build with `--features azure`; requires Rust 1.88+). See [Azure AD section](#azure-ad-azure-ai-foundry).
+- `auth = "azure-ad"` configs are validated up front: `Config::validate` now requires a non-empty `base_url`, rejects an unknown `azure_credentials`, and surfaces typo'd `auth` values on any non-Gemini provider instead of failing cryptically at the first LLM call. Retry/401 classification was also fixed to inspect the full error chain, so token-expiry 401s actually trigger a refresh-and-retry.
 
 **0.5.1** — 2026-05-25
 - `pr` checkout safety: skip checkout when already on PR head, new `--clone` flag to force a fresh temp clone, lock now acquired before any git mutation and works correctly on macOS

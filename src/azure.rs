@@ -66,25 +66,40 @@ impl AzureAdClient {
     }
 
     /// Return a client backed by a non-expired token, refreshing (and rebuilding) if needed.
+    ///
+    /// Holds the cache mutex across the whole check-then-refresh so concurrent callers (e.g. a
+    /// reviewer's parallel subagents, which share this client) don't each kick off a redundant
+    /// token fetch — double-checked locking, with the lock also serializing the in-flight refresh.
     async fn ensure_client(&self) -> Result<Arc<dyn LLMClientDyn>> {
-        if let Some(cached) = self.cache.lock().await.as_ref() {
+        let mut guard = self.cache.lock().await;
+        if let Some(cached) = guard.as_ref() {
             if cached.expires_at_unix - now_unix() > EXPIRY_SKEW_SECS {
                 return Ok(Arc::clone(&cached.client));
             }
         }
-        self.refresh().await
+        let (client, cached) = self.build_fresh().await?;
+        *guard = Some(cached);
+        Ok(client)
     }
 
-    /// Acquire a fresh token, rebuild the rig client with it, and cache the result.
+    /// Acquire a fresh token, rebuild the rig client, and replace the cache. Takes the lock itself,
+    /// so it's used on the 401 fallback path where no lock is already held.
     async fn refresh(&self) -> Result<Arc<dyn LLMClientDyn>> {
+        let (client, cached) = self.build_fresh().await?;
+        *self.cache.lock().await = Some(cached);
+        Ok(client)
+    }
+
+    /// Fetch a token and rebuild the client, returning the client plus the cache entry to store.
+    /// Does not touch the cache mutex, so the caller controls locking.
+    async fn build_fresh(&self) -> Result<(Arc<dyn LLMClientDyn>, Cached)> {
         let (token, expires_at_unix) = self.fetch_token().await?;
         let client = (self.rebuild)(&token)?;
-        let mut guard = self.cache.lock().await;
-        *guard = Some(Cached {
+        let cached = Cached {
             client: Arc::clone(&client),
             expires_at_unix,
-        });
-        Ok(client)
+        };
+        Ok((client, cached))
     }
 }
 
@@ -143,6 +158,9 @@ pub fn build_azure_client(
             Box::new(move |token: &str| {
                 // The Anthropic rig client hardcodes the `x-api-key` header, so inject the AAD
                 // bearer via custom headers; `build()` preserves it alongside `anthropic-version`.
+                // Foundry's Anthropic gateway authenticates on `Authorization: Bearer`, so pass a
+                // placeholder (not the real token) to `.api_key(...)` to avoid leaking the AAD JWT
+                // into the unused `x-api-key` header.
                 let mut headers = reqwest::header::HeaderMap::new();
                 headers.insert(
                     reqwest::header::AUTHORIZATION,
@@ -151,7 +169,7 @@ pub fn build_azure_client(
                         .wrap_err("invalid Azure bearer token header")?,
                 );
                 let client = anthropic::Client::builder()
-                    .api_key(token)
+                    .api_key("azure-ad")
                     .base_url(&base)
                     .http_headers(headers)
                     .build()
@@ -184,21 +202,21 @@ fn build_credential_chain(mode: Option<&str>) -> Result<Vec<Arc<dyn TokenCredent
 
     let mut chain: Vec<Arc<dyn TokenCredential>> = Vec::new();
     match mode.as_str() {
-        // Developer tools only (Azure CLI → Azure Developer CLI). Use on a VM to prioritize
-        // `az login` over a system-assigned managed identity.
+        // Developer tools only (Azure CLI → Azure Developer CLI), excluding managed identity. Use
+        // on a VM where you want `az login` instead of a system-assigned managed identity.
+        // Construction failures are skipped (then caught by the `is_empty` guard below) rather than
+        // fatal, matching the `auto` branch.
         "dev" => {
-            chain.push(
-                DeveloperToolsCredential::new(None)
-                    .wrap_err("failed to construct Azure developer-tools credential")?,
-            );
+            if let Ok(dev) = DeveloperToolsCredential::new(None) {
+                chain.push(dev);
+            }
         }
         // Production identities only: env service principal, then managed identity.
         "prod" => {
             push_env_service_principal(&mut chain);
-            chain.push(
-                ManagedIdentityCredential::new(None)
-                    .wrap_err("failed to construct Azure managed-identity credential")?,
-            );
+            if let Ok(mi) = ManagedIdentityCredential::new(None) {
+                chain.push(mi);
+            }
         }
         // Default chain: env service principal → managed identity → developer tools. Credentials
         // whose construction fails for this environment are skipped rather than fatal.
@@ -247,8 +265,38 @@ fn now_unix() -> i64 {
 }
 
 fn is_unauthorized(err: &eyre::Report) -> bool {
-    let msg = err.to_string();
-    msg.contains(" 401")
-        || msg.contains("401 ")
-        || msg.to_ascii_lowercase().contains("unauthorized")
+    // The status/`unauthorized` text lives in the wrapped source (rig surfaces the raw response
+    // body as `ProviderError`, and `llm.rs` wraps it with `.wrap_err_with(...)`), so we must walk
+    // the whole chain — `err.to_string()` would only render the top-level context. `{err:#}` is the
+    // alternate Display that joins the full chain.
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    msg.contains(" 401") || msg.contains("401 ") || msg.contains("unauthorized")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mirror how a Foundry 401 reaches `completion`: rig returns the raw body as `ProviderError`,
+    /// wrapped by `llm.rs` via `.wrap_err_with(...)`. The status text is only in the source.
+    fn wrapped_provider_error(body: &str) -> eyre::Report {
+        Err::<(), _>(eyre::eyre!("ProviderError: {body}"))
+            .wrap_err("Anthropic completion failed for model 'claude'")
+            .unwrap_err()
+    }
+
+    #[test]
+    fn is_unauthorized_walks_the_chain() {
+        let err = wrapped_provider_error(r#"{"statusCode": 401, "message": "Unauthorized"}"#);
+        // Top-level Display hides the status; the chain-walk must still catch it.
+        let top_level = err.to_string().to_ascii_lowercase();
+        assert!(!top_level.contains("unauthorized"));
+        assert!(is_unauthorized(&err));
+    }
+
+    #[test]
+    fn is_unauthorized_false_for_unrelated_error() {
+        let err = wrapped_provider_error(r#"{"statusCode": 500, "message": "boom"}"#);
+        assert!(!is_unauthorized(&err));
+    }
 }

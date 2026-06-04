@@ -357,7 +357,10 @@ fn retry_policy(err: &eyre::Report) -> RetryPolicy {
 }
 
 fn is_non_retryable_client_error(err: &eyre::Report) -> bool {
-    let msg = err.to_string();
+    // Walk the whole chain: provider clients map non-2xx to a `ProviderError` carrying the raw
+    // response body, then `.wrap_err_with(...)` adds a top-level context. `err.to_string()` renders
+    // only that context, so the status code would be invisible; `{err:#}` joins the full chain.
+    let msg = format!("{err:#}");
     msg.contains(" 400")
         || msg.contains(" 401")
         || msg.contains(" 402")
@@ -366,7 +369,9 @@ fn is_non_retryable_client_error(err: &eyre::Report) -> bool {
 }
 
 fn is_rate_limit_error(err: &eyre::Report) -> bool {
-    let msg = err.to_string().to_ascii_lowercase();
+    // Same reasoning as `is_non_retryable_client_error`: walk the full chain so a 429 carried in a
+    // wrapped `ProviderError` body still maps to the rate-limit backoff policy.
+    let msg = format!("{err:#}").to_ascii_lowercase();
     msg.contains(" 429")
         || msg.contains("rate limit")
         || msg.contains("too many requests")
@@ -755,5 +760,41 @@ fn map_gemini_finish_reason(
         GeminiFinishReason::MaxTokens => FinishReason::MaxTokens,
         GeminiFinishReason::FinishReasonUnspecified => FinishReason::None,
         other => FinishReason::Other(format!("{other:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reproduce how a provider 401 actually reaches the retry layer: rig surfaces the raw
+    /// response body as `ProviderError`, and the per-provider `completion` impls wrap it with
+    /// `.wrap_err_with(...)`. The status only lives in the source, so the classifier must walk
+    /// the chain rather than read `err.to_string()`.
+    fn wrapped_provider_error(body: &str) -> eyre::Report {
+        let inner = eyre::eyre!("ProviderError: {body}");
+        Err::<(), _>(inner)
+            .wrap_err("Anthropic completion failed for model 'claude'")
+            .unwrap_err()
+    }
+
+    #[test]
+    fn non_retryable_detects_status_in_wrapped_source() {
+        let err = wrapped_provider_error(r#"{"statusCode": 401, "message": "Unauthorized"}"#);
+        // `to_string()` only renders the top-level context — proves we must look deeper.
+        assert!(!err.to_string().contains("401"));
+        assert!(is_non_retryable_client_error(&err));
+    }
+
+    #[test]
+    fn non_retryable_false_for_server_error() {
+        let err = wrapped_provider_error(r#"{"statusCode": 500, "message": "boom"}"#);
+        assert!(!is_non_retryable_client_error(&err));
+    }
+
+    #[test]
+    fn rate_limit_detects_429_in_wrapped_source() {
+        let err = wrapped_provider_error(r#"{"statusCode": 429, "message": "Too Many Requests"}"#);
+        assert!(is_rate_limit_error(&err));
     }
 }

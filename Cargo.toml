@@ -2,6 +2,8 @@
 name = "nitpicker"
 version = "0.6.0"
 edition = "2024"
+# MSRV of the default (azure-off) build. The optional `azure` feature raises the floor to 1.88
+# via azure_core's own rust-version; cargo enforces that when `--features azure` is enabled.
 rust-version = "1.85"
 default-run = "nitpicker"
 description = "Multi-reviewer code review using LLMs with parallel agents and debate mode"
@@ -51,5 +53,5 @@ libc = "0.2"
 
 [features]
 # Enables `auth = "azure-ad"` for OpenAI/Anthropic providers (Azure AI Foundry).
-# Off by default: pulls in the Azure SDK (requires Rust 1.88+). Build with `--features azure`.
+# Off by default: pulls in the Azure SDK (azure_core declares rust-version 1.88). Build with `--features azure`.
 azure = ["dep:azure_identity", "dep:azure_core"]

@@ -1,4 +1,4 @@
-use crate::config::{AggregatorConfig, Config, ProviderType, ReviewerConfig};
+use crate::config::{AggregatorConfig, Config, ProviderType, ReviewerConfig, is_azure_ad_auth};
 use crate::gemini_proxy::GeminiProxyClient;
 use crate::llm::{LLMClient, LLMClientDyn, LLMProvider, WithRetryExt};
 use eyre::Result;
@@ -19,10 +19,6 @@ pub fn aggregator_needs_gemini_proxy(agg: &AggregatorConfig) -> bool {
 pub fn config_needs_gemini_proxy(config: &Config) -> bool {
     aggregator_needs_gemini_proxy(&config.aggregator)
         || config.reviewer.iter().any(reviewer_needs_gemini_proxy)
-}
-
-fn is_azure_ad_auth(auth: Option<&str>) -> bool {
-    matches!(auth, Some("azure-ad"))
 }
 
 /// Build a refreshing Azure AD client (feature `azure`). The config validator already rejects
