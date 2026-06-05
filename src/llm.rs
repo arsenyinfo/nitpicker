@@ -12,6 +12,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::Semaphore;
 use tracing::warn;
 
 const MAX_COMPLETION_ATTEMPTS: usize = 4;
@@ -320,6 +321,19 @@ impl LLMClientDyn for AlloyClient {
             Ok(response)
         })
     }
+}
+
+/// Run a single completion under a concurrency permit. The permit is held only for the duration of
+/// this one call and released immediately after — never across a subagent spawn — so callers may
+/// block on acquire without risking deadlock. This is the single chokepoint that bounds account-wide
+/// in-flight LLM calls; route every concurrent completion (agent turns, compaction) through it.
+pub async fn throttled_completion(
+    semaphore: &Semaphore,
+    client: &Arc<dyn LLMClientDyn>,
+    completion: Completion,
+) -> Result<CompletionResponse> {
+    let _permit = semaphore.acquire().await.expect("llm semaphore closed");
+    client.completion(completion).await
 }
 
 struct RetryPolicy {

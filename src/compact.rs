@@ -1,8 +1,9 @@
-use crate::llm::{Completion, CompletionResponse, LLMClientDyn, TokenUsage};
+use crate::llm::{Completion, CompletionResponse, LLMClientDyn, TokenUsage, throttled_completion};
 use eyre::Result;
 use rig_core::completion::message::{ToolChoice, ToolResultContent, UserContent};
 use rig_core::completion::{AssistantContent, Message};
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 const COMPACTION_MAX_OUTPUT_TOKENS: u64 = 8_192;
@@ -47,7 +48,10 @@ enum CorrectionMode {
     WrapSummary,
 }
 
+// threads the shared throttle semaphore alongside the existing client/history args; not worth a struct
+#[allow(clippy::too_many_arguments)]
 pub async fn compact_history(
+    semaphore: &Semaphore,
     client: Arc<dyn LLMClientDyn>,
     model: &str,
     system_prompt: &str,
@@ -60,7 +64,8 @@ pub async fn compact_history(
         return Ok(None);
     }
 
-    let outcome = summarize_history(client, model, system_prompt, history, turn, usage).await?;
+    let outcome =
+        summarize_history(semaphore, client, model, system_prompt, history, turn, usage).await?;
     let continue_msg = Message::user(CONTINUE_MESSAGE.to_string());
     *history = vec![
         Message::user(format!(
@@ -84,6 +89,7 @@ pub async fn compact_history(
 }
 
 async fn summarize_history(
+    semaphore: &Semaphore,
     client: Arc<dyn LLMClientDyn>,
     model: &str,
     system_prompt: &str,
@@ -92,6 +98,7 @@ async fn summarize_history(
     usage: TokenUsage,
 ) -> Result<CompactionOutcome> {
     match run_compaction(
+        semaphore,
         &client,
         model,
         system_prompt,
@@ -106,6 +113,7 @@ async fn summarize_history(
             warn!("in-context compaction failed ({err}), retrying with rendered transcript");
             let transcript = render_history_as_text(thread);
             let outcome = run_compaction(
+                semaphore,
                 &client,
                 model,
                 system_prompt,
@@ -121,6 +129,7 @@ async fn summarize_history(
 }
 
 async fn run_compaction(
+    semaphore: &Semaphore,
     client: &Arc<dyn LLMClientDyn>,
     model: &str,
     system_prompt: &str,
@@ -129,14 +138,17 @@ async fn run_compaction(
     usage: TokenUsage,
 ) -> Result<CompactionOutcome> {
     let prompt = build_compaction_prompt(&input, turn, usage);
-    let response = client
-        .completion(compaction_completion(
+    let response = throttled_completion(
+        semaphore,
+        client,
+        compaction_completion(
             model,
             system_prompt,
             history_for_initial_request(&input),
             Message::user(prompt.clone()),
-        ))
-        .await?;
+        ),
+    )
+    .await?;
 
     match extract_summary(&response) {
         Some(summary) => Ok(CompactionOutcome {
@@ -150,7 +162,7 @@ async fn run_compaction(
                 response,
                 correction_mode: correction_mode(&input),
             };
-            run_corrections(client, model, system_prompt, &input, usage, attempt).await
+            run_corrections(semaphore, client, model, system_prompt, &input, usage, attempt).await
         }
     }
 }
@@ -162,6 +174,7 @@ struct InitialAttempt {
 }
 
 async fn run_corrections(
+    semaphore: &Semaphore,
     client: &Arc<dyn LLMClientDyn>,
     model: &str,
     system_prompt: &str,
@@ -179,14 +192,17 @@ async fn run_corrections(
     let mut previous = initial_response;
 
     for _ in 0..COMPACTION_MAX_CORRECTIONS {
-        let next = client
-            .completion(compaction_completion(
+        let next = throttled_completion(
+            semaphore,
+            client,
+            compaction_completion(
                 model,
                 system_prompt,
                 history.clone(),
                 Message::user(correction.to_string()),
-            ))
-            .await?;
+            ),
+        )
+        .await?;
         match extract_summary(&next) {
             Some(summary) => {
                 return Ok(CompactionOutcome {

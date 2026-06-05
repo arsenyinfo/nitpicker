@@ -1,9 +1,10 @@
 use crate::compact::{CompactionOutcome, compact_history};
-use crate::llm::{Completion, ConversationUsageWindow, LLMClientDyn};
+use crate::llm::{Completion, ConversationUsageWindow, LLMClientDyn, throttled_completion};
 use crate::prompts::subagent_system_prompt;
 use crate::session::{SessionWriter, ToolCallRecord, now_unix_ms};
 use crate::tools::{Tool, floor_char_boundary, tool_definitions};
 use eyre::Result;
+use futures::future::join_all;
 use rig_core::OneOrMany;
 use rig_core::completion::Message;
 use rig_core::completion::message::{ToolResult, ToolResultContent, UserContent};
@@ -12,9 +13,13 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 const MAX_TOOL_RESULT_BYTES: usize = 50_000;
+/// Global cap on concurrent in-flight LLM completion calls (reviewers + subagents share it),
+/// so a wide subagent wave throttles through the provider instead of firing every call at once.
+pub const MAX_CONCURRENT_LLM_CALLS: usize = 16;
 const MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS: usize = 3;
 const MAX_CYCLE_REPETITIONS: usize = 2;
 const TOOL_CALL_HISTORY_WINDOW: usize = 8;
@@ -75,6 +80,7 @@ pub struct AgentConfig {
     pub empty_response_nudge: Option<String>,
     pub max_empty_responses: usize,
     pub subagent_counter: Arc<AtomicUsize>,
+    pub llm_semaphore: Arc<Semaphore>,
     pub progress: Option<Arc<dyn Fn(AgentProgress) + Send + Sync>>,
     pub project_context: Option<String>,
     pub session_writer: Option<SessionWriter>,
@@ -220,6 +226,7 @@ pub async fn run_agent(
                 "compaction triggered"
             );
             let compaction = compact_history(
+                &config.llm_semaphore,
                 Arc::clone(&config.client),
                 &config.model,
                 &effective_system_prompt,
@@ -262,7 +269,10 @@ pub async fn run_agent(
             additional_params: None,
         };
 
-        let response = config.client.completion(completion).await?;
+        // throttled so this call counts against the global in-flight cap; the permit is released
+        // before the subagent spawns below, so blocking on it can't deadlock
+        let response =
+            throttled_completion(&config.llm_semaphore, &config.client, completion).await?;
         total_input_tokens = total_input_tokens.saturating_add(response.usage.input_tokens);
         total_output_tokens = total_output_tokens.saturating_add(response.usage.output_tokens);
         total_tokens = total_tokens.saturating_add(response.usage.total_tokens);
@@ -273,7 +283,6 @@ pub async fn run_agent(
 
         if let Some(tool_calls) = response.tool_calls() {
             empty_response_count = 0;
-            let mut results = Vec::new();
             total_tool_calls += tool_calls.len();
             report_progress(
                 &config,
@@ -282,17 +291,21 @@ pub async fn run_agent(
                 initial_subagent_count,
                 last_subagent.clone(),
             );
+
+            // phase 1: ordered bookkeeping (cycle detection, terminal check, logging) with no
+            // awaits, so the shared cycle-history stays sequentially consistent before any fan-out
             let mut should_terminate = false;
-            for call in tool_calls {
-                let tool_name = call.function.name.clone();
-                let args = call.function.arguments.clone();
+            let mut cycle_lens = Vec::with_capacity(tool_calls.len());
+            for call in &tool_calls {
+                let tool_name = &call.function.name;
+                let args = &call.function.arguments;
                 let tool_call_key = format!("{tool_name}:{args}");
                 tool_call_history.push_back(tool_call_key);
                 if tool_call_history.len() > TOOL_CALL_HISTORY_WINDOW {
                     tool_call_history.pop_front();
                 }
-                let cycle_len = detect_tool_call_cycle(&tool_call_history);
-                should_terminate |= config.terminal_tools.iter().any(|name| name == &tool_name);
+                cycle_lens.push(detect_tool_call_cycle(&tool_call_history));
+                should_terminate |= config.terminal_tools.iter().any(|name| name == tool_name);
                 if tool_name == "spawn_subagent" {
                     if let Some(task) = args.get("task").and_then(|v| v.as_str()) {
                         last_subagent = Some(first_line(task));
@@ -302,7 +315,12 @@ pub async fn run_agent(
                     Some(m) => info!(agent = %config.name, tool = %tool_name, args = %args, turn, model = %m, "tool call"),
                     None => info!(agent = %config.name, tool = %tool_name, args = %args, turn, "tool call"),
                 }
-                let outcome = execute_tool_call(
+            }
+
+            // phase 2: execute the whole wave concurrently so a spawn_subagent batch overlaps
+            // instead of running one-at-a-time; outcomes stay index-aligned with tool_calls
+            let outcomes = join_all(tool_calls.iter().zip(&cycle_lens).map(|(call, &cycle_len)| {
+                execute_tool_call(
                     ToolCallContext {
                         config: &config,
                         runtime_tools: &available_tools,
@@ -313,18 +331,26 @@ pub async fn run_agent(
                         total_tool_calls,
                         initial_subagent_count,
                     },
-                    &tool_name,
-                    args,
+                    call.function.name.as_str(),
+                    call.function.arguments.clone(),
                     cycle_len,
                 )
-                .await?;
-                if outcome.repeated_tool_call_blocked {
+            }))
+            .await;
+
+            // phase 3: fold results back in original order (tool-result ordering is load-bearing
+            // for the provider, and the running counters must apply deterministically)
+            let mut results = Vec::with_capacity(tool_calls.len());
+            for (call, outcome) in tool_calls.iter().zip(outcomes) {
+                let outcome = outcome?;
+                let blocked = outcome.repeated_tool_call_blocked;
+                if blocked {
                     consecutive_blocked_count += 1;
                 } else {
                     consecutive_blocked_count = 0;
                 }
                 let ToolCallOutcome {
-                    output,
+                    mut output,
                     nested_tool_calls,
                     repeated_tool_call_blocked: _,
                     status: _,
@@ -337,17 +363,20 @@ pub async fn run_agent(
                 total_input_tokens = total_input_tokens.saturating_add(subagent_input_tokens);
                 total_output_tokens = total_output_tokens.saturating_add(subagent_output_tokens);
                 total_tokens = total_tokens.saturating_add(subagent_total_tokens);
-                if tool_name == "spawn_subagent" {
+                if call.function.name == "spawn_subagent" {
                     last_subagent = None;
                 }
-                report_progress(
-                    &config,
-                    turn + 1,
-                    total_tool_calls,
-                    initial_subagent_count,
-                    last_subagent.clone(),
-                );
-                let mut output = output;
+                // re-resolve the finish payload here in provider order, so the authoritative value is
+                // deterministic even though FinishTool also wrote it during concurrent phase-2
+                // execution (a malformed turn with multiple finish calls → provider-last wins)
+                if config.depth.is_subagent() && !blocked && call.function.name == "finish" {
+                    if let Some(result) =
+                        call.function.arguments.get("result").and_then(|v| v.as_str())
+                    {
+                        *finish_store.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(result.to_string());
+                    }
+                }
                 if output.len() > MAX_TOOL_RESULT_BYTES {
                     let original_len = output.len();
                     let boundary = floor_char_boundary(&output, MAX_TOOL_RESULT_BYTES);
@@ -363,6 +392,13 @@ pub async fn run_agent(
                     content: OneOrMany::one(ToolResultContent::text(output)),
                 });
             }
+            report_progress(
+                &config,
+                turn + 1,
+                total_tool_calls,
+                initial_subagent_count,
+                last_subagent.clone(),
+            );
 
             if config.depth.is_subagent() {
                 if let Some(result) = finish_store
@@ -433,6 +469,7 @@ pub async fn run_agent(
                 );
                 let usage = conversation_usage.usage();
                 let compaction = compact_history(
+                    &config.llm_semaphore,
                     Arc::clone(&config.client),
                     &config.model,
                     &effective_system_prompt,
@@ -633,6 +670,7 @@ fn prepare_subagent(
         empty_response_nudge: None,
         max_empty_responses: 0,
         subagent_counter: Arc::clone(&parent_config.subagent_counter),
+        llm_semaphore: Arc::clone(&parent_config.llm_semaphore),
         progress: None,
         project_context: parent_config.project_context.clone(),
         session_writer: parent_config.session_writer.clone(),

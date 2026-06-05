@@ -6,10 +6,13 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub struct SessionLogger {
     root: Arc<PathBuf>,
+    // serializes appends so concurrent subagents sharing a writer don't interleave lines
+    write_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -58,6 +61,7 @@ impl SessionLogger {
             .wrap_err_with(|| format!("failed to create session dir {}", root.display()))?;
         Ok(Some(Self {
             root: Arc::new(root),
+            write_lock: Arc::new(Mutex::new(())),
         }))
     }
 
@@ -69,6 +73,7 @@ impl SessionLogger {
         SessionWriter {
             root: Arc::clone(&self.root),
             relative_path: relative_path.as_ref().to_path_buf(),
+            write_lock: Arc::clone(&self.write_lock),
         }
     }
 
@@ -86,6 +91,7 @@ impl SessionLogger {
 pub struct SessionWriter {
     root: Arc<PathBuf>,
     relative_path: PathBuf,
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl SessionWriter {
@@ -96,15 +102,17 @@ impl SessionWriter {
                 .await
                 .wrap_err_with(|| format!("failed to create session log dir {}", parent.display()))?;
         }
+        let mut buf = serde_json::to_vec(record)?;
+        buf.push(b'\n');
+        // hold the lock across open+write so concurrent appends emit whole lines, not interleaved bytes
+        let _guard = self.write_lock.lock().await;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .await
             .wrap_err_with(|| format!("failed to open session log {}", path.display()))?;
-        let line = serde_json::to_string(record)?;
-        file.write_all(line.as_bytes()).await?;
-        file.write_all(b"\n").await?;
+        file.write_all(&buf).await?;
         Ok(())
     }
 }

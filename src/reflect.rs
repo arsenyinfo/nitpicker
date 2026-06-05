@@ -1,6 +1,6 @@
-use crate::agent::{AgentConfig, AgentDepth, run_agent};
+use crate::agent::{AgentConfig, AgentDepth, MAX_CONCURRENT_LLM_CALLS, run_agent};
 use crate::config::Config;
-use crate::llm::{Completion, LLMClientDyn};
+use crate::llm::{Completion, LLMClientDyn, throttled_completion};
 use crate::provider::build_reviewer_client;
 use crate::session::{AggregationRecord, ToolCallRecord};
 use crate::tools::{floor_char_boundary, reflect_tools};
@@ -9,6 +9,7 @@ use rig_core::completion::Message;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -198,6 +199,7 @@ async fn analyze_session(
     session_md: String,
     model: String,
     client: Arc<dyn LLMClientDyn>,
+    semaphore: Arc<Semaphore>,
 ) -> Result<String> {
     let completion = Completion {
         model,
@@ -209,7 +211,7 @@ async fn analyze_session(
         max_tokens: Some(1024),
         additional_params: None,
     };
-    Ok(client.completion(completion).await?.text())
+    Ok(throttled_completion(&semaphore, &client, completion).await?.text())
 }
 
 async fn synthesize(
@@ -238,6 +240,9 @@ async fn synthesize(
         empty_response_nudge: None,
         max_empty_responses: 3,
         subagent_counter: Arc::new(AtomicUsize::new(0)),
+        llm_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            crate::agent::MAX_CONCURRENT_LLM_CALLS,
+        )),
         progress: None,
         project_context: None,
         session_writer: None,
@@ -335,13 +340,16 @@ pub async fn run_reflect(args: ReflectArgs) -> Result<()> {
     };
 
     info!("analyzing sessions with {}…", map_model);
+    // bound concurrent in-flight session-analysis calls the same way the review path does
+    let map_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_LLM_CALLS));
     let mut handles: Vec<(String, JoinHandle<Result<String>>)> = Vec::new();
     for session in &sessions {
         let md = format_session(session);
         let name = session.name.clone();
         let model = map_model.clone();
         let client = Arc::clone(&map_client);
-        let handle = tokio::spawn(async move { analyze_session(md, model, client).await });
+        let semaphore = Arc::clone(&map_semaphore);
+        let handle = tokio::spawn(async move { analyze_session(md, model, client, semaphore).await });
         handles.push((name, handle));
     }
 
