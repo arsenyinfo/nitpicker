@@ -1,4 +1,7 @@
-use crate::agent::{AgentConfig, AgentDepth, AgentProgress, add_spawn_subagent_tool, run_agent};
+use crate::agent::{
+    AgentConfig, AgentDepth, AgentProgress, MAX_CONCURRENT_LLM_CALLS, add_spawn_subagent_tool,
+    run_agent,
+};
 use crate::config::{Config, ReviewerConfig};
 use crate::llm::{Completion, FinishReason};
 pub use crate::prompts::TaskMode;
@@ -37,6 +40,8 @@ pub async fn run_review(
     let initial_message = mode.initial_message(user_prompt);
     let mut handles = Vec::new();
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_REVIEWERS));
+    // shared across every reviewer + their subagents to cap account-wide in-flight LLM calls
+    let llm_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_LLM_CALLS));
 
     let mp = MultiProgress::new();
     if verbose {
@@ -70,6 +75,7 @@ pub async fn run_review(
             max_turns,
             gemini_proxy.as_ref(),
             Arc::clone(&subagent_counter),
+            Arc::clone(&llm_semaphore),
             session_writer,
         );
         info!(reviewer = %name, "spawning agent");
@@ -272,6 +278,8 @@ pub async fn build_context(repo: &Path) -> String {
     context
 }
 
+// internal single-call-site builder; the args are distinct per-reviewer handles, not worth a struct
+#[allow(clippy::too_many_arguments)]
 fn build_agent_config(
     config: &Config,
     reviewer: &ReviewerConfig,
@@ -279,6 +287,7 @@ fn build_agent_config(
     max_turns: usize,
     gemini_proxy: Option<&crate::gemini_proxy::GeminiProxyClient>,
     subagent_counter: Arc<AtomicUsize>,
+    llm_semaphore: Arc<Semaphore>,
     session_writer: Option<crate::session::SessionWriter>,
 ) -> Result<AgentConfig> {
     let client = build_reviewer_client(reviewer, gemini_proxy)?;
@@ -297,6 +306,7 @@ fn build_agent_config(
         empty_response_nudge: None,
         max_empty_responses: 0,
         subagent_counter,
+        llm_semaphore,
         progress: None,
         project_context: None,
         session_writer,

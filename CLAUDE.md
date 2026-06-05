@@ -90,11 +90,14 @@ azure.rs        Azure AD token auth for Foundry-hosted OpenAI/Anthropic (feature
 ### Agent execution (`agent.rs`)
 
 - Each reviewer runs an agentic loop with file/git tools until it returns text or reaches the turn limit
-- Review prompts encourage a quick local map, a short working plan, and an early wave of subagents for bounded disjoint investigations
+- Review prompts encourage a quick local map, a short working plan, and fanning out **all** disjoint threads as one broad parallel wave of subagents, re-spawning only when a finding demands a follow-up (each extra serial wave adds wall-clock latency)
+- Within a single turn, all tool calls run **concurrently** (`join_all`): a wave of `spawn_subagent` calls overlaps instead of running one-at-a-time, so subagent breadth no longer scales wall-clock. The turn is processed in three phases — ordered cycle/terminal bookkeeping (no awaits), concurrent execution, then results folded back in original index order (provider requires tool-result ordering)
+- Concurrent in-flight LLM calls are bounded by a shared `llm_semaphore` (`MAX_CONCURRENT_LLM_CALLS`, default 16), acquired only around each `completion()` call — never held across a subagent spawn, so a blocking acquire bounds account-wide provider concurrency without deadlock. Shared across all reviewers + subagents in `review.rs`; per-turn in `debate.rs` (debate turns never overlap)
 - Reviewers can delegate deeper investigations via `spawn_subagent`
 - Subagent depth is capped at 2 to bound recursion and cost
 - Subagents return results through a hidden `finish(result)` tool; debate agents use `submit_verdict(verdict, agree)` instead
 - Repetitive tool-call cycles are blocked, and the agent can force a context reset to break out of loops
+- Session-log appends are serialized by a shared mutex and written as a single buffer (`session.rs`), so a concurrent subagent wave sharing a writer can't interleave partial lines
 
 ### PR flow (`pr.rs`)
 
@@ -181,7 +184,7 @@ Reviewers automatically load project context from `CLAUDE.md` or `AGENTS.md` if 
 ## Key constraints
 
 - Reviewers run concurrently — reviewer code must be `Send + Sync`
-- Parallel review execution is capped at 8 concurrent reviewers
+- Parallel review execution is capped at 8 concurrent reviewers; within an agent, a turn's tool calls run concurrently and all in-flight LLM calls share a global cap of `MAX_CONCURRENT_LLM_CALLS` (16)
 - Tool results are truncated to 50k bytes before being sent to the LLM
 - Git tool output is truncated to 50k chars
 - Agent and debate turn loops default to 100 turns and can be overridden via config or CLI

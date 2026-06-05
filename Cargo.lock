@@ -2020,7 +2020,7 @@ dependencies = [
 
 [[package]]
 name = "nitpicker"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "axum",
  "azure_core",
@@ -2030,6 +2030,7 @@ dependencies = [
  "clap",
  "dirs",
  "eyre",
+ "futures",
  "glob",
  "indicatif",
  "keyring",

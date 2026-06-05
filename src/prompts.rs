@@ -3,13 +3,11 @@ const VERIFY_WARNING: &str =
 Independently verify every claim against the actual code before accepting it.";
 
 const DELEGATION_GUIDANCE: &str = "Always first build a quick high-level map of the relevant code: change intent, affected files, nearby modules, and major components involved. \
-Then write a short working plan covering scope, knowledge gaps, local checks, and candidate delegations. \
-After that initial map, prefer spawn_subagent(task) for bounded investigations that follow separate questions, touch different filesets, or would take multiple tool calls to resolve locally. \
+Then write a short working plan that enumerates the disjoint threads worth investigating — separate questions, distinct filesets, individual call paths, tests vs implementation, focused security or performance concerns. \
+Subagents spawned in a single turn run in parallel, so the fastest path in wall-clock is to fan out ALL the disjoint threads from your plan as one broad wave of spawn_subagent(task) calls in the same turn, rather than spawning a few and walking the rest serially. \
 Use local tools for quick triage and synthesis, but do not try to personally exhaust every branch of the investigation. \
-Use parallel subagents to reduce latency when the investigations are clearly disjoint. \
-It is good to spawn a small early batch of subagents in one turn when they cover distinct components, filesets, or review criteria. Good delegation targets include tracing one call path, validating one suspected issue, checking tests separately from implementation, or investigating a focused security or performance concern. \
-Do not spawn overlapping or near-duplicate subagents that are likely to reread the same files for the same question. \
-After a wave of subagents returns, refine your understanding of what is established, update the plan, and only then spawn more.";
+Keep each subagent task bounded and self-contained so it converges quickly, and do not spawn overlapping or near-duplicate subagents that would reread the same files for the same question. \
+After the wave returns, synthesize what is now established. Spawn another wave only when a concrete finding demands a specific follow-up — not as a routine next step. Each additional serial wave adds latency, so prefer to conclude from the evidence you already gathered.";
 
 const NO_FINDINGS: &str = "No findings. Great job! 🎉";
 

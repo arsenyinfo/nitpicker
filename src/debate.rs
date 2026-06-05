@@ -1,4 +1,7 @@
-use crate::agent::{AgentConfig, AgentDepth, AgentProgress, add_spawn_subagent_tool, run_agent};
+use crate::agent::{
+    AgentConfig, AgentDepth, AgentProgress, MAX_CONCURRENT_LLM_CALLS, add_spawn_subagent_tool,
+    run_agent,
+};
 use crate::config::{Config, ReviewerConfig};
 use crate::llm::{Completion, LLMClientDyn};
 pub use crate::prompts::DebateMode;
@@ -101,6 +104,10 @@ impl Tool for SubmitVerdictTool {
         _work_dir: PathBuf,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<String>> + Send>> {
         let verdict_store = Arc::clone(&self.verdict);
+        // a turn's tool calls run concurrently (agent.rs phase 2). When this future is polled it runs
+        // straight to the store write with no await before it, and join_all polls futures in provider
+        // order — so if a single (malformed) turn emits multiple submit_verdict calls, the provider-last
+        // one deterministically wins. Keep this future await-free before the write or that breaks.
         Box::pin(async move {
             let text = args
                 .get("verdict")
@@ -148,6 +155,8 @@ async fn run_debate_turn(
         ),
         max_empty_responses: 3,
         subagent_counter,
+        // debate turns never overlap, so a per-turn cap is the same as a global one
+        llm_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LLM_CALLS)),
         progress: request.progress,
         project_context: request.project_context,
         session_writer: request.session_writer,
