@@ -13,6 +13,7 @@ mod detect;
 mod gemini_proxy;
 mod llm;
 mod openrouter;
+mod output;
 mod pr;
 mod prompts;
 mod provider;
@@ -129,7 +130,10 @@ async fn main() -> Result<()> {
     };
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
+    // logs are never the report — keep stdout reserved for the deliverable so
+    // `pr --format json` emits a clean single JSON object.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(filter)
         .with_target(false)
         .with_thread_ids(false)
@@ -141,6 +145,11 @@ async fn main() -> Result<()> {
         .compact()
         .init();
 
+    // note: no json panic hook. reviewer work runs in tokio::spawn tasks whose
+    // panics are caught as JoinError and folded into the report (status stays ok,
+    // degraded section in the markdown); a process-wide hook would double-emit
+    // there. a genuine top-level panic aborts non-zero with a stderr message,
+    // which is an acceptable catastrophic-failure signal for the consumer.
     match args.command {
         Some(Command::Init { global, free }) => {
             let path = init_config_path(global)?;
@@ -188,6 +197,7 @@ async fn main() -> Result<()> {
                         verbose: common.verbose,
                         mode: debate::DebateMode::Topic,
                         alloy: use_alloy,
+                        format: output::OutputFormat::Text,
                     },
                 )
                 .await?;
@@ -211,10 +221,8 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Command::Pr(pr_args)) => {
-            let config =
-                load_resolved_config(pr_args.common.config.as_deref(), &pr_args.common.repo)
-                    .await?;
-            return pr::run_pr(pr_args, config).await;
+            // config loading happens inside run_pr so its failures honor --format json too
+            return pr::run_pr(pr_args).await;
         }
         Some(Command::Reflect { sessions_dir, n }) => {
             let repo = args.common.repo.canonicalize()?;
@@ -276,6 +284,7 @@ async fn main() -> Result<()> {
                 verbose: args.common.verbose,
                 mode: debate::DebateMode::Review,
                 alloy: use_alloy,
+                format: output::OutputFormat::Text,
             },
         )
         .await?;
@@ -325,7 +334,10 @@ fn load_config(explicit_path: Option<&Path>, repo: &Path) -> Result<config::Conf
     Ok(config)
 }
 
-async fn load_resolved_config(explicit_path: Option<&Path>, repo: &Path) -> Result<config::Config> {
+pub(crate) async fn load_resolved_config(
+    explicit_path: Option<&Path>,
+    repo: &Path,
+) -> Result<config::Config> {
     let mut config = load_config(explicit_path, repo)?;
     openrouter::resolve_free_models(&mut config).await?;
     Ok(config)
@@ -578,7 +590,6 @@ fn print_init_hints(detected: &[detect::Detected]) {
         println!("\n  Note: found GOOGLE_AI_API_KEY — the gemini client reads GEMINI_API_KEY;");
         println!("  add `export GEMINI_API_KEY=$GOOGLE_AI_API_KEY` to your shell profile.");
     }
-
 }
 
 fn init_config_path(global: bool) -> Result<PathBuf> {

@@ -296,6 +296,7 @@ pub struct DebateOptions {
     pub verbose: bool,
     pub mode: DebateMode,
     pub alloy: bool,
+    pub format: crate::output::OutputFormat,
 }
 
 pub async fn run_debate(
@@ -310,7 +311,11 @@ pub async fn run_debate(
         verbose,
         mode,
         alloy,
+        format,
     } = opts;
+    // in json mode stdout is reserved for the final envelope; the cast lines and
+    // rendered verdicts below would otherwise corrupt it.
+    let stdout_ok = matches!(format, crate::output::OutputFormat::Text);
     if config.reviewer.len() < 2 {
         eyre::bail!(
             "debate requires at least 2 reviewers in config (actor = reviewer[0], critic = reviewer[1])"
@@ -383,21 +388,23 @@ pub async fn run_debate(
         mp.set_draw_target(ProgressDrawTarget::hidden());
     }
 
-    if alloy {
-        print_cast_line(actor_role, &actor_label.full);
-        print_cast_line(critic_role, &critic_label.full);
-    } else {
-        print_cast_line(
-            actor_role,
-            &format!("{} · {}", actor_cfg.name, actor_label.full),
-        );
-        print_cast_line(
-            critic_role,
-            &format!("{} · {}", critic_cfg.name, critic_label.full),
-        );
+    if stdout_ok {
+        if alloy {
+            print_cast_line(actor_role, &actor_label.full);
+            print_cast_line(critic_role, &critic_label.full);
+        } else {
+            print_cast_line(
+                actor_role,
+                &format!("{} · {}", actor_cfg.name, actor_label.full),
+            );
+            print_cast_line(
+                critic_role,
+                &format!("{} · {}", critic_cfg.name, critic_label.full),
+            );
+        }
+        print_cast_line("Meta-review", &agg_cfg.model);
+        println!();
     }
-    print_cast_line("Meta-review", &agg_cfg.model);
-    println!();
 
     // (role_label, round_number, verdict_text)
     let mut verdicts: Vec<(String, usize, String)> = Vec::new();
@@ -458,7 +465,7 @@ pub async fn run_debate(
         pb.finish_with_message(format!(
             "✓ round {round} ({turns} turns, {tool_calls} tool calls, {subagents_spawned} subagents, {total_input_tokens} in, {total_output_tokens} out, {total_tokens} total tokens, {elapsed}s)"
         ));
-        if verbose {
+        if verbose && stdout_ok {
             println!();
             skin.print_text(&verdict.text);
             println!();
@@ -516,7 +523,7 @@ pub async fn run_debate(
         pb.finish_with_message(format!(
             "✓ round {round} ({turns} turns, {tool_calls} tool calls, {subagents_spawned} subagents, {total_input_tokens} in, {total_output_tokens} out, {total_tokens} total tokens, {elapsed}s)"
         ));
-        if verbose {
+        if verbose && stdout_ok {
             println!();
             skin.print_text(&verdict.text);
             println!();
@@ -602,7 +609,11 @@ pub async fn run_debate(
     }
     transcript.push_str(&format!("---\n\n## Meta-review\n\n{meta_text}\n"));
 
-    tokio::fs::write(&transcript_path, &transcript).await?;
+    // only the verbose path surfaces this file; skip the write otherwise so a
+    // long-running server doesn't litter the temp dir on every review.
+    if verbose {
+        tokio::fs::write(&transcript_path, &transcript).await?;
+    }
 
     Ok((meta_text, transcript_path))
 }

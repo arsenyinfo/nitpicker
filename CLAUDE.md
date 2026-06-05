@@ -36,6 +36,9 @@ cargo run -- pr
 # Review a remote PR by URL
 cargo run -- pr https://github.com/owner/repo/pull/42
 
+# Machine-readable output for embedding (single JSON object on stdout)
+cargo run -- pr https://github.com/owner/repo/pull/42 --no-comment --json
+
 # Reflect on saved sessions
 cargo run -- reflect
 cargo run -- reflect --n 10
@@ -62,6 +65,7 @@ agent.rs        agentic tool-use loop for a single reviewer
 llm.rs          LLM client trait, per-provider impls, retry wrapper
 tools.rs        tool definitions: read_file, glob, grep, git
 pr.rs           GitHub PR subcommand: fetch metadata via gh, review, post comment
+output.rs       JSON output contract for `pr --json` (OutputFormat, PrReviewOutput envelope, emit_json)
 reflect.rs      Reflect subcommand: analyze saved session trajectories and synthesize improvements
 gemini_proxy/   local HTTP proxy that translates Gemini API calls to Google Code Assist
 azure.rs        Azure AD token auth for Foundry-hosted OpenAI/Anthropic (feature `azure`, off by default)
@@ -101,13 +105,15 @@ azure.rs        Azure AD token auth for Foundry-hosted OpenAI/Anthropic (feature
 
 ### PR flow (`pr.rs`)
 
+0. `run_pr` is a thin wrapper around `run_pr_inner`: it stamps a start `Instant` and, in `--json` mode, turns any `Err` into a `status: "error"` JSON object on stdout + `process::exit(1)` (text mode keeps the eyre-to-stderr path). Config loading happens inside `run_pr_inner` so its failures honor the JSON contract too. There is deliberately no JSON panic hook — reviewer work runs in `tokio::spawn` tasks whose panics are caught as `JoinError` and folded into the report (a process-wide hook would double-emit there); a genuine top-level panic aborts non-zero with a stderr message.
 1. `check_gh()` verifies the `gh` CLI is available
-2. `PrFlow` enum picks the path: `CurrentBranch` (no URL), `InPlace` (URL + origin matches + no `--clone`), or `TempClone`. `PrLock` is acquired BEFORE any git mutation for the first two; `TempClone` is lock-free (unique temp dir per process). Liveness uses `libc::kill(pid, 0)`.
+2. `PrFlow` enum picks the path: `CurrentBranch` (no URL), `InPlace` (URL + origin matches + no `--clone`), or `TempClone`. `PrLock` is acquired BEFORE any git mutation for the first two; `TempClone` is lock-free (unique temp dir per process). Liveness uses `libc::kill(pid, 0)`. The PR number is carried out of the flow arms (it is not part of `PrMeta`) for the JSON envelope.
 3. In-place: refresh remote-tracking branches, skip checkout if `HEAD == headRefOid`, otherwise require a clean working tree and `git switch -c` to a namespaced `nitpicker/pr-N` from `FETCH_HEAD`. Restored on exit via `git switch --`.
 4. Temp clone: `git clone --filter=blob:none` (partial clone, so merge-base is reachable) then fetch + switch to the PR head; `TempDir` drops at the end.
 5. `fetch_pr_meta` retrieves title, body, and `headRefOid` via `gh pr view --json`; `fetch_pr_comments` pulls issue-level comments separately.
 6. `build_pr_prompt` assembles the review prompt from PR title + body + PR comments + diff context + optional `--prompt`.
 7. Review runs via `debate::run_debate` by default, or `review::run_review` with `--no-debate`. Unless `--no-comment`, result is posted back via `gh pr comment`.
+8. Output is governed by the `--json` flag (on `PrArgs`, scoped to `pr` only) which maps to the internal `OutputFormat` enum: `Text` keeps the legacy human stdout (report printed, then comment posted); `Json` posts the comment first (so its outcome is reflected in `comment_posted`), then writes one `PrReviewOutput` line to stdout via `output::emit_json` (which flushes before the caller's `process::exit`). In JSON mode, `debate.rs` suppresses its cast-line/verdict `println!`s and the `termimad` verdict rendering (threaded via `DebateOptions.format`), and tracing is always routed to stderr — so stdout stays a single clean JSON object. Subprocess caveats (for callers): `gh` auth/rate-limit is shared across processes, `--repo` must be an existing dir, kill via process-group on timeout (blocking `git`/`gh` children don't get the signal otherwise), and set `log_trajectories=false` to avoid per-run session writes.
 
 ### Reflect flow (`reflect.rs`)
 
