@@ -64,6 +64,7 @@ tools.rs        tool definitions: read_file, glob, grep, git
 pr.rs           GitHub PR subcommand: fetch metadata via gh, review, post comment
 reflect.rs      Reflect subcommand: analyze saved session trajectories and synthesize improvements
 gemini_proxy/   local HTTP proxy that translates Gemini API calls to Google Code Assist
+azure.rs        Azure AD token auth for Foundry-hosted OpenAI/Anthropic (feature `azure`, off by default)
 ```
 
 ### Review flow
@@ -118,8 +119,16 @@ gemini_proxy/   local HTTP proxy that translates Gemini API calls to Google Code
 - `LLMClient` trait: one method, `completion(Completion) -> Result<CompletionResponse>`
 - Per-provider impls: `anthropic::Client`, `gemini::Client`, `openai::CompletionsClient`
 - `AlloyClient` wraps a vec of `(Arc<dyn LLMClientDyn>, model_name)` slots and picks one at random per call (XBOW Alloy technique)
-- `RetryingLLM<C>` wraps any client with jittered exponential backoff (4 attempts, 250ms–5s). Skips retry on 4xx errors.
+- `RetryingLLM<C>` wraps any client with jittered exponential backoff (4 attempts, 250ms–5s). Skips retry on 4xx errors. The 4xx/429 classifiers match against the full error chain (`format!("{err:#}")`), not `err.to_string()`, because provider impls surface the status only in the wrapped source (`ProviderError(body)` under a `.wrap_err_with(...)` context). The shared `mentions_http_status` matcher (also used by `azure::is_unauthorized`) requires the status number to be standalone (not in a longer digit run) **and** in an HTTP-status context — preceded by a nearby `status`/`code` key or followed by its reason phrase (`401 Unauthorized`) — so an incidental number in a body (`400 tokens`, `trace 404`) isn't misread as the response status.
 - Always wrap clients with `.with_retry()` — the OAuth Gemini path is no exception
+- `AzureAdClient` (in `azure.rs`, feature `azure`) is a refreshing decorator: it acquires an AAD bearer token via the Azure SDK and rebuilds the inner rig client just before the token expires. Built in `provider.rs` when `auth = "azure-ad"`, then wrapped with `.with_retry()` like every other client. Since 401 is non-retryable, it also force-refreshes once on a 401 (detected via the same chain-walk as the retry classifiers). `ensure_client` uses double-checked locking so concurrent callers (e.g. parallel subagents sharing the client) don't each refresh; the 401-refresh path dedups the same way but gates on **client identity** rather than expiry (the token was rejected despite not being clock-expired, so an expiry re-check would wrongly skip the refresh) — a burst of concurrent 401s triggers exactly one token fetch.
+
+### Azure AD auth (`azure.rs`)
+
+- Gated behind the off-by-default `azure` cargo feature (the base crate's MSRV is 1.85; the `azure` feature raises it to 1.88 via `azure_core`). The whole module compiles out when the feature is off; `provider.rs` and the config validator bail with a `--features azure` hint if `auth = "azure-ad"` is configured without it.
+- `Config::validate` fails fast on `auth = "azure-ad"`: it requires a non-empty `base_url` and rejects an unknown credential mode (anything other than `dev`/`prod`/`auto`/unset). The credential-mode check mirrors the runtime resolution order — when `azure_credentials` is unset it validates the `AZURE_TOKEN_CREDENTIALS` env-var fallback too, so a bogus env value fails here rather than at the first LLM call. Unknown `auth` values on any non-Gemini provider are also rejected rather than silently accepted.
+- For Foundry, `provider = "openai"` (base_url `.../openai/v1`) sends the token via the OpenAI client's Bearer auth; `provider = "anthropic"` (base_url `.../anthropic`) injects `Authorization: Bearer` through rig's `.http_headers()` since that client otherwise hardcodes `x-api-key` — `.api_key(...)` gets a placeholder so the AAD token isn't leaked into the unused `x-api-key` header.
+- Credential chain selected by `azure_credentials` (`dev`/`prod`/auto, falling back to the `AZURE_TOKEN_CREDENTIALS` env var); scope via `azure_scope` (default `https://cognitiveservices.azure.com/.default`; empty/whitespace is treated as unset and falls back to the default rather than failing at the first call). `base_url` is trimmed at both config validation and client construction, so a whitespace-padded endpoint normalizes identically instead of reaching rig verbatim. Credential construction is non-fatal for all modes — failures are skipped and an empty chain produces a clear "no Azure credentials could be constructed" error. Each reviewer/aggregator owns its own client and caches the token until ~60s before expiry.
 
 ### Tools (`tools.rs`)
 

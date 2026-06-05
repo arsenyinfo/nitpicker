@@ -356,18 +356,89 @@ fn retry_policy(err: &eyre::Report) -> RetryPolicy {
     }
 }
 
+/// HTTP status codes the retry/refresh classifiers key on, paired with their canonical reason
+/// phrase. The phrase lets us recognize the plain-text `"<code> <reason>"` status-line form
+/// (`401 Unauthorized`, `429 Too Many Requests`) that carries no JSON status key.
+const STATUS_REASONS: &[(u16, &str)] = &[
+    (400, "bad request"),
+    (401, "unauthorized"),
+    (402, "payment required"),
+    (403, "forbidden"),
+    (404, "not found"),
+    (429, "too many requests"),
+];
+
+/// How far back (in bytes) to scan for a status key before a candidate number. Comfortably covers
+/// `"statusCode": ` even with extra spacing, while staying local enough that an unrelated
+/// `code`/`status` field elsewhere in the body doesn't bleed in.
+const STATUS_KEY_WINDOW: usize = 24;
+
+/// True if `status` (an HTTP status code) appears in `msg` as a genuine status reference: a
+/// standalone number (not part of a longer digit run) that is *also* in an HTTP-status context —
+/// either immediately followed by its canonical reason phrase (`401 Unauthorized`) or preceded
+/// within [`STATUS_KEY_WINDOW`] by a `status`/`code` key (covering `"statusCode": 401`, `:401`,
+/// `Invalid status code 401`, ...). The context requirement keeps incidental standalone numbers in
+/// a raw provider body — `400 tokens`, `trace 404`, `req_402abc` — from being misread as the
+/// response status. Provider errors surface the status only inside the raw body, whose punctuation
+/// varies (spaced `"statusCode": 401` vs compact `"statusCode":401`), so we can't rely on fixed
+/// delimiters; the trade-off is that a status carrying neither a nearby key nor a reason phrase is
+/// not recognized (rare in practice, and recoverable — at worst a retried/failed request).
+pub(crate) fn mentions_http_status(msg: &str, status: u16) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    let needle = status.to_string();
+    let reason = STATUS_REASONS
+        .iter()
+        .find(|(code, _)| *code == status)
+        .map(|(_, phrase)| *phrase);
+    let bytes = lower.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find(&needle) {
+        let start = from + rel;
+        let end = start + needle.len();
+        let prev_digit = start > 0 && bytes[start - 1].is_ascii_digit();
+        let next_digit = end < bytes.len() && bytes[end].is_ascii_digit();
+        if !prev_digit && !next_digit && status_in_context(&lower, start, end, reason) {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// Whether the standalone number at `start..end` in `lower` (already lowercased) sits in an
+/// HTTP-status context: followed by its reason phrase, or preceded within [`STATUS_KEY_WINDOW`] by a
+/// `status`/`code` key. `start`/`end` are byte offsets on char boundaries (the needle is ASCII); the
+/// preceding-window start is floored to a boundary so a multibyte char in the body can't panic the
+/// slice.
+fn status_in_context(lower: &str, start: usize, end: usize, reason: Option<&str>) -> bool {
+    if let Some(reason) = reason {
+        if lower[end..].trim_start().starts_with(reason) {
+            return true;
+        }
+    }
+    let mut window_start = start.saturating_sub(STATUS_KEY_WINDOW);
+    while !lower.is_char_boundary(window_start) {
+        window_start += 1;
+    }
+    let prefix = &lower[window_start..start];
+    prefix.contains("status") || prefix.contains("code")
+}
+
 fn is_non_retryable_client_error(err: &eyre::Report) -> bool {
-    let msg = err.to_string();
-    msg.contains(" 400")
-        || msg.contains(" 401")
-        || msg.contains(" 402")
-        || msg.contains(" 403")
-        || msg.contains(" 404")
+    // Walk the whole chain: provider clients map non-2xx to a `ProviderError` carrying the raw
+    // response body, then `.wrap_err_with(...)` adds a top-level context. `err.to_string()` renders
+    // only that context, so the status code would be invisible; `{err:#}` joins the full chain.
+    let msg = format!("{err:#}");
+    [400, 401, 402, 403, 404]
+        .iter()
+        .any(|&status| mentions_http_status(&msg, status))
 }
 
 fn is_rate_limit_error(err: &eyre::Report) -> bool {
-    let msg = err.to_string().to_ascii_lowercase();
-    msg.contains(" 429")
+    // Same reasoning as `is_non_retryable_client_error`: walk the full chain so a 429 carried in a
+    // wrapped `ProviderError` body still maps to the rate-limit backoff policy.
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    mentions_http_status(&msg, 429)
         || msg.contains("rate limit")
         || msg.contains("too many requests")
         || msg.contains("tokens per minute")
@@ -755,5 +826,73 @@ fn map_gemini_finish_reason(
         GeminiFinishReason::MaxTokens => FinishReason::MaxTokens,
         GeminiFinishReason::FinishReasonUnspecified => FinishReason::None,
         other => FinishReason::Other(format!("{other:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reproduce how a provider 401 actually reaches the retry layer: rig surfaces the raw
+    /// response body as `ProviderError`, and the per-provider `completion` impls wrap it with
+    /// `.wrap_err_with(...)`. The status only lives in the source, so the classifier must walk
+    /// the chain rather than read `err.to_string()`.
+    fn wrapped_provider_error(body: &str) -> eyre::Report {
+        let inner = eyre::eyre!("ProviderError: {body}");
+        Err::<(), _>(inner)
+            .wrap_err("Anthropic completion failed for model 'claude'")
+            .unwrap_err()
+    }
+
+    #[test]
+    fn non_retryable_detects_status_in_wrapped_source() {
+        let err = wrapped_provider_error(r#"{"statusCode": 401, "message": "Unauthorized"}"#);
+        // `to_string()` only renders the top-level context — proves we must look deeper.
+        assert!(!err.to_string().contains("401"));
+        assert!(is_non_retryable_client_error(&err));
+    }
+
+    #[test]
+    fn non_retryable_false_for_server_error() {
+        let err = wrapped_provider_error(r#"{"statusCode": 500, "message": "boom"}"#);
+        assert!(!is_non_retryable_client_error(&err));
+    }
+
+    #[test]
+    fn rate_limit_detects_429_in_wrapped_source() {
+        let err = wrapped_provider_error(r#"{"statusCode": 429, "message": "Too Many Requests"}"#);
+        assert!(is_rate_limit_error(&err));
+    }
+
+    #[test]
+    fn classifiers_detect_compact_json_status() {
+        // Compact bodies (no space after the colon) must still classify — `:401,` / `:429,` would
+        // slip past a plain `" 401"` / `" 429"` substring check.
+        let unauthorized = wrapped_provider_error(r#"{"statusCode":401,"message":"nope"}"#);
+        assert!(is_non_retryable_client_error(&unauthorized));
+        let throttled = wrapped_provider_error(r#"{"statusCode":429,"message":"slow down"}"#);
+        assert!(is_rate_limit_error(&throttled));
+    }
+
+    #[test]
+    fn mentions_http_status_requires_standalone_number() {
+        assert!(mentions_http_status(r#"{"code":401}"#, 401)); // bounded by punctuation, `code` key
+        assert!(mentions_http_status("got 401 unauthorized", 401)); // reason phrase follows
+        assert!(!mentions_http_status("request id 4017 failed", 401)); // part of a longer run
+        assert!(!mentions_http_status("token count 1401", 401)); // trailing digits
+    }
+
+    #[test]
+    fn mentions_http_status_requires_status_context() {
+        // A standalone status-valued number that is neither keyed nor followed by its reason phrase
+        // is incidental, not the response status — don't misclassify the surrounding error.
+        assert!(!mentions_http_status("max 400 tokens allowed", 400));
+        assert!(!mentions_http_status("trace 404 emitted", 404));
+        assert!(!mentions_http_status("req_402abc failed", 402)); // embedded in an identifier
+        assert!(!mentions_http_status("retry after 429 seconds", 429)); // bare number, wrong meaning
+        // Genuine status references in their usual shapings still match.
+        assert!(mentions_http_status(r#"{"statusCode":429,"message":"slow"}"#, 429));
+        assert!(mentions_http_status("HttpError: Invalid status code 401", 401));
+        assert!(mentions_http_status("429 Too Many Requests", 429)); // reason phrase
     }
 }
