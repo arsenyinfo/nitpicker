@@ -112,6 +112,18 @@ pub struct PrArgs {
     /// Always review in a fresh temp clone, even if the current repo matches the PR's origin
     #[arg(long)]
     pub clone: bool,
+    /// Emit a single machine-readable JSON object on stdout (for embedding); human output goes to stderr
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl PrArgs {
+    fn output_format(&self) -> crate::output::OutputFormat {
+        match self.json {
+            true => crate::output::OutputFormat::Json,
+            false => crate::output::OutputFormat::Text,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -453,7 +465,31 @@ enum PrFlow {
     },
 }
 
-pub async fn run_pr(args: PrArgs, config: Config) -> Result<()> {
+pub async fn run_pr(args: PrArgs) -> Result<()> {
+    let start = std::time::Instant::now();
+    let format = args.output_format();
+    // in json mode every failure (incl. config loading) must still leave a
+    // parseable object on stdout and exit non-zero; text mode keeps the
+    // eyre-to-stderr behavior.
+    match run_pr_inner(args, start).await {
+        Ok(()) => Ok(()),
+        Err(e) => match format {
+            crate::output::OutputFormat::Text => Err(e),
+            crate::output::OutputFormat::Json => {
+                let env = crate::output::PrReviewOutput::error(
+                    format!("{e:#}"),
+                    start.elapsed().as_millis() as u64,
+                );
+                let _ = crate::output::emit_json(&env);
+                std::process::exit(1);
+            }
+        },
+    }
+}
+
+async fn run_pr_inner(args: PrArgs, start: std::time::Instant) -> Result<()> {
+    let config =
+        crate::load_resolved_config(args.common.config.as_deref(), &args.common.repo).await?;
     check_gh()?;
 
     let verbose = args.common.verbose;
@@ -501,65 +537,74 @@ pub async fn run_pr(args: PrArgs, config: Config) -> Result<()> {
     // set when we switch branches in the user's own repo so we can restore on the way out
     let original_branch: Option<(PathBuf, String)>;
 
-    let (repo, url_for_gh, meta): (PathBuf, Option<String>, PrMeta) = match flow {
-        PrFlow::InPlace { url, pr_number } => {
-            // fetch meta first — a failure here leaves the branch untouched
-            let meta = fetch_pr_meta(Some(&url), &user_repo)?;
-            // refresh remote-tracking branches so the diff is computed against an up-to-date base
-            refresh_remote_branches(&user_repo)?;
-            // if HEAD already matches the PR head, skip the fetch+checkout dance
-            let head_matches = get_head_commit(&user_repo)
-                .ok()
-                .is_some_and(|sha| sha == meta.head_ref_oid);
-            match head_matches {
-                true => {
-                    original_branch = None;
+    // pr number is not part of PrMeta; carry it out of the flow for the json envelope
+    let (repo, url_for_gh, meta, pr_number): (PathBuf, Option<String>, PrMeta, Option<u32>) =
+        match flow {
+            PrFlow::InPlace { url, pr_number } => {
+                // fetch meta first — a failure here leaves the branch untouched
+                let meta = fetch_pr_meta(Some(&url), &user_repo)?;
+                // refresh remote-tracking branches so the diff is computed against an up-to-date base
+                refresh_remote_branches(&user_repo)?;
+                // if HEAD already matches the PR head, skip the fetch+checkout dance
+                let head_matches = get_head_commit(&user_repo)
+                    .ok()
+                    .is_some_and(|sha| sha == meta.head_ref_oid);
+                match head_matches {
+                    true => {
+                        original_branch = None;
+                    }
+                    false => {
+                        let branch = get_current_branch(&user_repo)?;
+                        checkout_pr_branch(&user_repo, pr_number).inspect_err(|_e| {
+                            restore_branch(&user_repo, &branch);
+                        })?;
+                        original_branch = Some((user_repo.clone(), branch));
+                    }
                 }
-                false => {
-                    let branch = get_current_branch(&user_repo)?;
-                    checkout_pr_branch(&user_repo, pr_number).inspect_err(|_e| {
-                        restore_branch(&user_repo, &branch);
-                    })?;
-                    original_branch = Some((user_repo.clone(), branch));
-                }
+                _tmpdir_guard = None;
+                (user_repo, Some(url), meta, Some(pr_number))
             }
-            _tmpdir_guard = None;
-            (user_repo, Some(url), meta)
-        }
-        PrFlow::TempClone {
-            url,
-            slug,
-            pr_number,
-        } => {
-            let cwd = std::env::current_dir().wrap_err("failed to get current directory")?;
-            let meta = fetch_pr_meta(Some(&url), &cwd)?;
-            let tmpdir = tempfile::TempDir::new().wrap_err("failed to create temp dir")?;
-            let path = tmpdir.path().to_path_buf();
-            clone_pr(&slug, pr_number, &path)?;
-            _tmpdir_guard = Some(tmpdir);
-            original_branch = None;
-            (path, Some(url), meta)
-        }
-        PrFlow::CurrentBranch => {
-            let meta = fetch_pr_meta(None, &user_repo)?;
-            // refresh remote-tracking branches so the diff is computed against an up-to-date base
-            refresh_remote_branches(&user_repo)?;
-            _tmpdir_guard = None;
-            original_branch = None;
-            (user_repo, None, meta)
-        }
-    };
+            PrFlow::TempClone {
+                url,
+                slug,
+                pr_number,
+            } => {
+                let cwd = std::env::current_dir().wrap_err("failed to get current directory")?;
+                let meta = fetch_pr_meta(Some(&url), &cwd)?;
+                let tmpdir = tempfile::TempDir::new().wrap_err("failed to create temp dir")?;
+                // canonicalize so the workspace root matches the canonical paths the tools
+                // resolve files to (on macOS the temp dir lives under /var → /private/var)
+                let path = tmpdir
+                    .path()
+                    .canonicalize()
+                    .wrap_err("failed to canonicalize temp dir path")?;
+                clone_pr(&slug, pr_number, &path)?;
+                _tmpdir_guard = Some(tmpdir);
+                original_branch = None;
+                (path, Some(url), meta, Some(pr_number))
+            }
+            PrFlow::CurrentBranch => {
+                let meta = fetch_pr_meta(None, &user_repo)?;
+                // refresh remote-tracking branches so the diff is computed against an up-to-date base
+                refresh_remote_branches(&user_repo)?;
+                _tmpdir_guard = None;
+                original_branch = None;
+                (user_repo, None, meta, None)
+            }
+        };
 
     let comments = fetch_pr_comments(url_for_gh.as_deref(), &repo)?;
 
     let result = run_review_inner(
         &repo,
         url_for_gh.as_deref(),
+        pr_number,
         &args,
         &config,
         verbose,
         &meta,
         &comments,
+        start,
     )
     .await;
 
@@ -570,18 +615,24 @@ pub async fn run_pr(args: PrArgs, config: Config) -> Result<()> {
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_review_inner(
     repo: &Path,
     url_for_gh: Option<&str>,
+    pr_number: Option<u32>,
     args: &PrArgs,
     config: &Config,
     verbose: bool,
     meta: &PrMeta,
     comments: &[PrComment],
+    start: std::time::Instant,
 ) -> Result<()> {
+    use crate::output::{OutputFormat, PrInfo, PrReviewOutput, ReviewMode, Status};
+
     const FOOTER: &str =
         "\n\n---\n🔍 Reviewed by [nitpicker](https://github.com/arsenyinfo/nitpicker)";
 
+    let format = args.output_format();
     let diff_context = crate::detect_diff_context(repo)?;
     let full_prompt = build_pr_prompt(meta, comments, &diff_context, args.prompt.as_deref());
     let max_turns = config.max_turns(args.max_turns)?;
@@ -591,7 +642,8 @@ async fn run_review_inner(
     if use_alloy && args.no_debate {
         eprintln!("warning: --alloy has no effect with --no-debate");
     }
-    let (report, transcript_path) = if !args.no_debate && config.default_debate() {
+    let debate = !args.no_debate && config.default_debate();
+    let (report, transcript_path) = if debate {
         debate::run_debate(
             repo,
             &full_prompt,
@@ -602,6 +654,7 @@ async fn run_review_inner(
                 verbose,
                 mode: DebateMode::Review,
                 alloy: use_alloy,
+                format,
             },
         )
         .await?
@@ -618,12 +671,54 @@ async fn run_review_inner(
         (report, std::path::PathBuf::new())
     };
 
-    println!("{report}");
-    if !args.no_comment {
-        post_comment(url_for_gh, repo, &format!("{report}{FOOTER}"))?;
-    }
-    if verbose && !transcript_path.as_os_str().is_empty() {
-        eprintln!("\nTranscript saved to: {}", transcript_path.display());
+    match format {
+        OutputFormat::Text => {
+            println!("{report}");
+            if !args.no_comment {
+                post_comment(url_for_gh, repo, &format!("{report}{FOOTER}"))?;
+            }
+            if verbose && !transcript_path.as_os_str().is_empty() {
+                eprintln!("\nTranscript saved to: {}", transcript_path.display());
+            }
+        }
+        OutputFormat::Json => {
+            // post the comment before emitting so its outcome is reflected in the
+            // envelope rather than arriving after a success-looking object. a
+            // posting failure is non-fatal here — the report itself succeeded.
+            let comment_posted = match args.no_comment {
+                true => false,
+                false => match post_comment(url_for_gh, repo, &format!("{report}{FOOTER}")) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!("failed to post PR comment: {e:#}");
+                        false
+                    }
+                },
+            };
+            let envelope = PrReviewOutput {
+                schema_version: crate::output::SCHEMA_VERSION,
+                status: Status::Ok,
+                pr: Some(PrInfo {
+                    url: url_for_gh.map(str::to_string),
+                    number: pr_number,
+                    title: meta.title.clone(),
+                    head_sha: meta.head_ref_oid.clone(),
+                }),
+                mode: Some(match debate {
+                    true => ReviewMode::Debate,
+                    false => ReviewMode::Parallel,
+                }),
+                models: Some(crate::output::Models {
+                    reviewers: config.reviewer.iter().map(|r| r.model.clone()).collect(),
+                    aggregator: config.aggregator.model.clone(),
+                }),
+                report_markdown: Some(report),
+                comment_posted,
+                duration_ms: start.elapsed().as_millis() as u64,
+                error: None,
+            };
+            crate::output::emit_json(&envelope)?;
+        }
     }
 
     Ok(())

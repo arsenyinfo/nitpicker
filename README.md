@@ -51,6 +51,8 @@ nitpicker pr --no-comment
 nitpicker pr https://github.com/owner/repo/pull/42 --no-comment
 # force a fresh temp clone even when the URL points to your current repo
 nitpicker pr https://github.com/owner/repo/pull/42 --clone
+# machine-readable output for embedding (one JSON object on stdout)
+nitpicker pr https://github.com/owner/repo/pull/42 --no-comment --json
 ```
 
 ### Ask
@@ -259,7 +261,7 @@ nitpicker init [--global] [--free]
 ### PR subcommand
 
 ```
-nitpicker pr [URL] [--no-comment] [--no-debate] [--rounds N] [--max-turns N] [--prompt TEXT] [--repo .] [--config PATH] [-v]
+nitpicker pr [URL] [--no-comment] [--no-debate] [--rounds N] [--max-turns N] [--prompt TEXT] [--repo .] [--config PATH] [--json] [-v]
 ```
 
 Reviews a GitHub PR using its title, description, and diff. Requires the `gh` CLI (`gh auth login` to authenticate).
@@ -268,6 +270,7 @@ Reviews a GitHub PR using its title, description, and diff. Requires the `gh` CL
 - With `URL` (`https://github.com/owner/repo/pull/N`): clones the repo into a temp dir, checks out the PR branch, reviews it, then cleans up
 - By default, posts the review as a PR comment. Pass `--no-comment` to skip posting.
 - `--no-debate`, `--rounds`, and `--max-turns` work the same as in the default review mode
+- `--json` emits a single machine-readable JSON object on stdout (status, PR metadata, models, `report_markdown`, …) instead of the human report, with all logs/progress on stderr — handy for calling nitpicker as a subprocess. Exits non-zero on failure, with a `status: "error"` object on stdout.
 
 ### Ask subcommand
 
@@ -290,6 +293,10 @@ By default, nitpicker prints only the final synthesized result. Use `--verbose` 
 Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timestamp}.md`.
 
 ## Changelog
+
+**0.6.2** — 2026-06-05
+- `nitpicker pr --json` emits a single machine-readable JSON object on stdout, making the binary embeddable as a subprocess from a backend that lets users review public GitHub PRs. stdout carries only the JSON envelope (status, PR metadata, mode, models, `report_markdown`, `comment_posted`, `duration_ms`); all human output (logs, spinners, debate text) is routed to stderr. Failures — bad URL, `gh`/`git` errors, config-loading errors — still emit a `status: "error"` object on stdout and exit non-zero. Tracing now always writes to stderr (even in text mode). Debate transcripts are only written to the temp dir under `--verbose`.
+- Fixed `pr --clone` denying every file read on macOS: the temp clone dir is now canonicalized so the workspace root matches the symlink-resolved (`/var` → `/private/var`) paths the file tools check against.
 
 **0.6.1** — 2026-06-05
 - Subagent waves now run **concurrently**. Previously a turn's `spawn_subagent` calls executed one-at-a-time, so a wide swarm turned directly into wall-clock — the main driver of review time varying wildly (minutes to hours) on similar inputs. A turn's tool calls now run in parallel via `join_all`, so subagent breadth no longer scales latency. Concurrent in-flight LLM calls are bounded by a shared global semaphore (default 16) acquired only around each provider call, so the swarm throttles to the provider instead of firing every request at once. Review prompts now bias fanning out all disjoint threads as one broad up-front wave rather than dribbling out serial waves. Session-log appends are serialized so a concurrent wave can't interleave partial lines.
