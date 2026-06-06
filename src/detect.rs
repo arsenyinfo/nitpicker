@@ -35,6 +35,9 @@ const PROVIDER_ORDER: &[&str] = &[
     "mistral",
     "zai",
     "minimax",
+    // research-only subscription path: ranks above local servers (a real model beats a local one
+    // for the primary slot) but below every paid API key, so it never displaces a paid provider.
+    "codex",
     "ollama",
     "lmstudio",
 ];
