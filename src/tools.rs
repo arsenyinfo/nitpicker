@@ -25,6 +25,51 @@ pub fn floor_char_boundary(s: &str, pos: usize) -> usize {
     0
 }
 
+/// Allowlisted read-only git subcommands. Ref listing is served by the `for-each-ref`/`show-ref`
+/// plumbing (no ref-creating/deleting mode → safe by construction for any args), deliberately not
+/// the `branch`/`tag` porcelain whose read and write modes are indistinguishable by arguments.
+const ALLOWED_GIT_SUBCOMMANDS: &[&str] = &[
+    "diff",
+    "log",
+    "show",
+    "blame",
+    "status",
+    "rev-parse",
+    "shortlog",
+    "ls-files",
+    "for-each-ref",
+    "show-ref",
+];
+
+/// Reject git invocations that aren't genuinely read-only. The subcommand allowlist alone is not
+/// enough: `diff`/`log`/`show` accept `--output=<path>` (write-anywhere, traversal-capable). Ref
+/// listing is served by the read-only plumbing `for-each-ref`/`show-ref` (no ref-creating mode),
+/// not the `branch`/`tag` porcelain, so no per-subcommand argument validation is needed beyond
+/// blocking the output-to-file flag. Returns `Err(message)` for a rejected invocation.
+fn ensure_readonly_git(subcommand: &str, rest: &[&str]) -> std::result::Result<(), String> {
+    // `--output`/`-o` is a write-to-file flag only on `diff`/`log`/`show` (which share diff's
+    // output machinery). On other subcommands `-o` means something else and is read-only — notably
+    // `ls-files -o` (= `--others`) — so only gate these three to avoid blocking legitimate reads.
+    if !matches!(subcommand, "diff" | "log" | "show") {
+        return Ok(());
+    }
+    // git accepts unambiguous long-option abbreviations, so reject any `--…` prefix of `--output`
+    // too (e.g. `--out`), alongside the exact, `=`-glued, and short (`-o`/`-o<file>`) forms.
+    for token in rest {
+        let abbreviates_output = token
+            .strip_prefix("--")
+            .map(|long| long.split('=').next().unwrap_or(long))
+            .is_some_and(|stem| !stem.is_empty() && "output".starts_with(stem));
+        if abbreviates_output
+            || *token == "-o"
+            || (token.starts_with("-o") && !token.starts_with("--") && token.len() > 2)
+        {
+            return Err("Error: writing git output to a file (--output/-o) is not allowed".into());
+        }
+    }
+    Ok(())
+}
+
 pub trait Tool: Send + Sync {
     fn name(&self) -> String;
     fn definition(&self) -> ToolDefinition;
@@ -428,7 +473,7 @@ impl Tool for GitTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "git".to_string(),
-            description: "Run an allowlisted read-only git command for review context, such as diff, log, show, blame, or status. Use this for repository history or patch context, not for general file search."
+            description: "Run an allowlisted read-only git command for review context: diff, log, show, blame, status, rev-parse, shortlog, ls-files, for-each-ref, show-ref. To list or query branches/tags use for-each-ref (e.g. `for-each-ref --contains <sha> refs/heads/`), not branch/tag. Use this for repository history or patch context, not for general file search."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -455,26 +500,21 @@ impl Tool for GitTool {
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| eyre::eyre!("missing command"))?;
             let tokens = command.split_whitespace().collect::<Vec<_>>();
-            let Some((subcommand, _rest)) = tokens.split_first() else {
+            let Some((subcommand, rest)) = tokens.split_first() else {
                 return Ok("Error: empty git command".to_string());
             };
-            let allowed = [
-                "diff",
-                "log",
-                "show",
-                "blame",
-                "status",
-                "branch",
-                "tag",
-                "rev-parse",
-                "shortlog",
-                "ls-files",
-            ];
-            if !allowed.contains(subcommand) {
+            if !ALLOWED_GIT_SUBCOMMANDS.contains(subcommand) {
                 return Ok(format!("Error: git subcommand '{subcommand}' not allowed"));
             }
+            if let Err(msg) = ensure_readonly_git(subcommand, rest) {
+                return Ok(msg);
+            }
+            // GIT_OPTIONAL_LOCKS=0 keeps even nominally-read commands side-effect-free: it stops
+            // e.g. `git status` from refreshing/rewriting `.git/index` stat caches and avoids
+            // index.lock contention when running against the user's repo in `pr` in-place mode.
             let output = tokio::process::Command::new("git")
                 .args(tokens)
+                .env("GIT_OPTIONAL_LOCKS", "0")
                 .current_dir(&work_dir)
                 .output()
                 .await?;
@@ -494,5 +534,69 @@ impl Tool for GitTool {
             }
             Ok(stdout)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ALLOWED_GIT_SUBCOMMANDS, ensure_readonly_git};
+
+    /// Mirror the two gates GitTool applies: subcommand allowlist, then read-only argument check.
+    fn check(cmd: &str) -> Result<(), String> {
+        let tokens: Vec<&str> = cmd.split_whitespace().collect();
+        let (sub, rest) = tokens.split_first().expect("non-empty command");
+        if !ALLOWED_GIT_SUBCOMMANDS.contains(sub) {
+            return Err(format!("subcommand '{sub}' not allowed"));
+        }
+        ensure_readonly_git(sub, rest)
+    }
+
+    #[test]
+    fn rejects_output_file_write() {
+        // --output / -o turn a read-only command into a write-anywhere primitive
+        assert!(check("diff HEAD~1 --output=/tmp/evil").is_err());
+        assert!(check("diff --output ../escape.txt HEAD~1").is_err());
+        assert!(check("log --oneline -o /tmp/x").is_err());
+        assert!(check("show -o/tmp/glued HEAD").is_err());
+        assert!(check("diff --out=/tmp/abbrev HEAD~1").is_err()); // long-option abbreviation
+    }
+
+    #[test]
+    fn allows_plain_read_commands() {
+        assert!(check("diff HEAD~1").is_ok());
+        assert!(check("log --oneline -n 5").is_ok());
+        assert!(check("show HEAD").is_ok());
+        assert!(check("status --porcelain").is_ok());
+        // --oneline must not be mistaken for the -o output flag
+        assert!(check("log --oneline").is_ok());
+        // -o is a write flag only on diff/log/show; on ls-files it means --others (read-only)
+        assert!(check("ls-files -o --exclude-standard").is_ok());
+        assert!(check("ls-files --others").is_ok());
+    }
+
+    #[test]
+    fn rejects_branch_and_tag_porcelain() {
+        // branch/tag conflate read and write and are not on the allowlist at all; ref listing must
+        // go through the for-each-ref/show-ref plumbing instead.
+        assert!(check("branch -D some-branch").is_err());
+        assert!(check("branch new-branch").is_err());
+        assert!(check("branch --set-upstream-to=origin/main").is_err());
+        assert!(check("branch -- newbranch").is_err());
+        assert!(check("tag v9.9.9").is_err());
+        assert!(check("tag -d v1").is_err());
+        // even pure listing forms are rejected — the model is steered to for-each-ref
+        assert!(check("branch --list").is_err());
+    }
+
+    #[test]
+    fn allows_readonly_ref_plumbing() {
+        // for-each-ref / show-ref have no ref-creating mode, so any arg shape is safe.
+        assert!(check("for-each-ref refs/heads/").is_ok());
+        assert!(check("for-each-ref --contains HEAD refs/heads/").is_ok());
+        assert!(check("for-each-ref --format=%(refname) --sort=-creatordate").is_ok());
+        assert!(check("show-ref --tags").is_ok());
+        assert!(check("show-ref --heads").is_ok());
+        // for-each-ref/show-ref have no --output flag, so git itself rejects a write attempt; our
+        // layer doesn't need to gate them (the --output block is scoped to diff/log/show).
     }
 }

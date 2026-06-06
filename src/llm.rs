@@ -380,6 +380,10 @@ const STATUS_REASONS: &[(u16, &str)] = &[
     (403, "forbidden"),
     (404, "not found"),
     (429, "too many requests"),
+    (500, "internal server error"),
+    (502, "bad gateway"),
+    (503, "service unavailable"),
+    (504, "gateway timeout"),
 ];
 
 /// How far back (in bytes) to scan for a status key before a candidate number. Comfortably covers
@@ -434,8 +438,37 @@ fn status_in_context(lower: &str, start: usize, end: usize, reason: Option<&str>
     while !lower.is_char_boundary(window_start) {
         window_start += 1;
     }
-    let prefix = &lower[window_start..start];
-    prefix.contains("status") || prefix.contains("code")
+    // `statuscode` is the lowercased compact `statusCode` (no separator), where neither `status`
+    // nor `code` is a whole word on its own, so it needs its own key.
+    key_word_present(lower, window_start, start, "status")
+        || key_word_present(lower, window_start, start, "code")
+        || key_word_present(lower, window_start, start, "statuscode")
+}
+
+/// Whether `key` appears as a whole word within `lower[lo..hi]`. The left edge must be the string
+/// start or a non-`[a-z0-9_]` byte; the right edge must be the string end or a non-`[a-z0-9]` byte
+/// (`_` is allowed on the right so `status_code` still matches via the `status` key, while
+/// `decode`/`encode`/`unicode`/`error_code`/`codec`/`statuslike` do NOT count as keys). Boundary
+/// checks read `lower`'s absolute bytes, so a word split by the `[lo..hi]` window edge is judged
+/// against its real neighbours. `key` is ASCII; `lo`/`hi` are on char boundaries.
+fn key_word_present(lower: &str, lo: usize, hi: usize, key: &str) -> bool {
+    let bytes = lower.as_bytes();
+    let region = &lower[lo..hi];
+    let mut from = 0;
+    while let Some(rel) = region[from..].find(key) {
+        let abs = lo + from + rel;
+        let left_ok = abs == 0 || {
+            let b = bytes[abs - 1];
+            !b.is_ascii_alphanumeric() && b != b'_'
+        };
+        let after = abs + key.len();
+        let right_ok = after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
+        if left_ok && right_ok {
+            return true;
+        }
+        from += rel + 1;
+    }
+    false
 }
 
 fn is_non_retryable_client_error(err: &eyre::Report) -> bool {
@@ -443,6 +476,16 @@ fn is_non_retryable_client_error(err: &eyre::Report) -> bool {
     // response body, then `.wrap_err_with(...)` adds a top-level context. `err.to_string()` renders
     // only that context, so the status code would be invisible; `{err:#}` joins the full chain.
     let msg = format!("{err:#}");
+    // a 5xx response takes precedence: even when a 4xx is nested in the body (e.g. an upstream
+    // `"code": 403` inside a 502 envelope), the response itself is a retryable server error, so we
+    // must not classify it as a permanent client error. Cover the full registered 5xx range; the
+    // JSON `status`/`code`-key form is matched even for codes without a reason phrase here.
+    if [500, 501, 502, 503, 504, 505, 506, 507, 508, 510, 511]
+        .iter()
+        .any(|&status| mentions_http_status(&msg, status))
+    {
+        return false;
+    }
     [400, 401, 402, 403, 404]
         .iter()
         .any(|&status| mentions_http_status(&msg, status))
@@ -908,5 +951,37 @@ mod tests {
         assert!(mentions_http_status(r#"{"statusCode":429,"message":"slow"}"#, 429));
         assert!(mentions_http_status("HttpError: Invalid status code 401", 401));
         assert!(mentions_http_status("429 Too Many Requests", 429)); // reason phrase
+    }
+
+    #[test]
+    fn key_must_be_a_whole_word_not_a_substring() {
+        // `code` embedded in another word is not a status key, so these transient errors must NOT
+        // be classified as non-retryable client errors (they should keep their retries).
+        assert!(!mentions_http_status("decode error 404", 404)); // decode contains "code"
+        assert!(!mentions_http_status("unicode error 400", 400)); // unicode contains "code"
+        assert!(!mentions_http_status("encode failure 403", 403)); // encode contains "code"
+        assert!(!mentions_http_status("error_code 402 seen", 402)); // underscore is a left edge
+        // right boundary: `code`/`status` as a prefix of a longer word is not a key either.
+        assert!(!mentions_http_status("codec 404 negotiation failed", 404));
+        assert!(!mentions_http_status("statuslike 401 marker", 401));
+        // window edge: even if the 24-byte key window cuts `unicode` right before `code`, the real
+        // preceding char ('i') is still consulted, so it stays a non-match.
+        assert!(!mentions_http_status("xxxxxxxxxxxxxxxxxunicode 404", 404));
+        // `status_code` is still a real key (matched via the `status` word).
+        assert!(mentions_http_status(r#"{"status_code": 401}"#, 401));
+    }
+
+    #[test]
+    fn server_error_takes_precedence_over_nested_4xx() {
+        // a 5xx response whose body nests a 4xx (e.g. an upstream code) is a retryable server
+        // error, not a permanent client error — so it must NOT be classified non-retryable.
+        let err = wrapped_provider_error(r#"{"statusCode":502,"error":{"code":403}}"#);
+        assert!(!is_non_retryable_client_error(&err));
+        // 5xx codes without a reason phrase here (501) are still matched via the status key.
+        let nested = wrapped_provider_error(r#"{"statusCode":501,"error":{"code":403}}"#);
+        assert!(!is_non_retryable_client_error(&nested));
+        // a genuine 4xx with no 5xx in the chain is still non-retryable.
+        let pure_4xx = wrapped_provider_error(r#"{"statusCode":403,"message":"forbidden"}"#);
+        assert!(is_non_retryable_client_error(&pure_4xx));
     }
 }

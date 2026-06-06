@@ -264,7 +264,13 @@ fn get_head_commit(repo: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn get_current_branch(repo: &Path) -> Result<String> {
+/// Where HEAD pointed before nitpicker checked out the PR branch, so it can be restored on exit.
+enum HeadState {
+    Branch(String),
+    Detached(String),
+}
+
+fn get_head_state(repo: &Path) -> Result<HeadState> {
     // symbolic-ref succeeds for attached HEAD, fails for detached
     let out = Command::new("git")
         .args(["symbolic-ref", "-q", "--short", "HEAD"])
@@ -272,9 +278,11 @@ fn get_current_branch(repo: &Path) -> Result<String> {
         .output()
         .wrap_err("failed to get current branch")?;
     if out.status.success() {
-        return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
+        return Ok(HeadState::Branch(
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        ));
     }
-    // detached HEAD — return commit hash so restore_branch can check it out
+    // detached HEAD — capture the commit so restore can re-detach onto it
     let out = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(repo)
@@ -283,23 +291,45 @@ fn get_current_branch(repo: &Path) -> Result<String> {
     if !out.status.success() {
         eyre::bail!("failed to get current branch or commit");
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    Ok(HeadState::Detached(
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+    ))
 }
 
-fn restore_branch(repo: &Path, branch: &str) {
-    let result = Command::new("git")
-        .args(["switch", "--", branch])
-        .current_dir(repo)
-        .output();
+fn restore_head(repo: &Path, head: &HeadState) {
+    // a detached HEAD must be restored with `switch --detach`: `git switch -- <sha>` refuses a bare
+    // commit ("a branch is expected, got commit"), which would silently strand the user on
+    // nitpicker's PR branch.
+    let (args, recover): (Vec<&str>, String) = match head {
+        HeadState::Branch(b) => (vec!["switch", "--", b], format!("git switch -- {b}")),
+        HeadState::Detached(sha) => (
+            vec!["switch", "--detach", sha],
+            format!("git switch --detach {sha}"),
+        ),
+    };
+    let result = Command::new("git").args(&args).current_dir(repo).output();
     let detail = match result {
         Ok(out) if out.status.success() => return,
         Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
         Err(e) => e.to_string(),
     };
     eprintln!(
-        "warning: could not restore branch '{branch}' in {repo}; run `git switch -- {branch}` to recover ({detail})",
+        "warning: could not restore HEAD in {repo}; run `{recover}` to recover ({detail})",
         repo = repo.display(),
     );
+}
+
+/// Restores the user's original HEAD when dropped, so a panic or early error anywhere in the review
+/// path (not just a clean return) can't strand them on nitpicker's PR branch.
+struct BranchRestoreGuard {
+    repo: PathBuf,
+    head: HeadState,
+}
+
+impl Drop for BranchRestoreGuard {
+    fn drop(&mut self) {
+        restore_head(&self.repo, &self.head);
+    }
 }
 
 fn assert_clean_working_tree(repo: &Path) -> Result<()> {
@@ -360,7 +390,7 @@ fn checkout_pr_branch(repo: &Path, pr_number: u32) -> Result<()> {
     // namespaced branch — safe to delete, will never match a user branch
     let branch = format!("nitpicker/pr-{pr_number}");
 
-    if get_current_branch(repo).ok().as_deref() == Some(branch.as_str()) {
+    if matches!(get_head_state(repo), Ok(HeadState::Branch(b)) if b == branch) {
         // already on our tracking branch — fast-forward only
         let out = Command::new("git")
             .args(["merge", "--ff-only", "FETCH_HEAD"])
@@ -534,8 +564,9 @@ async fn run_pr_inner(args: PrArgs, start: std::time::Instant) -> Result<()> {
     };
 
     let _tmpdir_guard: Option<tempfile::TempDir>;
-    // set when we switch branches in the user's own repo so we can restore on the way out
-    let original_branch: Option<(PathBuf, String)>;
+    // set when we switch branches in the user's own repo; its Drop restores HEAD on the way out
+    // (including on panic/early-error), so it must outlive the whole review below
+    let _restore_guard: Option<BranchRestoreGuard>;
 
     // pr number is not part of PrMeta; carry it out of the flow for the json envelope
     let (repo, url_for_gh, meta, pr_number): (PathBuf, Option<String>, PrMeta, Option<u32>) =
@@ -551,14 +582,17 @@ async fn run_pr_inner(args: PrArgs, start: std::time::Instant) -> Result<()> {
                     .is_some_and(|sha| sha == meta.head_ref_oid);
                 match head_matches {
                     true => {
-                        original_branch = None;
+                        _restore_guard = None;
                     }
                     false => {
-                        let branch = get_current_branch(&user_repo)?;
+                        let head = get_head_state(&user_repo)?;
                         checkout_pr_branch(&user_repo, pr_number).inspect_err(|_e| {
-                            restore_branch(&user_repo, &branch);
+                            restore_head(&user_repo, &head);
                         })?;
-                        original_branch = Some((user_repo.clone(), branch));
+                        _restore_guard = Some(BranchRestoreGuard {
+                            repo: user_repo.clone(),
+                            head,
+                        });
                     }
                 }
                 _tmpdir_guard = None;
@@ -580,7 +614,7 @@ async fn run_pr_inner(args: PrArgs, start: std::time::Instant) -> Result<()> {
                     .wrap_err("failed to canonicalize temp dir path")?;
                 clone_pr(&slug, pr_number, &path)?;
                 _tmpdir_guard = Some(tmpdir);
-                original_branch = None;
+                _restore_guard = None;
                 (path, Some(url), meta, Some(pr_number))
             }
             PrFlow::CurrentBranch => {
@@ -588,14 +622,17 @@ async fn run_pr_inner(args: PrArgs, start: std::time::Instant) -> Result<()> {
                 // refresh remote-tracking branches so the diff is computed against an up-to-date base
                 refresh_remote_branches(&user_repo)?;
                 _tmpdir_guard = None;
-                original_branch = None;
+                _restore_guard = None;
                 (user_repo, None, meta, None)
             }
         };
 
     let comments = fetch_pr_comments(url_for_gh.as_deref(), &repo)?;
 
-    let result = run_review_inner(
+    // _restore_guard's Drop restores the user's HEAD (panic- and early-error-safe). It drops at the
+    // end of this scope, after the review completes and before `_lock`, so restore happens while
+    // the lock is still held.
+    run_review_inner(
         &repo,
         url_for_gh.as_deref(),
         pr_number,
@@ -606,13 +643,7 @@ async fn run_pr_inner(args: PrArgs, start: std::time::Instant) -> Result<()> {
         &comments,
         start,
     )
-    .await;
-
-    if let Some((ref restore_repo, ref branch)) = original_branch {
-        restore_branch(restore_repo, branch);
-    }
-
-    result
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]

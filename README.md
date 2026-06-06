@@ -294,6 +294,9 @@ Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timesta
 
 ## Changelog
 
+**0.6.3** — 2026-06-06
+- Audit fixes: (1) **git tool security** — the read-only allowlist gated only the subcommand, allowing file writes (`diff --output=<path>`) and ref mutation (`branch`/`tag`) against the user's real repo in `pr` in-place mode; `branch`/`tag` are replaced by the safe-by-construction `for-each-ref`/`show-ref` plumbing and `--output`/`-o` is blocked. (2) **detached-HEAD restore** in `pr` mode was broken and not panic-safe, stranding the user on `nitpicker/pr-N`; now restored via `git switch --detach` from a `Drop` guard. (3) **retry classifier** misread `code` as a substring (`error decoding…404` → permanent 4xx, retries lost); keys are now whole-word matched and 5xx-nested-4xx stays retryable. (4) **debate** no longer records an empty verdict when a terminal tool call is blocked/malformed.
+
 **0.6.2** — 2026-06-05
 - `nitpicker pr --json` emits a single machine-readable JSON object on stdout, making the binary embeddable as a subprocess from a backend that lets users review public GitHub PRs. stdout carries only the JSON envelope (status, PR metadata, mode, models, `report_markdown`, `comment_posted`, `duration_ms`); all human output (logs, spinners, debate text) is routed to stderr. Failures — bad URL, `gh`/`git` errors, config-loading errors — still emit a `status: "error"` object on stdout and exit non-zero. Tracing now always writes to stderr (even in text mode). Debate transcripts are only written to the temp dir under `--verbose`.
 - Fixed `pr --clone` denying every file read on macOS: the temp clone dir is now canonicalized so the workspace root matches the symlink-resolved (`/var` → `/private/var`) paths the file tools check against.
