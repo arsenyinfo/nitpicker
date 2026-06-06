@@ -25,10 +25,28 @@ pub fn floor_char_boundary(s: &str, pos: usize) -> usize {
     0
 }
 
+/// Allowlisted read-only git subcommands. Ref listing is served by the `for-each-ref`/`show-ref`
+/// plumbing (no ref-creating/deleting mode → safe by construction for any args), deliberately not
+/// the `branch`/`tag` porcelain whose read and write modes are indistinguishable by arguments.
+const ALLOWED_GIT_SUBCOMMANDS: &[&str] = &[
+    "diff",
+    "log",
+    "show",
+    "blame",
+    "status",
+    "rev-parse",
+    "shortlog",
+    "ls-files",
+    "for-each-ref",
+    "show-ref",
+];
+
 /// Reject git invocations that aren't genuinely read-only. The subcommand allowlist alone is not
-/// enough: `diff`/`log`/`show` accept `--output=<path>` (write-anywhere, traversal-capable), and
-/// `branch`/`tag` can create/delete/move refs. Returns `Err(message)` for a rejected invocation.
-fn ensure_readonly_git(subcommand: &str, rest: &[&str]) -> std::result::Result<(), String> {
+/// enough: `diff`/`log`/`show` accept `--output=<path>` (write-anywhere, traversal-capable). Ref
+/// listing is served by the read-only plumbing `for-each-ref`/`show-ref` (no ref-creating mode),
+/// not the `branch`/`tag` porcelain, so no per-subcommand argument validation is needed beyond
+/// blocking the output-to-file flag. Returns `Err(message)` for a rejected invocation.
+fn ensure_readonly_git(rest: &[&str]) -> std::result::Result<(), String> {
     // `--output`/`-o <file>` writes command output to an arbitrary path on every subcommand. git
     // also accepts unambiguous long-option abbreviations, so reject any `--…` prefix of `--output`
     // too (e.g. `--out`), alongside the exact, `=`-glued, and short (`-o`/`-o<file>`) forms.
@@ -44,139 +62,7 @@ fn ensure_readonly_git(subcommand: &str, rest: &[&str]) -> std::result::Result<(
             return Err("Error: writing git output to a file (--output/-o) is not allowed".into());
         }
     }
-    match subcommand {
-        // `branch`/`tag` can create, delete, move, or reconfigure refs. A subcommand-only allowlist
-        // plus a mutating-flag denylist is not enough: git prefix-abbreviates long options and
-        // accepts `=`-glued values and glued short options, so any denylist of full flag names is
-        // bypassable (`--set-upstream-to=x`, `--unset-up`, `-uorigin`). Default-deny instead, with
-        // two flag classes: ACTION flags actually list/query refs (and so authorize a positional
-        // operand, treated as a pattern/commit), MODIFIER flags only shape output and never
-        // authorize a positional (otherwise `branch --color <name>` would create a ref).
-        "branch" => ensure_readonly_ref_subcommand(
-            "branch",
-            rest,
-            &[
-                "--list",
-                "-l",
-                "-a",
-                "--all",
-                "-r",
-                "--remotes",
-                "--contains",
-                "--no-contains",
-                "--merged",
-                "--no-merged",
-                "--points-at",
-                "--show-current",
-            ],
-            &[
-                "-v",
-                "--verbose",
-                "--format",
-                "--sort",
-                "--color",
-                "--no-color",
-                "--ignore-case",
-                "--column",
-                "--no-column",
-                "--abbrev",
-                "--no-abbrev",
-            ],
-        ),
-        "tag" => ensure_readonly_ref_subcommand(
-            "tag",
-            rest,
-            &[
-                "--list",
-                "-l",
-                "-n",
-                "--contains",
-                "--no-contains",
-                "--merged",
-                "--no-merged",
-                "--points-at",
-            ],
-            &[
-                "--sort",
-                "--format",
-                "--color",
-                "--no-color",
-                "--ignore-case",
-                "--column",
-                "--no-column",
-                "--omit-empty",
-            ],
-        ),
-        _ => Ok(()),
-    }
-}
-
-/// `branch`/`tag` are read-only only when every flag resolves to a known action/modifier flag and
-/// no bare positional creates a ref. A positional (pattern/commit) is allowed only alongside an
-/// ACTION flag (e.g. `branch --contains <sha>`, `tag --list <pattern>`); modifier flags shape
-/// output but never authorize a positional. Default-deny is bypass-resistant: a long token that
-/// prefixes a known flag either resolves to it or is ambiguous (git then errors, mutating nothing),
-/// while any token that is *not* such a prefix — including abbreviations/glued forms of mutating
-/// flags — is rejected. Short options must match exactly (no glued value or cluster), so
-/// `-uorigin` / `-D` / `-d` are rejected. `--` is treated as git's end-of-options marker: every
-/// later token is an operand, so it can't smuggle a flag-looking ref name past the action check.
-fn ensure_readonly_ref_subcommand(
-    name: &str,
-    rest: &[&str],
-    action: &[&str],
-    modifier: &[&str],
-) -> std::result::Result<(), String> {
-    let prefixes_any = |flags: &[&str], devalued: &str| {
-        flags
-            .iter()
-            .any(|q| q.starts_with("--") && q.starts_with(devalued))
-    };
-    let mut has_action = false;
-    let mut has_positional = false;
-    let mut end_of_options = false;
-    for token in rest {
-        if end_of_options {
-            has_positional = true;
-            continue;
-        }
-        match token.strip_prefix("--") {
-            Some(long) => {
-                let stem = long.split('=').next().unwrap_or(long);
-                if stem.is_empty() {
-                    end_of_options = true; // bare `--`: authorizes nothing, operands follow
-                    continue;
-                }
-                let devalued = format!("--{stem}");
-                let is_action = prefixes_any(action, &devalued);
-                if !is_action && !prefixes_any(modifier, &devalued) {
-                    return Err(reject_ref_flag(name, token));
-                }
-                has_action |= is_action;
-            }
-            None => match token.strip_prefix('-') {
-                Some(_short) => {
-                    let is_action = action.contains(token);
-                    if !is_action && !modifier.contains(token) {
-                        return Err(reject_ref_flag(name, token));
-                    }
-                    has_action |= is_action;
-                }
-                None => has_positional = true,
-            },
-        }
-    }
-    if has_positional && !has_action {
-        return Err(format!(
-            "Error: 'git {name} <name>' can create a ref; use a listing/query form (e.g. --list, --contains)"
-        ));
-    }
     Ok(())
-}
-
-fn reject_ref_flag(name: &str, flag: &str) -> String {
-    format!(
-        "Error: 'git {name} {flag}' is not a read-only form; only listing/query flags are allowed"
-    )
 }
 
 pub trait Tool: Send + Sync {
@@ -582,7 +468,7 @@ impl Tool for GitTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "git".to_string(),
-            description: "Run an allowlisted read-only git command for review context, such as diff, log, show, blame, or status. Use this for repository history or patch context, not for general file search."
+            description: "Run an allowlisted read-only git command for review context: diff, log, show, blame, status, rev-parse, shortlog, ls-files, for-each-ref, show-ref. To list or query branches/tags use for-each-ref (e.g. `for-each-ref --contains <sha> refs/heads/`), not branch/tag. Use this for repository history or patch context, not for general file search."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -612,22 +498,10 @@ impl Tool for GitTool {
             let Some((subcommand, rest)) = tokens.split_first() else {
                 return Ok("Error: empty git command".to_string());
             };
-            let allowed = [
-                "diff",
-                "log",
-                "show",
-                "blame",
-                "status",
-                "branch",
-                "tag",
-                "rev-parse",
-                "shortlog",
-                "ls-files",
-            ];
-            if !allowed.contains(subcommand) {
+            if !ALLOWED_GIT_SUBCOMMANDS.contains(subcommand) {
                 return Ok(format!("Error: git subcommand '{subcommand}' not allowed"));
             }
-            if let Err(msg) = ensure_readonly_git(subcommand, rest) {
+            if let Err(msg) = ensure_readonly_git(rest) {
                 return Ok(msg);
             }
             let output = tokio::process::Command::new("git")
@@ -656,12 +530,16 @@ impl Tool for GitTool {
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_readonly_git;
+    use super::{ALLOWED_GIT_SUBCOMMANDS, ensure_readonly_git};
 
+    /// Mirror the two gates GitTool applies: subcommand allowlist, then read-only argument check.
     fn check(cmd: &str) -> Result<(), String> {
         let tokens: Vec<&str> = cmd.split_whitespace().collect();
         let (sub, rest) = tokens.split_first().expect("non-empty command");
-        ensure_readonly_git(sub, rest)
+        if !ALLOWED_GIT_SUBCOMMANDS.contains(sub) {
+            return Err(format!("subcommand '{sub}' not allowed"));
+        }
+        ensure_readonly_git(rest)
     }
 
     #[test]
@@ -671,6 +549,7 @@ mod tests {
         assert!(check("diff --output ../escape.txt HEAD~1").is_err());
         assert!(check("log --oneline -o /tmp/x").is_err());
         assert!(check("show -o/tmp/glued HEAD").is_err());
+        assert!(check("diff --out=/tmp/abbrev HEAD~1").is_err()); // long-option abbreviation
     }
 
     #[test]
@@ -684,52 +563,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_ref_mutation() {
+    fn rejects_branch_and_tag_porcelain() {
+        // branch/tag conflate read and write and are not on the allowlist at all; ref listing must
+        // go through the for-each-ref/show-ref plumbing instead.
         assert!(check("branch -D some-branch").is_err());
-        assert!(check("branch -d some-branch").is_err());
-        assert!(check("branch -m old new").is_err());
-        assert!(check("branch new-branch").is_err()); // bare positional creates a ref
-        assert!(check("tag -d v1").is_err());
-        assert!(check("tag v9.9.9").is_err()); // creates a tag
-        assert!(check("tag -a v1 -m msg").is_err());
-    }
-
-    #[test]
-    fn rejects_mutation_via_abbreviated_and_glued_flags() {
-        // git prefix-abbreviates long options, accepts `=`-glued values, and glues short-option
-        // values — none of these may slip an upstream/ref mutation past the allowlist.
+        assert!(check("branch new-branch").is_err());
         assert!(check("branch --set-upstream-to=origin/main").is_err());
-        assert!(check("branch --unset-up").is_err()); // abbreviation of --unset-upstream
-        assert!(check("branch -uorigin/main").is_err()); // glued short option
-        assert!(check("branch --edit-desc").is_err()); // abbreviation of --edit-description
-        assert!(check("tag --cleanup=verbatim").is_err());
-    }
-
-    #[test]
-    fn rejects_ref_creation_via_separator_or_modifier() {
-        // `--` end-of-options marker must not authorize the operand that follows
         assert!(check("branch -- newbranch").is_err());
-        assert!(check("tag -- v1.0").is_err());
-        // a flag-looking name after `--` is an operand, not an action flag
-        assert!(check("branch -- --list newbranch").is_err());
-        // output-modifier flags must not authorize a positional (would create a ref)
-        assert!(check("branch --color newbranch").is_err());
-        assert!(check("branch --verbose newbranch").is_err());
-        assert!(check("tag --format=%(refname) newtag").is_err());
-        // a modifier alongside a real action flag is still fine
-        assert!(check("branch --color --list").is_ok());
-        assert!(check("branch --list -- pattern").is_ok());
+        assert!(check("tag v9.9.9").is_err());
+        assert!(check("tag -d v1").is_err());
+        // even pure listing forms are rejected — the model is steered to for-each-ref
+        assert!(check("branch --list").is_err());
     }
 
     #[test]
-    fn allows_ref_listing_and_queries() {
-        assert!(check("branch").is_ok());
-        assert!(check("branch -a").is_ok());
-        assert!(check("branch --list").is_ok());
-        assert!(check("branch --contains HEAD").is_ok()); // positional ok with a query flag
-        assert!(check("branch --cont HEAD").is_ok()); // abbreviation of a read-only flag is fine
-        assert!(check("tag").is_ok());
-        assert!(check("tag -l v1.*").is_ok());
-        assert!(check("tag --list v1.*").is_ok());
+    fn allows_readonly_ref_plumbing() {
+        // for-each-ref / show-ref have no ref-creating mode, so any arg shape is safe.
+        assert!(check("for-each-ref refs/heads/").is_ok());
+        assert!(check("for-each-ref --contains HEAD refs/heads/").is_ok());
+        assert!(check("for-each-ref --format=%(refname) --sort=-creatordate").is_ok());
+        assert!(check("show-ref --tags").is_ok());
+        assert!(check("show-ref --heads").is_ok());
+        // but the global output-to-file block still applies to them
+        assert!(check("for-each-ref --output=/tmp/evil").is_err());
     }
 }
