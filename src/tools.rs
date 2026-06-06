@@ -46,9 +46,14 @@ const ALLOWED_GIT_SUBCOMMANDS: &[&str] = &[
 /// listing is served by the read-only plumbing `for-each-ref`/`show-ref` (no ref-creating mode),
 /// not the `branch`/`tag` porcelain, so no per-subcommand argument validation is needed beyond
 /// blocking the output-to-file flag. Returns `Err(message)` for a rejected invocation.
-fn ensure_readonly_git(rest: &[&str]) -> std::result::Result<(), String> {
-    // `--output`/`-o <file>` writes command output to an arbitrary path on every subcommand. git
-    // also accepts unambiguous long-option abbreviations, so reject any `--…` prefix of `--output`
+fn ensure_readonly_git(subcommand: &str, rest: &[&str]) -> std::result::Result<(), String> {
+    // `--output`/`-o` is a write-to-file flag only on `diff`/`log`/`show` (which share diff's
+    // output machinery). On other subcommands `-o` means something else and is read-only — notably
+    // `ls-files -o` (= `--others`) — so only gate these three to avoid blocking legitimate reads.
+    if !matches!(subcommand, "diff" | "log" | "show") {
+        return Ok(());
+    }
+    // git accepts unambiguous long-option abbreviations, so reject any `--…` prefix of `--output`
     // too (e.g. `--out`), alongside the exact, `=`-glued, and short (`-o`/`-o<file>`) forms.
     for token in rest {
         let abbreviates_output = token
@@ -501,11 +506,15 @@ impl Tool for GitTool {
             if !ALLOWED_GIT_SUBCOMMANDS.contains(subcommand) {
                 return Ok(format!("Error: git subcommand '{subcommand}' not allowed"));
             }
-            if let Err(msg) = ensure_readonly_git(rest) {
+            if let Err(msg) = ensure_readonly_git(subcommand, rest) {
                 return Ok(msg);
             }
+            // GIT_OPTIONAL_LOCKS=0 keeps even nominally-read commands side-effect-free: it stops
+            // e.g. `git status` from refreshing/rewriting `.git/index` stat caches and avoids
+            // index.lock contention when running against the user's repo in `pr` in-place mode.
             let output = tokio::process::Command::new("git")
                 .args(tokens)
+                .env("GIT_OPTIONAL_LOCKS", "0")
                 .current_dir(&work_dir)
                 .output()
                 .await?;
@@ -539,7 +548,7 @@ mod tests {
         if !ALLOWED_GIT_SUBCOMMANDS.contains(sub) {
             return Err(format!("subcommand '{sub}' not allowed"));
         }
-        ensure_readonly_git(rest)
+        ensure_readonly_git(sub, rest)
     }
 
     #[test]
@@ -560,6 +569,9 @@ mod tests {
         assert!(check("status --porcelain").is_ok());
         // --oneline must not be mistaken for the -o output flag
         assert!(check("log --oneline").is_ok());
+        // -o is a write flag only on diff/log/show; on ls-files it means --others (read-only)
+        assert!(check("ls-files -o --exclude-standard").is_ok());
+        assert!(check("ls-files --others").is_ok());
     }
 
     #[test]
@@ -584,7 +596,7 @@ mod tests {
         assert!(check("for-each-ref --format=%(refname) --sort=-creatordate").is_ok());
         assert!(check("show-ref --tags").is_ok());
         assert!(check("show-ref --heads").is_ok());
-        // but the global output-to-file block still applies to them
-        assert!(check("for-each-ref --output=/tmp/evil").is_err());
+        // for-each-ref/show-ref have no --output flag, so git itself rejects a write attempt; our
+        // layer doesn't need to gate them (the --output block is scoped to diff/log/show).
     }
 }

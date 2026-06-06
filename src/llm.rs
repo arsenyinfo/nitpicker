@@ -478,8 +478,9 @@ fn is_non_retryable_client_error(err: &eyre::Report) -> bool {
     let msg = format!("{err:#}");
     // a 5xx response takes precedence: even when a 4xx is nested in the body (e.g. an upstream
     // `"code": 403` inside a 502 envelope), the response itself is a retryable server error, so we
-    // must not classify it as a permanent client error.
-    if [500, 502, 503, 504]
+    // must not classify it as a permanent client error. Cover the full registered 5xx range; the
+    // JSON `status`/`code`-key form is matched even for codes without a reason phrase here.
+    if [500, 501, 502, 503, 504, 505, 506, 507, 508, 510, 511]
         .iter()
         .any(|&status| mentions_http_status(&msg, status))
     {
@@ -976,6 +977,9 @@ mod tests {
         // error, not a permanent client error — so it must NOT be classified non-retryable.
         let err = wrapped_provider_error(r#"{"statusCode":502,"error":{"code":403}}"#);
         assert!(!is_non_retryable_client_error(&err));
+        // 5xx codes without a reason phrase here (501) are still matched via the status key.
+        let nested = wrapped_provider_error(r#"{"statusCode":501,"error":{"code":403}}"#);
+        assert!(!is_non_retryable_client_error(&nested));
         // a genuine 4xx with no 5xx in the chain is still non-retryable.
         let pure_4xx = wrapped_provider_error(r#"{"statusCode":403,"message":"forbidden"}"#);
         assert!(is_non_retryable_client_error(&pure_4xx));
