@@ -60,5 +60,10 @@ azure = ["dep:azure_identity", "dep:azure_core"]
 # Off by default: pulls in axum + keyring (native crypto/secret-service backends). Build with `--features antigravity`.
 antigravity = ["dep:axum", "dep:uuid", "dep:keyring"]
 
+# thin LTO + opt-level "z" trims the binary (~12M → ~8.7M) while keeping clean release
+# builds faster than the no-LTO default; codegen-units stays at the default 16 for build
+# parallelism. panic stays "unwind" — review.rs catches reviewer-task panics as JoinError.
 [profile.release]
+opt-level = "z"
+lto = "thin"
 strip = true
