@@ -9,12 +9,12 @@
 //! mirroring the posture of the Antigravity Gemini path.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use eyre::{Result, WrapErr};
-use rig_core::OneOrMany;
 use rig_core::completion::message::AssistantContent;
 use rig_core::providers::openai::responses_api::{
     CompletionRequest as ResponsesBody, CompletionResponse as ResponsesResp,
@@ -23,8 +23,8 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use crate::llm::{
-    Completion, CompletionResponse, FinishReason, LLMClient, TokenUsage, mentions_http_status,
-    merge_json,
+    Completion, CompletionResponse, FinishReason, LLMClient, LLMClientDyn, TokenUsage,
+    WithRetryExt, mentions_http_status, merge_json,
 };
 
 /// Codex CLI's public OAuth client id (PKCE, no secret) — shared with the official CLI.
@@ -35,6 +35,9 @@ const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const ORIGINATOR: &str = "nitpicker";
 /// Refresh this long before the token's stated expiry to avoid racing the deadline.
 const EXPIRY_SKEW: Duration = Duration::from_secs(60);
+/// Bound the token refresh so a stalled auth request can't pin the token mutex (and thus every
+/// concurrent completion sharing the client) indefinitely.
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn user_agent() -> String {
     format!(
@@ -204,6 +207,7 @@ async fn refresh_tokens(
 ) -> Result<CodexTokens> {
     let resp = http
         .post(TOKEN_URL)
+        .timeout(REFRESH_TIMEOUT)
         .form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
@@ -215,12 +219,22 @@ async fn refresh_tokens(
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        // surface the HTTP status (with reason phrase) so the 4xx/refresh-rotation logic can classify it
-        eyre::bail!("Codex token refresh returned HTTP {status}: {body}");
+        // surface the HTTP status (with reason phrase) so the 4xx/refresh-rotation logic can
+        // classify it. The OAuth error body is `{"error": ...}` and doesn't echo the submitted
+        // tokens, but truncate it anyway so nothing unbounded reaches logs.
+        eyre::bail!(
+            "Codex token refresh returned HTTP {status}: {}",
+            truncate(&body, 1000)
+        );
     }
     let parsed: RefreshResponse =
         serde_json::from_str(&body).wrap_err("parsing Codex token refresh response")?;
-    let expires_at = SystemTime::now() + Duration::from_secs(parsed.expires_in.unwrap_or(3600));
+    // prefer the authoritative `expires_in`; if absent, derive from the new access token's JWT `exp`
+    // rather than guessing a fixed lifetime.
+    let expires_at = match parsed.expires_in {
+        Some(secs) => SystemTime::now() + Duration::from_secs(secs),
+        None => expiry_from_access_token(&parsed.access_token),
+    };
     let account_id = prev_account_id
         .map(str::to_string)
         .or_else(|| account_id_from_tokens(parsed.id_token.as_deref(), &parsed.access_token));
@@ -270,7 +284,7 @@ impl CodexClient {
                 *tokens = fresh;
                 Ok(())
             }
-            Err(err) if mentions_4xx(&err) => {
+            Err(err) if is_rotation_4xx(&err) => {
                 let disk = load_tokens(&self.auth_path)
                     .wrap_err("Codex refresh token rejected and reloading auth.json failed")?;
                 let fresh = refresh_tokens(
@@ -353,6 +367,26 @@ impl CodexClient {
     }
 }
 
+/// Process-wide shared Codex client (retry-wrapped), built once on first use.
+///
+/// The token store is inherently process-global — there is a single `~/.codex/auth.json` and a
+/// single live token chain — so every Codex reviewer/aggregator must share ONE [`CodexClient`].
+/// Per-client caches would each hold their own in-memory refresh token; after a rotation, one
+/// client's fresh token would be invisible to the others, and a concurrent refresh on the stale
+/// disk token could fail. Sharing one instance gives a single token cache with working
+/// concurrent-refresh dedup.
+pub fn shared_client() -> Result<Arc<dyn LLMClientDyn>> {
+    static CELL: OnceLock<StdMutex<Option<Arc<dyn LLMClientDyn>>>> = OnceLock::new();
+    let cell = CELL.get_or_init(|| StdMutex::new(None));
+    let mut guard = cell.lock().expect("codex shared-client mutex poisoned");
+    if let Some(existing) = guard.as_ref() {
+        return Ok(Arc::clone(existing));
+    }
+    let client = CodexClient::new()?.with_retry().into_arc();
+    *guard = Some(Arc::clone(&client));
+    Ok(client)
+}
+
 impl LLMClient for CodexClient {
     async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
         let (access, account_id) = self.current_access().await?;
@@ -403,22 +437,54 @@ fn build_body(completion: &Completion) -> Result<ResponsesBody> {
     Ok(body)
 }
 
-/// Parse the Codex SSE stream into rig's response type. With `store:false` the terminal
-/// `response.completed` event carries an empty `output`, so the real items are accumulated from the
-/// per-item `response.output_item.done` events and injected before deserializing.
+/// Split an SSE stream into per-event payloads. Events are separated by a blank line, and a single
+/// event may carry its payload across several `data:` fields that must be rejoined with `\n`
+/// (per the SSE spec). `str::lines()` strips a trailing `\r`, so this handles `\n` and `\r\n`.
+fn sse_event_payloads(text: &str) -> Vec<String> {
+    let mut events = vec![];
+    let mut current = String::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            if !current.is_empty() {
+                events.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            if !current.is_empty() {
+                current.push('\n');
+            }
+            // an optional single leading space after the colon is part of the SSE framing, not data
+            current.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+        }
+        // other field lines (`event:`, `id:`, comments) are not needed here
+    }
+    if !current.is_empty() {
+        events.push(current);
+    }
+    events
+}
+
+/// Parse the Codex SSE stream into rig's response type. The terminal event is `response.completed`
+/// or `response.incomplete` (the latter when the model stops early, e.g. hitting the output cap);
+/// both carry the full `response` object. With `store:false` that object's `output` is empty, so the
+/// real items are accumulated from the per-item `response.output_item.done` events and injected.
 fn parse_sse(text: &str) -> Result<ResponsesResp> {
     let mut items: Vec<Value> = vec![];
-    for line in text.lines() {
-        let Some(data) = line.strip_prefix("data:") else {
-            continue;
-        };
+    let mut last_parse_err: Option<String> = None;
+    for data in sse_event_payloads(text) {
         let data = data.trim();
         if data.is_empty() || data == "[DONE]" {
             continue;
         }
         let ev: Value = match serde_json::from_str(data) {
             Ok(v) => v,
-            Err(_) => continue,
+            // keep going (most events are deltas we ignore), but remember the failure so a missing
+            // terminal event reports the real parse error instead of a generic "not found".
+            Err(e) => {
+                last_parse_err = Some(e.to_string());
+                continue;
+            }
         };
         match ev.get("type").and_then(Value::as_str) {
             Some("response.output_item.done") => {
@@ -426,13 +492,22 @@ fn parse_sse(text: &str) -> Result<ResponsesResp> {
                     items.push(item.clone());
                 }
             }
-            Some("response.completed") => {
-                let mut response = ev.get("response").cloned().ok_or_else(|| {
-                    eyre::eyre!("Codex `response.completed` event missing `response`")
-                })?;
-                response["output"] = Value::Array(items);
+            Some("response.completed") | Some("response.incomplete") => {
+                let mut response = ev
+                    .get("response")
+                    .cloned()
+                    .ok_or_else(|| eyre::eyre!("Codex terminal SSE event missing `response`"))?;
+                // only inject accumulated items when the event didn't echo its own output
+                // (store:false leaves it empty; a future stored mode might populate it).
+                let echoed_output = response
+                    .get("output")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| !a.is_empty());
+                if !echoed_output {
+                    response["output"] = Value::Array(std::mem::take(&mut items));
+                }
                 return serde_json::from_value::<ResponsesResp>(response)
-                    .wrap_err("parsing Codex `response.completed` payload");
+                    .wrap_err("parsing Codex terminal response payload");
             }
             Some("response.failed") | Some("error") => {
                 eyre::bail!(
@@ -443,10 +518,13 @@ fn parse_sse(text: &str) -> Result<ResponsesResp> {
             _ => {}
         }
     }
-    eyre::bail!(
-        "no `response.completed` event in Codex SSE stream: {}",
-        truncate(text, 1000)
-    )
+    match last_parse_err {
+        Some(e) => eyre::bail!("no terminal event in Codex SSE stream; last parse error: {e}"),
+        None => eyre::bail!(
+            "no terminal event in Codex SSE stream: {}",
+            truncate(text, 1000)
+        ),
+    }
 }
 
 fn to_completion_response(raw: ResponsesResp, model: String) -> Result<CompletionResponse> {
@@ -468,18 +546,12 @@ fn to_completion_response(raw: ResponsesResp, model: String) -> Result<Completio
         }
     };
     Ok(CompletionResponse {
-        choice: ensure_non_empty(parsed.choice)?,
+        // rig's `TryFrom` above already errors on an empty response, so `choice` is non-empty here.
+        choice: parsed.choice,
         finish_reason,
         usage: TokenUsage::new(parsed.usage.input_tokens, parsed.usage.output_tokens),
         selected_model: Some(model),
     })
-}
-
-fn ensure_non_empty(choice: OneOrMany<AssistantContent>) -> Result<OneOrMany<AssistantContent>> {
-    if choice.iter().next().is_none() {
-        eyre::bail!("Codex response contained no content");
-    }
-    Ok(choice)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -493,11 +565,15 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
-/// A 4xx (non-5xx) status anywhere in the error chain — used to decide whether a failed token
-/// refresh warrants reloading a rotated refresh token from disk.
-fn mentions_4xx(err: &eyre::Report) -> bool {
+/// A 4xx-other-than-429 status anywhere in the error chain — used to decide whether a failed token
+/// refresh warrants reloading a rotated refresh token from disk. 429 is excluded: a rate-limited
+/// refresh is transient and reloading `auth.json` can't fix it, so it should bubble up to the outer
+/// retry/backoff instead of immediately firing a second refresh.
+fn is_rotation_4xx(err: &eyre::Report) -> bool {
     let msg = format!("{err:#}");
-    (400..500).any(|status| mentions_http_status(&msg, status))
+    (400..500)
+        .filter(|status| *status != 429)
+        .any(|status| mentions_http_status(&msg, status))
 }
 
 #[cfg(test)]
@@ -746,5 +822,74 @@ mod tests {
             json!({ "type": "response.failed", "error": { "message": "boom" } })
         );
         assert!(parse_sse(&sse).is_err());
+    }
+
+    fn usage_json() -> Value {
+        json!({
+            "input_tokens": 5,
+            "input_tokens_details": { "cached_tokens": 0 },
+            "output_tokens": 1,
+            "output_tokens_details": { "reasoning_tokens": 0 },
+            "total_tokens": 6
+        })
+    }
+
+    #[test]
+    fn parse_sse_handles_incomplete_as_max_tokens() {
+        // model stopped early on the output cap: terminal event is `response.incomplete`
+        let item = json!({
+            "type": "message", "id": "m", "role": "assistant", "status": "incomplete",
+            "content": [{ "type": "output_text", "text": "partial" }]
+        });
+        let response = json!({
+            "id": "r", "object": "response", "created_at": 1, "status": "incomplete",
+            "model": "gpt-5.4", "output": [],
+            "incomplete_details": { "reason": "max_output_tokens" },
+            "usage": usage_json()
+        });
+        let sse = format!(
+            "data: {}\n\ndata: {}\n",
+            json!({ "type": "response.output_item.done", "item": item }),
+            json!({ "type": "response.incomplete", "response": response })
+        );
+        let raw = parse_sse(&sse).unwrap();
+        let resp = to_completion_response(raw, "gpt-5.4".to_string()).unwrap();
+        assert_eq!(resp.text(), "partial");
+        assert_eq!(resp.finish_reason, FinishReason::MaxTokens);
+    }
+
+    #[test]
+    fn parse_sse_rejoins_multiline_data_fields() {
+        // a single event whose JSON payload is split across two `data:` lines (valid SSE);
+        // splitting after a `,` keeps each half from being valid alone but the `\n`-join valid.
+        let completed = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "r", "object": "response", "created_at": 1, "status": "completed",
+                "model": "gpt-5.4",
+                "output": [{
+                    "type": "message", "id": "m", "role": "assistant", "status": "completed",
+                    "content": [{ "type": "output_text", "text": "hi" }]
+                }],
+                "usage": usage_json()
+            }
+        })
+        .to_string();
+        let comma = completed.find(',').unwrap();
+        let (head, tail) = completed.split_at(comma);
+        let sse = format!("data: {head}\ndata: {tail}\n\n");
+        let raw = parse_sse(&sse).unwrap();
+        let resp = to_completion_response(raw, "gpt-5.4".to_string()).unwrap();
+        assert_eq!(resp.text(), "hi");
+    }
+
+    #[test]
+    fn is_rotation_4xx_excludes_429_and_5xx() {
+        let mk = |s: &str| eyre::eyre!("Codex token refresh returned HTTP {s}");
+        assert!(is_rotation_4xx(&mk("400 Bad Request")));
+        assert!(is_rotation_4xx(&mk("401 Unauthorized")));
+        // 429 is transient — must NOT trigger the reload-from-disk rotation path
+        assert!(!is_rotation_4xx(&mk("429 Too Many Requests")));
+        assert!(!is_rotation_4xx(&mk("500 Internal Server Error")));
     }
 }
