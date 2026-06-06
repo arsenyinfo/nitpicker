@@ -17,14 +17,14 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use eyre::{Result, WrapErr};
 use rig_core::completion::message::AssistantContent;
 use rig_core::providers::openai::responses_api::{
-    CompletionRequest as ResponsesBody, CompletionResponse as ResponsesResp,
+    CompletionRequest as ResponsesBody, CompletionResponse as ResponsesResp, Include,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::llm::{
     Completion, CompletionResponse, FinishReason, LLMClient, LLMClientDyn, TokenUsage,
-    WithRetryExt, mentions_http_status, merge_json,
+    WithRetryExt, mentions_http_status,
 };
 
 /// Codex CLI's public OAuth client id (PKCE, no secret) — shared with the official CLI.
@@ -147,6 +147,13 @@ fn load_tokens(path: &Path) -> Result<CodexTokens> {
         )
     })?;
     parse_tokens(&raw, &path.display().to_string())
+}
+
+/// True when a usable Codex CLI OAuth token file is present (CODEX_HOME or `~/.codex/auth.json`).
+/// Used by `init` detection; reuses the same parse the client does, so API-key-mode files (which
+/// the client rejects) don't surface as a codex provider.
+pub fn auth_available() -> bool {
+    auth_path().and_then(|p| load_tokens(&p)).is_ok()
 }
 
 /// Parse a Codex `auth.json` payload. Split from IO so it is unit-testable without a real file.
@@ -412,12 +419,6 @@ fn build_body(completion: &Completion) -> Result<ResponsesBody> {
     let mut c = completion.clone();
     // codex rejects max_output_tokens outright (matches the Codex CLI, which omits it).
     c.max_tokens = None;
-    // store:false is mandatory; merge so an existing additional_params object is preserved.
-    let store = json!({ "store": false });
-    c.additional_params = Some(match c.additional_params.take() {
-        Some(existing) => merge_json(existing, store),
-        None => store,
-    });
     // the system prompt must be sent as top-level `instructions`, not an input item, so take it out
     // of the rig request (None preamble => rig adds no system input item).
     let instructions = c.preamble.take();
@@ -434,6 +435,22 @@ fn build_body(completion: &Completion) -> Result<ResponsesBody> {
     body.instructions = Some(instructions);
     body.stream = Some(true);
     body.max_output_tokens = None;
+    // store:false is mandatory, but it makes the stream stateless: a reasoning item the model
+    // returns this turn would be echoed back next turn as a bare `rs_...` id the backend can no
+    // longer resolve ("Items are not persisted when `store` is set to false" → HTTP 404). Asking
+    // for `reasoning.encrypted_content` makes the backend return each reasoning item's opaque blob,
+    // which rig round-trips through the core Reasoning type, so the next turn replays it inline
+    // instead of by id. Set both on the lowered body (rig only auto-adds the include when a
+    // `reasoning` config is present, which we don't set) so any caller additional_params survive.
+    let params = &mut body.additional_parameters;
+    params.store = Some(false);
+    let include = params.include.get_or_insert_with(Vec::new);
+    if !include
+        .iter()
+        .any(|i| matches!(i, Include::ReasoningEncryptedContent))
+    {
+        include.push(Include::ReasoningEncryptedContent);
+    }
     Ok(body)
 }
 
@@ -580,6 +597,7 @@ fn is_rotation_4xx(err: &eyre::Report) -> bool {
 mod tests {
     use super::*;
     use rig_core::completion::message::Message;
+    use serde_json::json;
 
     /// Build an unsigned JWT (`alg: none`) with the given claims — enough to exercise our
     /// claims-reading code, which never verifies the signature.
@@ -700,6 +718,14 @@ mod tests {
         // store:false ends up in the flattened additional parameters
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json.get("store"), Some(&Value::Bool(false)));
+        // encrypted reasoning content is requested so reasoning items survive store:false round-trips
+        assert_eq!(
+            json.get("include").and_then(Value::as_array),
+            Some(&vec![Value::String(
+                "reasoning.encrypted_content".to_string()
+            )]),
+            "must request reasoning.encrypted_content to avoid bare rs_ id 404s"
+        );
         // instructions is top-level, not folded into an input system item
         let has_system_input = json
             .get("input")

@@ -184,6 +184,15 @@ pub async fn detect_all() -> Vec<Detected> {
         }
     }
 
+    // ChatGPT/Codex subscription token (Codex CLI) — research-only path, see README warning.
+    // Only surface it when no paid OpenAI key already covers the OpenAI family, to avoid a
+    // redundant second OpenAI-flavored reviewer.
+    if !detected.iter().any(|d| d.name == "openai") {
+        if let Some(d) = detect_codex() {
+            detected.push(d);
+        }
+    }
+
     // local servers
     if let Some(d) = detect_ollama().await {
         if !detected.iter().any(|e| e.name == "ollama") {
@@ -221,6 +230,19 @@ fn detect_agy_keyring() -> Option<Detected> {
         }),
         Err(_) => None,
     }
+}
+
+fn detect_codex() -> Option<Detected> {
+    crate::codex::auth_available().then(|| Detected {
+        name: "codex",
+        provider: "openai",
+        model: "gpt-5.5".to_string(),
+        base_url: None,
+        api_key_env: None,
+        auth: Some("codex"),
+        source: "codex CLI (research only — see README)",
+        local_server: false,
+    })
 }
 
 fn opencode_auth_path() -> Option<PathBuf> {
