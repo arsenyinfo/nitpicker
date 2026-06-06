@@ -305,7 +305,6 @@ pub async fn run_agent(
                     tool_call_history.pop_front();
                 }
                 cycle_lens.push(detect_tool_call_cycle(&tool_call_history));
-                should_terminate |= config.terminal_tools.iter().any(|name| name == tool_name);
                 if tool_name == "spawn_subagent" {
                     if let Some(task) = args.get("task").and_then(|v| v.as_str()) {
                         last_subagent = Some(first_line(task));
@@ -348,6 +347,18 @@ pub async fn run_agent(
                     consecutive_blocked_count += 1;
                 } else {
                     consecutive_blocked_count = 0;
+                }
+                // a terminal tool (e.g. submit_verdict, finish) only terminates the loop when it
+                // actually ran: a cycle-blocked or errored call never populated the verdict/finish
+                // store, so terminating here would return an empty result. let the agent retry.
+                if !blocked
+                    && outcome.status != "error"
+                    && config
+                        .terminal_tools
+                        .iter()
+                        .any(|name| name == &call.function.name)
+                {
+                    should_terminate = true;
                 }
                 let ToolCallOutcome {
                     mut output,

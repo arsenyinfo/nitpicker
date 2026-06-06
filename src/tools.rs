@@ -25,6 +25,75 @@ pub fn floor_char_boundary(s: &str, pos: usize) -> usize {
     0
 }
 
+/// Reject git invocations that aren't genuinely read-only. The subcommand allowlist alone is not
+/// enough: `diff`/`log`/`show` accept `--output=<path>` (write-anywhere, traversal-capable), and
+/// `branch`/`tag` can create/delete/move refs. Returns `Err(message)` for a rejected invocation.
+fn ensure_readonly_git(subcommand: &str, rest: &[&str]) -> std::result::Result<(), String> {
+    // `--output`/`-o <file>` writes command output to an arbitrary path on every subcommand.
+    for token in rest {
+        if *token == "--output"
+            || token.starts_with("--output=")
+            || *token == "-o"
+            || (token.starts_with("-o") && !token.starts_with("--") && token.len() > 2)
+        {
+            return Err("Error: writing git output to a file (--output/-o) is not allowed".into());
+        }
+    }
+    match subcommand {
+        "branch" => ensure_readonly_ref_subcommand(
+            "branch",
+            rest,
+            &[
+                "-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy", "-f",
+                "--force", "-u", "--set-upstream-to", "--unset-upstream", "--edit-description",
+                "--create-reflog",
+            ],
+            &[
+                "--list", "-l", "--contains", "--no-contains", "--merged", "--no-merged",
+                "--points-at", "-a", "--all", "-r", "--remotes",
+            ],
+        ),
+        "tag" => ensure_readonly_ref_subcommand(
+            "tag",
+            rest,
+            &[
+                "-a", "--annotate", "-s", "--sign", "-u", "--local-user", "-m", "--message", "-F",
+                "--file", "-e", "--edit", "-d", "--delete", "-f", "--force", "--create-reflog",
+                "--cleanup",
+            ],
+            &[
+                "-l", "--list", "-n", "--contains", "--no-contains", "--merged", "--no-merged",
+                "--points-at", "--sort", "--format",
+            ],
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// `branch`/`tag` are read-only only when they neither carry a mutating flag nor name a bare
+/// positional (a positional without a query flag creates a ref). A positional is allowed solely
+/// alongside a query flag (e.g. `branch --contains <sha>`, `tag --list <pattern>`).
+fn ensure_readonly_ref_subcommand(
+    name: &str,
+    rest: &[&str],
+    mutating: &[&str],
+    query: &[&str],
+) -> std::result::Result<(), String> {
+    if let Some(bad) = rest.iter().copied().find(|t| mutating.contains(t)) {
+        return Err(format!(
+            "Error: 'git {name} {bad}' is a mutating operation; only read-only forms are allowed"
+        ));
+    }
+    let has_query = rest.iter().any(|t| query.contains(t));
+    let has_positional = rest.iter().any(|t| !t.starts_with('-'));
+    if has_positional && !has_query {
+        return Err(format!(
+            "Error: 'git {name} <name>' can create a ref; use a listing/query form (e.g. --list, --contains)"
+        ));
+    }
+    Ok(())
+}
+
 pub trait Tool: Send + Sync {
     fn name(&self) -> String;
     fn definition(&self) -> ToolDefinition;
@@ -455,7 +524,7 @@ impl Tool for GitTool {
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| eyre::eyre!("missing command"))?;
             let tokens = command.split_whitespace().collect::<Vec<_>>();
-            let Some((subcommand, _rest)) = tokens.split_first() else {
+            let Some((subcommand, rest)) = tokens.split_first() else {
                 return Ok("Error: empty git command".to_string());
             };
             let allowed = [
@@ -472,6 +541,9 @@ impl Tool for GitTool {
             ];
             if !allowed.contains(subcommand) {
                 return Ok(format!("Error: git subcommand '{subcommand}' not allowed"));
+            }
+            if let Err(msg) = ensure_readonly_git(subcommand, rest) {
+                return Ok(msg);
             }
             let output = tokio::process::Command::new("git")
                 .args(tokens)
@@ -494,5 +566,57 @@ impl Tool for GitTool {
             }
             Ok(stdout)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_readonly_git;
+
+    fn check(cmd: &str) -> Result<(), String> {
+        let tokens: Vec<&str> = cmd.split_whitespace().collect();
+        let (sub, rest) = tokens.split_first().expect("non-empty command");
+        ensure_readonly_git(sub, rest)
+    }
+
+    #[test]
+    fn rejects_output_file_write() {
+        // --output / -o turn a read-only command into a write-anywhere primitive
+        assert!(check("diff HEAD~1 --output=/tmp/evil").is_err());
+        assert!(check("diff --output ../escape.txt HEAD~1").is_err());
+        assert!(check("log --oneline -o /tmp/x").is_err());
+        assert!(check("show -o/tmp/glued HEAD").is_err());
+    }
+
+    #[test]
+    fn allows_plain_read_commands() {
+        assert!(check("diff HEAD~1").is_ok());
+        assert!(check("log --oneline -n 5").is_ok());
+        assert!(check("show HEAD").is_ok());
+        assert!(check("status --porcelain").is_ok());
+        // --oneline must not be mistaken for the -o output flag
+        assert!(check("log --oneline").is_ok());
+    }
+
+    #[test]
+    fn rejects_ref_mutation() {
+        assert!(check("branch -D some-branch").is_err());
+        assert!(check("branch -d some-branch").is_err());
+        assert!(check("branch -m old new").is_err());
+        assert!(check("branch new-branch").is_err()); // bare positional creates a ref
+        assert!(check("tag -d v1").is_err());
+        assert!(check("tag v9.9.9").is_err()); // creates a tag
+        assert!(check("tag -a v1 -m msg").is_err());
+    }
+
+    #[test]
+    fn allows_ref_listing_and_queries() {
+        assert!(check("branch").is_ok());
+        assert!(check("branch -a").is_ok());
+        assert!(check("branch --list").is_ok());
+        assert!(check("branch --contains HEAD").is_ok()); // positional ok with a query flag
+        assert!(check("tag").is_ok());
+        assert!(check("tag -l v1.*").is_ok());
+        assert!(check("tag --list v1.*").is_ok());
     }
 }
