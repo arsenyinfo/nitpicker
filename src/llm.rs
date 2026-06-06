@@ -956,10 +956,10 @@ mod tests {
     fn key_must_be_a_whole_word_not_a_substring() {
         // `code` embedded in another word is not a status key, so these transient errors must NOT
         // be classified as non-retryable client errors (they should keep their retries).
-        assert!(!mentions_http_status("error decoding response body near 404", 404));
-        assert!(!mentions_http_status("unicode error at offset 400", 400));
-        assert!(!mentions_http_status("encode failure 403 chars", 403));
-        assert!(!mentions_http_status("upstream error_code 402 exhausted", 402));
+        assert!(!mentions_http_status("decode error 404", 404)); // decode contains "code"
+        assert!(!mentions_http_status("unicode error 400", 400)); // unicode contains "code"
+        assert!(!mentions_http_status("encode failure 403", 403)); // encode contains "code"
+        assert!(!mentions_http_status("error_code 402 seen", 402)); // underscore is a left edge
         // right boundary: `code`/`status` as a prefix of a longer word is not a key either.
         assert!(!mentions_http_status("codec 404 negotiation failed", 404));
         assert!(!mentions_http_status("statuslike 401 marker", 401));
