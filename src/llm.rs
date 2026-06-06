@@ -180,15 +180,40 @@ impl CompletionResponse {
     }
 
     pub fn text(&self) -> String {
-        self.choice
+        // join the raw text blocks first, then strip once: a think block that spans
+        // (or a truncated one that runs to EOF) is judged against the whole text, and an
+        // all-reasoning response collapses to "" so callers' is_empty() checks fire.
+        let raw = self
+            .choice
             .iter()
             .filter_map(|content| match content {
                 AssistantContent::Text(text) => Some(text.text().to_string()),
                 _ => None,
             })
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        strip_think_blocks(&raw)
     }
+}
+
+// some providers (notably MiniMax/GLM/DeepSeek via OpenRouter) emit chain-of-thought
+// inline as <think>...</think> in the message content rather than in a structured
+// reasoning field rig can drop. OpenRouter often hoists the inner reasoning into a
+// separate field but leaves the bare tags behind, so we also clean stray empties.
+// note: this is content-wide, so a review that legitimately quotes a <think> tag in a
+// code snippet will have it stripped too — an accepted tradeoff for clean aggregation.
+//
+// the close is `</think>|$` so a streamed/truncated block with no closing tag is removed
+// through end-of-text rather than leaking its reasoning body.
+static THINK_BLOCK_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)<think>.*?(?:</think>|$)").unwrap());
+static THINK_STRAY_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)</?think\s*>").unwrap());
+
+fn strip_think_blocks(text: &str) -> String {
+    let without_blocks = THINK_BLOCK_RE.replace_all(text, "");
+    let without_stray = THINK_STRAY_RE.replace_all(&without_blocks, "");
+    without_stray.trim().to_string()
 }
 
 pub trait LLMClient: Send + Sync {
@@ -900,6 +925,46 @@ mod tests {
         Err::<(), _>(inner)
             .wrap_err("Anthropic completion failed for model 'claude'")
             .unwrap_err()
+    }
+
+    #[test]
+    fn strips_full_think_block() {
+        let raw = "<think>let me reason about this</think>\n\nThe bug is in foo().";
+        assert_eq!(strip_think_blocks(raw), "The bug is in foo().");
+    }
+
+    #[test]
+    fn strips_stray_empty_think_tags() {
+        // OpenRouter hoists MiniMax's reasoning into a separate field but leaves the tags.
+        let raw = "<think></think>\n## Findings\n- looks fine";
+        assert_eq!(strip_think_blocks(raw), "## Findings\n- looks fine");
+    }
+
+    #[test]
+    fn strips_unbalanced_and_multiline_think() {
+        let raw = "intro\n<think>\nstep 1\nstep 2\n</think>verdict: ok</think>";
+        assert_eq!(strip_think_blocks(raw), "intro\nverdict: ok");
+    }
+
+    #[test]
+    fn leaves_non_think_text_untouched() {
+        let raw = "no reasoning tags here, just review text";
+        assert_eq!(strip_think_blocks(raw), raw);
+    }
+
+    #[test]
+    fn strips_unterminated_think_to_eof() {
+        // a streamed/truncated block with no closing tag must not leak its body.
+        let raw = "answer first\n<think>reasoning that never closes\nstep 2";
+        assert_eq!(strip_think_blocks(raw), "answer first");
+    }
+
+    #[test]
+    fn all_reasoning_collapses_to_empty() {
+        // an all-think response (incl. the multi-block join) must be empty so the
+        // agent loop's is_empty() nudge path fires instead of returning "\n".
+        let joined = format!("{}\n{}", "<think>round one</think>", "<think>round two");
+        assert_eq!(strip_think_blocks(&joined), "");
     }
 
     #[test]
