@@ -438,16 +438,19 @@ fn status_in_context(lower: &str, start: usize, end: usize, reason: Option<&str>
     while !lower.is_char_boundary(window_start) {
         window_start += 1;
     }
+    // `statuscode` is the lowercased compact `statusCode` (no separator), where neither `status`
+    // nor `code` is a whole word on its own, so it needs its own key.
     key_word_present(lower, window_start, start, "status")
         || key_word_present(lower, window_start, start, "code")
+        || key_word_present(lower, window_start, start, "statuscode")
 }
 
-/// Whether `key` appears as a whole word within `lower[lo..hi]` — its left edge is the string start
-/// or a non-`[a-z0-9_]` byte. This distinguishes a real status key from `key` embedded in another
-/// word: `decode`/`encode`/`unicode`/`error_code` must NOT count as a `code` status key, while
-/// `code`/`"code"`/`status_code` (matched via the `status` key) still do. The left-boundary check
-/// uses `lower`'s absolute bytes, so a word split by the `[lo..hi]` window edge is still judged
-/// against the real preceding char. `key` is ASCII; `lo`/`hi` are on char boundaries.
+/// Whether `key` appears as a whole word within `lower[lo..hi]`. The left edge must be the string
+/// start or a non-`[a-z0-9_]` byte; the right edge must be the string end or a non-`[a-z0-9]` byte
+/// (`_` is allowed on the right so `status_code` still matches via the `status` key, while
+/// `decode`/`encode`/`unicode`/`error_code`/`codec`/`statuslike` do NOT count as keys). Boundary
+/// checks read `lower`'s absolute bytes, so a word split by the `[lo..hi]` window edge is judged
+/// against its real neighbours. `key` is ASCII; `lo`/`hi` are on char boundaries.
 fn key_word_present(lower: &str, lo: usize, hi: usize, key: &str) -> bool {
     let bytes = lower.as_bytes();
     let region = &lower[lo..hi];
@@ -458,7 +461,9 @@ fn key_word_present(lower: &str, lo: usize, hi: usize, key: &str) -> bool {
             let b = bytes[abs - 1];
             !b.is_ascii_alphanumeric() && b != b'_'
         };
-        if left_ok {
+        let after = abs + key.len();
+        let right_ok = after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
+        if left_ok && right_ok {
             return true;
         }
         from += rel + 1;
@@ -955,6 +960,9 @@ mod tests {
         assert!(!mentions_http_status("unicode error at offset 400", 400));
         assert!(!mentions_http_status("encode failure 403 chars", 403));
         assert!(!mentions_http_status("upstream error_code 402 exhausted", 402));
+        // right boundary: `code`/`status` as a prefix of a longer word is not a key either.
+        assert!(!mentions_http_status("codec 404 negotiation failed", 404));
+        assert!(!mentions_http_status("statuslike 401 marker", 401));
         // window edge: even if the 24-byte key window cuts `unicode` right before `code`, the real
         // preceding char ('i') is still consulted, so it stays a non-match.
         assert!(!mentions_http_status("xxxxxxxxxxxxxxxxxunicode 404", 404));

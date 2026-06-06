@@ -29,10 +29,15 @@ pub fn floor_char_boundary(s: &str, pos: usize) -> usize {
 /// enough: `diff`/`log`/`show` accept `--output=<path>` (write-anywhere, traversal-capable), and
 /// `branch`/`tag` can create/delete/move refs. Returns `Err(message)` for a rejected invocation.
 fn ensure_readonly_git(subcommand: &str, rest: &[&str]) -> std::result::Result<(), String> {
-    // `--output`/`-o <file>` writes command output to an arbitrary path on every subcommand.
+    // `--output`/`-o <file>` writes command output to an arbitrary path on every subcommand. git
+    // also accepts unambiguous long-option abbreviations, so reject any `--…` prefix of `--output`
+    // too (e.g. `--out`), alongside the exact, `=`-glued, and short (`-o`/`-o<file>`) forms.
     for token in rest {
-        if *token == "--output"
-            || token.starts_with("--output=")
+        let abbreviates_output = token
+            .strip_prefix("--")
+            .map(|long| long.split('=').next().unwrap_or(long))
+            .is_some_and(|stem| !stem.is_empty() && "output".starts_with(stem));
+        if abbreviates_output
             || *token == "-o"
             || (token.starts_with("-o") && !token.starts_with("--") && token.len() > 2)
         {
@@ -40,58 +45,116 @@ fn ensure_readonly_git(subcommand: &str, rest: &[&str]) -> std::result::Result<(
         }
     }
     match subcommand {
+        // `branch`/`tag` can create, delete, move, or reconfigure refs. A subcommand-only allowlist
+        // plus a mutating-flag denylist is not enough: git prefix-abbreviates long options and
+        // accepts `=`-glued values and glued short options, so any denylist of full flag names is
+        // bypassable (`--set-upstream-to=x`, `--unset-up`, `-uorigin`). Default-deny instead: allow
+        // only flags that resolve to a known read-only query flag.
         "branch" => ensure_readonly_ref_subcommand(
             "branch",
             rest,
             &[
-                "-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy", "-f",
-                "--force", "-u", "--set-upstream-to", "--unset-upstream", "--edit-description",
-                "--create-reflog",
-            ],
-            &[
-                "--list", "-l", "--contains", "--no-contains", "--merged", "--no-merged",
-                "--points-at", "-a", "--all", "-r", "--remotes",
+                "--list",
+                "-l",
+                "-a",
+                "--all",
+                "-r",
+                "--remotes",
+                "-v",
+                "--verbose",
+                "--contains",
+                "--no-contains",
+                "--merged",
+                "--no-merged",
+                "--points-at",
+                "--format",
+                "--sort",
+                "--color",
+                "--no-color",
+                "--ignore-case",
+                "--column",
+                "--no-column",
+                "--abbrev",
+                "--no-abbrev",
+                "--show-current",
             ],
         ),
         "tag" => ensure_readonly_ref_subcommand(
             "tag",
             rest,
             &[
-                "-a", "--annotate", "-s", "--sign", "-u", "--local-user", "-m", "--message", "-F",
-                "--file", "-e", "--edit", "-d", "--delete", "-f", "--force", "--create-reflog",
-                "--cleanup",
-            ],
-            &[
-                "-l", "--list", "-n", "--contains", "--no-contains", "--merged", "--no-merged",
-                "--points-at", "--sort", "--format",
+                "--list",
+                "-l",
+                "-n",
+                "--contains",
+                "--no-contains",
+                "--merged",
+                "--no-merged",
+                "--points-at",
+                "--sort",
+                "--format",
+                "--color",
+                "--no-color",
+                "--ignore-case",
+                "--column",
+                "--no-column",
+                "--omit-empty",
             ],
         ),
         _ => Ok(()),
     }
 }
 
-/// `branch`/`tag` are read-only only when they neither carry a mutating flag nor name a bare
-/// positional (a positional without a query flag creates a ref). A positional is allowed solely
-/// alongside a query flag (e.g. `branch --contains <sha>`, `tag --list <pattern>`).
+/// `branch`/`tag` are read-only only when every flag resolves to a known query flag and no bare
+/// positional creates a ref (a positional is allowed solely alongside a query flag, e.g.
+/// `branch --contains <sha>`, `tag --list <pattern>`). Default-deny is bypass-resistant: a long
+/// token that prefixes a query flag either resolves to it or is ambiguous (git then errors,
+/// mutating nothing), while a token that is *not* such a prefix — including any abbreviation or
+/// glued form of a mutating flag — is rejected here. Short options must match exactly (no glued
+/// value or cluster), so `-uorigin` / `-D` / `-d` are rejected.
 fn ensure_readonly_ref_subcommand(
     name: &str,
     rest: &[&str],
-    mutating: &[&str],
     query: &[&str],
 ) -> std::result::Result<(), String> {
-    if let Some(bad) = rest.iter().copied().find(|t| mutating.contains(t)) {
-        return Err(format!(
-            "Error: 'git {name} {bad}' is a mutating operation; only read-only forms are allowed"
-        ));
+    let mut has_query = false;
+    let mut has_positional = false;
+    for token in rest {
+        match token.strip_prefix("--") {
+            Some(long) => {
+                let stem = long.split('=').next().unwrap_or(long);
+                let devalued = format!("--{stem}");
+                let allowed = query
+                    .iter()
+                    .any(|q| q.starts_with("--") && q.starts_with(devalued.as_str()));
+                if !allowed {
+                    return Err(reject_ref_flag(name, token));
+                }
+                has_query = true;
+            }
+            None => match token.strip_prefix('-') {
+                Some(_short) => {
+                    if !query.contains(token) {
+                        return Err(reject_ref_flag(name, token));
+                    }
+                    has_query = true;
+                }
+                None => has_positional = true,
+            },
+        }
     }
-    let has_query = rest.iter().any(|t| query.contains(t));
-    let has_positional = rest.iter().any(|t| !t.starts_with('-'));
     if has_positional && !has_query {
         return Err(format!(
             "Error: 'git {name} <name>' can create a ref; use a listing/query form (e.g. --list, --contains)"
         ));
     }
     Ok(())
+}
+
+fn reject_ref_flag(name: &str, flag: &str) -> String {
+    format!(
+        "Error: 'git {name} {flag}' is not a read-only form; only listing/query flags are allowed"
+    )
 }
 
 pub trait Tool: Send + Sync {
@@ -610,11 +673,23 @@ mod tests {
     }
 
     #[test]
+    fn rejects_mutation_via_abbreviated_and_glued_flags() {
+        // git prefix-abbreviates long options, accepts `=`-glued values, and glues short-option
+        // values — none of these may slip an upstream/ref mutation past the allowlist.
+        assert!(check("branch --set-upstream-to=origin/main").is_err());
+        assert!(check("branch --unset-up").is_err()); // abbreviation of --unset-upstream
+        assert!(check("branch -uorigin/main").is_err()); // glued short option
+        assert!(check("branch --edit-desc").is_err()); // abbreviation of --edit-description
+        assert!(check("tag --cleanup=verbatim").is_err());
+    }
+
+    #[test]
     fn allows_ref_listing_and_queries() {
         assert!(check("branch").is_ok());
         assert!(check("branch -a").is_ok());
         assert!(check("branch --list").is_ok());
         assert!(check("branch --contains HEAD").is_ok()); // positional ok with a query flag
+        assert!(check("branch --cont HEAD").is_ok()); // abbreviation of a read-only flag is fine
         assert!(check("tag").is_ok());
         assert!(check("tag -l v1.*").is_ok());
         assert!(check("tag --list v1.*").is_ok());
