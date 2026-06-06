@@ -183,6 +183,15 @@ AG2 is Google's current agentic IDE, succeeding both the older Gemini CLI OAuth 
 
 The proxy reads `agy`'s OAuth token from the system keyring (`service=gemini`, `account=antigravity`) via the `keyring` crate (Secret Service on Linux, Keychain on macOS, Credential Manager on Windows), relies on `agy` to refresh it, and routes chat through CloudCode's `v1internal:streamGenerateContent` SSE endpoint. Run `agy` and complete its login first. `NITPICKER_ANTIGRAVITY_PLATFORM` can override the auto-detected platform enum if needed.
 
+This path requires a build with the `antigravity` feature (off by default, since it pulls in the local proxy stack — `axum` — and the `keyring` crate with its native backends):
+
+```bash
+cargo build --release --features antigravity
+# or: cargo install --features antigravity ...
+```
+
+Without the feature, `auth = "agy-keyring"` is rejected at config validation with a build hint, and `nitpicker init` won't offer the keyring reviewer.
+
 Tested AG2 models (current author config): `gemini-3.1-pro-low`, `gemini-3.5-flash-low`. Other IDs returned by `fetchAvailableModels` (e.g. `gemini-3-flash-agent`) likely work but have not been exercised.
 
 ```toml
@@ -325,6 +334,7 @@ Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timesta
 - Codex multi-turn reasoning fix: under the mandatory `store: false`, a reasoning item returned this turn was echoed back next turn as a bare `rs_...` id the backend could no longer resolve (`HTTP 404 — Items are not persisted when store is set to false`), breaking every debate/agent loop after the first turn. nitpicker now requests `include: ["reasoning.encrypted_content"]`, so each reasoning item carries an opaque blob that is replayed inline instead of by id.
 - `nitpicker init` now auto-detects a logged-in Codex CLI (`~/.codex/auth.json`, `CODEX_HOME` honored) and emits a commented `auth = "codex"` reviewer (`gpt-5.5`), provided no paid `OPENAI_API_KEY` is already configured. Research-only path, same posture as the Antigravity keyring detection.
 - Bumped `rig-core` to 0.38.
+- The Antigravity Gemini path (`auth = "agy-keyring"` + the local `gemini_proxy`) is now gated behind the off-by-default `antigravity` cargo feature (build with `--features antigravity`), mirroring `azure`. Without it, that auth is rejected at config validation with a build hint and `init` won't offer the keyring reviewer. This drops `axum`, `keyring`, and `uuid` from the default build and, together with `strip = true` on the release profile, trims the default release binary from ~16M to ~12M (−25%).
 
 **0.6.3** — 2026-06-06
 - Audit fixes: (1) **git tool security** — the read-only allowlist gated only the subcommand, allowing file writes (`diff --output=<path>`) and ref mutation (`branch`/`tag`) against the user's real repo in `pr` in-place mode; `branch`/`tag` are replaced by the safe-by-construction `for-each-ref`/`show-ref` plumbing and `--output`/`-o` is blocked. (2) **detached-HEAD restore** in `pr` mode was broken and not panic-safe, stranding the user on `nitpicker/pr-N`; now restored via `git switch --detach` from a `Drop` guard. (3) **retry classifier** misread `code` as a substring (`error decoding…404` → permanent 4xx, retries lost); keys are now whole-word matched and 5xx-nested-4xx stays retryable. (4) **debate** no longer records an empty verdict when a terminal tool call is blocked/malformed.

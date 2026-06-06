@@ -696,6 +696,7 @@ impl LLMClient for openrouter::Client {
 }
 
 /// Create a Gemini client that routes through the local OAuth proxy
+#[cfg(feature = "antigravity")]
 pub fn create_gemini_client_with_proxy(
     proxy_url: &str,
 ) -> Result<std::sync::Arc<dyn LLMClientDyn>> {

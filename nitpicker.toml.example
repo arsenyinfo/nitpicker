@@ -23,7 +23,8 @@ provider = "openrouter"
 # model = "claude-sonnet-4-6"
 # provider = "anthropic"
 
-# Gemini via Antigravity keyring (research only — reuses the agy CLI token)
+# Gemini via Antigravity keyring (research only — reuses the agy CLI token).
+# Requires building with `--features antigravity` (off by default).
 # [[reviewer]]
 # name = "gemini"
 # model = "gemini-3.1-pro-low"

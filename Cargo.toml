@@ -33,18 +33,18 @@ termimad = "0.34"
 regex = "1"
 toml = "1"
 
-# Gemini proxy dependencies
-axum = "0.8"
 reqwest = { version = "0.13", features = ["json", "form"] }
 dirs = "6"
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.11"
 rand = "0.10"
 base64 = "0.22"
-uuid = { version = "1", features = ["v4"] }
 url = "2"
 tempfile = "3"
-keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
+# Antigravity Gemini proxy deps — opt-in, see the `antigravity` feature below
+axum = { version = "0.8", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"], optional = true }
 # Azure AD (Entra ID) auth for Foundry-hosted models — opt-in, see `azure` feature below
 azure_identity = { version = "1", optional = true }
 azure_core = { version = "1", optional = true }
@@ -56,3 +56,9 @@ libc = "0.2"
 # Enables `auth = "azure-ad"` for OpenAI/Anthropic providers (Azure AI Foundry).
 # Off by default: pulls in the Azure SDK (azure_core declares rust-version 1.88). Build with `--features azure`.
 azure = ["dep:azure_identity", "dep:azure_core"]
+# Enables `auth = "agy-keyring"` (Antigravity Gemini via the local proxy in `src/gemini_proxy`).
+# Off by default: pulls in axum + keyring (native crypto/secret-service backends). Build with `--features antigravity`.
+antigravity = ["dep:axum", "dep:uuid", "dep:keyring"]
+
+[profile.release]
+strip = true

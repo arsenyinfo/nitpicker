@@ -11,6 +11,7 @@ mod compact;
 mod config;
 mod debate;
 mod detect;
+#[cfg(feature = "antigravity")]
 mod gemini_proxy;
 mod llm;
 mod openrouter;

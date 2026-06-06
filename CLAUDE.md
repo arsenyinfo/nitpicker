@@ -67,7 +67,7 @@ tools.rs        tool definitions: read_file, glob, grep, git
 pr.rs           GitHub PR subcommand: fetch metadata via gh, review, post comment
 output.rs       JSON output contract for `pr --json` (OutputFormat, PrReviewOutput envelope, emit_json)
 reflect.rs      Reflect subcommand: analyze saved session trajectories and synthesize improvements
-gemini_proxy/   local HTTP proxy that translates Gemini API calls to Google Code Assist
+gemini_proxy/   local HTTP proxy that translates Gemini API calls to Google Code Assist (feature `antigravity`, off by default)
 azure.rs        Azure AD token auth for Foundry-hosted OpenAI/Anthropic (feature `azure`, off by default)
 codex.rs        ChatGPT/Codex subscription auth — reuses `~/.codex/auth.json`, talks the Codex Responses endpoint
 ```
@@ -168,7 +168,9 @@ Tool outputs are intentionally a bit self-describing: `read_file` includes file/
 
 ### Gemini AG2 proxy (`gemini_proxy/`)
 
-When `auth = "agy-keyring"` is set for a Gemini reviewer/aggregator, nitpicker:
+Gated behind the off-by-default `antigravity` cargo feature. The whole module compiles out when the feature is off, which drops `axum`, `keyring`, and `uuid` from the default build; `provider.rs`/`review.rs`/`debate.rs` thread only the proxy's base URL (`Option<&str>`) downstream so their signatures compile feature-off, and the proxy predicates (`*_needs_gemini_proxy`, `ProviderType::is_gemini`) plus `create_gemini_client_with_proxy` and `detect::detect_agy_keyring` are all `#[cfg(feature = "antigravity")]`. The config validator bails with a `--features antigravity` hint if `auth = "agy-keyring"` is configured without it (mirrors the azure gate). Combined with `strip = true` on `[profile.release]`, the default release binary is ~12M (down from ~16M).
+
+When `auth = "agy-keyring"` is set for a Gemini reviewer/aggregator (feature-on), nitpicker:
 1. Runs a local axum HTTP server on a random port
 2. Translates incoming Gemini API requests to Google Code Assist API format
 3. Attaches the Antigravity OAuth Bearer token read from the system keyring

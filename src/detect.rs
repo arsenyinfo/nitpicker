@@ -2,6 +2,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+#[cfg(feature = "antigravity")]
 const AGY_KEYRING_AUTH: &str = "agy-keyring";
 
 pub struct Detected {
@@ -170,7 +171,9 @@ pub async fn detect_all() -> Vec<Detected> {
         });
     }
 
-    // agy keyring token (Antigravity CLI) — research-only path, see README warning
+    // agy keyring token (Antigravity CLI) — research-only path, see README warning.
+    // Gated behind the `antigravity` feature (off by default), like the auth path itself.
+    #[cfg(feature = "antigravity")]
     if !detected.iter().any(|d| d.name == "gemini") {
         if let Some(d) = detect_agy_keyring() {
             detected.push(d);
@@ -218,6 +221,7 @@ pub async fn detect_all() -> Vec<Detected> {
     detected
 }
 
+#[cfg(feature = "antigravity")]
 fn detect_agy_keyring() -> Option<Detected> {
     let entry = keyring::Entry::new("gemini", "antigravity").ok()?;
     match entry.get_password() {

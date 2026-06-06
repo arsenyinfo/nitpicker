@@ -86,6 +86,8 @@ pub enum ProviderType {
 }
 
 impl ProviderType {
+    // only consulted by the antigravity-gated gemini-proxy predicates in provider.rs
+    #[cfg(feature = "antigravity")]
     pub fn is_gemini(&self) -> bool {
         matches!(self, ProviderType::Gemini)
     }
@@ -237,7 +239,16 @@ fn validate_auth(
                 "{label}: auth = \"oauth\" has been removed — use auth = \"agy-keyring\" (see README) or unset `auth` to use GEMINI_API_KEY"
             );
         }
-        (ProviderType::Gemini, Some("agy-keyring")) => Ok(()),
+        // agy-keyring routes through the local Gemini proxy, gated behind the `antigravity`
+        // feature (mirrors the azure-ad gate below).
+        (ProviderType::Gemini, Some("agy-keyring")) => {
+            if !cfg!(feature = "antigravity") {
+                eyre::bail!(
+                    "{label}: auth = \"agy-keyring\" requires building nitpicker with `--features antigravity`"
+                );
+            }
+            Ok(())
+        }
         (ProviderType::Gemini, Some(other)) => {
             eyre::bail!(
                 "{label}: unknown auth value \"{other}\" — expected \"agy-keyring\" or unset"
@@ -438,16 +449,20 @@ mod tests {
     #[test]
     fn validate_auth_allows_unset_and_known_values() {
         assert!(validate_auth("[t]", &ProviderType::OpenAi, &None, None, None).is_ok());
-        assert!(
-            validate_auth(
-                "[t]",
-                &ProviderType::Gemini,
-                &Some("agy-keyring".to_string()),
-                None,
-                None
-            )
-            .is_ok()
+        // agy-keyring is accepted only when compiled with the `antigravity` feature; otherwise
+        // validation fails fast with a build hint (mirrors the azure gate).
+        let agy = validate_auth(
+            "[t]",
+            &ProviderType::Gemini,
+            &Some("agy-keyring".to_string()),
+            None,
+            None,
         );
+        if cfg!(feature = "antigravity") {
+            assert!(agy.is_ok());
+        } else {
+            assert!(agy.is_err());
+        }
     }
 
     #[test]
