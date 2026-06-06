@@ -258,6 +258,14 @@ fn validate_auth(
                 "{label}: auth = \"azure-ad\" is only supported with provider \"openai\" or \"anthropic\""
             );
         }
+        // Codex/ChatGPT subscription auth reuses the OpenAI Responses endpoint, so it only makes
+        // sense for the OpenAI provider; the token comes from `~/.codex/auth.json`, not an env var.
+        (ProviderType::OpenAi, Some("codex")) => Ok(()),
+        (_, Some("codex")) => {
+            eyre::bail!(
+                "{label}: auth = \"codex\" is only supported with provider \"openai\""
+            );
+        }
         // Any other auth value on a non-Gemini provider is a typo or unsupported — reject it at
         // config time rather than failing cryptically at client construction.
         (_, Some(other)) => {
@@ -332,6 +340,9 @@ fn required_env_var_reviewer(reviewer: &ReviewerConfig) -> Option<&str> {
     if is_azure_ad_auth(reviewer.auth.as_deref()) {
         return None;
     }
+    if is_codex_auth(reviewer.auth.as_deref()) {
+        return None;
+    }
     if is_local_server(reviewer.base_url.as_deref()) {
         return None;
     }
@@ -346,6 +357,9 @@ fn required_env_var_aggregator(agg: &AggregatorConfig) -> Option<&str> {
         return None;
     }
     if is_azure_ad_auth(agg.auth.as_deref()) {
+        return None;
+    }
+    if is_codex_auth(agg.auth.as_deref()) {
         return None;
     }
     if is_local_server(agg.base_url.as_deref()) {
@@ -365,6 +379,11 @@ fn is_gemini_proxy_auth(auth: &Option<String>) -> bool {
 /// config types so validation and construction can't drift apart.
 pub fn is_azure_ad_auth(auth: Option<&str>) -> bool {
     matches!(auth, Some("azure-ad"))
+}
+
+/// Codex/ChatGPT subscription auth. Canonical check shared with `provider.rs`.
+pub fn is_codex_auth(auth: Option<&str>) -> bool {
+    matches!(auth, Some("codex"))
 }
 
 fn default_env_var(provider: &ProviderType) -> Option<&'static str> {
@@ -429,6 +448,49 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn codex_auth_detection() {
+        assert!(is_codex_auth(Some("codex")));
+        assert!(!is_codex_auth(Some("azure-ad")));
+        assert!(!is_codex_auth(None));
+    }
+
+    #[test]
+    fn validate_auth_codex_only_on_openai() {
+        let auth = Some("codex".to_string());
+        assert!(validate_auth("[t]", &ProviderType::OpenAi, &auth, None, None).is_ok());
+        assert!(validate_auth("[t]", &ProviderType::Anthropic, &auth, None, None).is_err());
+        assert!(validate_auth("[t]", &ProviderType::Gemini, &auth, None, None).is_err());
+        assert!(validate_auth("[t]", &ProviderType::OpenRouter, &auth, None, None).is_err());
+    }
+
+    #[test]
+    fn codex_auth_requires_no_env_var() {
+        let reviewer = ReviewerConfig {
+            name: "r".to_string(),
+            model: "gpt-5.4".to_string(),
+            provider: ProviderType::OpenAi,
+            base_url: None,
+            api_key_env: None,
+            compact_threshold: None,
+            auth: Some("codex".to_string()),
+            azure_scope: None,
+            azure_credentials: None,
+        };
+        assert_eq!(required_env_var_reviewer(&reviewer), None);
+        let agg = AggregatorConfig {
+            model: "gpt-5.4".to_string(),
+            provider: ProviderType::OpenAi,
+            base_url: None,
+            api_key_env: None,
+            max_tokens: None,
+            auth: Some("codex".to_string()),
+            azure_scope: None,
+            azure_credentials: None,
+        };
+        assert_eq!(required_env_var_aggregator(&agg), None);
     }
 
     #[test]

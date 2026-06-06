@@ -1,4 +1,7 @@
-use crate::config::{AggregatorConfig, Config, ProviderType, ReviewerConfig, is_azure_ad_auth};
+use crate::codex::CodexClient;
+use crate::config::{
+    AggregatorConfig, Config, ProviderType, ReviewerConfig, is_azure_ad_auth, is_codex_auth,
+};
 use crate::gemini_proxy::GeminiProxyClient;
 use crate::llm::{LLMClient, LLMClientDyn, LLMProvider, WithRetryExt};
 use eyre::Result;
@@ -42,6 +45,12 @@ fn build_azure_ad_client(
     }
 }
 
+/// Build a refreshing Codex/ChatGPT-subscription client. Token is read from `~/.codex/auth.json`
+/// (see [`CodexClient`]); wrapped with `.with_retry()` like every other client.
+fn build_codex_client() -> Result<Arc<dyn LLMClientDyn>> {
+    Ok(CodexClient::new()?.with_retry().into_arc())
+}
+
 pub fn provider_from_config(
     provider: &ProviderType,
     base_url: Option<&str>,
@@ -83,6 +92,10 @@ pub fn build_reviewer_client(
         );
     }
 
+    if is_codex_auth(reviewer.auth.as_deref()) {
+        return build_codex_client();
+    }
+
     Ok(provider_from_config(
         &reviewer.provider,
         reviewer.base_url.as_deref(),
@@ -111,6 +124,10 @@ pub fn build_aggregator_client(
             agg.azure_scope.as_deref(),
             agg.azure_credentials.as_deref(),
         );
+    }
+
+    if is_codex_auth(agg.auth.as_deref()) {
+        return build_codex_client();
     }
 
     Ok(provider_from_config(

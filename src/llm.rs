@@ -791,7 +791,7 @@ fn model_needs_max_completion_tokens(model: &str) -> bool {
         || model.starts_with("gpt-5")
 }
 
-fn merge_json(mut base: Value, extra: Value) -> Value {
+pub(crate) fn merge_json(mut base: Value, extra: Value) -> Value {
     if let (Some(base_obj), Some(extra_obj)) = (base.as_object_mut(), extra.as_object()) {
         for (k, v) in extra_obj {
             base_obj.insert(k.clone(), v.clone());

@@ -6,6 +6,7 @@ use tracing_subscriber::EnvFilter;
 mod agent;
 #[cfg(feature = "azure")]
 mod azure;
+mod codex;
 mod compact;
 mod config;
 mod debate;
