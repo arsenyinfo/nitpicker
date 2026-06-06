@@ -48,8 +48,10 @@ fn ensure_readonly_git(subcommand: &str, rest: &[&str]) -> std::result::Result<(
         // `branch`/`tag` can create, delete, move, or reconfigure refs. A subcommand-only allowlist
         // plus a mutating-flag denylist is not enough: git prefix-abbreviates long options and
         // accepts `=`-glued values and glued short options, so any denylist of full flag names is
-        // bypassable (`--set-upstream-to=x`, `--unset-up`, `-uorigin`). Default-deny instead: allow
-        // only flags that resolve to a known read-only query flag.
+        // bypassable (`--set-upstream-to=x`, `--unset-up`, `-uorigin`). Default-deny instead, with
+        // two flag classes: ACTION flags actually list/query refs (and so authorize a positional
+        // operand, treated as a pattern/commit), MODIFIER flags only shape output and never
+        // authorize a positional (otherwise `branch --color <name>` would create a ref).
         "branch" => ensure_readonly_ref_subcommand(
             "branch",
             rest,
@@ -60,13 +62,16 @@ fn ensure_readonly_git(subcommand: &str, rest: &[&str]) -> std::result::Result<(
                 "--all",
                 "-r",
                 "--remotes",
-                "-v",
-                "--verbose",
                 "--contains",
                 "--no-contains",
                 "--merged",
                 "--no-merged",
                 "--points-at",
+                "--show-current",
+            ],
+            &[
+                "-v",
+                "--verbose",
                 "--format",
                 "--sort",
                 "--color",
@@ -76,7 +81,6 @@ fn ensure_readonly_git(subcommand: &str, rest: &[&str]) -> std::result::Result<(
                 "--no-column",
                 "--abbrev",
                 "--no-abbrev",
-                "--show-current",
             ],
         ),
         "tag" => ensure_readonly_ref_subcommand(
@@ -91,6 +95,8 @@ fn ensure_readonly_git(subcommand: &str, rest: &[&str]) -> std::result::Result<(
                 "--merged",
                 "--no-merged",
                 "--points-at",
+            ],
+            &[
                 "--sort",
                 "--format",
                 "--color",
@@ -105,45 +111,61 @@ fn ensure_readonly_git(subcommand: &str, rest: &[&str]) -> std::result::Result<(
     }
 }
 
-/// `branch`/`tag` are read-only only when every flag resolves to a known query flag and no bare
-/// positional creates a ref (a positional is allowed solely alongside a query flag, e.g.
-/// `branch --contains <sha>`, `tag --list <pattern>`). Default-deny is bypass-resistant: a long
-/// token that prefixes a query flag either resolves to it or is ambiguous (git then errors,
-/// mutating nothing), while a token that is *not* such a prefix — including any abbreviation or
-/// glued form of a mutating flag — is rejected here. Short options must match exactly (no glued
-/// value or cluster), so `-uorigin` / `-D` / `-d` are rejected.
+/// `branch`/`tag` are read-only only when every flag resolves to a known action/modifier flag and
+/// no bare positional creates a ref. A positional (pattern/commit) is allowed only alongside an
+/// ACTION flag (e.g. `branch --contains <sha>`, `tag --list <pattern>`); modifier flags shape
+/// output but never authorize a positional. Default-deny is bypass-resistant: a long token that
+/// prefixes a known flag either resolves to it or is ambiguous (git then errors, mutating nothing),
+/// while any token that is *not* such a prefix — including abbreviations/glued forms of mutating
+/// flags — is rejected. Short options must match exactly (no glued value or cluster), so
+/// `-uorigin` / `-D` / `-d` are rejected. `--` is treated as git's end-of-options marker: every
+/// later token is an operand, so it can't smuggle a flag-looking ref name past the action check.
 fn ensure_readonly_ref_subcommand(
     name: &str,
     rest: &[&str],
-    query: &[&str],
+    action: &[&str],
+    modifier: &[&str],
 ) -> std::result::Result<(), String> {
-    let mut has_query = false;
+    let prefixes_any = |flags: &[&str], devalued: &str| {
+        flags
+            .iter()
+            .any(|q| q.starts_with("--") && q.starts_with(devalued))
+    };
+    let mut has_action = false;
     let mut has_positional = false;
+    let mut end_of_options = false;
     for token in rest {
+        if end_of_options {
+            has_positional = true;
+            continue;
+        }
         match token.strip_prefix("--") {
             Some(long) => {
                 let stem = long.split('=').next().unwrap_or(long);
+                if stem.is_empty() {
+                    end_of_options = true; // bare `--`: authorizes nothing, operands follow
+                    continue;
+                }
                 let devalued = format!("--{stem}");
-                let allowed = query
-                    .iter()
-                    .any(|q| q.starts_with("--") && q.starts_with(devalued.as_str()));
-                if !allowed {
+                let is_action = prefixes_any(action, &devalued);
+                if !is_action && !prefixes_any(modifier, &devalued) {
                     return Err(reject_ref_flag(name, token));
                 }
-                has_query = true;
+                has_action |= is_action;
             }
             None => match token.strip_prefix('-') {
                 Some(_short) => {
-                    if !query.contains(token) {
+                    let is_action = action.contains(token);
+                    if !is_action && !modifier.contains(token) {
                         return Err(reject_ref_flag(name, token));
                     }
-                    has_query = true;
+                    has_action |= is_action;
                 }
                 None => has_positional = true,
             },
         }
     }
-    if has_positional && !has_query {
+    if has_positional && !has_action {
         return Err(format!(
             "Error: 'git {name} <name>' can create a ref; use a listing/query form (e.g. --list, --contains)"
         ));
@@ -681,6 +703,22 @@ mod tests {
         assert!(check("branch -uorigin/main").is_err()); // glued short option
         assert!(check("branch --edit-desc").is_err()); // abbreviation of --edit-description
         assert!(check("tag --cleanup=verbatim").is_err());
+    }
+
+    #[test]
+    fn rejects_ref_creation_via_separator_or_modifier() {
+        // `--` end-of-options marker must not authorize the operand that follows
+        assert!(check("branch -- newbranch").is_err());
+        assert!(check("tag -- v1.0").is_err());
+        // a flag-looking name after `--` is an operand, not an action flag
+        assert!(check("branch -- --list newbranch").is_err());
+        // output-modifier flags must not authorize a positional (would create a ref)
+        assert!(check("branch --color newbranch").is_err());
+        assert!(check("branch --verbose newbranch").is_err());
+        assert!(check("tag --format=%(refname) newtag").is_err());
+        // a modifier alongside a real action flag is still fine
+        assert!(check("branch --color --list").is_ok());
+        assert!(check("branch --list -- pattern").is_ok());
     }
 
     #[test]
