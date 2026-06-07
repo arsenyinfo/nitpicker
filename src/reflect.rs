@@ -203,8 +203,10 @@ async fn analyze_session(
 ) -> Result<String> {
     let completion = Completion {
         model,
-        prompt: Message::user(format!("{MAP_PROMPT}{session_md}")),
-        preamble: None,
+        // MAP_PROMPT goes in the system preamble (not folded into the user message): codex auth
+        // requires a top-level system prompt, and this matches every other call site's shape.
+        prompt: Message::user(session_md),
+        preamble: Some(MAP_PROMPT.to_string()),
         history: Vec::new(),
         tools: Vec::new(),
         tool_choice: None,

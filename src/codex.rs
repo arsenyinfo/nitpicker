@@ -92,7 +92,9 @@ fn account_id_from_tokens(id_token: Option<&str>, access_token: &str) -> Option<
 fn expiry_from_access_token(access_token: &str) -> SystemTime {
     decode_jwt_claims(access_token)
         .and_then(|c| c.get("exp").and_then(Value::as_u64))
-        .map(|exp| UNIX_EPOCH + Duration::from_secs(exp))
+        // checked_add: a garbage/huge `exp` would otherwise overflow SystemTime and panic; treat
+        // overflow as already-expired (forces a refresh) rather than aborting the process.
+        .and_then(|exp| UNIX_EPOCH.checked_add(Duration::from_secs(exp)))
         .unwrap_or(UNIX_EPOCH)
 }
 
@@ -239,7 +241,11 @@ async fn refresh_tokens(
     // prefer the authoritative `expires_in`; if absent, derive from the new access token's JWT `exp`
     // rather than guessing a fixed lifetime.
     let expires_at = match parsed.expires_in {
-        Some(secs) => SystemTime::now() + Duration::from_secs(secs),
+        // checked_add guards against an absurd `expires_in` overflowing SystemTime (panic);
+        // on overflow fall back to the access token's own `exp`.
+        Some(secs) => SystemTime::now()
+            .checked_add(Duration::from_secs(secs))
+            .unwrap_or_else(|| expiry_from_access_token(&parsed.access_token)),
         None => expiry_from_access_token(&parsed.access_token),
     };
     let account_id = prev_account_id
@@ -279,6 +285,12 @@ impl CodexClient {
 
     /// Refresh under the held lock. If the refresh token was rejected (4xx) the Codex CLI may have
     /// rotated it on disk concurrently — reload `auth.json` once and retry before giving up.
+    ///
+    /// Read-only limitation: when the OAuth server rotates the refresh token, the new one is held
+    /// only in memory (we never write back to `auth.json` — that's the Codex CLI's file). A later
+    /// process therefore reads the pre-rotation token from disk; if the server invalidated it, the
+    /// reload-retry below hits the same stale token and can't self-heal — so it surfaces a clear
+    /// `run \`codex login\`` error rather than persisting a token behind the CLI's back.
     async fn refresh_locked(&self, tokens: &mut CodexTokens) -> Result<()> {
         match refresh_tokens(
             &self.http,

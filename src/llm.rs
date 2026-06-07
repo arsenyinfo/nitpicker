@@ -198,22 +198,54 @@ impl CompletionResponse {
 
 // some providers (notably MiniMax/GLM/DeepSeek via OpenRouter) emit chain-of-thought
 // inline as <think>...</think> in the message content rather than in a structured
-// reasoning field rig can drop. OpenRouter often hoists the inner reasoning into a
-// separate field but leaves the bare tags behind, so we also clean stray empties.
-// note: this is content-wide, so a review that legitimately quotes a <think> tag in a
-// code snippet will have it stripped too — an accepted tradeoff for clean aggregation.
-//
-// the close is `</think>|$` so a streamed/truncated block with no closing tag is removed
-// through end-of-text rather than leaking its reasoning body.
-static THINK_BLOCK_RE: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)<think>.*?(?:</think>|$)").unwrap());
-static THINK_STRAY_RE: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)</?think\s*>").unwrap());
-
+// reasoning field rig can drop. A depth-tracking scanner (not a single regex, which can't
+// match balanced nesting) keeps text only at nesting depth 0, so:
+//   - `<think...>` / `</think...>` are matched case-insensitively, tolerating padded tags
+//     like `<think >` (a regex whose open tag lacked `\s*` would leak their bodies)
+//   - nested tags can't leak: inner reasoning stays inside depth > 0
+//   - an unterminated block is dropped through end-of-text rather than leaking its body
+//   - a stray closing tag at depth 0 is dropped
+// note: this is content-wide, so a review that legitimately quotes a <think> tag in a code
+// snippet will have it stripped too — an accepted tradeoff for clean aggregation.
 fn strip_think_blocks(text: &str) -> String {
-    let without_blocks = THINK_BLOCK_RE.replace_all(text, "");
-    let without_stray = THINK_STRAY_RE.replace_all(&without_blocks, "");
-    without_stray.trim().to_string()
+    // match `<think` (or `</think` when `close`) + optional whitespace + `>` at the start of
+    // `s`, case-insensitively; return the matched byte length. `<thinking>` is not a tag (the
+    // char after `think` must be whitespace or `>`).
+    fn match_think_tag(s: &str, close: bool) -> Option<usize> {
+        let prefix = if close { "</think" } else { "<think" };
+        if !s.get(..prefix.len())?.eq_ignore_ascii_case(prefix) {
+            return None;
+        }
+        let after = &s[prefix.len()..];
+        let ws = after.len() - after.trim_start().len();
+        after[ws..]
+            .starts_with('>')
+            .then_some(prefix.len() + ws + 1)
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut depth: usize = 0;
+    let mut rest = text;
+    while !rest.is_empty() {
+        if rest.starts_with('<') {
+            if let Some(len) = match_think_tag(rest, false) {
+                depth += 1;
+                rest = &rest[len..];
+                continue;
+            }
+            if let Some(len) = match_think_tag(rest, true) {
+                depth = depth.saturating_sub(1);
+                rest = &rest[len..];
+                continue;
+            }
+        }
+        let ch = rest.chars().next().expect("rest is non-empty");
+        if depth == 0 {
+            out.push(ch);
+        }
+        rest = &rest[ch.len_utf8()..];
+    }
+    out.trim().to_string()
 }
 
 pub trait LLMClient: Send + Sync {
@@ -965,6 +997,31 @@ mod tests {
         // agent loop's is_empty() nudge path fires instead of returning "\n".
         let joined = format!("{}\n{}", "<think>round one</think>", "<think>round two");
         assert_eq!(strip_think_blocks(&joined), "");
+    }
+
+    #[test]
+    fn strips_nested_think_blocks() {
+        // a single non-greedy regex stops at the first </think> and leaks the tail; the
+        // depth-tracking scanner must drop the whole balanced span.
+        let raw = "<think>outer <think>inner</think> still hidden</think>answer";
+        assert_eq!(strip_think_blocks(raw), "answer");
+    }
+
+    #[test]
+    fn strips_whitespace_padded_think_tags() {
+        // `<think >` must be recognized as an open tag, not leaked as content.
+        let raw = "<think >hidden</think >visible";
+        assert_eq!(strip_think_blocks(raw), "visible");
+    }
+
+    #[test]
+    fn leaves_thinking_word_untouched() {
+        // `<thinking>` is a different tag — the char after `think` must be ws or `>`.
+        let raw = "see <thinking>kept</thinking> here";
+        assert_eq!(
+            strip_think_blocks(raw),
+            "see <thinking>kept</thinking> here"
+        );
     }
 
     #[test]
