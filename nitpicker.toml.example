@@ -23,17 +23,26 @@ provider = "openrouter"
 # model = "claude-sonnet-4-6"
 # provider = "anthropic"
 
-# Gemini OAuth example
+# Gemini via Antigravity keyring (research only — reuses the agy CLI token).
+# Requires building with `--features antigravity` (off by default).
 # [[reviewer]]
 # name = "gemini"
-# model = "gemini-3-flash-preview"
+# model = "gemini-3.1-pro-low"
 # provider = "gemini"
-# auth = "oauth"
+# auth = "agy-keyring"
 
 # [[reviewer]]
 # name = "openai"
 # model = "gpt-5.5"
 # provider = "openai"
+
+# ChatGPT/Codex subscription (research only — reuses the Codex CLI token from
+# ~/.codex/auth.json; no API key needed). Run `codex login` first.
+# [[reviewer]]
+# name = "codex"
+# model = "gpt-5.5"
+# provider = "openai"
+# auth = "codex"
 
 # OpenRouter with explicit model
 # [[reviewer]]

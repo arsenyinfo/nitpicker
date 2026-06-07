@@ -180,15 +180,72 @@ impl CompletionResponse {
     }
 
     pub fn text(&self) -> String {
-        self.choice
+        // join the raw text blocks first, then strip once: a think block that spans
+        // (or a truncated one that runs to EOF) is judged against the whole text, and an
+        // all-reasoning response collapses to "" so callers' is_empty() checks fire.
+        let raw = self
+            .choice
             .iter()
             .filter_map(|content| match content {
                 AssistantContent::Text(text) => Some(text.text().to_string()),
                 _ => None,
             })
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        strip_think_blocks(&raw)
     }
+}
+
+// some providers (notably MiniMax/GLM/DeepSeek via OpenRouter) emit chain-of-thought
+// inline as <think>...</think> in the message content rather than in a structured
+// reasoning field rig can drop. A depth-tracking scanner (not a single regex, which can't
+// match balanced nesting) keeps text only at nesting depth 0, so:
+//   - `<think...>` / `</think...>` are matched case-insensitively, tolerating padded tags
+//     like `<think >` (a regex whose open tag lacked `\s*` would leak their bodies)
+//   - nested tags can't leak: inner reasoning stays inside depth > 0
+//   - an unterminated block is dropped through end-of-text rather than leaking its body
+//   - a stray closing tag at depth 0 is dropped
+// note: this is content-wide, so a review that legitimately quotes a <think> tag in a code
+// snippet will have it stripped too — an accepted tradeoff for clean aggregation.
+fn strip_think_blocks(text: &str) -> String {
+    // match `<think` (or `</think` when `close`) + optional whitespace + `>` at the start of
+    // `s`, case-insensitively; return the matched byte length. `<thinking>` is not a tag (the
+    // char after `think` must be whitespace or `>`).
+    fn match_think_tag(s: &str, close: bool) -> Option<usize> {
+        let prefix = if close { "</think" } else { "<think" };
+        if !s.get(..prefix.len())?.eq_ignore_ascii_case(prefix) {
+            return None;
+        }
+        let after = &s[prefix.len()..];
+        let ws = after.len() - after.trim_start().len();
+        after[ws..]
+            .starts_with('>')
+            .then_some(prefix.len() + ws + 1)
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut depth: usize = 0;
+    let mut rest = text;
+    while !rest.is_empty() {
+        if rest.starts_with('<') {
+            if let Some(len) = match_think_tag(rest, false) {
+                depth += 1;
+                rest = &rest[len..];
+                continue;
+            }
+            if let Some(len) = match_think_tag(rest, true) {
+                depth = depth.saturating_sub(1);
+                rest = &rest[len..];
+                continue;
+            }
+        }
+        let ch = rest.chars().next().expect("rest is non-empty");
+        if depth == 0 {
+            out.push(ch);
+        }
+        rest = &rest[ch.len_utf8()..];
+    }
+    out.trim().to_string()
 }
 
 pub trait LLMClient: Send + Sync {
@@ -696,6 +753,7 @@ impl LLMClient for openrouter::Client {
 }
 
 /// Create a Gemini client that routes through the local OAuth proxy
+#[cfg(feature = "antigravity")]
 pub fn create_gemini_client_with_proxy(
     proxy_url: &str,
 ) -> Result<std::sync::Arc<dyn LLMClientDyn>> {
@@ -791,7 +849,7 @@ fn model_needs_max_completion_tokens(model: &str) -> bool {
         || model.starts_with("gpt-5")
 }
 
-fn merge_json(mut base: Value, extra: Value) -> Value {
+pub(crate) fn merge_json(mut base: Value, extra: Value) -> Value {
     if let (Some(base_obj), Some(extra_obj)) = (base.as_object_mut(), extra.as_object()) {
         for (k, v) in extra_obj {
             base_obj.insert(k.clone(), v.clone());
@@ -899,6 +957,71 @@ mod tests {
         Err::<(), _>(inner)
             .wrap_err("Anthropic completion failed for model 'claude'")
             .unwrap_err()
+    }
+
+    #[test]
+    fn strips_full_think_block() {
+        let raw = "<think>let me reason about this</think>\n\nThe bug is in foo().";
+        assert_eq!(strip_think_blocks(raw), "The bug is in foo().");
+    }
+
+    #[test]
+    fn strips_stray_empty_think_tags() {
+        // OpenRouter hoists MiniMax's reasoning into a separate field but leaves the tags.
+        let raw = "<think></think>\n## Findings\n- looks fine";
+        assert_eq!(strip_think_blocks(raw), "## Findings\n- looks fine");
+    }
+
+    #[test]
+    fn strips_unbalanced_and_multiline_think() {
+        let raw = "intro\n<think>\nstep 1\nstep 2\n</think>verdict: ok</think>";
+        assert_eq!(strip_think_blocks(raw), "intro\nverdict: ok");
+    }
+
+    #[test]
+    fn leaves_non_think_text_untouched() {
+        let raw = "no reasoning tags here, just review text";
+        assert_eq!(strip_think_blocks(raw), raw);
+    }
+
+    #[test]
+    fn strips_unterminated_think_to_eof() {
+        // a streamed/truncated block with no closing tag must not leak its body.
+        let raw = "answer first\n<think>reasoning that never closes\nstep 2";
+        assert_eq!(strip_think_blocks(raw), "answer first");
+    }
+
+    #[test]
+    fn all_reasoning_collapses_to_empty() {
+        // an all-think response (incl. the multi-block join) must be empty so the
+        // agent loop's is_empty() nudge path fires instead of returning "\n".
+        let joined = format!("{}\n{}", "<think>round one</think>", "<think>round two");
+        assert_eq!(strip_think_blocks(&joined), "");
+    }
+
+    #[test]
+    fn strips_nested_think_blocks() {
+        // a single non-greedy regex stops at the first </think> and leaks the tail; the
+        // depth-tracking scanner must drop the whole balanced span.
+        let raw = "<think>outer <think>inner</think> still hidden</think>answer";
+        assert_eq!(strip_think_blocks(raw), "answer");
+    }
+
+    #[test]
+    fn strips_whitespace_padded_think_tags() {
+        // `<think >` must be recognized as an open tag, not leaked as content.
+        let raw = "<think >hidden</think >visible";
+        assert_eq!(strip_think_blocks(raw), "visible");
+    }
+
+    #[test]
+    fn leaves_thinking_word_untouched() {
+        // `<thinking>` is a different tag — the char after `think` must be ws or `>`.
+        let raw = "see <thinking>kept</thinking> here";
+        assert_eq!(
+            strip_think_blocks(raw),
+            "see <thinking>kept</thinking> here"
+        );
     }
 
     #[test]

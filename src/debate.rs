@@ -5,7 +5,9 @@ use crate::agent::{
 use crate::config::{Config, ReviewerConfig};
 use crate::llm::{Completion, LLMClientDyn};
 pub use crate::prompts::DebateMode;
-use crate::provider::{build_aggregator_client, build_reviewer_client, config_needs_gemini_proxy};
+#[cfg(feature = "antigravity")]
+use crate::provider::config_needs_gemini_proxy;
+use crate::provider::{build_aggregator_client, build_reviewer_client};
 use crate::session::{AggregationRecord, SessionLogger, SessionWriter};
 use crate::tools::{Tool, all_tools};
 use eyre::Result;
@@ -285,9 +287,9 @@ fn make_sub_spinner(mp: &MultiProgress, pb: &ProgressBar) -> ProgressBar {
 
 fn build_client(
     reviewer: &ReviewerConfig,
-    gemini_proxy: Option<&crate::gemini_proxy::GeminiProxyClient>,
+    proxy_url: Option<&str>,
 ) -> Result<Arc<dyn LLMClientDyn>> {
-    build_reviewer_client(reviewer, gemini_proxy)
+    build_reviewer_client(reviewer, proxy_url)
 }
 
 pub struct DebateOptions {
@@ -326,6 +328,9 @@ pub async fn run_debate(
     let critic_cfg = &config.reviewer[1];
     let agg_cfg = &config.aggregator;
 
+    // proxy client stays bound for the function so its local server outlives the debate;
+    // only its base URL is threaded into the client builders.
+    #[cfg(feature = "antigravity")]
     let gemini_proxy = match config_needs_gemini_proxy(config) {
         true => {
             info!("Starting Gemini proxy (agy-keyring)");
@@ -333,6 +338,10 @@ pub async fn run_debate(
         }
         false => None,
     };
+    #[cfg(feature = "antigravity")]
+    let proxy_url: Option<String> = gemini_proxy.as_ref().map(|p| p.base_url());
+    #[cfg(not(feature = "antigravity"))]
+    let proxy_url: Option<String> = None;
 
     let actor_client: Arc<dyn LLMClientDyn>;
     let critic_client: Arc<dyn LLMClientDyn>;
@@ -344,7 +353,7 @@ pub async fn run_debate(
     if alloy {
         let mut slots = Vec::new();
         for r in &config.reviewer {
-            slots.push((build_client(r, gemini_proxy.as_ref())?, r.model.clone()));
+            slots.push((build_client(r, proxy_url.as_deref())?, r.model.clone()));
         }
         let shared: Arc<dyn LLMClientDyn> = Arc::new(crate::llm::AlloyClient::new(slots)?);
         actor_client = Arc::clone(&shared);
@@ -358,8 +367,8 @@ pub async fn run_debate(
         actor_compact_threshold = config.reviewer_compact_threshold(actor_cfg);
         critic_compact_threshold = config.reviewer_compact_threshold(critic_cfg);
     } else {
-        actor_client = build_client(actor_cfg, gemini_proxy.as_ref())?;
-        critic_client = build_client(critic_cfg, gemini_proxy.as_ref())?;
+        actor_client = build_client(actor_cfg, proxy_url.as_deref())?;
+        critic_client = build_client(critic_cfg, proxy_url.as_deref())?;
         actor_label = ModelLabel::plain(&actor_cfg.model);
         critic_label = ModelLabel::plain(&critic_cfg.model);
         actor_compact_threshold = config.reviewer_compact_threshold(actor_cfg);
@@ -372,8 +381,7 @@ pub async fn run_debate(
 
     let project_context = crate::review::build_context(repo).await;
 
-    let agg_client: Arc<dyn LLMClientDyn> =
-        build_aggregator_client(agg_cfg, gemini_proxy.as_ref())?;
+    let agg_client: Arc<dyn LLMClientDyn> = build_aggregator_client(agg_cfg, proxy_url.as_deref())?;
 
     let actor_role = mode.actor_role();
     let critic_role = mode.critic_role();

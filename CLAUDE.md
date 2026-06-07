@@ -67,8 +67,9 @@ tools.rs        tool definitions: read_file, glob, grep, git
 pr.rs           GitHub PR subcommand: fetch metadata via gh, review, post comment
 output.rs       JSON output contract for `pr --json` (OutputFormat, PrReviewOutput envelope, emit_json)
 reflect.rs      Reflect subcommand: analyze saved session trajectories and synthesize improvements
-gemini_proxy/   local HTTP proxy that translates Gemini API calls to Google Code Assist
+gemini_proxy/   local HTTP proxy that translates Gemini API calls to Google Code Assist (feature `antigravity`, off by default)
 azure.rs        Azure AD token auth for Foundry-hosted OpenAI/Anthropic (feature `azure`, off by default)
+codex.rs        ChatGPT/Codex subscription auth — reuses `~/.codex/auth.json`, talks the Codex Responses endpoint
 ```
 
 ### Review flow
@@ -139,6 +140,16 @@ azure.rs        Azure AD token auth for Foundry-hosted OpenAI/Anthropic (feature
 - For Foundry, `provider = "openai"` (base_url `.../openai/v1`) sends the token via the OpenAI client's Bearer auth; `provider = "anthropic"` (base_url `.../anthropic`) injects `Authorization: Bearer` through rig's `.http_headers()` since that client otherwise hardcodes `x-api-key` — `.api_key(...)` gets a placeholder so the AAD token isn't leaked into the unused `x-api-key` header.
 - Credential chain selected by `azure_credentials` (`dev`/`prod`/auto, falling back to the `AZURE_TOKEN_CREDENTIALS` env var); scope via `azure_scope` (default `https://cognitiveservices.azure.com/.default`; empty/whitespace is treated as unset and falls back to the default rather than failing at the first call). `base_url` is trimmed at both config validation and client construction, so a whitespace-padded endpoint normalizes identically instead of reaching rig verbatim. Credential construction is non-fatal for all modes — failures are skipped and an empty chain produces a clear "no Azure credentials could be constructed" error. Each reviewer/aggregator owns its own client and caches the token until ~60s before expiry.
 
+### ChatGPT/Codex subscription auth (`codex.rs`)
+
+- `auth = "codex"` (validated for `provider = "openai"` only; no env var required) reuses the OAuth token the Codex CLI writes to `~/.codex/auth.json` (or `$CODEX_HOME/auth.json` when set, non-empty, absolute — relative/unresolvable paths fail fast). The file is read **read-only**; nitpicker never writes back. API-key-mode files (no `tokens` object) are rejected with a `codex login` hint.
+- Token lifecycle: initial expiry is decoded from the access token's JWT `exp` claim (missing/unparseable → already-expired, forcing one refresh). Refresh POSTs `grant_type=refresh_token` to `auth.openai.com/oauth/token` with the public Codex client id; expiry then comes from the response's `expires_in` (authoritative, so a token without `exp` never thrashes). Account id is `tokens.account_id`, else derived from `id_token`/`access_token` claims (`chatgpt_account_id` → nested `https://api.openai.com/auth` → `organizations[0].id`). A refresh rejected with a 4xx reloads `auth.json` once (the Codex CLI may have rotated the refresh token concurrently) before failing.
+- Concurrency: token cache + reqwest client live in one `CodexClient` (the token is supplied per-request, so unlike `AzureAdClient` there's no inner-client rebuild). `current_access` double-checks expiry under the lock so a concurrent subagent wave refreshes once; a 401 forces a single refresh-and-retry gated on the rejected access token (a burst of 401s collapses to one fetch). Wrapped with `.with_retry()` like every client; the 401 path is handled internally since RetryingLLM treats 401 as fatal.
+- Request path: the endpoint `chatgpt.com/backend-api/codex/responses` speaks the OpenAI **Responses** API but rig's high-level responses client is unusable here (it hardcodes `instructions: None`). So `CodexClient` reuses rig's public `responses_api::{CompletionRequest, CompletionResponse}` types for request **lowering** and response **parsing** but does the HTTP itself to satisfy the backend's quirks: top-level `instructions` = the system prompt (taken out of the rig request so it isn't also added as an input item; a completion with no system prompt is rejected up front), `stream: true` (mandatory), `store: false` (merged into `additional_params`), and `max_output_tokens` omitted (rejected outright). Because `store: false` is stateless, the terminal `response.completed` event carries an empty `output`, so items are accumulated from `response.output_item.done` events and injected before rig parses. Finish reason: tool calls → ToolUse; else `incomplete_details.reason == "max_output_tokens"` → MaxTokens; else Stop.
+- **Multi-turn reasoning under `store: false`**: a reasoning item the model returns this turn is, by default, replayed next turn as a bare `rs_...` id — which the stateless backend can't resolve (`HTTP 404 — Items are not persisted when store is set to false`), so every loop past turn 1 died. `build_body` therefore merges `include: ["reasoning.encrypted_content"]` alongside `store: false`. rig round-trips that blob both ways (response `Output::Reasoning.encrypted_content` → core `ReasoningContent::Encrypted` → request reasoning input item), so reasoning replays **inline** rather than by id. rig only auto-adds that `include` when a `reasoning` config is present, which nitpicker doesn't set, hence the explicit merge.
+- `init` detection (`detect.rs::detect_codex`) surfaces a logged-in Codex CLI as a commented `auth = "codex"` reviewer (`gpt-5.5`) via `codex::auth_available()` (reuses the same `auth.json` parse, so API-key-mode files don't qualify), gated on no `openai`-named provider already detected.
+- Research-only framing in user-facing copy (third-party use of the Codex OAuth client is arguably against OpenAI ToS), mirroring the AG2 gemini path. Tokens are never logged.
+
 ### Tools (`tools.rs`)
 
 Tools return `String`, never `Err` — errors are returned as `"Error: ..."` strings so the LLM can self-correct. The exception is truly unrecoverable errors (e.g. missing required argument).
@@ -157,7 +168,9 @@ Tool outputs are intentionally a bit self-describing: `read_file` includes file/
 
 ### Gemini AG2 proxy (`gemini_proxy/`)
 
-When `auth = "agy-keyring"` is set for a Gemini reviewer/aggregator, nitpicker:
+Gated behind the off-by-default `antigravity` cargo feature. The whole module compiles out when the feature is off, which drops `axum`, `keyring`, and `uuid` from the default build; `provider.rs`/`review.rs`/`debate.rs` thread only the proxy's base URL (`Option<&str>`) downstream so their signatures compile feature-off, and the proxy predicates (`*_needs_gemini_proxy`, `ProviderType::is_gemini`) plus `create_gemini_client_with_proxy` and `detect::detect_agy_keyring` are all `#[cfg(feature = "antigravity")]`. The config validator bails with a `--features antigravity` hint if `auth = "agy-keyring"` is configured without it (mirrors the azure gate). Combined with a size-tuned `[profile.release]` (`opt-level = "z"`, `lto = "thin"`, `strip = true`; `panic` left at `unwind`), the default release binary is ~8.7M (down from ~16M).
+
+When `auth = "agy-keyring"` is set for a Gemini reviewer/aggregator (feature-on), nitpicker:
 1. Runs a local axum HTTP server on a random port
 2. Translates incoming Gemini API requests to Google Code Assist API format
 3. Attaches the Antigravity OAuth Bearer token read from the system keyring

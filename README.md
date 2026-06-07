@@ -123,12 +123,14 @@ Set `[defaults].log_trajectories = true` to save per-agent JSONL traces and a fi
 |---|---|---|
 | `anthropic` | `ANTHROPIC_API_KEY` env var (or `api_key_env`), or `auth = "azure-ad"` | `base_url` optional |
 | `gemini` | `GEMINI_API_KEY` env var, or `auth = "agy-keyring"` | `agy-keyring` reuses the Antigravity CLI OAuth token from the system keyring — research only, [see warning](#antigravity-keyring-research-only) |
-| `openai` | `OPENAI_API_KEY` env var (or `api_key_env`), or `auth = "azure-ad"` | `base_url` optional |
+| `openai` | `OPENAI_API_KEY` env var (or `api_key_env`), `auth = "azure-ad"`, or `auth = "codex"` | `codex` reuses your ChatGPT subscription via the Codex CLI token — research only, [see warning](#chatgptcodex-subscription-research-only) |
 | `openrouter` | `OPENROUTER_API_KEY` env var (or `api_key_env`) | explicit model names are recommended; `model = "free"` is experimental |
 
 `anthropic_compatible` and `openai_compatible` are accepted as aliases for backward compatibility.
 
 `auth = "azure-ad"` authenticates with a refreshing Azure AD (Entra ID) token instead of a static key — for OpenAI and Anthropic models hosted on Azure AI Foundry. Requires a build with the `azure` feature, [see below](#azure-ad-azure-ai-foundry).
+
+`auth = "codex"` authenticates with your ChatGPT Plus/Pro (Codex) subscription instead of a paid API key, reusing the token the Codex CLI stores on disk, [see below](#chatgptcodex-subscription-research-only).
 
 ### OpenRouter models
 
@@ -181,6 +183,15 @@ AG2 is Google's current agentic IDE, succeeding both the older Gemini CLI OAuth 
 
 The proxy reads `agy`'s OAuth token from the system keyring (`service=gemini`, `account=antigravity`) via the `keyring` crate (Secret Service on Linux, Keychain on macOS, Credential Manager on Windows), relies on `agy` to refresh it, and routes chat through CloudCode's `v1internal:streamGenerateContent` SSE endpoint. Run `agy` and complete its login first. `NITPICKER_ANTIGRAVITY_PLATFORM` can override the auto-detected platform enum if needed.
 
+This path requires a build with the `antigravity` feature (off by default, since it pulls in the local proxy stack — `axum` — and the `keyring` crate with its native backends):
+
+```bash
+cargo build --release --features antigravity
+# or: cargo install --features antigravity ...
+```
+
+Without the feature, `auth = "agy-keyring"` is rejected at config validation with a build hint, and `nitpicker init` won't offer the keyring reviewer.
+
 Tested AG2 models (current author config): `gemini-3.1-pro-low`, `gemini-3.5-flash-low`. Other IDs returned by `fetchAvailableModels` (e.g. `gemini-3-flash-agent`) likely work but have not been exercised.
 
 ```toml
@@ -194,6 +205,30 @@ name = "gemini"
 model = "gemini-3.1-pro-low"
 provider = "gemini"
 auth = "agy-keyring"
+```
+
+### ChatGPT/Codex subscription (research only)
+
+> [!CAUTION]
+> **Research only.** This reuses the OpenAI Codex CLI's public OAuth client to call OpenAI through your ChatGPT Plus/Pro subscription. Third-party use of that client is arguably outside OpenAI's terms — same posture as the Antigravity path above. Use a paid `OPENAI_API_KEY` for anything you care about.
+
+`auth = "codex"` (on an `openai` reviewer/aggregator) reuses the OAuth token the [Codex CLI](https://developers.openai.com/codex) stores in `~/.codex/auth.json`. Log in once with `codex login` (choosing your ChatGPT account, not an API key); nitpicker reads the token **read-only** and refreshes the short-lived access token in-memory via the refresh token — it never writes back to `auth.json`. Set `CODEX_HOME` to override the token directory.
+
+Under the hood this talks to the Codex subscription endpoint (`chatgpt.com/backend-api/codex/responses`), which speaks the OpenAI Responses API with subscription-specific quirks (a required top-level system prompt, mandatory streaming, `store: false`, no `max_output_tokens`, and encrypted reasoning items round-tripped across turns since nothing is server-side persisted); nitpicker handles all of that transparently. No API-key env var is needed.
+
+Models are your subscription's Codex models (e.g. `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`):
+
+```toml
+[aggregator]
+model = "gpt-5.4"
+provider = "openai"
+auth = "codex"
+
+[[reviewer]]
+name = "codex"
+model = "gpt-5.4"
+provider = "openai"
+auth = "codex"
 ```
 
 ### Azure AD (Azure AI Foundry)
@@ -293,6 +328,13 @@ By default, nitpicker prints only the final synthesized result. Use `--verbose` 
 Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timestamp}.md`.
 
 ## Changelog
+
+**0.7.0** — 2026-06-07
+- Added `auth = "codex"` for the `openai` provider: authenticate with a ChatGPT Plus/Pro (Codex) subscription instead of a paid API key. nitpicker reuses the OAuth token the Codex CLI stores in `~/.codex/auth.json` (read-only; `CODEX_HOME` honored), refreshing the short-lived access token in-memory via the refresh token — never writing back, and recovering from a refresh-token rotation by reloading from disk once. Requests go to the Codex subscription endpoint (`chatgpt.com/backend-api/codex/responses`), which speaks the OpenAI Responses API with subscription-specific requirements handled transparently: a top-level `instructions` system prompt, mandatory SSE streaming, `store: false` (so output items are accumulated from the stream), and omitted `max_output_tokens`. No API-key env var is required. Research only — third-party use of the Codex OAuth client is arguably outside OpenAI's terms; see README warning. See [ChatGPT/Codex subscription section](#chatgptcodex-subscription-research-only).
+- Codex multi-turn reasoning fix: under the mandatory `store: false`, a reasoning item returned this turn was echoed back next turn as a bare `rs_...` id the backend could no longer resolve (`HTTP 404 — Items are not persisted when store is set to false`), breaking every debate/agent loop after the first turn. nitpicker now requests `include: ["reasoning.encrypted_content"]`, so each reasoning item carries an opaque blob that is replayed inline instead of by id.
+- `nitpicker init` now auto-detects a logged-in Codex CLI (`~/.codex/auth.json`, `CODEX_HOME` honored) and emits a commented `auth = "codex"` reviewer (`gpt-5.5`), provided no paid `OPENAI_API_KEY` is already configured. Research-only path, same posture as the Antigravity keyring detection.
+- Bumped `rig-core` to 0.38.
+- The Antigravity Gemini path (`auth = "agy-keyring"` + the local `gemini_proxy`) is now gated behind the off-by-default `antigravity` cargo feature (build with `--features antigravity`), mirroring `azure`. Without it, that auth is rejected at config validation with a build hint and `init` won't offer the keyring reviewer. This drops `axum`, `keyring`, and `uuid` from the default build and, with a size-tuned release profile (`opt-level = "z"`, thin LTO, `strip`), trims the default release binary from ~16M to ~8.7M (−46%) — clean release builds stay as fast as the old default. `panic` stays `unwind` so reviewer-task panics are still caught as `JoinError`.
 
 **0.6.3** — 2026-06-06
 - Audit fixes: (1) **git tool security** — the read-only allowlist gated only the subcommand, allowing file writes (`diff --output=<path>`) and ref mutation (`branch`/`tag`) against the user's real repo in `pr` in-place mode; `branch`/`tag` are replaced by the safe-by-construction `for-each-ref`/`show-ref` plumbing and `--output`/`-o` is blocked. (2) **detached-HEAD restore** in `pr` mode was broken and not panic-safe, stranding the user on `nitpicker/pr-N`; now restored via `git switch --detach` from a `Drop` guard. (3) **retry classifier** misread `code` as a substring (`error decoding…404` → permanent 4xx, retries lost); keys are now whole-word matched and 5xx-nested-4xx stays retryable. (4) **debate** no longer records an empty verdict when a terminal tool call is blocked/malformed.

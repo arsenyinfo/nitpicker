@@ -5,7 +5,9 @@ use crate::agent::{
 use crate::config::{Config, ReviewerConfig};
 use crate::llm::{Completion, FinishReason};
 pub use crate::prompts::TaskMode;
-use crate::provider::{build_aggregator_client, build_reviewer_client, config_needs_gemini_proxy};
+#[cfg(feature = "antigravity")]
+use crate::provider::config_needs_gemini_proxy;
+use crate::provider::{build_aggregator_client, build_reviewer_client};
 use crate::session::{AggregationRecord, SessionLogger, sanitize_path_component};
 use crate::tools::{all_tools, floor_char_boundary, is_binary_file};
 use eyre::Result;
@@ -52,6 +54,9 @@ pub async fn run_review(
         .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", ""]);
     let done_style = ProgressStyle::with_template("  {prefix:<12} {msg}").unwrap();
 
+    // the proxy client stays bound for the whole function so its local server outlives the
+    // reviewers; only its base URL is threaded downstream (see build_reviewer_client).
+    #[cfg(feature = "antigravity")]
     let gemini_proxy = match config_needs_gemini_proxy(config) {
         true => {
             info!("Starting Gemini proxy (agy-keyring)");
@@ -59,6 +64,10 @@ pub async fn run_review(
         }
         false => None,
     };
+    #[cfg(feature = "antigravity")]
+    let proxy_url: Option<String> = gemini_proxy.as_ref().map(|p| p.base_url());
+    #[cfg(not(feature = "antigravity"))]
+    let proxy_url: Option<String> = None;
 
     for reviewer in &config.reviewer {
         let tools_map = tools.clone();
@@ -73,7 +82,7 @@ pub async fn run_review(
             reviewer,
             &system_prompt,
             max_turns,
-            gemini_proxy.as_ref(),
+            proxy_url.as_deref(),
             Arc::clone(&subagent_counter),
             Arc::clone(&llm_semaphore),
             session_writer,
@@ -172,7 +181,7 @@ pub async fn run_review(
     pb_agg.enable_steady_tick(Duration::from_millis(80));
 
     let agg = &config.aggregator;
-    let client = build_aggregator_client(agg, gemini_proxy.as_ref())?;
+    let client = build_aggregator_client(agg, proxy_url.as_deref())?;
     let completion = Completion {
         model: agg.model.clone(),
         prompt: Message::user(reduce_prompt),
@@ -285,12 +294,12 @@ fn build_agent_config(
     reviewer: &ReviewerConfig,
     system_prompt: &str,
     max_turns: usize,
-    gemini_proxy: Option<&crate::gemini_proxy::GeminiProxyClient>,
+    proxy_url: Option<&str>,
     subagent_counter: Arc<AtomicUsize>,
     llm_semaphore: Arc<Semaphore>,
     session_writer: Option<crate::session::SessionWriter>,
 ) -> Result<AgentConfig> {
-    let client = build_reviewer_client(reviewer, gemini_proxy)?;
+    let client = build_reviewer_client(reviewer, proxy_url)?;
     let compact_threshold = config.reviewer_compact_threshold(reviewer);
 
     Ok(AgentConfig {

@@ -1,21 +1,30 @@
-use crate::config::{AggregatorConfig, Config, ProviderType, ReviewerConfig, is_azure_ad_auth};
-use crate::gemini_proxy::GeminiProxyClient;
+#[cfg(feature = "antigravity")]
+use crate::config::Config;
+use crate::config::{
+    AggregatorConfig, ProviderType, ReviewerConfig, is_azure_ad_auth, is_codex_auth,
+};
 use crate::llm::{LLMClient, LLMClientDyn, LLMProvider, WithRetryExt};
 use eyre::Result;
 use std::sync::Arc;
 
+// The Antigravity Gemini proxy path is gated behind the `antigravity` feature; these
+// predicates (and the proxy branches below) compile out entirely when it is off.
+#[cfg(feature = "antigravity")]
 pub fn needs_gemini_proxy(provider: &ProviderType, auth: Option<&str>) -> bool {
     provider.is_gemini() && matches!(auth, Some("agy-keyring"))
 }
 
+#[cfg(feature = "antigravity")]
 pub fn reviewer_needs_gemini_proxy(reviewer: &ReviewerConfig) -> bool {
     needs_gemini_proxy(&reviewer.provider, reviewer.auth.as_deref())
 }
 
+#[cfg(feature = "antigravity")]
 pub fn aggregator_needs_gemini_proxy(agg: &AggregatorConfig) -> bool {
     needs_gemini_proxy(&agg.provider, agg.auth.as_deref())
 }
 
+#[cfg(feature = "antigravity")]
 pub fn config_needs_gemini_proxy(config: &Config) -> bool {
     aggregator_needs_gemini_proxy(&config.aggregator)
         || config.reviewer.iter().any(reviewer_needs_gemini_proxy)
@@ -65,14 +74,16 @@ pub fn provider_from_config(
 
 pub fn build_reviewer_client(
     reviewer: &ReviewerConfig,
-    gemini_proxy: Option<&GeminiProxyClient>,
+    proxy_url: Option<&str>,
 ) -> Result<Arc<dyn LLMClientDyn>> {
+    #[cfg(feature = "antigravity")]
     if reviewer_needs_gemini_proxy(reviewer) {
-        let proxy_url = gemini_proxy
-            .map(|p| p.base_url())
-            .ok_or_else(|| eyre::eyre!("Gemini proxy required but not available"))?;
-        return crate::llm::create_gemini_client_with_proxy(&proxy_url);
+        let url =
+            proxy_url.ok_or_else(|| eyre::eyre!("Gemini proxy required but not available"))?;
+        return crate::llm::create_gemini_client_with_proxy(url);
     }
+    #[cfg(not(feature = "antigravity"))]
+    let _ = proxy_url;
 
     if is_azure_ad_auth(reviewer.auth.as_deref()) {
         return build_azure_ad_client(
@@ -81,6 +92,10 @@ pub fn build_reviewer_client(
             reviewer.azure_scope.as_deref(),
             reviewer.azure_credentials.as_deref(),
         );
+    }
+
+    if is_codex_auth(reviewer.auth.as_deref()) {
+        return crate::codex::shared_client();
     }
 
     Ok(provider_from_config(
@@ -95,14 +110,16 @@ pub fn build_reviewer_client(
 
 pub fn build_aggregator_client(
     agg: &AggregatorConfig,
-    gemini_proxy: Option<&GeminiProxyClient>,
+    proxy_url: Option<&str>,
 ) -> Result<Arc<dyn LLMClientDyn>> {
+    #[cfg(feature = "antigravity")]
     if aggregator_needs_gemini_proxy(agg) {
-        let proxy_url = gemini_proxy
-            .map(|p| p.base_url())
-            .ok_or_else(|| eyre::eyre!("Gemini proxy required but not available"))?;
-        return crate::llm::create_gemini_client_with_proxy(&proxy_url);
+        let url =
+            proxy_url.ok_or_else(|| eyre::eyre!("Gemini proxy required but not available"))?;
+        return crate::llm::create_gemini_client_with_proxy(url);
     }
+    #[cfg(not(feature = "antigravity"))]
+    let _ = proxy_url;
 
     if is_azure_ad_auth(agg.auth.as_deref()) {
         return build_azure_ad_client(
@@ -111,6 +128,10 @@ pub fn build_aggregator_client(
             agg.azure_scope.as_deref(),
             agg.azure_credentials.as_deref(),
         );
+    }
+
+    if is_codex_auth(agg.auth.as_deref()) {
+        return crate::codex::shared_client();
     }
 
     Ok(provider_from_config(
