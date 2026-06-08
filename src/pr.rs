@@ -674,8 +674,8 @@ async fn run_review_inner(
         eprintln!("warning: --alloy has no effect with --no-debate");
     }
     let debate = !args.no_debate && config.default_debate();
-    let (report, transcript_path) = if debate {
-        debate::run_debate(
+    let (report, transcript_path, usage) = if debate {
+        let outcome = debate::run_debate(
             repo,
             &full_prompt,
             config,
@@ -688,9 +688,10 @@ async fn run_review_inner(
                 format,
             },
         )
-        .await?
+        .await?;
+        (outcome.report, outcome.transcript_path, outcome.usage)
     } else {
-        let report = review::run_review(
+        let outcome = review::run_review(
             repo,
             &full_prompt,
             config,
@@ -699,7 +700,7 @@ async fn run_review_inner(
             TaskMode::Review,
         )
         .await?;
-        (report, std::path::PathBuf::new())
+        (outcome.report, std::path::PathBuf::new(), outcome.usage)
     };
 
     match format {
@@ -744,6 +745,7 @@ async fn run_review_inner(
                     aggregator: config.aggregator.model.clone(),
                 }),
                 report_markdown: Some(report),
+                usage: Some(usage),
                 comment_posted,
                 duration_ms: start.elapsed().as_millis() as u64,
                 error: None,

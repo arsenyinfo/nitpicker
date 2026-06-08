@@ -1,9 +1,10 @@
 use crate::agent::{
-    AgentConfig, AgentDepth, AgentProgress, MAX_CONCURRENT_LLM_CALLS, add_spawn_subagent_tool,
-    run_agent,
+    AgentConfig, AgentDepth, AgentProgress, AgentResult, MAX_CONCURRENT_LLM_CALLS,
+    add_spawn_subagent_tool, run_agent,
 };
 use crate::config::{Config, ReviewerConfig};
 use crate::llm::{Completion, FinishReason};
+use crate::output::UsageReport;
 pub use crate::prompts::TaskMode;
 #[cfg(feature = "antigravity")]
 use crate::provider::config_needs_gemini_proxy;
@@ -23,6 +24,11 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tracing::info;
 
+pub struct ReviewOutcome {
+    pub report: String,
+    pub usage: UsageReport,
+}
+
 pub async fn run_review(
     repo: &Path,
     user_prompt: &str,
@@ -30,7 +36,7 @@ pub async fn run_review(
     max_turns: usize,
     verbose: bool,
     mode: TaskMode,
-) -> Result<String> {
+) -> Result<ReviewOutcome> {
     let mut tools = all_tools();
     add_spawn_subagent_tool(&mut tools);
     let session_logger = SessionLogger::maybe_new(config.log_trajectories())?;
@@ -102,7 +108,7 @@ pub async fn run_review(
         let initial_message = initial_message.clone();
         let context = context.clone();
         let sem = Arc::clone(&semaphore);
-        let handle: JoinHandle<(String, Result<String>)> = tokio::spawn(async move {
+        let handle: JoinHandle<(String, Result<AgentResult>)> = tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
             let mut config = match agent_config {
                 Ok(config) => config,
@@ -148,16 +154,18 @@ pub async fn run_review(
                 )),
                 Err(e) => pb.finish_with_message(format!("✗ failed: {e}")),
             }
-            (name, result.map(|r| r.text))
+            (name, result)
         });
         handles.push(handle);
     }
 
+    let mut usage = UsageReport::default();
     let mut rendered = Vec::new();
     for handle in handles {
         match handle.await {
-            Ok((name, Ok(text))) => {
-                rendered.push(format!("## {name} review\n\n{text}"));
+            Ok((name, Ok(result))) => {
+                usage.add(result.usage(), result.subagents_spawned);
+                rendered.push(format!("## {name} review\n\n{}", result.text));
                 info!(reviewer = %name, "review completed");
             }
             Ok((name, Err(err))) => {
@@ -193,6 +201,7 @@ pub async fn run_review(
         additional_params: None,
     };
     let response = client.completion(completion).await?;
+    usage.add(response.usage, 0);
     pb_agg.set_style(done_style);
     if response.finish_reason == FinishReason::ToolUse {
         pb_agg.finish_with_message("✗ failed: unexpected tool call");
@@ -211,7 +220,10 @@ pub async fn run_review(
             })
             .await?;
     }
-    Ok(text)
+    Ok(ReviewOutcome {
+        report: text,
+        usage,
+    })
 }
 
 const MAX_CONTEXT_SIZE: usize = 50_000;
