@@ -1,5 +1,5 @@
 use crate::compact::{CompactionOutcome, compact_history};
-use crate::llm::{Completion, ConversationUsageWindow, LLMClientDyn, throttled_completion};
+use crate::llm::{Completion, ConversationUsageWindow, LLMClientDyn, TokenUsage, throttled_completion};
 use crate::prompts::subagent_system_prompt;
 use crate::session::{SessionWriter, ToolCallRecord, now_unix_ms};
 use crate::tools::{Tool, floor_char_boundary, tool_definitions};
@@ -35,6 +35,18 @@ pub struct AgentResult {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_tokens: u64,
+}
+
+impl AgentResult {
+    /// the agent's accumulated token usage (preserving its reported `total_tokens`
+    /// verbatim rather than recomputing from input+output).
+    pub fn usage(&self) -> TokenUsage {
+        TokenUsage {
+            input_tokens: self.total_input_tokens,
+            output_tokens: self.total_output_tokens,
+            total_tokens: self.total_tokens,
+        }
+    }
 }
 
 pub struct AgentProgress {

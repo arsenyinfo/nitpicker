@@ -189,7 +189,7 @@ async fn main() -> Result<()> {
                         config.reviewer.len()
                     );
                 }
-                let (report, transcript_path) = debate::run_debate(
+                let outcome = debate::run_debate(
                     &repo,
                     &topic,
                     &config,
@@ -203,14 +203,14 @@ async fn main() -> Result<()> {
                     },
                 )
                 .await?;
-                println!("{report}");
+                println!("{}", outcome.report);
                 if common.verbose {
-                    eprintln!("\nTranscript saved to: {}", transcript_path.display());
+                    eprintln!("\nTranscript saved to: {}", outcome.transcript_path.display());
                 }
                 return Ok(());
             }
 
-            let report = review::run_review(
+            let outcome = review::run_review(
                 &repo,
                 &topic,
                 &config,
@@ -219,7 +219,7 @@ async fn main() -> Result<()> {
                 review::TaskMode::Ask,
             )
             .await?;
-            println!("{report}");
+            println!("{}", outcome.report);
             return Ok(());
         }
         Some(Command::Pr(pr_args)) => {
@@ -276,7 +276,7 @@ async fn main() -> Result<()> {
                 config.reviewer.len()
             );
         }
-        let (report, transcript_path) = debate::run_debate(
+        let outcome = debate::run_debate(
             &repo,
             &prompt,
             &config,
@@ -290,13 +290,13 @@ async fn main() -> Result<()> {
             },
         )
         .await?;
-        println!("{report}");
+        println!("{}", outcome.report);
         if args.common.verbose {
-            eprintln!("\nTranscript saved to: {}", transcript_path.display());
+            eprintln!("\nTranscript saved to: {}", outcome.transcript_path.display());
         }
         Ok(())
     } else {
-        let report = review::run_review(
+        let outcome = review::run_review(
             &repo,
             &prompt,
             &config,
@@ -305,7 +305,7 @@ async fn main() -> Result<()> {
             review::TaskMode::Review,
         )
         .await?;
-        println!("{report}");
+        println!("{}", outcome.report);
         Ok(())
     }
 }

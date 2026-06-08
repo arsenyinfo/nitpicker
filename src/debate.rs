@@ -3,7 +3,8 @@ use crate::agent::{
     run_agent,
 };
 use crate::config::{Config, ReviewerConfig};
-use crate::llm::{Completion, LLMClientDyn};
+use crate::llm::{Completion, LLMClientDyn, TokenUsage};
+use crate::output::UsageReport;
 pub use crate::prompts::DebateMode;
 #[cfg(feature = "antigravity")]
 use crate::provider::config_needs_gemini_proxy;
@@ -52,6 +53,14 @@ impl ModelLabel {
 struct DebateVerdict {
     text: String,
     agree: bool,
+}
+
+struct DebateTurnResult {
+    verdict: DebateVerdict,
+    turns: usize,
+    tool_calls: usize,
+    subagents_spawned: usize,
+    usage: TokenUsage,
 }
 
 struct DebateTurnRequest<'a> {
@@ -129,9 +138,7 @@ impl Tool for SubmitVerdictTool {
     }
 }
 
-async fn run_debate_turn(
-    request: DebateTurnRequest<'_>,
-) -> Result<(DebateVerdict, usize, usize, usize, u64, u64, u64)> {
+async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnResult> {
     let verdict_store: Arc<Mutex<Option<DebateVerdict>>> = Arc::new(Mutex::new(None));
     let submit_tool = Arc::new(SubmitVerdictTool {
         verdict: Arc::clone(&verdict_store),
@@ -175,48 +182,34 @@ async fn run_debate_turn(
         Ok(r) => r,
         Err(err) => {
             warn!(model = request.model, error = ?err, "debate agent failed");
-            return Ok((
-                DebateVerdict {
+            return Ok(DebateTurnResult {
+                verdict: DebateVerdict {
                     text: format!("*Agent failed: {err:#}*"),
                     agree: false,
                 },
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-            ));
+                turns: 0,
+                tool_calls: 0,
+                subagents_spawned: 0,
+                usage: TokenUsage::default(),
+            });
         }
     };
-    if let Some(verdict) = verdict_store
+    let usage = result.usage();
+    let verdict = verdict_store
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take()
-    {
-        return Ok((
-            verdict,
-            result.turns,
-            result.tool_calls,
-            result.subagents_spawned,
-            result.total_input_tokens,
-            result.total_output_tokens,
-            result.total_tokens,
-        ));
-    }
-
-    Ok((
-        DebateVerdict {
+        .unwrap_or(DebateVerdict {
             text: result.text,
             agree: false,
-        },
-        result.turns,
-        result.tool_calls,
-        result.subagents_spawned,
-        result.total_input_tokens,
-        result.total_output_tokens,
-        result.total_tokens,
-    ))
+        });
+    Ok(DebateTurnResult {
+        verdict,
+        turns: result.turns,
+        tool_calls: result.tool_calls,
+        subagents_spawned: result.subagents_spawned,
+        usage,
+    })
 }
 
 fn build_turn_message(
@@ -301,12 +294,18 @@ pub struct DebateOptions {
     pub format: crate::output::OutputFormat,
 }
 
+pub struct DebateOutcome {
+    pub report: String,
+    pub transcript_path: std::path::PathBuf,
+    pub usage: UsageReport,
+}
+
 pub async fn run_debate(
     repo: &Path,
     prompt: &str,
     config: &Config,
     opts: DebateOptions,
-) -> Result<(String, std::path::PathBuf)> {
+) -> Result<DebateOutcome> {
     let DebateOptions {
         max_rounds,
         max_turns,
@@ -418,6 +417,7 @@ pub async fn run_debate(
     let mut verdicts: Vec<(String, usize, String)> = Vec::new();
     let mut converged = false;
     let mut final_round = 0usize;
+    let mut usage = UsageReport::default();
 
     'debate: for round in 1..=max_rounds {
         final_round = round;
@@ -444,15 +444,13 @@ pub async fn run_debate(
             );
         })
             as Arc<dyn Fn(AgentProgress) + Send + Sync>);
-        let (
+        let DebateTurnResult {
             verdict,
             turns,
             tool_calls,
             subagents_spawned,
-            total_input_tokens,
-            total_output_tokens,
-            total_tokens,
-        ) = run_debate_turn(DebateTurnRequest {
+            usage: turn_usage,
+        } = run_debate_turn(DebateTurnRequest {
             client: Arc::clone(&actor_client),
             compact_threshold: actor_compact_threshold,
             model: &actor_label.alias,
@@ -467,11 +465,13 @@ pub async fn run_debate(
                 .map(|logger| logger.child(format!("review-{round}.jsonl"))),
         })
         .await?;
+        usage.add(turn_usage, subagents_spawned);
         let elapsed = start.elapsed().as_secs();
         sub_pb.finish_and_clear();
         pb.set_style(done_style.clone());
         pb.finish_with_message(format!(
-            "✓ round {round} ({turns} turns, {tool_calls} tool calls, {subagents_spawned} subagents, {total_input_tokens} in, {total_output_tokens} out, {total_tokens} total tokens, {elapsed}s)"
+            "✓ round {round} ({turns} turns, {tool_calls} tool calls, {subagents_spawned} subagents, {} in, {} out, {} total tokens, {elapsed}s)",
+            turn_usage.input_tokens, turn_usage.output_tokens, turn_usage.total_tokens
         ));
         if verbose && stdout_ok {
             println!();
@@ -502,15 +502,13 @@ pub async fn run_debate(
             );
         })
             as Arc<dyn Fn(AgentProgress) + Send + Sync>);
-        let (
+        let DebateTurnResult {
             verdict,
             turns,
             tool_calls,
             subagents_spawned,
-            total_input_tokens,
-            total_output_tokens,
-            total_tokens,
-        ) = run_debate_turn(DebateTurnRequest {
+            usage: turn_usage,
+        } = run_debate_turn(DebateTurnRequest {
             client: Arc::clone(&critic_client),
             compact_threshold: critic_compact_threshold,
             model: &critic_label.alias,
@@ -525,11 +523,13 @@ pub async fn run_debate(
                 .map(|logger| logger.child(format!("validate-{round}.jsonl"))),
         })
         .await?;
+        usage.add(turn_usage, subagents_spawned);
         let elapsed = start.elapsed().as_secs();
         sub_pb.finish_and_clear();
         pb.set_style(done_style.clone());
         pb.finish_with_message(format!(
-            "✓ round {round} ({turns} turns, {tool_calls} tool calls, {subagents_spawned} subagents, {total_input_tokens} in, {total_output_tokens} out, {total_tokens} total tokens, {elapsed}s)"
+            "✓ round {round} ({turns} turns, {tool_calls} tool calls, {subagents_spawned} subagents, {} in, {} out, {} total tokens, {elapsed}s)",
+            turn_usage.input_tokens, turn_usage.output_tokens, turn_usage.total_tokens
         ));
         if verbose && stdout_ok {
             println!();
@@ -570,6 +570,7 @@ pub async fn run_debate(
     pb.set_message("synthesizing…");
     let meta_response: crate::llm::CompletionResponse =
         agg_client.completion(meta_completion).await?;
+    usage.add(meta_response.usage, 0);
     let meta_text = meta_response.text();
     pb.set_style(done_style);
     pb.finish_with_message("✓ done");
@@ -623,5 +624,9 @@ pub async fn run_debate(
         tokio::fs::write(&transcript_path, &transcript).await?;
     }
 
-    Ok((meta_text, transcript_path))
+    Ok(DebateOutcome {
+        report: meta_text,
+        transcript_path,
+        usage,
+    })
 }
