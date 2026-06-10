@@ -108,7 +108,7 @@ pub async fn run_review(
         let initial_message = initial_message.clone();
         let context = context.clone();
         let sem = Arc::clone(&semaphore);
-        let handle: JoinHandle<(String, Result<AgentResult>)> = tokio::spawn(async move {
+        let handle: JoinHandle<Result<AgentResult>> = tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
             let mut config = match agent_config {
                 Ok(config) => config,
@@ -116,7 +116,7 @@ pub async fn run_review(
                     pb.set_style(done.clone());
                     pb.finish_with_message(format!("✗ error: {err}"));
                     sub_pb.finish_and_clear();
-                    return (name, Err(err));
+                    return Err(err);
                 }
             };
             config.project_context = Some(context);
@@ -154,29 +154,41 @@ pub async fn run_review(
                 )),
                 Err(e) => pb.finish_with_message(format!("✗ failed: {e}")),
             }
-            (name, result)
+            result
         });
-        handles.push(handle);
+        handles.push((name, handle));
     }
 
+    let reviewer_count = handles.len();
     let mut usage = UsageReport::default();
     let mut rendered = Vec::new();
-    for handle in handles {
+    let mut success_count = 0usize;
+    for (name, handle) in handles {
         match handle.await {
-            Ok((name, Ok(result))) => {
+            Ok(Ok(result)) => {
                 usage.add(result.usage(), result.subagents_spawned);
                 rendered.push(format!("## {name} review\n\n{}", result.text));
+                success_count += 1;
                 info!(reviewer = %name, "review completed");
             }
-            Ok((name, Err(err))) => {
+            Ok(Err(err)) => {
                 rendered.push(format!("## {name} review\n\n*Failed: {err:#}*"));
                 info!(reviewer = %name, error = ?err, "review failed");
             }
             Err(err) => {
-                rendered.push(format!("## reviewer failed\n\n*Failed: {err:#}*"));
-                info!(error = ?err, "reviewer task failed");
+                rendered.push(format!(
+                    "## {name} review\n\n*Failed (task panicked): {err:#}*"
+                ));
+                info!(reviewer = %name, error = ?err, "reviewer task panicked");
             }
         }
+    }
+
+    // Refuse to synthesize a verdict out of nothing but failures: the aggregator would hallucinate
+    // a confident review from error notes, and `pr` would post it. A total failure is an error, not
+    // an "ok" report with empty findings.
+    if success_count == 0 {
+        eyre::bail!("all {reviewer_count} reviewer(s) failed; refusing to synthesize a verdict");
     }
 
     let combined = rendered.join("\n\n---\n\n");

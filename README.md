@@ -122,7 +122,7 @@ Set `[defaults].log_trajectories = true` to save per-agent JSONL traces and a fi
 | `provider` | Auth | Notes |
 |---|---|---|
 | `anthropic` | `ANTHROPIC_API_KEY` env var (or `api_key_env`), or `auth = "azure-ad"` | `base_url` optional |
-| `gemini` | `GEMINI_API_KEY` env var, or `auth = "agy-keyring"` | `agy-keyring` reuses the Antigravity CLI OAuth token from the system keyring — research only, [see warning](#antigravity-keyring-research-only) |
+| `gemini` | `GEMINI_API_KEY`/`GOOGLE_AI_API_KEY` env var (or `api_key_env`), or `auth = "agy-keyring"` | `base_url` optional (e.g. a local Gemini-compatible server); `agy-keyring` reuses the Antigravity CLI OAuth token from the system keyring — research only, [see warning](#antigravity-keyring-research-only) |
 | `openai` | `OPENAI_API_KEY` env var (or `api_key_env`), `auth = "azure-ad"`, or `auth = "codex"` | `codex` reuses your ChatGPT subscription via the Codex CLI token — research only, [see warning](#chatgptcodex-subscription-research-only) |
 | `openrouter` | `OPENROUTER_API_KEY` env var (or `api_key_env`) | explicit model names are recommended; `model = "free"` is experimental |
 
@@ -328,6 +328,15 @@ By default, nitpicker prints only the final synthesized result. Use `--verbose` 
 Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timestamp}.md`.
 
 ## Changelog
+
+**0.7.1** — 2026-06-10
+- Audit fixes (high/medium severity):
+  - **git tool sandbox escape** — `diff --no-index <path>` and `blame --contents <path>` read files anywhere on disk, bypassing the working-tree confinement that `read_file`/`grep`/`glob` enforce. `ensure_readonly_git` now rejects absolute / `..` path arguments on every subcommand and denies those two filesystem-reading flags by name.
+  - **fabricated verdict on total failure** — if every reviewer (parallel) or every debate turn failed (e.g. bad key, dead endpoint), the aggregator/meta-reviewer still synthesized a confident review from the error notes and `pr` posted it (`status: "ok"` in `--json`). A total failure is now an error; no comment is posted. A panicked reviewer task also keeps its name in the report.
+  - **retry/auth misclassification for direct Anthropic & OpenAI** — rig surfaces non-2xx as a body string with no numeric status, so permanent 4xx got the full retry backoff, rate limits missed their policy, and a lapsed Azure AD token was never refreshed. The classifiers now also match provider error *types* (`authentication_error`, `invalid_api_key`, `insufficient_quota`, `overloaded_error`, …).
+  - **Gemini `base_url` / `api_key_env` ignored** — a Gemini reviewer pointed at a local endpoint passed validation but silently sent code to the real Google API (or failed on a missing default key). Both fields are now honored at client construction, matching the other providers.
+  - **`pr` lock race** — the pid-file lock had a check-then-create TOCTOU that let two concurrent runs mutate the same working tree; replaced with an advisory `flock` held for the process lifetime (auto-released on crash).
+  - **`pr` checkout robustness** — the review branch was created from the shared `.git/FETCH_HEAD`, which a concurrent fetch could rewrite (reviewing unrelated code); it now fetches into a private ref. The in-place fast path no longer reviews uncommitted local changes or breaks on a detached HEAD, and the `--json` `head_sha` reports the commit actually reviewed.
 
 **0.7.0** — 2026-06-07
 - Added `auth = "codex"` for the `openai` provider: authenticate with a ChatGPT Plus/Pro (Codex) subscription instead of a paid API key. nitpicker reuses the OAuth token the Codex CLI stores in `~/.codex/auth.json` (read-only; `CODEX_HOME` honored), refreshing the short-lived access token in-memory via the refresh token — never writing back, and recovering from a refresh-token rotation by reloading from disk once. Requests go to the Codex subscription endpoint (`chatgpt.com/backend-api/codex/responses`), which speaks the OpenAI Responses API with subscription-specific requirements handled transparently: a top-level `instructions` system prompt, mandatory SSE streaming, `store: false` (so output items are accumulated from the stream), and omitted `max_output_tokens`. No API-key env var is required. Research only — third-party use of the Codex OAuth client is arguably outside OpenAI's terms; see README warning. See [ChatGPT/Codex subscription section](#chatgptcodex-subscription-research-only).

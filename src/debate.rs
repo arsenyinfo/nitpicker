@@ -61,6 +61,8 @@ struct DebateTurnResult {
     tool_calls: usize,
     subagents_spawned: usize,
     usage: TokenUsage,
+    /// The agent errored and `verdict` is a synthesized failure stub rather than a real verdict.
+    agent_failed: bool,
 }
 
 struct DebateTurnRequest<'a> {
@@ -191,6 +193,7 @@ async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnRes
                 tool_calls: 0,
                 subagents_spawned: 0,
                 usage: TokenUsage::default(),
+                agent_failed: true,
             });
         }
     };
@@ -209,6 +212,7 @@ async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnRes
         tool_calls: result.tool_calls,
         subagents_spawned: result.subagents_spawned,
         usage,
+        agent_failed: false,
     })
 }
 
@@ -417,6 +421,7 @@ pub async fn run_debate(
     let mut verdicts: Vec<(String, usize, String)> = Vec::new();
     let mut converged = false;
     let mut final_round = 0usize;
+    let mut any_turn_succeeded = false;
     let mut usage = UsageReport::default();
 
     'debate: for round in 1..=max_rounds {
@@ -450,6 +455,7 @@ pub async fn run_debate(
             tool_calls,
             subagents_spawned,
             usage: turn_usage,
+            agent_failed: actor_failed,
         } = run_debate_turn(DebateTurnRequest {
             client: Arc::clone(&actor_client),
             compact_threshold: actor_compact_threshold,
@@ -478,6 +484,7 @@ pub async fn run_debate(
             skin.print_text(&verdict.text);
             println!();
         }
+        any_turn_succeeded |= !actor_failed;
         verdicts.push((actor_role.to_string(), round, verdict.text));
 
         let (pb, _) = make_spinner(&mp);
@@ -508,6 +515,7 @@ pub async fn run_debate(
             tool_calls,
             subagents_spawned,
             usage: turn_usage,
+            agent_failed: critic_failed,
         } = run_debate_turn(DebateTurnRequest {
             client: Arc::clone(&critic_client),
             compact_threshold: critic_compact_threshold,
@@ -536,13 +544,24 @@ pub async fn run_debate(
             skin.print_text(&verdict.text);
             println!();
         }
-        let agreed = verdict.agree;
+        any_turn_succeeded |= !critic_failed;
+        // Convergence requires a real agreement: a critic that agrees with a failed actor's
+        // `*Agent failed*` stub (or a failed critic, whose verdict defaults to agree=false) must
+        // not end the debate early.
+        let agreed = verdict.agree && !actor_failed && !critic_failed;
         verdicts.push((critic_role.to_string(), round, verdict.text));
 
         if agreed {
             converged = true;
             break 'debate;
         }
+    }
+
+    // Every turn failed (provider down, bad config): the dialogue is nothing but failure stubs, so
+    // synthesizing a meta-verdict would fabricate a confident review from errors. Surface the
+    // failure instead — `run_pr` maps this to a `status: "error"` envelope and posts no comment.
+    if !any_turn_succeeded {
+        eyre::bail!("all debate turns failed; refusing to synthesize a verdict");
     }
 
     // meta-review: non-agentic single completion over the full dialogue

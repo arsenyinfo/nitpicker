@@ -328,7 +328,14 @@ fn is_unauthorized(err: &eyre::Report) -> bool {
     // shapings it can take in a raw body (`: 401`, `:401`, `401,`, `"401"`, ...), shared with the
     // `llm.rs` retry classifiers so the two paths agree on what a 401 looks like.
     let msg = format!("{err:#}");
-    mentions_http_status(&msg, 401)
+    if mentions_http_status(&msg, 401) {
+        return true;
+    }
+    // A Foundry route fronting OpenAI/Anthropic can return a provider-style auth body with no numeric
+    // status (rig drops it). Match the auth-specific error *types* only — NOT the 403 permission
+    // types, which a token refresh can't fix.
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("authentication_error") || lower.contains("invalid_api_key")
 }
 
 #[cfg(test)]
@@ -378,6 +385,19 @@ mod tests {
     }
 
     #[test]
+    fn is_unauthorized_detects_provider_auth_types_without_status() {
+        // A Foundry route fronting OpenAI/Anthropic returns an auth body with no numeric status.
+        let openai = wrapped_provider_error(r#"{"error":{"code":"invalid_api_key"}}"#);
+        assert!(is_unauthorized(&openai));
+        let anthropic =
+            wrapped_provider_error(r#"{"type":"error","error":{"type":"authentication_error"}}"#);
+        assert!(is_unauthorized(&anthropic));
+        // A 403-class permission type is NOT an auth failure a refresh can fix.
+        let permission = wrapped_provider_error(r#"{"error":{"type":"permission_error"}}"#);
+        assert!(!is_unauthorized(&permission));
+    }
+
+    #[test]
     fn resolve_scope_falls_back_on_empty_or_whitespace() {
         // `azure_scope` is a defaulted field: empty/whitespace means "unset", so fall back to the
         // documented default rather than letting an empty scope reach `get_token` and fail late.
@@ -387,7 +407,10 @@ mod tests {
         let custom = "https://example.com/.default";
         assert_eq!(resolve_scope(Some(custom)), custom);
         // surrounding whitespace on a real scope is trimmed off
-        assert_eq!(resolve_scope(Some("  https://example.com/.default  ")), custom);
+        assert_eq!(
+            resolve_scope(Some("  https://example.com/.default  ")),
+            custom
+        );
     }
 
     #[test]
@@ -396,7 +419,10 @@ mod tests {
         // so rig never receives the untrimmed string and builds a malformed endpoint.
         let url = "https://res.services.ai.azure.com/openai/v1";
         assert_eq!(resolve_base_url(Some(url)).unwrap(), url);
-        assert_eq!(resolve_base_url(Some("  https://res.services.ai.azure.com/openai/v1  ")).unwrap(), url);
+        assert_eq!(
+            resolve_base_url(Some("  https://res.services.ai.azure.com/openai/v1  ")).unwrap(),
+            url
+        );
         // No default for the endpoint — empty/whitespace/unset is a hard error.
         assert!(resolve_base_url(None).is_err());
         assert!(resolve_base_url(Some("")).is_err());
@@ -429,7 +455,10 @@ mod tests {
             }
         }
 
-        assert_eq!(format_error_chain(&Outer(Inner)), "credential failed: az login required");
+        assert_eq!(
+            format_error_chain(&Outer(Inner)),
+            "credential failed: az login required"
+        );
         assert_eq!(format_error_chain(&Inner), "az login required");
     }
 

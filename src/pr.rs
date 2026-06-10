@@ -4,8 +4,6 @@ use crate::review::{self, TaskMode};
 use eyre::{Result, WrapErr};
 use serde::Deserialize;
 use sha2::Digest;
-use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -17,76 +15,73 @@ fn lock_path(repo: &Path) -> PathBuf {
 }
 
 struct PrLock {
+    // unix: an open fd holding an advisory `flock` for the process lifetime (the lock is the fd, not
+    // the file's existence). non-unix: the exclusively-created lock file's path, removed on drop.
+    #[cfg(unix)]
+    _file: std::fs::File,
+    #[cfg(not(unix))]
     path: PathBuf,
 }
 
 impl PrLock {
+    #[cfg(unix)]
     fn acquire(repo: &Path) -> Result<Self> {
+        use std::os::unix::io::AsRawFd;
         let path = lock_path(repo);
-
-        // Treat the lock as stale (and remove it) when:
-        //   - the holding pid is no longer alive, OR
-        //   - the file is unreadable / empty / non-numeric — which happens when a previous
-        //     process was killed between create_new() and writeln!(pid), leaving a 0-byte
-        //     file that would otherwise deadlock all future invocations.
-        if path.exists() {
-            let stale = match fs::read_to_string(&path) {
-                Ok(contents) => match contents.trim().parse::<u32>() {
-                    Ok(pid) => !is_process_running(pid),
-                    Err(_) => true,
-                },
-                Err(_) => true,
-            };
-            if stale {
-                let _ = fs::remove_file(&path);
+        // Advisory `flock(LOCK_EX|LOCK_NB)` held for the process lifetime. The kernel releases it
+        // when the fd closes — normal return, `?`, or crash — so there is no stale-pid bookkeeping
+        // and no TOCTOU window between a staleness check and an exclusive create (the previous
+        // pid-file scheme had both, letting two racers each delete and recreate the lock). The lock
+        // file lives at a fixed per-repo path and is never unlinked: unlinking it would let a racing
+        // process create a *new* inode and lock that independently. (Advisory flock is unreliable
+        // over NFS; PR review runs against a local working tree, so this is acceptable.)
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .wrap_err("failed to open PR review lock file")?;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(code) if code == libc::EWOULDBLOCK => eyre::bail!(
+                    "Another PR review is already running for this repo (lock file: {}). Wait for it to finish.",
+                    path.display()
+                ),
+                _ => return Err(err).wrap_err("failed to acquire PR review lock"),
             }
         }
+        Ok(Self { _file: file })
+    }
 
-        let mut file = match std::fs::OpenOptions::new()
+    #[cfg(not(unix))]
+    fn acquire(repo: &Path) -> Result<Self> {
+        // No flock: fall back to exclusive create. A crashed run leaves a lock the user must remove
+        // by hand (no crash-release), but nitpicker targets unix in practice.
+        let path = lock_path(repo);
+        match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
         {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                eyre::bail!(
-                    "Another PR review is already running for this repo (lock file: {}). Wait for it to finish or remove the lock file if it crashed.",
-                    path.display()
-                );
-            }
-            Err(e) => return Err(e).wrap_err("failed to create lock file"),
-        };
-
-        let pid = std::process::id();
-        writeln!(file, "{pid}").wrap_err("failed to write to lock file")?;
-        Ok(Self { path })
-    }
-}
-
-fn is_process_running(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        // kill(pid, 0) does no signaling — only validates pid lookup and permissions.
-        // 0 => exists and we can signal it. EPERM => exists but we can't (still running).
-        // ESRCH => no such process. anything else: assume still running (safer than racing).
-        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        match (rc, std::io::Error::last_os_error().raw_os_error()) {
-            (0, _) => true,
-            (_, Some(e)) if e == libc::EPERM => true,
-            (_, Some(e)) if e == libc::ESRCH => false,
-            _ => true,
+            Ok(_) => Ok(Self { path }),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => eyre::bail!(
+                "Another PR review is already running for this repo (lock file: {}). Remove it if it crashed.",
+                path.display()
+            ),
+            Err(e) => Err(e).wrap_err("failed to create lock file"),
         }
-    }
-    #[cfg(not(unix))]
-    {
-        // on non-unix, assume the process is still running to be safe
-        true
     }
 }
 
 impl Drop for PrLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        // unix: dropping `_file` closes the fd and releases the flock; the lock file is left in
+        // place by design. non-unix: remove the exclusive-create lock file.
+        #[cfg(not(unix))]
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -376,7 +371,13 @@ fn refresh_remote_branches(repo: &Path) -> Result<()> {
 fn checkout_pr_branch(repo: &Path, pr_number: u32) -> Result<()> {
     assert_clean_working_tree(repo)?;
 
-    let refspec = format!("refs/pull/{pr_number}/head");
+    // Fetch into a private named ref instead of relying on the shared `.git/FETCH_HEAD`, which any
+    // other fetch in the repo (IDE autofetch, a shell prompt plugin, cron) could rewrite between the
+    // fetch and the checkout — silently pointing the review branch at unrelated code. The leading
+    // `+` forces the update so a force-pushed PR head still lands. The ref is reused (force-updated)
+    // each run, so it is namespace litter at worst, never stale.
+    let fetch_ref = format!("refs/nitpicker/pr-{pr_number}-head");
+    let refspec = format!("+refs/pull/{pr_number}/head:{fetch_ref}");
     let out = Command::new("git")
         .args(["fetch", "origin", &refspec])
         .current_dir(repo)
@@ -393,7 +394,7 @@ fn checkout_pr_branch(repo: &Path, pr_number: u32) -> Result<()> {
     if matches!(get_head_state(repo), Ok(HeadState::Branch(b)) if b == branch) {
         // already on our tracking branch — fast-forward only
         let out = Command::new("git")
-            .args(["merge", "--ff-only", "FETCH_HEAD"])
+            .args(["merge", "--ff-only", &fetch_ref])
             .current_dir(repo)
             .output()
             .wrap_err("failed to fast-forward PR branch")?;
@@ -411,7 +412,7 @@ fn checkout_pr_branch(repo: &Path, pr_number: u32) -> Result<()> {
         .output();
 
     let out = Command::new("git")
-        .args(["switch", "-c", &branch, "--no-track", "FETCH_HEAD"])
+        .args(["switch", "-c", &branch, "--no-track", &fetch_ref])
         .current_dir(repo)
         .output()
         .wrap_err("failed to checkout PR branch")?;
@@ -576,16 +577,23 @@ async fn run_pr_inner(args: PrArgs, start: std::time::Instant) -> Result<()> {
                 let meta = fetch_pr_meta(Some(&url), &user_repo)?;
                 // refresh remote-tracking branches so the diff is computed against an up-to-date base
                 refresh_remote_branches(&user_repo)?;
-                // if HEAD already matches the PR head, skip the fetch+checkout dance
+                // Skip the fetch+checkout dance only when HEAD already points at the PR head AND we
+                // are on a real branch with a clean tree. Otherwise fall through to checkout:
+                //   - a detached HEAD at the PR head must still get a named branch (else
+                //     `detect_diff_context` bails) and a restore guard to re-detach afterwards;
+                //   - a dirty tree must be rejected by `assert_clean_working_tree`, never reviewed —
+                //     skipping would feed local uncommitted WIP into the review and the PR comment.
                 let head_matches = get_head_commit(&user_repo)
                     .ok()
                     .is_some_and(|sha| sha == meta.head_ref_oid);
-                match head_matches {
+                let head = get_head_state(&user_repo)?;
+                let can_skip = head_matches && matches!(head, HeadState::Branch(_));
+                match can_skip {
                     true => {
+                        assert_clean_working_tree(&user_repo)?;
                         _restore_guard = None;
                     }
                     false => {
-                        let head = get_head_state(&user_repo)?;
                         checkout_pr_branch(&user_repo, pr_number).inspect_err(|_e| {
                             restore_head(&user_repo, &head);
                         })?;
@@ -734,7 +742,10 @@ async fn run_review_inner(
                     url: url_for_gh.map(str::to_string),
                     number: pr_number,
                     title: meta.title.clone(),
-                    head_sha: meta.head_ref_oid.clone(),
+                    // report the commit actually reviewed (HEAD), not the oid from `gh pr view`,
+                    // which can be stale if the PR was force-pushed between metadata fetch and
+                    // checkout. Fall back to the metadata oid if HEAD can't be resolved.
+                    head_sha: get_head_commit(repo).unwrap_or_else(|_| meta.head_ref_oid.clone()),
                 }),
                 mode: Some(match debate {
                     true => ReviewMode::Debate,
