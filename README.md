@@ -323,13 +323,26 @@ Two LLM agents take turns exploring the codebase with file/git tools and submitt
 - `reviewer[1]` in config → Critic (review: Validator)
 - `aggregator` → Meta-reviewer
 
-By default, nitpicker prints only the final synthesized result. Use `--verbose` to show intermediate debate output and the saved transcript path.
+By default, nitpicker prints only the final synthesized result. Use `--verbose` to show intermediate debate output (including the cast lines) and the saved transcript path.
 
 Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timestamp}.md`.
+
+### Exit codes (default review and `ask`)
+
+| code | meaning |
+|------|---------|
+| 0 | clean verdict |
+| 1 | hard failure — no verdict (bad config, missing key, every reviewer/turn failed) |
+| 2 | CLI usage error (clap's exit code for bad arguments) |
+| 3 | degraded verdict — report printed, but a reviewer failed, or a debate turn failed or ended without calling `submit_verdict` |
+
+Non-verbose stdout carries exactly the final report, so the binary can be driven as a subprocess: read stdout for the verdict, branch on the exit code. `pr` keeps its own contract (`--json` emits `status: ok|error` and exits 0/1).
 
 ## Changelog
 
 **0.7.1** — 2026-06-10
+- **Degraded-verdict exit code** — a verdict synthesized while some reviewer or debate turn failed (or a turn ended without calling `submit_verdict`) previously exited 0, indistinguishable from a clean verdict for subprocess callers. Default review and `ask` now print the report, flush stdout (`process::exit` skips teardown — a piped report would otherwise be lost), and exit 3 (2 is clap's usage-error code). Contract: 0 = clean, 1 = hard failure, 3 = degraded. `pr`'s exit-code/JSON contract is unchanged.
+- **Verdict-only stdout for debates** — the cast lines (Actor/Critic/Meta-review header) printed to stdout in non-verbose mode, contradicting the documented "only the final synthesized result" contract; they are now verbose-only. This also applies to `pr` in text mode (`--json` already suppressed them).
 - Audit fixes (high/medium severity):
   - **git tool sandbox escape** — `diff --no-index <path>` and `blame --contents <path>` read files anywhere on disk, bypassing the working-tree confinement that `read_file`/`grep`/`glob` enforce. `ensure_readonly_git` now rejects absolute / `..` path arguments on every subcommand and denies those two filesystem-reading flags by name.
   - **fabricated verdict on total failure** — if every reviewer (parallel) or every debate turn failed (e.g. bad key, dead endpoint), the aggregator/meta-reviewer still synthesized a confident review from the error notes and `pr` posted it (`status: "ok"` in `--json`). A total failure is now an error; no comment is posted. A panicked reviewer task also keeps its name in the report.

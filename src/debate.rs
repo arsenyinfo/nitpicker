@@ -63,6 +63,8 @@ struct DebateTurnResult {
     usage: TokenUsage,
     /// The agent errored and `verdict` is a synthesized failure stub rather than a real verdict.
     agent_failed: bool,
+    /// The agent finished without calling `submit_verdict`; `verdict` is its raw final text.
+    used_fallback: bool,
 }
 
 struct DebateTurnRequest<'a> {
@@ -194,18 +196,20 @@ async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnRes
                 subagents_spawned: 0,
                 usage: TokenUsage::default(),
                 agent_failed: true,
+                used_fallback: false,
             });
         }
     };
     let usage = result.usage();
-    let verdict = verdict_store
+    let stored = verdict_store
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .take()
-        .unwrap_or(DebateVerdict {
-            text: result.text,
-            agree: false,
-        });
+        .take();
+    let used_fallback = stored.is_none();
+    let verdict = stored.unwrap_or(DebateVerdict {
+        text: result.text,
+        agree: false,
+    });
     Ok(DebateTurnResult {
         verdict,
         turns: result.turns,
@@ -213,6 +217,7 @@ async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnRes
         subagents_spawned: result.subagents_spawned,
         usage,
         agent_failed: false,
+        used_fallback,
     })
 }
 
@@ -302,6 +307,9 @@ pub struct DebateOutcome {
     pub report: String,
     pub transcript_path: std::path::PathBuf,
     pub usage: UsageReport,
+    /// At least one turn failed or fell back to raw text; the report is synthesized from a
+    /// partial dialogue. Surfaced as exit code 2 in the default-review/`ask` CLI arms.
+    pub degraded: bool,
 }
 
 pub async fn run_debate(
@@ -399,7 +407,9 @@ pub async fn run_debate(
         mp.set_draw_target(ProgressDrawTarget::hidden());
     }
 
-    if stdout_ok {
+    // cast lines are progress flavor, not the report: non-verbose stdout stays verdict-only
+    // so subprocess callers can consume it directly.
+    if verbose && stdout_ok {
         if alloy {
             print_cast_line(actor_role, &actor_label.full);
             print_cast_line(critic_role, &critic_label.full);
@@ -422,6 +432,7 @@ pub async fn run_debate(
     let mut converged = false;
     let mut final_round = 0usize;
     let mut any_turn_succeeded = false;
+    let mut degraded = false;
     let mut usage = UsageReport::default();
 
     'debate: for round in 1..=max_rounds {
@@ -456,6 +467,7 @@ pub async fn run_debate(
             subagents_spawned,
             usage: turn_usage,
             agent_failed: actor_failed,
+            used_fallback: actor_fallback,
         } = run_debate_turn(DebateTurnRequest {
             client: Arc::clone(&actor_client),
             compact_threshold: actor_compact_threshold,
@@ -485,6 +497,7 @@ pub async fn run_debate(
             println!();
         }
         any_turn_succeeded |= !actor_failed;
+        degraded |= actor_failed || actor_fallback;
         verdicts.push((actor_role.to_string(), round, verdict.text));
 
         let (pb, _) = make_spinner(&mp);
@@ -516,6 +529,7 @@ pub async fn run_debate(
             subagents_spawned,
             usage: turn_usage,
             agent_failed: critic_failed,
+            used_fallback: critic_fallback,
         } = run_debate_turn(DebateTurnRequest {
             client: Arc::clone(&critic_client),
             compact_threshold: critic_compact_threshold,
@@ -545,6 +559,7 @@ pub async fn run_debate(
             println!();
         }
         any_turn_succeeded |= !critic_failed;
+        degraded |= critic_failed || critic_fallback;
         // Convergence requires a real agreement: a critic that agrees with a failed actor's
         // `*Agent failed*` stub (or a failed critic, whose verdict defaults to agree=false) must
         // not end the debate early.
@@ -647,5 +662,6 @@ pub async fn run_debate(
         report: meta_text,
         transcript_path,
         usage,
+        degraded,
     })
 }

@@ -207,6 +207,7 @@ async fn main() -> Result<()> {
                 if common.verbose {
                     eprintln!("\nTranscript saved to: {}", outcome.transcript_path.display());
                 }
+                exit_if_degraded(outcome.degraded);
                 return Ok(());
             }
 
@@ -220,6 +221,7 @@ async fn main() -> Result<()> {
             )
             .await?;
             println!("{}", outcome.report);
+            exit_if_degraded(outcome.degraded);
             return Ok(());
         }
         Some(Command::Pr(pr_args)) => {
@@ -294,6 +296,7 @@ async fn main() -> Result<()> {
         if args.common.verbose {
             eprintln!("\nTranscript saved to: {}", outcome.transcript_path.display());
         }
+        exit_if_degraded(outcome.degraded);
         Ok(())
     } else {
         let outcome = review::run_review(
@@ -306,8 +309,33 @@ async fn main() -> Result<()> {
         )
         .await?;
         println!("{}", outcome.report);
+        exit_if_degraded(outcome.degraded);
         Ok(())
     }
+}
+
+/// Exit-code contract for the default-review and `ask` arms: 0 = clean verdict,
+/// 1 = hard failure (no verdict), 3 = degraded verdict (report printed, but at least one
+/// reviewer or debate turn failed or fell back). 2 is deliberately unused — clap exits 2
+/// on usage errors, and the whole point is an unambiguous subprocess signal.
+/// `pr` keeps its own JSON/text contract.
+fn exit_if_degraded(degraded: bool) {
+    if !degraded {
+        return;
+    }
+    // process::exit skips stdout teardown; without a flush a piped report would be lost
+    // (same reasoning as output::emit_json).
+    match std::io::Write::flush(&mut std::io::stdout()) {
+        Ok(()) => {}
+        Err(err) => {
+            eprintln!("error: failed to flush report to stdout: {err}");
+            std::process::exit(1);
+        }
+    }
+    eprintln!(
+        "warning: degraded verdict — a reviewer or debate turn failed or ended without submit_verdict (exit code 3)"
+    );
+    std::process::exit(3);
 }
 
 fn load_config(explicit_path: Option<&Path>, repo: &Path) -> Result<config::Config> {

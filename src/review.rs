@@ -27,6 +27,9 @@ use tracing::info;
 pub struct ReviewOutcome {
     pub report: String,
     pub usage: UsageReport,
+    /// At least one reviewer failed; the report is synthesized from the survivors.
+    /// Surfaced as exit code 2 in the default-review/`ask` CLI arms.
+    pub degraded: bool,
 }
 
 pub async fn run_review(
@@ -235,6 +238,7 @@ pub async fn run_review(
     Ok(ReviewOutcome {
         report: text,
         usage,
+        degraded: success_count < reviewer_count,
     })
 }
 

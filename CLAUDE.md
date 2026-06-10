@@ -77,7 +77,7 @@ codex.rs        ChatGPT/Codex subscription auth — reuses `~/.codex/auth.json`,
 1. `review.rs` spawns one `tokio::task` per `[[reviewer]]` in config
 2. Each task runs `agent.rs::run_agent` — an agentic loop: call LLM → execute tool calls → feed results back → repeat until the model returns text (default max 100 turns, overrideable via config/CLI)
 3. All reviewer outputs are collected, concatenated, and sent to the aggregator model in a single completion call. If **every** reviewer failed, `run_review` bails before the aggregator (a panicked task keeps its name in the report) — synthesizing a verdict from nothing but failure notes would fabricate a confident review; in `pr --json` this surfaces as `status: "error"` and no comment is posted
-4. The aggregator's response is printed to stdout
+4. The aggregator's response is printed to stdout. `ReviewOutcome.degraded` (some but not all reviewers failed) makes the default-review/`ask` arms exit 3 after printing — stdout is flushed first since `process::exit` skips teardown (contract: 0 clean / 1 hard failure / 3 degraded; 2 is clap's usage-error code, deliberately unused; `pr`'s exit-code/JSON contract unchanged)
 
 ### Debate flow (default review mode and `ask`)
 
@@ -85,7 +85,7 @@ codex.rs        ChatGPT/Codex subscription auth — reuses `~/.codex/auth.json`,
 2. Each round: Actor turn → Critic turn. Both have access to all file/git tools plus `submit_verdict(verdict, agree)`
 3. `agree=true` from Critic → convergence, loop ends early — but only a *real* agreement counts: a critic that agrees with a failed actor's `*Agent failed*` stub (or a failed critic, whose verdict defaults to `agree=false`) does not converge
 4. After all rounds: meta-reviewer synthesizes the full dialogue in a single non-agentic completion. If **every** turn failed (all are `*Agent failed*` stubs), `run_debate` bails before the meta step rather than fabricating a verdict from errors (→ `status: "error"` in `pr --json`)
-5. Default stdout shows only the final synthesized result; `--verbose` also prints the intermediate debate text and transcript path
+5. Default stdout shows only the final synthesized result (cast lines are verbose-only too, so subprocess callers get a verdict-only stdout); `--verbose` also prints the intermediate debate text and transcript path. `DebateOutcome.degraded` (any turn failed or ended without calling `submit_verdict`, detected at the verdict-store `take()` — `None` means fallback) → exit 3 in the default-review/`ask` arms, same contract as the review flow
 6. Transcript saved to the OS temp dir as `debate-{ts}.md` (topic) or `review-debate-{ts}.md` (code review)
 7. `DebateMode::Topic` (from `ask`) uses Actor/Critic roles and general debate prompts
 8. `DebateMode::Review` (from default review mode) uses Reviewer/Validator roles and code-review-focused prompts
