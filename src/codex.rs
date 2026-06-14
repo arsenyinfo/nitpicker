@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use eyre::{Result, WrapErr};
-use rig_core::completion::message::AssistantContent;
+use rig_core::completion::message::{AssistantContent, UserContent};
 use rig_core::providers::openai::responses_api::{
     CompletionRequest as ResponsesBody, CompletionResponse as ResponsesResp, Include,
 };
@@ -355,7 +355,7 @@ impl CodexClient {
         access: &str,
         account_id: Option<&str>,
     ) -> Result<CompletionResponse> {
-        let body = build_body(completion)?;
+        let body = build_body_value(completion)?;
         let mut req = self
             .http
             .post(format!("{CODEX_BASE_URL}/responses"))
@@ -429,6 +429,7 @@ impl LLMClient for CodexClient {
 /// Lower a nitpicker [`Completion`] to the Codex Responses body, applying the backend quirks.
 fn build_body(completion: &Completion) -> Result<ResponsesBody> {
     let mut c = completion.clone();
+    normalize_codex_completion_history(&mut c);
     // codex rejects max_output_tokens outright (matches the Codex CLI, which omits it).
     c.max_tokens = None;
     // the system prompt must be sent as top-level `instructions`, not an input item, so take it out
@@ -464,6 +465,91 @@ fn build_body(completion: &Completion) -> Result<ResponsesBody> {
         include.push(Include::ReasoningEncryptedContent);
     }
     Ok(body)
+}
+
+fn build_body_value(completion: &Completion) -> Result<Value> {
+    let body = build_body(completion)?;
+    let mut value = serde_json::to_value(&body).wrap_err("serializing Codex Responses request")?;
+    normalize_codex_responses_request(&mut value);
+    Ok(value)
+}
+
+fn normalize_codex_responses_request(body: &mut Value) {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in items {
+        normalize_codex_input_item(item);
+    }
+}
+
+fn normalize_codex_input_item(item: &mut Value) {
+    match item.get("type").and_then(Value::as_str) {
+        Some("function_call") => normalize_codex_function_call_item(item),
+        _ => normalize_codex_message_item(item),
+    }
+}
+
+fn normalize_codex_message_item(item: &mut Value) {
+    if item.get("role").and_then(Value::as_str) != Some("assistant") {
+        return;
+    }
+    let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for part in content {
+        match part.get("type").and_then(Value::as_str) {
+            Some("input_text" | "text") => {
+                if let Some(map) = part.as_object_mut() {
+                    map.insert("type".to_string(), Value::String("output_text".to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn normalize_codex_function_call_item(item: &mut Value) {
+    let replacement = item
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.starts_with("fc"))
+        .map(|id| format!("fc_{id}"));
+    if let Some(id) = replacement {
+        item["id"] = Value::String(id);
+    }
+}
+
+fn normalize_codex_completion_history(completion: &mut Completion) {
+    for message in completion
+        .history
+        .iter_mut()
+        .chain(std::iter::once(&mut completion.prompt))
+    {
+        match message {
+            rig_core::completion::Message::Assistant { content, .. } => {
+                for item in content.iter_mut() {
+                    match item {
+                        AssistantContent::ToolCall(call) if call.call_id.is_none() => {
+                            call.call_id = Some(call.id.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            rig_core::completion::Message::User { content } => {
+                for item in content.iter_mut() {
+                    match item {
+                        UserContent::ToolResult(result) if result.call_id.is_none() => {
+                            result.call_id = Some(result.id.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            rig_core::completion::Message::System { .. } => {}
+        }
+    }
 }
 
 /// Split an SSE stream into per-event payloads. Events are separated by a blank line, and a single
@@ -608,7 +694,10 @@ fn is_rotation_4xx(err: &eyre::Report) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rig_core::completion::message::Message;
+    use rig_core::OneOrMany;
+    use rig_core::completion::message::{
+        Message, ToolCall, ToolFunction, ToolResult, ToolResultContent,
+    };
     use serde_json::json;
 
     /// Build an unsigned JWT (`alg: none`) with the given claims — enough to exercise our
@@ -785,6 +874,146 @@ mod tests {
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json.get("store"), Some(&Value::Bool(false)));
         assert!(json.get("reasoning").is_some());
+    }
+
+    #[test]
+    fn build_body_fills_missing_tool_call_ids_for_mixed_provider_history() {
+        let tool_id = "toolu_1".to_string();
+        let completion = Completion {
+            model: "gpt-5.5".to_string(),
+            prompt: Message::user("continue"),
+            preamble: Some("sys".to_string()),
+            history: vec![
+                Message::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::ToolCall(ToolCall::new(
+                        tool_id.clone(),
+                        ToolFunction::new(
+                            "read_file".to_string(),
+                            json!({ "path": "src/main.rs" }),
+                        ),
+                    ))),
+                },
+                Message::User {
+                    content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                        id: tool_id.clone(),
+                        call_id: None,
+                        content: OneOrMany::one(ToolResultContent::text("ok")),
+                    })),
+                },
+            ],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: None,
+            additional_params: None,
+        };
+
+        let body = build_body(&completion).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        assert!(
+            json.to_string()
+                .contains(&format!("\"call_id\":\"{tool_id}\""))
+        );
+    }
+
+    #[test]
+    fn body_value_rewrites_assistant_text_shape_for_codex() {
+        let mut body = json!({
+            "input": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        { "type": "input_text", "text": "from another provider" },
+                        { "type": "text", "text": "legacy text shape" },
+                        { "type": "refusal", "refusal": "no" }
+                    ]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "keep user input shape" }]
+                }
+            ]
+        });
+
+        normalize_codex_responses_request(&mut body);
+
+        assert_eq!(body["input"][0]["content"][0]["type"], "output_text");
+        assert_eq!(body["input"][0]["content"][1]["type"], "output_text");
+        assert_eq!(body["input"][0]["content"][2]["type"], "refusal");
+        assert_eq!(body["input"][1]["content"][0]["type"], "input_text");
+    }
+
+    #[test]
+    fn body_value_uses_output_text_for_assistant_text_history() {
+        let completion = Completion {
+            model: "gpt-5.5".to_string(),
+            prompt: Message::user("continue"),
+            preamble: Some("sys".to_string()),
+            history: vec![Message::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::text("previous answer")),
+            }],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: None,
+            additional_params: None,
+        };
+
+        let body = build_body_value(&completion).unwrap();
+        let assistant_message = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item.get("role").and_then(Value::as_str) == Some("assistant"))
+            .unwrap();
+
+        assert_eq!(assistant_message["content"][0]["type"], "output_text");
+    }
+
+    #[test]
+    fn body_value_rewrites_function_call_item_id_for_codex() {
+        let tool_id = "tool_5Xt5WpWtZ6Whah4Z2uZcZO34".to_string();
+        let completion = Completion {
+            model: "gpt-5.5".to_string(),
+            prompt: Message::user("continue"),
+            preamble: Some("sys".to_string()),
+            history: vec![
+                Message::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::ToolCall(ToolCall::new(
+                        tool_id.clone(),
+                        ToolFunction::new(
+                            "read_file".to_string(),
+                            json!({ "path": "src/main.rs" }),
+                        ),
+                    ))),
+                },
+                Message::User {
+                    content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                        id: tool_id.clone(),
+                        call_id: None,
+                        content: OneOrMany::one(ToolResultContent::text("ok")),
+                    })),
+                },
+            ],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: None,
+            additional_params: None,
+        };
+
+        let body = build_body_value(&completion).unwrap();
+        let function_call = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+            .unwrap();
+
+        assert_eq!(function_call["id"], format!("fc_{tool_id}"));
+        assert_eq!(function_call["call_id"], tool_id);
     }
 
     #[test]

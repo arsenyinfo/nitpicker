@@ -1,6 +1,6 @@
 [package]
 name = "nitpicker"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 # MSRV of the default (azure-off) build. The optional `azure` feature raises the floor to 1.88
 # via azure_core's own rust-version; cargo enforces that when `--features azure` is enabled.
@@ -32,6 +32,7 @@ indicatif = "0.18"
 termimad = "0.34"
 regex = "1"
 toml = "1"
+unicode-width = "0.2"
 
 reqwest = { version = "0.13", features = ["json", "form"] }
 dirs = "6"

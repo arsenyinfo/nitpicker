@@ -124,7 +124,7 @@ Set `[defaults].log_trajectories = true` to save per-agent JSONL traces and a fi
 | `provider` | Auth | Notes |
 |---|---|---|
 | `anthropic` | `ANTHROPIC_API_KEY` env var (or `api_key_env`), or `auth = "azure-ad"` | `base_url` optional |
-| `gemini` | `GEMINI_API_KEY` env var, or `auth = "agy-keyring"` | `agy-keyring` reuses the Antigravity CLI OAuth token from the system keyring — research only, [see warning](#antigravity-keyring-research-only) |
+| `gemini` | `GEMINI_API_KEY`/`GOOGLE_AI_API_KEY` env var (or `api_key_env`), or `auth = "agy-keyring"` | `base_url` optional (e.g. a local Gemini-compatible server); `agy-keyring` reuses the Antigravity CLI OAuth token from the system keyring — research only, [see warning](#antigravity-keyring-research-only) |
 | `openai` | `OPENAI_API_KEY` env var (or `api_key_env`), `auth = "azure-ad"`, or `auth = "codex"` | `codex` reuses your ChatGPT subscription via the Codex CLI token — research only, [see warning](#chatgptcodex-subscription-research-only) |
 | `openrouter` | `OPENROUTER_API_KEY` env var (or `api_key_env`) | explicit model names are recommended; `model = "free"` is experimental |
 
@@ -325,18 +325,33 @@ Two LLM agents take turns exploring the codebase with file/git tools and submitt
 - `reviewer[1]` in config → Critic (review: Validator)
 - `aggregator` → Meta-reviewer
 
-By default, nitpicker prints only the final synthesized result. Use `--verbose` to show intermediate debate output and the saved transcript path.
+Interactive text runs show a compact cast/progress view while debating, then print the final synthesized result. In a terminal, `--verbose` also shows intermediate debate output and the saved transcript path; redirected stdout stays final-report-only.
 
 Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timestamp}.md`.
 
+### Exit codes (default review and `ask`)
+
+| code | meaning |
+|------|---------|
+| 0 | clean verdict |
+| 1 | hard failure — no verdict (bad config, missing key, every reviewer/turn failed) |
+| 2 | CLI usage error (clap's exit code for bad arguments) |
+| 3 | degraded verdict — report printed, but a reviewer failed, or a debate turn failed or ended without calling `submit_verdict` |
+
+Non-interactive, non-verbose stdout carries exactly the final report, so the binary can be driven as a subprocess: read stdout for the verdict, branch on the exit code. `pr` keeps its own contract (`--json` emits `status: ok|error` and exits 0/1).
+
 ## Changelog
 
+**0.7.1** — 2026-06-14
+- Default review and `ask` now exit 3 for degraded verdicts after printing/flushing the report; 0 = clean, 1 = hard failure, 3 = degraded. `pr` keeps its existing JSON/exit-code contract.
+- Interactive debate/review progress is cleaner: model cast lines are shown only for terminal text runs, piped/JSON stdout stays final-output-only, and long subagent/status lines are truncated before they can wrap and corrupt the spinner redraw.
+- Fixed `--alloy` with Codex mixed into the reviewer pool by normalizing Responses `call_id`s, function-call item ids, and assistant text block shapes before Codex request sending.
+- Audit fixes: hardened git tool path/flag sandboxing, reject all-failed reviews instead of fabricating verdicts, fixed retry/auth classification for provider error bodies, honored Gemini `base_url`/`api_key_env`, and made `pr` locking/checkout safer.
+
 **0.7.0** — 2026-06-07
-- Added `auth = "codex"` for the `openai` provider: authenticate with a ChatGPT Plus/Pro (Codex) subscription instead of a paid API key. nitpicker reuses the OAuth token the Codex CLI stores in `~/.codex/auth.json` (read-only; `CODEX_HOME` honored), refreshing the short-lived access token in-memory via the refresh token — never writing back, and recovering from a refresh-token rotation by reloading from disk once. Requests go to the Codex subscription endpoint (`chatgpt.com/backend-api/codex/responses`), which speaks the OpenAI Responses API with subscription-specific requirements handled transparently: a top-level `instructions` system prompt, mandatory SSE streaming, `store: false` (so output items are accumulated from the stream), and omitted `max_output_tokens`. No API-key env var is required. Research only — third-party use of the Codex OAuth client is arguably outside OpenAI's terms; see README warning. See [ChatGPT/Codex subscription section](#chatgptcodex-subscription-research-only).
-- Codex multi-turn reasoning fix: under the mandatory `store: false`, a reasoning item returned this turn was echoed back next turn as a bare `rs_...` id the backend could no longer resolve (`HTTP 404 — Items are not persisted when store is set to false`), breaking every debate/agent loop after the first turn. nitpicker now requests `include: ["reasoning.encrypted_content"]`, so each reasoning item carries an opaque blob that is replayed inline instead of by id.
-- `nitpicker init` now auto-detects a logged-in Codex CLI (`~/.codex/auth.json`, `CODEX_HOME` honored) and emits a commented `auth = "codex"` reviewer (`gpt-5.5`), provided no paid `OPENAI_API_KEY` is already configured. Research-only path, same posture as the Antigravity keyring detection.
-- Bumped `rig-core` to 0.38.
-- The Antigravity Gemini path (`auth = "agy-keyring"` + the local `gemini_proxy`) is now gated behind the off-by-default `antigravity` cargo feature (build with `--features antigravity`), mirroring `azure`. Without it, that auth is rejected at config validation with a build hint and `init` won't offer the keyring reviewer. This drops `axum`, `keyring`, and `uuid` from the default build and, with a size-tuned release profile (`opt-level = "z"`, thin LTO, `strip`), trims the default release binary from ~16M to ~8.7M (−46%) — clean release builds stay as fast as the old default. `panic` stays `unwind` so reviewer-task panics are still caught as `JoinError`.
+- Added research-only `auth = "codex"` for the `openai` provider, reusing the Codex CLI ChatGPT subscription token read-only, refreshing in memory, handling subscription Responses API quirks, and surfacing a commented reviewer from `nitpicker init` when detected.
+- Fixed Codex multi-turn reasoning with `store: false` by requesting/replaying `reasoning.encrypted_content` instead of unresolved `rs_...` item ids.
+- Gated Antigravity keyring auth behind the off-by-default `antigravity` feature, slimmed the default release binary, and bumped `rig-core` to 0.38.
 
 **0.6.3** — 2026-06-06
 - Audit fixes: (1) **git tool security** — the read-only allowlist gated only the subcommand, allowing file writes (`diff --output=<path>`) and ref mutation (`branch`/`tag`) against the user's real repo in `pr` in-place mode; `branch`/`tag` are replaced by the safe-by-construction `for-each-ref`/`show-ref` plumbing and `--output`/`-o` is blocked. (2) **detached-HEAD restore** in `pr` mode was broken and not panic-safe, stranding the user on `nitpicker/pr-N`; now restored via `git switch --detach` from a `Drop` guard. (3) **retry classifier** misread `code` as a substring (`error decoding…404` → permanent 4xx, retries lost); keys are now whole-word matched and 5xx-nested-4xx stays retryable. (4) **debate** no longer records an empty verdict when a terminal tool call is blocked/malformed.

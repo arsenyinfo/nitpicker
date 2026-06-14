@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::fs;
-use tracing::warn;
+use tracing::debug;
 
 /// Find a valid UTF-8 character boundary at or before the given position.
 /// This is a polyfill for `str::floor_char_boundary` which requires Rust 1.91.
@@ -41,33 +41,101 @@ const ALLOWED_GIT_SUBCOMMANDS: &[&str] = &[
     "show-ref",
 ];
 
-/// Reject git invocations that aren't genuinely read-only. The subcommand allowlist alone is not
-/// enough: `diff`/`log`/`show` accept `--output=<path>` (write-anywhere, traversal-capable). Ref
-/// listing is served by the read-only plumbing `for-each-ref`/`show-ref` (no ref-creating mode),
-/// not the `branch`/`tag` porcelain, so no per-subcommand argument validation is needed beyond
-/// blocking the output-to-file flag. Returns `Err(message)` for a rejected invocation.
-fn ensure_readonly_git(subcommand: &str, rest: &[&str]) -> std::result::Result<(), String> {
-    // `--output`/`-o` is a write-to-file flag only on `diff`/`log`/`show` (which share diff's
-    // output machinery). On other subcommands `-o` means something else and is read-only — notably
-    // `ls-files -o` (= `--others`) — so only gate these three to avoid blocking legitimate reads.
-    if !matches!(subcommand, "diff" | "log" | "show") {
-        return Ok(());
+/// True if `token` is a long option `--<stem>` (optionally `--<stem>=value`) whose stem is a
+/// non-empty prefix of `name`. git accepts unambiguous long-option abbreviations, so `--out`
+/// matches `output` and `--no-i` matches `no-index`.
+fn long_flag_matches(token: &str, name: &str) -> bool {
+    long_flag_stem(token).is_some_and(|stem| name.starts_with(stem))
+}
+
+fn long_flag_stem(token: &str) -> Option<&str> {
+    token
+        .strip_prefix("--")
+        .map(|long| long.split('=').next().unwrap_or(long))
+        .filter(|stem| !stem.is_empty())
+}
+
+fn blocked_fs_reading_flag_matches(token: &str, name: &str) -> bool {
+    if name == "ignore-revs-file" && long_flag_stem(token) == Some("ignore-rev") {
+        return false;
     }
-    // git accepts unambiguous long-option abbreviations, so reject any `--…` prefix of `--output`
-    // too (e.g. `--out`), alongside the exact, `=`-glued, and short (`-o`/`-o<file>`) forms.
+    long_flag_matches(token, name)
+}
+
+/// Reject git invocations that aren't genuinely read-only or that escape the repository. The
+/// subcommand allowlist alone is not enough — `read_file`/`grep`/`glob` confine reads to `work_dir`
+/// via canonicalize, but several git flags read straight from the filesystem and would bypass that
+/// sandbox. Three layers: (1) no argument may reference a path outside the repo (absolute or `..`,
+/// including Windows-style paths), (2) filesystem-reading flags are denied outright, and (3) the
+/// write-to-file `--output`/`-o` on `diff`/`log`/`show`. Returns `Err(message)` when rejected.
+fn ensure_readonly_git(subcommand: &str, rest: &[&str]) -> std::result::Result<(), String> {
+    // Layer 1 (all subcommands): an argument value may not reference a path outside the repo. The
+    // value is the token itself, or the part after `=` for a `--flag=value`; a bare `--flag` whose
+    // path is the *next* token is caught when that token is examined on its own. Refs (`HEAD~1`,
+    // `origin/main..HEAD`), ranges, and `--format=%H` have no leading `/` and no `..` component.
     for token in rest {
-        let abbreviates_output = token
-            .strip_prefix("--")
-            .map(|long| long.split('=').next().unwrap_or(long))
-            .is_some_and(|stem| !stem.is_empty() && "output".starts_with(stem));
-        if abbreviates_output
-            || *token == "-o"
-            || (token.starts_with("-o") && !token.starts_with("--") && token.len() > 2)
+        let value = match token.starts_with('-') {
+            true => token.split_once('=').map(|(_, v)| v).unwrap_or(""),
+            false => token,
+        };
+        if looks_like_external_path(value) {
+            return Err(format!(
+                "Error: git argument '{token}' references a path outside the repository"
+            ));
+        }
+    }
+    // Layer 2: flags that read a file by path, bypassing the object database entirely. They have no
+    // role in reviewing repo history, so deny them by name (incl. unambiguous abbreviations and the
+    // `=`-glued form) — this also closes a relative-but-symlinked path that would slip past layer 1.
+    let fs_reading_flags: &[&str] = match subcommand {
+        "diff" => &["no-index"],
+        "blame" => &["contents", "ignore-revs-file"],
+        _ => &[],
+    };
+    for flag in fs_reading_flags {
+        if rest
+            .iter()
+            .any(|token| blocked_fs_reading_flag_matches(token, flag))
         {
-            return Err("Error: writing git output to a file (--output/-o) is not allowed".into());
+            return Err(format!(
+                "Error: git --{flag} reads files outside the repository and is not allowed"
+            ));
+        }
+    }
+    // Layer 3: `--output`/`-o` is a write-to-file flag only on `diff`/`log`/`show` (which share
+    // diff's output machinery). On other subcommands `-o` means something else and is read-only —
+    // notably `ls-files -o` (= `--others`) — so gate only these three to avoid blocking legit reads.
+    if matches!(subcommand, "diff" | "log" | "show") {
+        for token in rest {
+            if long_flag_matches(token, "output")
+                || *token == "-o"
+                || (token.starts_with("-o") && !token.starts_with("--") && token.len() > 2)
+            {
+                return Err(
+                    "Error: writing git output to a file (--output/-o) is not allowed".into(),
+                );
+            }
         }
     }
     Ok(())
+}
+
+fn looks_like_external_path(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    Path::new(value).is_absolute()
+        || value.starts_with('\\')
+        || has_windows_drive_prefix(value)
+        || value.split(['/', '\\']).any(|component| component == "..")
+}
+
+fn has_windows_drive_prefix(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes.get(2).copied(), Some(b'/' | b'\\'))
 }
 
 pub trait Tool: Send + Sync {
@@ -159,13 +227,25 @@ impl Tool for ReadFileTool {
                 .and_then(|value| value.as_u64())
                 .map(|value| value as usize);
             let full_path = work_dir.join(path);
-            let full_path = full_path
-                .canonicalize()
-                .map_err(|e| eyre::eyre!("cannot resolve path {path:?}: {e}. Only files within {} are accessible.", work_dir.display()))?;
+            let full_path = full_path.canonicalize().map_err(|e| {
+                eyre::eyre!(
+                    "cannot resolve path {path:?}: {e}. Only files within {} are accessible.",
+                    work_dir.display()
+                )
+            })?;
             if !full_path.starts_with(&work_dir) {
-                eyre::bail!("access denied: {path:?} is outside the allowed workspace ({}). Only project files are accessible.", work_dir.display());
+                eyre::bail!(
+                    "access denied: {path:?} is outside the allowed workspace ({}). Only project files are accessible.",
+                    work_dir.display()
+                );
             }
-            let content = fs::read_to_string(&full_path).await?;
+            let content = match fs::read_to_string(&full_path).await {
+                Ok(content) => content,
+                Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                    eyre::bail!("file is not valid UTF-8; read_file only supports text files")
+                }
+                Err(err) => return Err(err.into()),
+            };
             let lines = content.lines().collect::<Vec<_>>();
             let total = lines.len();
             let start = start_line.max(1).min(total.max(1));
@@ -231,7 +311,10 @@ impl Tool for GlobTool {
                     .components()
                     .any(|c| c == std::path::Component::ParentDir)
             {
-                eyre::bail!("access denied: glob pattern {pattern:?} must be relative to the workspace ({}). Absolute paths and parent-directory traversal are not allowed.", work_dir.display());
+                eyre::bail!(
+                    "access denied: glob pattern {pattern:?} must be relative to the workspace ({}). Absolute paths and parent-directory traversal are not allowed.",
+                    work_dir.display()
+                );
             }
             let mut results = Vec::new();
             let full_pattern = work_dir.join(pattern);
@@ -311,20 +394,23 @@ impl Tool for GrepTool {
                 .unwrap_or_else(|| work_dir.clone());
             if !base_path.starts_with(&work_dir) {
                 let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-                eyre::bail!("access denied: {path_arg:?} is outside the allowed workspace ({}). Only project files are accessible.", work_dir.display());
+                eyre::bail!(
+                    "access denied: {path_arg:?} is outside the allowed workspace ({}). Only project files are accessible.",
+                    work_dir.display()
+                );
             }
             let file_glob = args
                 .get("file_glob")
                 .and_then(|value| value.as_str())
                 .map(glob_to_regex)
                 .transpose()?;
-            let regex = Regex::new(pattern)
-                .map_err(|e| eyre::eyre!("invalid regex {pattern:?}: {e}"))?;
+            let regex =
+                Regex::new(pattern).map_err(|e| eyre::eyre!("invalid regex {pattern:?}: {e}"))?;
             let mut results = Vec::new();
             let mut skipped_files = 0usize;
             if base_path.is_file() {
                 if let Err(e) = search_file(&base_path, &regex, &work_dir, &mut results).await {
-                    warn!("skipping file {}: {e}", base_path.display());
+                    debug!("skipping file {}: {e}", base_path.display());
                     skipped_files += 1;
                 }
             } else {
@@ -333,7 +419,7 @@ impl Tool for GrepTool {
                     let entries = match fs::read_dir(&path).await {
                         Ok(entries) => entries,
                         Err(e) => {
-                            warn!("skipping unreadable dir {}: {e}", path.display());
+                            debug!("skipping unreadable dir {}: {e}", path.display());
                             continue;
                         }
                     };
@@ -343,7 +429,7 @@ impl Tool for GrepTool {
                         let file_type = match entry.file_type().await {
                             Ok(file_type) => file_type,
                             Err(e) => {
-                                warn!("skipping {}: {e}", entry_path.display());
+                                debug!("skipping {}: {e}", entry_path.display());
                                 continue;
                             }
                         };
@@ -363,7 +449,7 @@ impl Tool for GrepTool {
                             match search_file(&entry_path, &regex, &work_dir, &mut results).await {
                                 Ok(_) => {}
                                 Err(e) => {
-                                    warn!("skipping file {}: {e}", entry_path.display());
+                                    debug!("skipping file {}: {e}", entry_path.display());
                                     skipped_files += 1;
                                 }
                             }
@@ -539,7 +625,8 @@ impl Tool for GitTool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ALLOWED_GIT_SUBCOMMANDS, ensure_readonly_git};
+    use super::{ALLOWED_GIT_SUBCOMMANDS, ReadFileTool, Tool, ensure_readonly_git};
+    use serde_json::json;
 
     /// Mirror the two gates GitTool applies: subcommand allowlist, then read-only argument check.
     fn check(cmd: &str) -> Result<(), String> {
@@ -572,6 +659,68 @@ mod tests {
         // -o is a write flag only on diff/log/show; on ls-files it means --others (read-only)
         assert!(check("ls-files -o --exclude-standard").is_ok());
         assert!(check("ls-files --others").is_ok());
+        // refs, ranges, and in-repo pathspecs must survive the path-escape guard
+        assert!(check("diff --stat HEAD~1 -- src/foo.rs").is_ok());
+        assert!(check("log origin/main..HEAD").is_ok());
+        assert!(check("blame -- src/foo.rs").is_ok());
+        assert!(check("blame --ignore-rev HEAD -- src/foo.rs").is_ok());
+        assert!(check("blame --ignore-rev=HEAD -- src/foo.rs").is_ok());
+        assert!(check("show HEAD:src/foo.rs").is_ok());
+        assert!(check("show v:src/foo.rs").is_ok());
+        assert!(check("diff HEAD -- ./src").is_ok());
+        assert!(check(r"diff HEAD -- src\foo.rs").is_ok());
+    }
+
+    #[test]
+    fn rejects_arbitrary_file_read() {
+        // diff --no-index / blame --contents read straight from the filesystem, bypassing the
+        // canonicalize sandbox that read_file/grep/glob enforce.
+        assert!(check("diff --no-index /etc/passwd /dev/null").is_err());
+        assert!(check("diff --no-i /etc/passwd /dev/null").is_err()); // abbreviation
+        assert!(check("diff --no-index a b").is_err()); // flag denied even with relative paths
+        assert!(check("blame --contents /etc/passwd -- a.txt").is_err());
+        assert!(check("blame --contents=/etc/passwd -- a.txt").is_err());
+        assert!(check("blame --contents secret.txt -- a.txt").is_err());
+        // absolute paths and `..` traversal are rejected on any subcommand
+        assert!(check("diff /etc/passwd").is_err());
+        assert!(check("log -- ../../../etc/passwd").is_err());
+        assert!(check("show ../outside").is_err());
+        assert!(check("diff HEAD -- a/../../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn rejects_windows_style_path_escapes() {
+        assert!(check(r"diff C:\Users\victim\secret").is_err());
+        assert!(check(r"diff C:/Users/victim\secret").is_err());
+        assert!(check(r"diff \\server\share\secret").is_err());
+        assert!(check(r"log -- ..\secret").is_err());
+        assert!(check(r"show a\..\secret").is_err());
+    }
+
+    #[test]
+    fn rejects_blame_revision_file_reads() {
+        assert!(check("blame --ignore-revs-file README.md -- src/tools.rs").is_err());
+        assert!(check("blame --ignore-revs-file=README.md -- src/tools.rs").is_err());
+        assert!(check("blame --ignore-revs README.md -- src/tools.rs").is_err());
+        assert!(check("blame --ignore-revs-f=README.md -- src/tools.rs").is_err());
+    }
+
+    #[tokio::test]
+    async fn read_file_invalid_utf8_reports_text_only_feedback() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("bin.dat"), [0xff, 0xfe]).unwrap();
+        let work_dir = dir.path().canonicalize().unwrap();
+
+        let err = ReadFileTool
+            .call(json!({ "path": "bin.dat" }), work_dir)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            err,
+            "file is not valid UTF-8; read_file only supports text files"
+        );
     }
 
     #[test]

@@ -40,9 +40,11 @@ fn build_azure_ad_client(
 ) -> Result<Arc<dyn LLMClientDyn>> {
     #[cfg(feature = "azure")]
     {
-        Ok(crate::azure::build_azure_client(provider, base_url, scope, credentials)?
-            .with_retry()
-            .into_arc())
+        Ok(
+            crate::azure::build_azure_client(provider, base_url, scope, credentials)?
+                .with_retry()
+                .into_arc(),
+        )
     }
     #[cfg(not(feature = "azure"))]
     {
@@ -61,7 +63,10 @@ pub fn provider_from_config(
             base_url: base_url.map(str::to_string),
             api_key_env: api_key_env.map(str::to_string),
         }),
-        ProviderType::Gemini => Ok(LLMProvider::Gemini),
+        ProviderType::Gemini => Ok(LLMProvider::Gemini {
+            base_url: base_url.map(str::to_string),
+            api_key_env: api_key_env.map(str::to_string),
+        }),
         ProviderType::OpenAi => Ok(LLMProvider::OpenAi {
             base_url: base_url.map(str::to_string),
             api_key_env: api_key_env.map(str::to_string),
@@ -142,4 +147,29 @@ pub fn build_aggregator_client(
     .client_from_env()?
     .with_retry()
     .into_arc())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gemini_carries_base_url_and_api_key_env() {
+        let provider = provider_from_config(
+            &ProviderType::Gemini,
+            Some("http://localhost:8080"),
+            Some("MY_GEMINI_KEY"),
+        )
+        .unwrap();
+        match provider {
+            LLMProvider::Gemini {
+                base_url,
+                api_key_env,
+            } => {
+                assert_eq!(base_url.as_deref(), Some("http://localhost:8080"));
+                assert_eq!(api_key_env.as_deref(), Some("MY_GEMINI_KEY"));
+            }
+            _ => panic!("expected Gemini variant"),
+        }
+    }
 }

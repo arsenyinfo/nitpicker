@@ -2020,7 +2020,7 @@ dependencies = [
 
 [[package]]
 name = "nitpicker"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "axum",
  "azure_core",
@@ -2048,6 +2048,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "unicode-width 0.2.2",
  "url",
  "uuid",
 ]

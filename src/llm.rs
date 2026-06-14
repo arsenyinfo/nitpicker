@@ -116,8 +116,6 @@ impl TokenUsage {
             total_tokens: input_tokens.saturating_add(output_tokens),
         }
     }
-
-
 }
 
 #[derive(Debug, Clone, Default)]
@@ -528,6 +526,33 @@ fn key_word_present(lower: &str, lo: usize, hi: usize, key: &str) -> bool {
     false
 }
 
+/// Permanent error *types* that direct Anthropic/OpenAI bodies carry instead of a numeric status.
+/// rig flattens a non-2xx response to `ProviderError(<raw body>)` with the HTTP status dropped, so
+/// for those providers the numeric-status matchers never fire — these strings are the only signal.
+/// `insufficient_quota` (out of credits) is permanent despite arriving as HTTP 429: retrying never
+/// helps. Auth/permission `403`-class types are deliberately included here, *not* in the rate-limit
+/// set. All lowercase; matched as substrings on the lowercased chain.
+const NON_RETRYABLE_ERROR_TYPES: &[&str] = &[
+    "authentication_error",
+    "invalid_api_key",
+    "permission_error",
+    "permission_denied",
+    "invalid_request_error",
+    "not_found_error",
+    "context_length_exceeded",
+    "insufficient_quota",
+];
+
+/// Transient error *types* (overload / throttling) that warrant the rate-limit backoff policy.
+const RATE_LIMIT_ERROR_TYPES: &[&str] = &[
+    "rate_limit_error",
+    "rate_limit_exceeded",
+    "overloaded_error",
+];
+
+/// Error types that often arrive with HTTP 429 but are not transient throttles.
+const PERMANENT_QUOTA_ERROR_TYPES: &[&str] = &["insufficient_quota"];
+
 fn is_non_retryable_client_error(err: &eyre::Report) -> bool {
     // Walk the whole chain: provider clients map non-2xx to a `ProviderError` carrying the raw
     // response body, then `.wrap_err_with(...)` adds a top-level context. `err.to_string()` renders
@@ -543,20 +568,30 @@ fn is_non_retryable_client_error(err: &eyre::Report) -> bool {
     {
         return false;
     }
-    [400, 401, 402, 403, 404]
+    if [400, 401, 402, 403, 404]
         .iter()
         .any(|&status| mentions_http_status(&msg, status))
+    {
+        return true;
+    }
+    let lower = msg.to_ascii_lowercase();
+    NON_RETRYABLE_ERROR_TYPES.iter().any(|t| lower.contains(t))
 }
 
 fn is_rate_limit_error(err: &eyre::Report) -> bool {
     // Same reasoning as `is_non_retryable_client_error`: walk the full chain so a 429 carried in a
-    // wrapped `ProviderError` body still maps to the rate-limit backoff policy.
+    // wrapped `ProviderError` body still maps to the rate-limit backoff policy. Permanent quota
+    // types are excluded first because retrying them only burns the full rate-limit retry budget.
     let msg = format!("{err:#}").to_ascii_lowercase();
+    if PERMANENT_QUOTA_ERROR_TYPES.iter().any(|t| msg.contains(t)) {
+        return false;
+    }
     mentions_http_status(&msg, 429)
         || msg.contains("rate limit")
         || msg.contains("too many requests")
         || msg.contains("tokens per minute")
         || msg.contains("requests per minute")
+        || RATE_LIMIT_ERROR_TYPES.iter().any(|t| msg.contains(t))
 }
 
 fn jittered_backoff(attempt: usize, base_backoff_ms: u64, max_backoff_ms: u64) -> Duration {
@@ -626,12 +661,25 @@ fn is_local_base_url(base_url: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+/// Resolve the API key when its env var is unset: a local base_url needs no real key, otherwise it
+/// is a hard error naming the missing var.
+fn missing_or_local(key_env: &str, base_url: Option<&str>) -> Result<String> {
+    if is_local_base_url(base_url) {
+        Ok("local".to_string())
+    } else {
+        Err(eyre::eyre!("missing env var {key_env}"))
+    }
+}
+
 pub enum LLMProvider {
     Anthropic {
         base_url: Option<String>,
         api_key_env: Option<String>,
     },
-    Gemini,
+    Gemini {
+        base_url: Option<String>,
+        api_key_env: Option<String>,
+    },
     OpenAi {
         base_url: Option<String>,
         api_key_env: Option<String>,
@@ -649,24 +697,38 @@ impl LLMProvider {
                 api_key_env,
             } => {
                 let key_env = api_key_env.as_deref().unwrap_or("ANTHROPIC_API_KEY");
-                let api_key = std::env::var(key_env).or_else(|_| {
-                    if is_local_base_url(base_url.as_deref()) {
-                        Ok("local".to_string())
-                    } else {
-                        Err(eyre::eyre!("missing env var {key_env}"))
-                    }
-                })?;
+                let api_key = std::env::var(key_env)
+                    .or_else(|_| missing_or_local(key_env, base_url.as_deref()))?;
                 let mut builder = anthropic::Client::builder().api_key(api_key);
                 if let Some(url) = base_url {
                     builder = builder.base_url(url);
                 }
                 Ok(Box::new(builder.build()?))
             }
-            LLMProvider::Gemini => {
-                let api_key = std::env::var("GEMINI_API_KEY")
-                    .or_else(|_| std::env::var("GOOGLE_AI_API_KEY"))
-                    .map_err(|_| eyre::eyre!("missing env var GEMINI_API_KEY (or GOOGLE_AI_API_KEY)"))?;
-                let client = gemini::Client::new(api_key)
+            LLMProvider::Gemini {
+                base_url,
+                api_key_env,
+            } => {
+                // An explicit api_key_env overrides the GEMINI_API_KEY → GOOGLE_AI_API_KEY default
+                // chain; a local base_url needs no key (mirrors the Anthropic/OpenAi arms).
+                let api_key = match api_key_env {
+                    Some(key_env) => std::env::var(key_env)
+                        .or_else(|_| missing_or_local(key_env, base_url.as_deref()))?,
+                    None => std::env::var("GEMINI_API_KEY")
+                        .or_else(|_| std::env::var("GOOGLE_AI_API_KEY"))
+                        .or_else(|_| {
+                            missing_or_local(
+                                "GEMINI_API_KEY (or GOOGLE_AI_API_KEY)",
+                                base_url.as_deref(),
+                            )
+                        })?,
+                };
+                let mut builder = gemini::Client::builder().api_key(api_key);
+                if let Some(url) = base_url {
+                    builder = builder.base_url(url);
+                }
+                let client = builder
+                    .build()
                     .map_err(|e| eyre::eyre!("failed to create Gemini client: {e}"))?;
                 Ok(Box::new(client))
             }
@@ -675,13 +737,8 @@ impl LLMProvider {
                 api_key_env,
             } => {
                 let key_env = api_key_env.as_deref().unwrap_or("OPENAI_API_KEY");
-                let api_key = std::env::var(key_env).or_else(|_| {
-                    if is_local_base_url(base_url.as_deref()) {
-                        Ok("local".to_string())
-                    } else {
-                        Err(eyre::eyre!("missing env var {key_env}"))
-                    }
-                })?;
+                let api_key = std::env::var(key_env)
+                    .or_else(|_| missing_or_local(key_env, base_url.as_deref()))?;
                 let mut builder = openai::CompletionsClient::builder().api_key(&api_key);
                 if let Some(url) = base_url {
                     builder = builder.base_url(url);
@@ -703,9 +760,15 @@ impl LLMProvider {
 
 pub fn openrouter_headers() -> Result<reqwest::header::HeaderMap> {
     let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert("HTTP-Referer", "https://github.com/arsenyinfo/nitpicker".parse()?);
+    headers.insert(
+        "HTTP-Referer",
+        "https://github.com/arsenyinfo/nitpicker".parse()?,
+    );
     headers.insert("X-OpenRouter-Title", "nitpicker".parse()?);
-    headers.insert("X-OpenRouter-Categories", "cli-agent,programming-app".parse()?);
+    headers.insert(
+        "X-OpenRouter-Categories",
+        "cli-agent,programming-app".parse()?,
+    );
     Ok(headers)
 }
 
@@ -1071,8 +1134,14 @@ mod tests {
         assert!(!mentions_http_status("req_402abc failed", 402)); // embedded in an identifier
         assert!(!mentions_http_status("retry after 429 seconds", 429)); // bare number, wrong meaning
         // Genuine status references in their usual shapings still match.
-        assert!(mentions_http_status(r#"{"statusCode":429,"message":"slow"}"#, 429));
-        assert!(mentions_http_status("HttpError: Invalid status code 401", 401));
+        assert!(mentions_http_status(
+            r#"{"statusCode":429,"message":"slow"}"#,
+            429
+        ));
+        assert!(mentions_http_status(
+            "HttpError: Invalid status code 401",
+            401
+        ));
         assert!(mentions_http_status("429 Too Many Requests", 429)); // reason phrase
     }
 
@@ -1092,6 +1161,53 @@ mod tests {
         assert!(!mentions_http_status("xxxxxxxxxxxxxxxxxunicode 404", 404));
         // `status_code` is still a real key (matched via the `status` word).
         assert!(mentions_http_status(r#"{"status_code": 401}"#, 401));
+    }
+
+    #[test]
+    fn classifies_provider_error_types_without_numeric_status() {
+        // rig flattens direct Anthropic/OpenAI non-2xx to ProviderError(body) with no numeric status;
+        // these bodies carry only string error types. Confirm the type matchers fire.
+        let anthropic_auth = wrapped_provider_error(
+            r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
+        );
+        assert!(!anthropic_auth.to_string().contains("401"));
+        assert!(is_non_retryable_client_error(&anthropic_auth));
+        assert!(!is_rate_limit_error(&anthropic_auth));
+
+        let openai_key =
+            wrapped_provider_error(r#"{"error":{"code":"invalid_api_key","message":"bad key"}}"#);
+        assert!(is_non_retryable_client_error(&openai_key));
+
+        let bad_request = wrapped_provider_error(
+            r#"{"error":{"type":"invalid_request_error","message":"prompt is too long"}}"#,
+        );
+        assert!(is_non_retryable_client_error(&bad_request));
+
+        let ctx_len = wrapped_provider_error(r#"{"error":{"code":"context_length_exceeded"}}"#);
+        assert!(is_non_retryable_client_error(&ctx_len));
+
+        // insufficient_quota is permanent (out of credits) despite arriving as HTTP 429.
+        let quota = wrapped_provider_error(
+            r#"{"error":{"type":"insufficient_quota","message":"exceeded your current quota"}}"#,
+        );
+        assert!(is_non_retryable_client_error(&quota));
+        assert!(!is_rate_limit_error(&quota));
+
+        let quota_with_429 = wrapped_provider_error(
+            r#"{"statusCode":429,"error":{"type":"insufficient_quota","message":"Too Many Requests"}}"#,
+        );
+        assert!(is_non_retryable_client_error(&quota_with_429));
+        assert!(!is_rate_limit_error(&quota_with_429));
+        assert!(!retry_policy(&quota_with_429).retry);
+
+        // Transient overload/throttling types take the rate-limit policy and are not non-retryable.
+        let overloaded =
+            wrapped_provider_error(r#"{"type":"error","error":{"type":"overloaded_error"}}"#);
+        assert!(is_rate_limit_error(&overloaded));
+        assert!(!is_non_retryable_client_error(&overloaded));
+
+        let throttled = wrapped_provider_error(r#"{"error":{"code":"rate_limit_exceeded"}}"#);
+        assert!(is_rate_limit_error(&throttled));
     }
 
     #[test]

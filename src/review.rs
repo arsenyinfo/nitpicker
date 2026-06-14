@@ -27,6 +27,9 @@ use tracing::info;
 pub struct ReviewOutcome {
     pub report: String,
     pub usage: UsageReport,
+    /// At least one reviewer failed; the report is synthesized from the survivors.
+    /// Surfaced as exit code 3 in the default-review/`ask` CLI arms.
+    pub degraded: bool,
 }
 
 pub async fn run_review(
@@ -51,10 +54,12 @@ pub async fn run_review(
     // shared across every reviewer + their subagents to cap account-wide in-flight LLM calls
     let llm_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_LLM_CALLS));
 
-    let mp = MultiProgress::new();
+    let mp = Arc::new(MultiProgress::new());
     if verbose {
         mp.set_draw_target(ProgressDrawTarget::hidden());
     }
+    let _progress_guard = (!verbose && crate::progress::stderr_is_terminal())
+        .then(|| crate::progress::set_active_progress(&mp));
     let spinner_style = ProgressStyle::with_template("{spinner:.cyan} {prefix:<12} {msg}")
         .unwrap()
         .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", ""]);
@@ -98,7 +103,7 @@ pub async fn run_review(
         let pb = mp.add(ProgressBar::new_spinner());
         pb.set_style(spinner_style.clone());
         pb.set_prefix(name.clone());
-        pb.set_message("reviewing…");
+        pb.set_message(crate::progress::bar_message("reviewing…"));
         pb.enable_steady_tick(Duration::from_millis(80));
 
         let sub_pb = mp.insert_after(&pb, ProgressBar::new_spinner());
@@ -108,15 +113,15 @@ pub async fn run_review(
         let initial_message = initial_message.clone();
         let context = context.clone();
         let sem = Arc::clone(&semaphore);
-        let handle: JoinHandle<(String, Result<AgentResult>)> = tokio::spawn(async move {
+        let handle: JoinHandle<Result<AgentResult>> = tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
             let mut config = match agent_config {
                 Ok(config) => config,
                 Err(err) => {
                     pb.set_style(done.clone());
-                    pb.finish_with_message(format!("✗ error: {err}"));
+                    pb.finish_with_message(crate::progress::bar_message(format!("✗ error: {err}")));
                     sub_pb.finish_and_clear();
-                    return (name, Err(err));
+                    return Err(err);
                 }
             };
             config.project_context = Some(context);
@@ -124,17 +129,14 @@ pub async fn run_review(
                 let progress_pb = pb.clone();
                 let progress_sub_pb = sub_pb.clone();
                 config.progress = Some(Arc::new(move |progress: AgentProgress| {
-                    progress_pb.set_message(format!(
+                    progress_pb.set_message(crate::progress::bar_message(format!(
                         "reviewing… ({} turns, {} tool calls, {} subagents)",
                         progress.turns, progress.tool_calls, progress.subagents_spawned
+                    )));
+                    progress_sub_pb.set_message(crate::progress::detail_message(
+                        "    ↳ ",
+                        progress.last_subagent.as_deref(),
                     ));
-                    progress_sub_pb.set_message(
-                        progress
-                            .last_subagent
-                            .as_deref()
-                            .map(|s| format!("    ↳ {s}"))
-                            .unwrap_or_default(),
-                    );
                 }));
             }
             let start = Instant::now();
@@ -143,7 +145,7 @@ pub async fn run_review(
             sub_pb.finish_and_clear();
             pb.set_style(done);
             match &result {
-                Ok(r) => pb.finish_with_message(format!(
+                Ok(r) => pb.finish_with_message(crate::progress::bar_message(format!(
                     "✓ done ({elapsed}s, {} turns, {} tool calls, {} subagents, {} in, {} out, {} total tokens)",
                     r.turns,
                     r.tool_calls,
@@ -151,32 +153,46 @@ pub async fn run_review(
                     r.total_input_tokens,
                     r.total_output_tokens,
                     r.total_tokens
-                )),
-                Err(e) => pb.finish_with_message(format!("✗ failed: {e}")),
+                ))),
+                Err(e) => pb.finish_with_message(crate::progress::bar_message(format!(
+                    "✗ failed: {e}"
+                ))),
             }
-            (name, result)
+            result
         });
-        handles.push(handle);
+        handles.push((name, handle));
     }
 
+    let reviewer_count = handles.len();
     let mut usage = UsageReport::default();
     let mut rendered = Vec::new();
-    for handle in handles {
+    let mut success_count = 0usize;
+    for (name, handle) in handles {
         match handle.await {
-            Ok((name, Ok(result))) => {
+            Ok(Ok(result)) => {
                 usage.add(result.usage(), result.subagents_spawned);
                 rendered.push(format!("## {name} review\n\n{}", result.text));
+                success_count += 1;
                 info!(reviewer = %name, "review completed");
             }
-            Ok((name, Err(err))) => {
+            Ok(Err(err)) => {
                 rendered.push(format!("## {name} review\n\n*Failed: {err:#}*"));
                 info!(reviewer = %name, error = ?err, "review failed");
             }
             Err(err) => {
-                rendered.push(format!("## reviewer failed\n\n*Failed: {err:#}*"));
-                info!(error = ?err, "reviewer task failed");
+                rendered.push(format!(
+                    "## {name} review\n\n*Failed (task panicked): {err:#}*"
+                ));
+                info!(reviewer = %name, error = ?err, "reviewer task panicked");
             }
         }
+    }
+
+    // Refuse to synthesize a verdict out of nothing but failures: the aggregator would hallucinate
+    // a confident review from error notes, and `pr` would post it. A total failure is an error, not
+    // an "ok" report with empty findings.
+    if success_count == 0 {
+        eyre::bail!("all {reviewer_count} reviewer(s) failed; refusing to synthesize a verdict");
     }
 
     let combined = rendered.join("\n\n---\n\n");
@@ -185,7 +201,7 @@ pub async fn run_review(
     let pb_agg = mp.add(ProgressBar::new_spinner());
     pb_agg.set_style(spinner_style);
     pb_agg.set_prefix("aggregator");
-    pb_agg.set_message("synthesizing…");
+    pb_agg.set_message(crate::progress::bar_message("synthesizing…"));
     pb_agg.enable_steady_tick(Duration::from_millis(80));
 
     let agg = &config.aggregator;
@@ -204,7 +220,9 @@ pub async fn run_review(
     usage.add(response.usage, 0);
     pb_agg.set_style(done_style);
     if response.finish_reason == FinishReason::ToolUse {
-        pb_agg.finish_with_message("✗ failed: unexpected tool call");
+        pb_agg.finish_with_message(crate::progress::bar_message(
+            "✗ failed: unexpected tool call",
+        ));
         return Err(eyre::eyre!("aggregator returned tool calls unexpectedly"));
     }
     pb_agg.finish_with_message("✓ done");
@@ -223,6 +241,7 @@ pub async fn run_review(
     Ok(ReviewOutcome {
         report: text,
         usage,
+        degraded: success_count < reviewer_count,
     })
 }
 
