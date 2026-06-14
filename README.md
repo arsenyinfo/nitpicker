@@ -323,7 +323,7 @@ Two LLM agents take turns exploring the codebase with file/git tools and submitt
 - `reviewer[1]` in config → Critic (review: Validator)
 - `aggregator` → Meta-reviewer
 
-Interactive text runs show a compact cast/progress view while debating, then print the final synthesized result. Use `--verbose` to show intermediate debate output and the saved transcript path.
+Interactive text runs show a compact cast/progress view while debating, then print the final synthesized result. In a terminal, `--verbose` also shows intermediate debate output and the saved transcript path; redirected stdout stays final-report-only.
 
 Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timestamp}.md`.
 

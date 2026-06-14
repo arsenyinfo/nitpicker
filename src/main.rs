@@ -144,7 +144,7 @@ async fn main() -> Result<()> {
         .with_file(false)
         .with_line_number(false)
         .with_level(true)
-        .with_ansi(true)
+        .with_ansi(progress::stderr_supports_color())
         .compact()
         .init();
 

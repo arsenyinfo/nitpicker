@@ -252,9 +252,11 @@ fn role_color(role: &str) -> &'static str {
 }
 
 fn use_color() -> bool {
-    stdout_is_terminal()
-        && std::env::var_os("NO_COLOR").is_none()
-        && std::env::var("TERM").as_deref() != Ok("dumb")
+    stdout_is_terminal() && crate::progress::color_env_allows()
+}
+
+fn use_stderr_color() -> bool {
+    crate::progress::stderr_supports_color()
 }
 
 fn stdout_is_terminal() -> bool {
@@ -264,6 +266,14 @@ fn stdout_is_terminal() -> bool {
 
 fn colored_role(role: &str) -> String {
     if use_color() {
+        format!("{}{role}\x1b[0m", role_color(role))
+    } else {
+        role.to_string()
+    }
+}
+
+fn colored_role_stderr(role: &str) -> String {
+    if use_stderr_color() {
         format!("{}{role}\x1b[0m", role_color(role))
     } else {
         role.to_string()
@@ -445,7 +455,7 @@ pub async fn run_debate(
         final_round = round;
 
         let (pb, _) = make_spinner(&mp);
-        pb.set_prefix(colored_role(actor_role));
+        pb.set_prefix(colored_role_stderr(actor_role));
         pb.set_message(crate::progress::bar_message(format!(
             "round {round} — debating…"
         )));
@@ -496,7 +506,7 @@ pub async fn run_debate(
             "✓ round {round} ({turns} turns, {tool_calls} tool calls, {subagents_spawned} subagents, {} in, {} out, {} total tokens, {elapsed}s)",
             turn_usage.input_tokens, turn_usage.output_tokens, turn_usage.total_tokens
         )));
-        if verbose && stdout_ok {
+        if verbose && stdout_ok && stdout_is_terminal() {
             println!();
             skin.print_text(&verdict.text);
             println!();
@@ -506,7 +516,7 @@ pub async fn run_debate(
         verdicts.push((actor_role.to_string(), round, verdict.text));
 
         let (pb, _) = make_spinner(&mp);
-        pb.set_prefix(colored_role(critic_role));
+        pb.set_prefix(colored_role_stderr(critic_role));
         pb.set_message(crate::progress::bar_message(format!(
             "round {round} — debating…"
         )));
@@ -557,7 +567,7 @@ pub async fn run_debate(
             "✓ round {round} ({turns} turns, {tool_calls} tool calls, {subagents_spawned} subagents, {} in, {} out, {} total tokens, {elapsed}s)",
             turn_usage.input_tokens, turn_usage.output_tokens, turn_usage.total_tokens
         )));
-        if verbose && stdout_ok {
+        if verbose && stdout_ok && stdout_is_terminal() {
             println!();
             skin.print_text(&verdict.text);
             println!();
@@ -604,7 +614,7 @@ pub async fn run_debate(
         additional_params: None,
     };
     let (pb, _) = make_spinner(&mp);
-    pb.set_prefix(colored_role("Meta-review"));
+    pb.set_prefix(colored_role_stderr("Meta-review"));
     pb.set_message(crate::progress::bar_message("synthesizing…"));
     let meta_response: crate::llm::CompletionResponse =
         agg_client.completion(meta_completion).await?;

@@ -34,6 +34,14 @@ pub(crate) fn stderr_is_terminal() -> bool {
     io::stderr().is_terminal()
 }
 
+pub(crate) fn stderr_supports_color() -> bool {
+    stderr_is_terminal() && color_env_allows()
+}
+
+pub(crate) fn color_env_allows() -> bool {
+    std::env::var_os("NO_COLOR").is_none() && std::env::var("TERM").as_deref() != Ok("dumb")
+}
+
 pub(crate) struct ProgressLogWriter;
 
 impl Write for ProgressLogWriter {
