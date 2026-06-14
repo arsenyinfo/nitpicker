@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const MAX_TOOL_RESULT_BYTES: usize = 50_000;
 /// Global cap on concurrent in-flight LLM completion calls (reviewers + subagents share it),
@@ -919,7 +919,7 @@ async fn execute_tool_call(
                 subagent_total_tokens: 0,
             },
             Err(err) => {
-                warn!(agent = %ctx.config.name, tool = %tool_name, error = %err, "tool error");
+                debug!(agent = %ctx.config.name, tool = %tool_name, error = %err, "tool error");
                 ToolCallOutcome {
                     output: format!("Error: {err}"),
                     nested_tool_calls: 0,
@@ -934,7 +934,7 @@ async fn execute_tool_call(
         },
         None => {
             let msg = format!("Error: unknown tool '{tool_name}'");
-            warn!(agent = %ctx.config.name, tool = %tool_name, "unknown tool");
+            debug!(agent = %ctx.config.name, tool = %tool_name, "unknown tool");
             ToolCallOutcome {
                 output: msg,
                 nested_tool_calls: 0,

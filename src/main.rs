@@ -17,6 +17,7 @@ mod llm;
 mod openrouter;
 mod output;
 mod pr;
+mod progress;
 mod prompts;
 mod provider;
 mod reflect;
@@ -135,7 +136,7 @@ async fn main() -> Result<()> {
     // logs are never the report — keep stdout reserved for the deliverable so
     // `pr --format json` emits a clean single JSON object.
     tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+        .with_writer(progress::stderr_log_writer)
         .with_env_filter(filter)
         .with_target(false)
         .with_thread_ids(false)
@@ -148,8 +149,8 @@ async fn main() -> Result<()> {
         .init();
 
     // note: no json panic hook. reviewer work runs in tokio::spawn tasks whose
-    // panics are caught as JoinError and folded into the report (status stays ok,
-    // degraded section in the markdown); a process-wide hook would double-emit
+    // panics are caught as JoinError and folded into a degraded report (exit 3
+    // for review/ask, status ok for pr); a process-wide hook would double-emit
     // there. a genuine top-level panic aborts non-zero with a stderr message,
     // which is an acceptable catastrophic-failure signal for the consumer.
     match args.command {

@@ -32,6 +32,7 @@ indicatif = "0.18"
 termimad = "0.34"
 regex = "1"
 toml = "1"
+unicode-width = "0.2"
 
 reqwest = { version = "0.13", features = ["json", "form"] }
 dirs = "6"

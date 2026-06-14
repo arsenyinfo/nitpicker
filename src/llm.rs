@@ -550,6 +550,9 @@ const RATE_LIMIT_ERROR_TYPES: &[&str] = &[
     "overloaded_error",
 ];
 
+/// Error types that often arrive with HTTP 429 but are not transient throttles.
+const PERMANENT_QUOTA_ERROR_TYPES: &[&str] = &["insufficient_quota"];
+
 fn is_non_retryable_client_error(err: &eyre::Report) -> bool {
     // Walk the whole chain: provider clients map non-2xx to a `ProviderError` carrying the raw
     // response body, then `.wrap_err_with(...)` adds a top-level context. `err.to_string()` renders
@@ -577,9 +580,12 @@ fn is_non_retryable_client_error(err: &eyre::Report) -> bool {
 
 fn is_rate_limit_error(err: &eyre::Report) -> bool {
     // Same reasoning as `is_non_retryable_client_error`: walk the full chain so a 429 carried in a
-    // wrapped `ProviderError` body still maps to the rate-limit backoff policy. `retry_policy`
-    // consults this before `is_non_retryable_client_error`, so a transient type wins any overlap.
+    // wrapped `ProviderError` body still maps to the rate-limit backoff policy. Permanent quota
+    // types are excluded first because retrying them only burns the full rate-limit retry budget.
     let msg = format!("{err:#}").to_ascii_lowercase();
+    if PERMANENT_QUOTA_ERROR_TYPES.iter().any(|t| msg.contains(t)) {
+        return false;
+    }
     mentions_http_status(&msg, 429)
         || msg.contains("rate limit")
         || msg.contains("too many requests")
@@ -1186,6 +1192,13 @@ mod tests {
         );
         assert!(is_non_retryable_client_error(&quota));
         assert!(!is_rate_limit_error(&quota));
+
+        let quota_with_429 = wrapped_provider_error(
+            r#"{"statusCode":429,"error":{"type":"insufficient_quota","message":"Too Many Requests"}}"#,
+        );
+        assert!(is_non_retryable_client_error(&quota_with_429));
+        assert!(!is_rate_limit_error(&quota_with_429));
+        assert!(!retry_policy(&quota_with_429).retry);
 
         // Transient overload/throttling types take the rate-limit policy and are not non-retryable.
         let overloaded =

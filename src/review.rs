@@ -28,7 +28,7 @@ pub struct ReviewOutcome {
     pub report: String,
     pub usage: UsageReport,
     /// At least one reviewer failed; the report is synthesized from the survivors.
-    /// Surfaced as exit code 2 in the default-review/`ask` CLI arms.
+    /// Surfaced as exit code 3 in the default-review/`ask` CLI arms.
     pub degraded: bool,
 }
 
@@ -54,10 +54,12 @@ pub async fn run_review(
     // shared across every reviewer + their subagents to cap account-wide in-flight LLM calls
     let llm_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_LLM_CALLS));
 
-    let mp = MultiProgress::new();
+    let mp = Arc::new(MultiProgress::new());
     if verbose {
         mp.set_draw_target(ProgressDrawTarget::hidden());
     }
+    let _progress_guard = (!verbose && crate::progress::stderr_is_terminal())
+        .then(|| crate::progress::set_active_progress(&mp));
     let spinner_style = ProgressStyle::with_template("{spinner:.cyan} {prefix:<12} {msg}")
         .unwrap()
         .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", ""]);
@@ -101,7 +103,7 @@ pub async fn run_review(
         let pb = mp.add(ProgressBar::new_spinner());
         pb.set_style(spinner_style.clone());
         pb.set_prefix(name.clone());
-        pb.set_message("reviewing…");
+        pb.set_message(crate::progress::bar_message("reviewing…"));
         pb.enable_steady_tick(Duration::from_millis(80));
 
         let sub_pb = mp.insert_after(&pb, ProgressBar::new_spinner());
@@ -117,7 +119,7 @@ pub async fn run_review(
                 Ok(config) => config,
                 Err(err) => {
                     pb.set_style(done.clone());
-                    pb.finish_with_message(format!("✗ error: {err}"));
+                    pb.finish_with_message(crate::progress::bar_message(format!("✗ error: {err}")));
                     sub_pb.finish_and_clear();
                     return Err(err);
                 }
@@ -127,17 +129,14 @@ pub async fn run_review(
                 let progress_pb = pb.clone();
                 let progress_sub_pb = sub_pb.clone();
                 config.progress = Some(Arc::new(move |progress: AgentProgress| {
-                    progress_pb.set_message(format!(
+                    progress_pb.set_message(crate::progress::bar_message(format!(
                         "reviewing… ({} turns, {} tool calls, {} subagents)",
                         progress.turns, progress.tool_calls, progress.subagents_spawned
+                    )));
+                    progress_sub_pb.set_message(crate::progress::detail_message(
+                        "    ↳ ",
+                        progress.last_subagent.as_deref(),
                     ));
-                    progress_sub_pb.set_message(
-                        progress
-                            .last_subagent
-                            .as_deref()
-                            .map(|s| format!("    ↳ {s}"))
-                            .unwrap_or_default(),
-                    );
                 }));
             }
             let start = Instant::now();
@@ -146,7 +145,7 @@ pub async fn run_review(
             sub_pb.finish_and_clear();
             pb.set_style(done);
             match &result {
-                Ok(r) => pb.finish_with_message(format!(
+                Ok(r) => pb.finish_with_message(crate::progress::bar_message(format!(
                     "✓ done ({elapsed}s, {} turns, {} tool calls, {} subagents, {} in, {} out, {} total tokens)",
                     r.turns,
                     r.tool_calls,
@@ -154,8 +153,10 @@ pub async fn run_review(
                     r.total_input_tokens,
                     r.total_output_tokens,
                     r.total_tokens
-                )),
-                Err(e) => pb.finish_with_message(format!("✗ failed: {e}")),
+                ))),
+                Err(e) => pb.finish_with_message(crate::progress::bar_message(format!(
+                    "✗ failed: {e}"
+                ))),
             }
             result
         });
@@ -200,7 +201,7 @@ pub async fn run_review(
     let pb_agg = mp.add(ProgressBar::new_spinner());
     pb_agg.set_style(spinner_style);
     pb_agg.set_prefix("aggregator");
-    pb_agg.set_message("synthesizing…");
+    pb_agg.set_message(crate::progress::bar_message("synthesizing…"));
     pb_agg.enable_steady_tick(Duration::from_millis(80));
 
     let agg = &config.aggregator;
@@ -219,7 +220,9 @@ pub async fn run_review(
     usage.add(response.usage, 0);
     pb_agg.set_style(done_style);
     if response.finish_reason == FinishReason::ToolUse {
-        pb_agg.finish_with_message("✗ failed: unexpected tool call");
+        pb_agg.finish_with_message(crate::progress::bar_message(
+            "✗ failed: unexpected tool call",
+        ));
         return Err(eyre::eyre!("aggregator returned tool calls unexpectedly"));
     }
     pb_agg.finish_with_message("✓ done");
