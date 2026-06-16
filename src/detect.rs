@@ -240,7 +240,7 @@ fn detect_agy_keyring() -> Option<Detected> {
 }
 
 fn detect_codex() -> Option<Detected> {
-    crate::codex::auth_available().then(|| Detected {
+    nitpicker_agent::codex::auth_available().then(|| Detected {
         name: "codex",
         provider: "openai",
         model: "gpt-5.5".to_string(),

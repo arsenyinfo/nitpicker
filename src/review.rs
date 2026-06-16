@@ -1,16 +1,16 @@
-use crate::agent::{
+use nitpicker_agent::agent::{
     AgentConfig, AgentDepth, AgentProgress, AgentResult, MAX_CONCURRENT_LLM_CALLS,
     add_spawn_subagent_tool, run_agent,
 };
-use crate::config::{Config, ReviewerConfig};
-use crate::llm::{Completion, FinishReason};
+use nitpicker_agent::config::{Config, ReviewerConfig};
+use nitpicker_agent::llm::{Completion, FinishReason};
 use crate::output::UsageReport;
 pub use crate::prompts::TaskMode;
 #[cfg(feature = "antigravity")]
-use crate::provider::config_needs_gemini_proxy;
-use crate::provider::{build_aggregator_client, build_reviewer_client};
-use crate::session::{AggregationRecord, SessionLogger, sanitize_path_component};
-use crate::tools::{all_tools, floor_char_boundary, is_binary_file};
+use nitpicker_agent::provider::config_needs_gemini_proxy;
+use nitpicker_agent::provider::{build_aggregator_client, build_reviewer_client};
+use nitpicker_agent::session::{AggregationRecord, SessionLogger, sanitize_path_component};
+use nitpicker_agent::tools::{all_tools, floor_char_boundary, is_binary_file};
 use eyre::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rig_core::completion::Message;
@@ -328,7 +328,7 @@ fn build_agent_config(
     proxy_url: Option<&str>,
     subagent_counter: Arc<AtomicUsize>,
     llm_semaphore: Arc<Semaphore>,
-    session_writer: Option<crate::session::SessionWriter>,
+    session_writer: Option<nitpicker_agent::session::SessionWriter>,
 ) -> Result<AgentConfig> {
     let client = build_reviewer_client(reviewer, proxy_url)?;
     let compact_threshold = config.reviewer_compact_threshold(reviewer);
@@ -340,6 +340,7 @@ fn build_agent_config(
         max_turns,
         compact_threshold,
         system_prompt: system_prompt.to_string(),
+        subagent_system_prompt: None,
         client,
         depth: AgentDepth::TopLevel,
         terminal_tools: Vec::new(),

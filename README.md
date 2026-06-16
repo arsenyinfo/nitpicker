@@ -340,7 +340,29 @@ Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timesta
 
 Non-interactive, non-verbose stdout carries exactly the final report, so the binary can be driven as a subprocess: read stdout for the verdict, branch on the exit code. `pr` keeps its own contract (`--json` emits `status: ok|error` and exits 0/1).
 
+## Using the agent as a library
+
+The agentic core — the loop, the file/git tools, and the provider-agnostic LLM clients — lives in a separate crate, [`nitpicker-agent`](crates/nitpicker-agent), with none of the CLI/review/PR machinery. Use it to drive your own file-reading agent with subagents:
+
+```rust
+use nitpicker_agent::prelude::*;
+use std::path::Path;
+
+let client = client_from_env(LLMProvider::Anthropic { base_url: None, api_key_env: None })?;
+let result = AgentBuilder::new("explorer", "claude-sonnet-4-6", "You explore codebases.", client)
+    .subagent_system_prompt("You are a focused file-reading worker. Report findings concisely.")
+    .run("Map the module layout of this repo.", &file_agent_tools(), Path::new("."))
+    .await?;
+println!("{}", result.text);
+```
+
+`file_agent_tools()` is the read-only file/git toolset plus `spawn_subagent`. You control the top-level prompt, the subagent prompt, the toolset, and the client; config-file-driven client construction is available via the `config`/`provider` modules. See `crates/nitpicker-agent/examples/file_agent.rs`.
+
 ## Changelog
+
+**0.8.0** — 2026-06-16
+- Split the agentic core into a separate publishable library crate, [`nitpicker-agent`](crates/nitpicker-agent) (`crates/nitpicker-agent`). The `nitpicker` binary now depends on it; behavior is unchanged. The library exposes the agent loop, file/git tools, and provider-agnostic LLM clients without the CLI/review/PR machinery — see "Using the agent as a library" above.
+- Added `AgentConfig::subagent_system_prompt` so callers can customize the prompt spawned subagents run with (propagates through nested spawns); `None` keeps the previous generic prompt.
 
 **0.7.1** — 2026-06-14
 - Default review and `ask` now exit 3 for degraded verdicts after printing/flushing the report; 0 = clean, 1 = hard failure, 3 = degraded. `pr` keeps its existing JSON/exit-code contract.

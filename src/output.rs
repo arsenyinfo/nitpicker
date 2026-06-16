@@ -4,7 +4,7 @@
 //! line on stdout and nothing else; all human output (logs, spinners, debate
 //! chatter) is routed to stderr. see the "server / embedding" section of the README.
 
-use crate::llm::TokenUsage;
+use nitpicker_agent::llm::TokenUsage;
 use eyre::Result;
 use serde::Serialize;
 use std::io::Write;

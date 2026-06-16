@@ -3,27 +3,18 @@ use eyre::Result;
 use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
 
-mod agent;
-#[cfg(feature = "azure")]
-mod azure;
-mod codex;
-mod compact;
-mod config;
+use nitpicker_agent::{config, openrouter};
+
 mod debate;
 mod detect;
 #[cfg(feature = "antigravity")]
 mod gemini_proxy;
-mod llm;
-mod openrouter;
 mod output;
 mod pr;
 mod progress;
 mod prompts;
-mod provider;
 mod reflect;
 mod review;
-mod session;
-mod tools;
 
 /// Flags shared between the default review mode and the ask subcommand.
 #[derive(Debug, ClapArgs)]

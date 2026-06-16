@@ -1,0 +1,46 @@
+[package]
+name = "nitpicker-agent"
+version = "0.1.0"
+edition = "2024"
+# Matches the workspace floor; the optional `azure` feature raises it to 1.88 via azure_core.
+rust-version = "1.85"
+description = "Reusable agentic loop (file/git tools + parallel subagents) extracted from nitpicker"
+license = "MIT"
+repository = "https://github.com/arsenyinfo/nitpicker"
+documentation = "https://docs.rs/nitpicker-agent"
+readme = "README.md"
+
+[lib]
+name = "nitpicker_agent"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "time", "sync", "io-util"] }
+rig-core = "0.38"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+eyre = "0.6"
+tracing = "0.1"
+regex = "1"
+glob = "0.3"
+reqwest = { version = "0.13", features = ["json", "form"] }
+dirs = "6"
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.10"
+base64 = "0.22"
+# Azure AD (Entra ID) auth for Foundry-hosted models — opt-in, see `azure` feature below.
+azure_identity = { version = "1", optional = true }
+azure_core = { version = "1", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+# Enables `auth = "azure-ad"` (Azure AI Foundry). Pulls in the Azure SDK (azure_core declares
+# rust-version 1.88). Off by default.
+azure = ["dep:azure_identity", "dep:azure_core"]
+# Enables `auth = "agy-keyring"` routing through the Gemini proxy. Code-gate only here — the
+# proxy *server* and its heavy deps live in the `nitpicker` binary; this feature just compiles
+# in the config validation + proxy-URL client hook so the binary's feature can forward to it.
+antigravity = []

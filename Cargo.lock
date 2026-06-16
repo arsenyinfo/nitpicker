@@ -2020,23 +2020,19 @@ dependencies = [
 
 [[package]]
 name = "nitpicker"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "axum",
- "azure_core",
- "azure_identity",
  "base64",
  "chrono",
  "clap",
  "dirs",
  "eyre",
- "futures",
- "glob",
  "indicatif",
  "keyring",
  "libc",
+ "nitpicker-agent",
  "rand 0.10.1",
- "regex",
  "reqwest",
  "rig-core",
  "serde",
@@ -2051,6 +2047,29 @@ dependencies = [
  "unicode-width 0.2.2",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "nitpicker-agent"
+version = "0.1.0"
+dependencies = [
+ "azure_core",
+ "azure_identity",
+ "base64",
+ "chrono",
+ "dirs",
+ "eyre",
+ "futures",
+ "glob",
+ "rand 0.10.1",
+ "regex",
+ "reqwest",
+ "rig-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

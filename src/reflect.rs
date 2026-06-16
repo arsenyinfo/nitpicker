@@ -1,9 +1,9 @@
-use crate::agent::{AgentConfig, AgentDepth, MAX_CONCURRENT_LLM_CALLS, run_agent};
-use crate::config::Config;
-use crate::llm::{Completion, LLMClientDyn, throttled_completion};
-use crate::provider::build_reviewer_client;
-use crate::session::{AggregationRecord, ToolCallRecord};
-use crate::tools::{floor_char_boundary, reflect_tools};
+use nitpicker_agent::agent::{AgentConfig, AgentDepth, MAX_CONCURRENT_LLM_CALLS, run_agent};
+use nitpicker_agent::config::Config;
+use nitpicker_agent::llm::{Completion, LLMClientDyn, throttled_completion};
+use nitpicker_agent::provider::build_reviewer_client;
+use nitpicker_agent::session::{AggregationRecord, ToolCallRecord};
+use nitpicker_agent::tools::{floor_char_boundary, reflect_tools};
 use eyre::Result;
 use rig_core::completion::Message;
 use std::path::{Path, PathBuf};
@@ -236,6 +236,7 @@ async fn synthesize(
         max_turns: 20,
         compact_threshold: None,
         system_prompt: REDUCE_PROMPT.to_string(),
+        subagent_system_prompt: None,
         client,
         depth: AgentDepth::TopLevel,
         terminal_tools: vec![],
@@ -243,7 +244,7 @@ async fn synthesize(
         max_empty_responses: 3,
         subagent_counter: Arc::new(AtomicUsize::new(0)),
         llm_semaphore: Arc::new(tokio::sync::Semaphore::new(
-            crate::agent::MAX_CONCURRENT_LLM_CALLS,
+            nitpicker_agent::agent::MAX_CONCURRENT_LLM_CALLS,
         )),
         progress: None,
         project_context: None,
