@@ -72,6 +72,11 @@ pub fn client_from_env(provider: LLMProvider) -> Result<Arc<dyn LLMClientDyn>> {
 /// every other field defaults to the same values the nitpicker review path uses, and is
 /// overridable via the chainable setters. Use [`AgentBuilder::build`] for a raw config or
 /// [`AgentBuilder::run`] to execute in one call.
+///
+/// Concurrency note: each builder defaults to its **own** `Semaphore::new(MAX_CONCURRENT_LLM_CALLS)`,
+/// so it bounds in-flight LLM calls within one agent (and its subagents) but not *across*
+/// independent builders — N agents can run N × `MAX_CONCURRENT_LLM_CALLS` calls at once. To cap
+/// aggregate concurrency account-wide, share one `Arc<Semaphore>` via [`AgentBuilder::llm_semaphore`].
 pub struct AgentBuilder {
     config: AgentConfig,
 }
