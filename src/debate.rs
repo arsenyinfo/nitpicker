@@ -1,16 +1,16 @@
-use crate::agent::{
+use nitpicker_agent::agent::{
     AgentConfig, AgentDepth, AgentProgress, MAX_CONCURRENT_LLM_CALLS, add_spawn_subagent_tool,
     run_agent,
 };
-use crate::config::{Config, ReviewerConfig};
-use crate::llm::{Completion, LLMClientDyn, TokenUsage};
+use nitpicker_agent::config::{Config, ReviewerConfig};
+use nitpicker_agent::llm::{Completion, LLMClientDyn, TokenUsage};
 use crate::output::UsageReport;
 pub use crate::prompts::DebateMode;
 #[cfg(feature = "antigravity")]
-use crate::provider::config_needs_gemini_proxy;
-use crate::provider::{build_aggregator_client, build_reviewer_client};
-use crate::session::{AggregationRecord, SessionLogger, SessionWriter};
-use crate::tools::{Tool, all_tools};
+use nitpicker_agent::provider::config_needs_gemini_proxy;
+use nitpicker_agent::provider::{build_aggregator_client, build_reviewer_client};
+use nitpicker_agent::session::{AggregationRecord, SessionLogger, SessionWriter};
+use nitpicker_agent::tools::{Tool, all_tools};
 use eyre::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rig_core::completion::Message;
@@ -159,6 +159,7 @@ async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnRes
         max_turns: request.max_turns,
         compact_threshold: request.compact_threshold,
         system_prompt: request.system_prompt.to_string(),
+        subagent_system_prompt: None,
         client: request.client,
         depth: AgentDepth::TopLevel,
         terminal_tools: vec!["submit_verdict".to_string()],
@@ -380,7 +381,7 @@ pub async fn run_debate(
         for r in &config.reviewer {
             slots.push((build_client(r, proxy_url.as_deref())?, r.model.clone()));
         }
-        let shared: Arc<dyn LLMClientDyn> = Arc::new(crate::llm::AlloyClient::new(slots)?);
+        let shared: Arc<dyn LLMClientDyn> = Arc::new(nitpicker_agent::llm::AlloyClient::new(slots)?);
         actor_client = Arc::clone(&shared);
         critic_client = shared;
         let label = ModelLabel::alloy(config.reviewer.iter().map(|r| r.model.as_str()));
@@ -616,7 +617,7 @@ pub async fn run_debate(
     let (pb, _) = make_spinner(&mp);
     pb.set_prefix(colored_role_stderr("Meta-review"));
     pb.set_message(crate::progress::bar_message("synthesizing…"));
-    let meta_response: crate::llm::CompletionResponse =
+    let meta_response: nitpicker_agent::llm::CompletionResponse =
         agg_client.completion(meta_completion).await?;
     usage.add(meta_response.usage, 0);
     let meta_text = meta_response.text();

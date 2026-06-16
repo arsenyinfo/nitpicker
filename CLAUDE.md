@@ -56,22 +56,59 @@ cargo run -- ask --alloy "should we use eyre or thiserror?"
 
 ## Architecture
 
+This is a two-crate Cargo workspace: a publishable library crate `nitpicker-agent`
+(`crates/nitpicker-agent/`) holds the reusable agentic core, and the `nitpicker` binary at
+the repo root (`src/`) holds the CLI/review/debate/PR layer and depends on the library via
+`nitpicker_agent::`. The boundary is one-directional: the library never references a binary
+module. The binary's `azure`/`antigravity` features forward to the library's same-named
+features (see "Feature boundary" below).
+
 ```
-main.rs         CLI, config loading, wires everything together
-config.rs       TOML config deserialization (Config, ReviewerConfig, AggregatorConfig)
-review.rs       orchestrates parallel reviewers → aggregation
-debate.rs       sequential actor/critic debate loop → meta-review
-agent.rs        agentic tool-use loop for a single reviewer
-llm.rs          LLM client trait, per-provider impls, retry wrapper
-tools.rs        tool definitions: read_file, glob, grep, git
-pr.rs           GitHub PR subcommand: fetch metadata via gh, review, post comment
-output.rs       JSON output contract for `pr --json` (OutputFormat, PrReviewOutput envelope, UsageReport, emit_json)
-progress.rs     interactive progress formatting + tracing writer bridge for spinner-safe logs
-reflect.rs      Reflect subcommand: analyze saved session trajectories and synthesize improvements
-gemini_proxy/   local HTTP proxy that translates Gemini API calls to Google Code Assist (feature `antigravity`, off by default)
-azure.rs        Azure AD token auth for Foundry-hosted OpenAI/Anthropic (feature `azure`, off by default)
-codex.rs        ChatGPT/Codex subscription auth — reuses `~/.codex/auth.json`, talks the Codex Responses endpoint
+crates/nitpicker-agent/  — published library crate `nitpicker-agent`
+  lib.rs          public surface: pub mod re-exports, `prelude`, `AgentBuilder`,
+                  `file_agent_tools()`, `client_from_env()`
+  agent.rs        agentic tool-use loop for a single agent (run_agent, AgentConfig, subagents)
+  compact.rs      conversation history compaction
+  llm.rs          LLM client trait, per-provider impls, retry wrapper, AlloyClient
+  tools.rs        tool definitions: read_file, glob, grep, git (Tool trait, all_tools)
+  session.rs      session/trajectory JSONL writers
+  config.rs       TOML config deserialization (Config, ReviewerConfig, AggregatorConfig)
+  provider.rs     build LLM clients from config (build_reviewer_client, provider_from_config)
+  codex.rs        ChatGPT/Codex subscription auth — reuses `~/.codex/auth.json`
+  azure.rs        Azure AD token auth for Foundry-hosted models (feature `azure`, off by default)
+  openrouter.rs   OpenRouter free-model resolution
+  prompts.rs      `subagent_system_prompt()` (the default; overridable per AgentConfig)
+
+src/  — `nitpicker` binary (CLI)
+  main.rs         CLI, config loading, wires everything together
+  review.rs       orchestrates parallel reviewers → aggregation
+  debate.rs       sequential actor/critic debate loop → meta-review
+  pr.rs           GitHub PR subcommand: fetch metadata via gh, review, post comment
+  output.rs       JSON output contract for `pr --json` (OutputFormat, PrReviewOutput, emit_json)
+  progress.rs     interactive progress formatting + tracing writer bridge for spinner-safe logs
+  reflect.rs      Reflect subcommand: analyze saved session trajectories and synthesize improvements
+  detect.rs       provider auto-detection for `init`
+  prompts.rs      review/debate/ask prompts (TaskMode, DebateMode)
+  gemini_proxy/   local HTTP proxy server translating Gemini API → Google Code Assist (feature `antigravity`, off by default)
 ```
+
+### Feature boundary
+
+- `azure` (library): owns the Azure SDK deps (`azure_identity`/`azure_core`) and the `azure.rs`
+  module. The binary's `azure` feature is `["nitpicker-agent/azure"]` — pure forward.
+- `antigravity` (library): code-gate only (no extra deps) — compiles in the config validation
+  for `auth = "agy-keyring"` plus the proxy-URL client hook (`llm::create_gemini_client_with_proxy`).
+  The binary's `antigravity` feature forwards to it **and** adds the proxy *server*
+  (`gemini_proxy/`) with its `axum`/`uuid`/`keyring` deps. The two must be enabled together
+  (forwarding ensures this): enabling it binary-side without the library gate would accept the
+  auth value while the client hook compiled out.
+
+### Customizable prompts (library)
+
+The top-level agent's `system_prompt` and `initial_message` are caller-supplied and injected
+verbatim. The subagent system prompt defaults to `prompts::subagent_system_prompt()` but is
+overridable via `AgentConfig::subagent_system_prompt` (and `AgentBuilder::subagent_system_prompt`);
+the override is inherited by nested subagents. `None` ⇒ the built-in generic prompt.
 
 ### Review flow
 

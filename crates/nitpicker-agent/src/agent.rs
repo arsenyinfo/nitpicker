@@ -86,6 +86,10 @@ pub struct AgentConfig {
     pub max_turns: usize,
     pub compact_threshold: Option<u64>,
     pub system_prompt: String,
+    /// System prompt for spawned subagents. `None` uses the built-in generic prompt
+    /// (`prompts::subagent_system_prompt`); subagents inherit the parent's value so an
+    /// override propagates through nested spawns.
+    pub subagent_system_prompt: Option<String>,
     pub client: Arc<dyn LLMClientDyn>,
     pub depth: AgentDepth,
     pub terminal_tools: Vec<String>,
@@ -684,7 +688,11 @@ fn prepare_subagent(
         model: parent_config.model.clone(),
         max_turns: parent_config.max_turns,
         compact_threshold: parent_config.compact_threshold,
-        system_prompt: subagent_system_prompt().to_string(),
+        system_prompt: parent_config
+            .subagent_system_prompt
+            .clone()
+            .unwrap_or_else(|| subagent_system_prompt().to_string()),
+        subagent_system_prompt: parent_config.subagent_system_prompt.clone(),
         client: Arc::clone(&parent_config.client),
         depth: AgentDepth::Subagent {
             level: subagent_level,

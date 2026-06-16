@@ -1,6 +1,6 @@
 [package]
 name = "nitpicker"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2024"
 # MSRV of the default (azure-off) build. The optional `azure` feature raises the floor to 1.88
 # via azure_core's own rust-version; cargo enforces that when `--features azure` is enabled.
@@ -16,8 +16,10 @@ name = "nitpicker"
 path = "src/main.rs"
 
 [workspace]
+members = ["crates/nitpicker-agent"]
 
 [dependencies]
+nitpicker-agent = { path = "crates/nitpicker-agent", version = "0.1.0" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "time", "sync", "net"] }
 rig-core = "0.38"
 serde = { version = "1", features = ["derive"] }
@@ -46,20 +48,18 @@ tempfile = "3"
 axum = { version = "0.8", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"], optional = true }
-# Azure AD (Entra ID) auth for Foundry-hosted models — opt-in, see `azure` feature below
-azure_identity = { version = "1", optional = true }
-azure_core = { version = "1", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [features]
 # Enables `auth = "azure-ad"` for OpenAI/Anthropic providers (Azure AI Foundry).
-# Off by default: pulls in the Azure SDK (azure_core declares rust-version 1.88). Build with `--features azure`.
-azure = ["dep:azure_identity", "dep:azure_core"]
+# Forwards to the core crate's `azure` feature (which owns the Azure SDK deps). Build with `--features azure`.
+azure = ["nitpicker-agent/azure"]
 # Enables `auth = "agy-keyring"` (Antigravity Gemini via the local proxy in `src/gemini_proxy`).
-# Off by default: pulls in axum + keyring (native crypto/secret-service backends). Build with `--features antigravity`.
-antigravity = ["dep:axum", "dep:uuid", "dep:keyring"]
+# Off by default: pulls in axum + keyring (native crypto/secret-service backends) for the proxy
+# server here, and forwards to the core crate's `antigravity` code-gate. Build with `--features antigravity`.
+antigravity = ["nitpicker-agent/antigravity", "dep:axum", "dep:uuid", "dep:keyring"]
 
 # thin LTO + opt-level "z" trims the binary (~12M → ~8.7M) while keeping clean release
 # builds faster than the no-LTO default; codegen-units stays at the default 16 for build

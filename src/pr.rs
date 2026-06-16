@@ -1,4 +1,4 @@
-use crate::config::Config;
+use nitpicker_agent::config::Config;
 use crate::debate::{self, DebateMode};
 use crate::review::{self, TaskMode};
 use eyre::{Result, WrapErr};
