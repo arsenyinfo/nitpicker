@@ -4,6 +4,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GeminiRequest {
     #[serde(default)]
     pub contents: Vec<Content>,
@@ -70,6 +71,7 @@ pub struct FunctionResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GenerationConfig {
     #[serde(default)]
     pub temperature: Option<f32>,
@@ -103,6 +105,7 @@ pub struct GeminiRequestPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "toolConfig")]
     pub tool_config: Option<Value>,
 }
 
@@ -287,4 +290,43 @@ fn flush_sse_event(events: &mut Vec<Value>, data: &mut String) -> Result<()> {
     }
     data.clear();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserializes_camelcase_request_fields() {
+        // rig-core's Gemini client (the real producer hitting this proxy) serializes camelCase
+        // keys. Without rename_all, these fields silently defaulted to None, dropping the system
+        // prompt and generation params on every request.
+        let body = serde_json::json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+            "systemInstruction": { "role": "system", "parts": [{ "text": "be terse" }] },
+            "generationConfig": { "maxOutputTokens": 42, "topP": 0.9, "topK": 5 },
+            "toolConfig": { "functionCallingConfig": { "mode": "AUTO" } }
+        });
+        let req: GeminiRequest = serde_json::from_value(body).unwrap();
+        assert!(req.system_instruction.is_some(), "systemInstruction dropped");
+        assert!(req.tool_config.is_some(), "toolConfig dropped");
+        let cfg = req.generation_config.expect("generationConfig dropped");
+        assert_eq!(cfg.max_output_tokens, Some(42));
+        assert_eq!(cfg.top_p, Some(0.9));
+        assert_eq!(cfg.top_k, Some(5));
+    }
+
+    #[test]
+    fn outbound_payload_renames_tool_config() {
+        let payload = GeminiRequestPayload {
+            contents: vec![],
+            generation_config: None,
+            system_instruction: None,
+            tools: None,
+            tool_config: Some(serde_json::json!({ "x": 1 })),
+        };
+        let value = serde_json::to_value(&payload).unwrap();
+        assert!(value.get("toolConfig").is_some());
+        assert!(value.get("tool_config").is_none());
+    }
 }
