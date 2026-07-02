@@ -48,10 +48,7 @@ impl SessionLogger {
         }
 
         let home = dirs::home_dir().ok_or_else(|| eyre::eyre!("failed to resolve home directory"))?;
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
+        let ts = now_unix_ms();
         let pid = std::process::id();
         let root = home
             .join(".nitpicker")

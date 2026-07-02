@@ -355,9 +355,6 @@ fn extract_tag(text: &str, tag: &str) -> Option<String> {
     let end_tag = format!("</{tag}>");
     let start = text.find(&start_tag)? + start_tag.len();
     let end = start + text[start..].find(&end_tag)?;
-    if end < start {
-        return None;
-    }
     let content = text[start..end].trim();
     if content.is_empty() {
         None
