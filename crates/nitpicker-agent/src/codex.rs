@@ -513,7 +513,7 @@ fn normalize_codex_function_call_item(item: &mut Value) {
     let replacement = item
         .get("id")
         .and_then(Value::as_str)
-        .filter(|id| !id.starts_with("fc"))
+        .filter(|id| !id.starts_with("fc_"))
         .map(|id| format!("fc_{id}"));
     if let Some(id) = replacement {
         item["id"] = Value::String(id);
@@ -706,6 +706,24 @@ mod tests {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
         let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
         format!("{header}.{payload}.sig")
+    }
+
+    #[test]
+    fn normalize_function_call_id_only_skips_fc_underscore_prefix() {
+        // A non-Codex id that merely starts with the letters "fc" (but not "fc_") must still be
+        // normalized to the `fc_...` shape the backend expects.
+        let mut item = json!({ "id": "fcall_1" });
+        normalize_codex_function_call_item(&mut item);
+        assert_eq!(item["id"], "fc_fcall_1");
+
+        let mut generic = json!({ "id": "toolu_9" });
+        normalize_codex_function_call_item(&mut generic);
+        assert_eq!(generic["id"], "fc_toolu_9");
+
+        // An already-correct id is left untouched (no double-prefixing).
+        let mut already = json!({ "id": "fc_abc" });
+        normalize_codex_function_call_item(&mut already);
+        assert_eq!(already["id"], "fc_abc");
     }
 
     #[test]
