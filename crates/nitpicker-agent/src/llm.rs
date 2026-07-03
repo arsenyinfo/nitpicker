@@ -870,10 +870,10 @@ impl LLMClient for anthropic::Client {
 impl LLMClient for gemini::Client {
     async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
         let model_name = completion.model.clone();
-        let params = GeminiAdditionalParams::from_completion(&completion);
+        let params = build_gemini_additional_params(&completion)?;
         let mut request: rig_core::completion::CompletionRequest = completion.into();
         request.model = Some(model_name.clone());
-        request.additional_params = Some(serde_json::to_value(params)?);
+        request.additional_params = Some(params);
         let model = self.completion_model(model_name.clone());
         let response = model
             .completion(request)
@@ -912,14 +912,22 @@ fn model_needs_max_completion_tokens(model: &str) -> bool {
         || model.starts_with("gpt-5")
 }
 
-pub(crate) fn merge_json(mut base: Value, extra: Value) -> Value {
-    if let (Some(base_obj), Some(extra_obj)) = (base.as_object_mut(), extra.as_object()) {
-        for (k, v) in extra_obj {
-            base_obj.insert(k.clone(), v.clone());
+/// Deep-merge `extra` over `base`: nested objects are merged recursively; on a scalar/type
+/// conflict `extra` wins. Used to overlay computed request params without discarding caller-set
+/// ones (e.g. a Gemini `generation_config` the caller supplied alongside its own keys).
+pub(crate) fn merge_json(base: Value, extra: Value) -> Value {
+    match (base, extra) {
+        (Value::Object(mut base_obj), Value::Object(extra_obj)) => {
+            for (k, v) in extra_obj {
+                let merged = match base_obj.remove(&k) {
+                    Some(existing) => merge_json(existing, v),
+                    None => v,
+                };
+                base_obj.insert(k, merged);
+            }
+            Value::Object(base_obj)
         }
-        base
-    } else {
-        extra
+        (_, extra) => extra,
     }
 }
 
@@ -989,6 +997,18 @@ impl GeminiAdditionalParams {
     }
 }
 
+/// Overlay the computed generation config onto any caller-supplied `additional_params` instead of
+/// replacing them, mirroring the OpenAI path's `merge_json`. The computed value wins on conflict
+/// (e.g. the typed `max_tokens`), while caller keys like safety settings or a nested
+/// `generation_config.temperature` survive.
+fn build_gemini_additional_params(completion: &Completion) -> Result<Value> {
+    let computed = serde_json::to_value(GeminiAdditionalParams::from_completion(completion))?;
+    Ok(match &completion.additional_params {
+        Some(existing) => merge_json(existing.clone(), computed),
+        None => computed,
+    })
+}
+
 #[derive(Debug, Serialize, Default)]
 struct GenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1010,6 +1030,7 @@ fn map_gemini_finish_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     /// Reproduce how a provider 401 actually reaches the retry layer: rig surfaces the raw
     /// response body as `ProviderError`, and the per-provider `completion` impls wrap it with
@@ -1020,6 +1041,58 @@ mod tests {
         Err::<(), _>(inner)
             .wrap_err("Anthropic completion failed for model 'claude'")
             .unwrap_err()
+    }
+
+    fn gemini_completion(max_tokens: Option<u64>, additional_params: Option<Value>) -> Completion {
+        Completion {
+            model: "gemini-3-pro".to_string(),
+            prompt: Message::user("hi".to_string()),
+            preamble: None,
+            history: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            max_tokens,
+            additional_params,
+        }
+    }
+
+    #[test]
+    fn merge_json_is_deep_and_extra_wins() {
+        // nested objects merge recursively; scalar conflicts resolve to `extra`.
+        let merged = merge_json(
+            json!({"generation_config": {"temperature": 0.2}, "a": 1}),
+            json!({"generation_config": {"max_output_tokens": 50}, "a": 2}),
+        );
+        assert_eq!(
+            merged,
+            json!({"generation_config": {"temperature": 0.2, "max_output_tokens": 50}, "a": 2})
+        );
+    }
+
+    #[test]
+    fn gemini_params_preserve_caller_config() {
+        // A caller's safety settings and nested generation_config must survive the computed overlay.
+        let params = build_gemini_additional_params(&gemini_completion(
+            Some(50),
+            Some(json!({
+                "generation_config": {"temperature": 0.2},
+                "safetySettings": [{"category": "HARM", "threshold": "NONE"}]
+            })),
+        ))
+        .unwrap();
+        assert_eq!(
+            params,
+            json!({
+                "generation_config": {"temperature": 0.2, "max_output_tokens": 50},
+                "safetySettings": [{"category": "HARM", "threshold": "NONE"}]
+            })
+        );
+    }
+
+    #[test]
+    fn gemini_params_none_yields_generation_config_only() {
+        let params = build_gemini_additional_params(&gemini_completion(Some(50), None)).unwrap();
+        assert_eq!(params, json!({"generation_config": {"max_output_tokens": 50}}));
     }
 
     #[test]
