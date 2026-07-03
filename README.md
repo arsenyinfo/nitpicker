@@ -360,6 +360,9 @@ println!("{}", result.text);
 
 ## Changelog
 
+**0.8.1** — 2026-07-03
+- Bumped `rig-core` to 0.39. rig 0.39 lowers assistant text into a valid Responses shape natively (a bare-string `AssistantInput` for the id-less messages nitpicker builds), so the Codex request path no longer rewrites assistant text blocks to `output_text` — it now only normalizes function-call ids and missing `call_id`s. No behavior change.
+
 **0.8.0** — 2026-06-16
 - Split the agentic core into a separate publishable library crate, [`nitpicker-agent`](crates/nitpicker-agent) (`crates/nitpicker-agent`). The `nitpicker` binary now depends on it; behavior is unchanged. The library exposes the agent loop, file/git tools, and provider-agnostic LLM clients without the CLI/review/PR machinery — see "Using the agent as a library" above.
 - Added `AgentConfig::subagent_system_prompt` so callers can customize the prompt spawned subagents run with (propagates through nested spawns); `None` keeps the previous generic prompt.

@@ -500,29 +500,13 @@ fn normalize_codex_responses_request(body: &mut Value) {
     }
 }
 
+// rig 0.39 lowers assistant text into a valid Responses shape itself (a bare-string
+// `AssistantInput` when the message has no id — nitpicker's only case — or an `output_text`
+// array when it does), so no assistant-content rewrite is needed here. Only function-call item
+// ids still need the `fc_` normalization for cross-provider (Alloy) replay.
 fn normalize_codex_input_item(item: &mut Value) {
-    match item.get("type").and_then(Value::as_str) {
-        Some("function_call") => normalize_codex_function_call_item(item),
-        _ => normalize_codex_message_item(item),
-    }
-}
-
-fn normalize_codex_message_item(item: &mut Value) {
-    if item.get("role").and_then(Value::as_str) != Some("assistant") {
-        return;
-    }
-    let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) else {
-        return;
-    };
-    for part in content {
-        match part.get("type").and_then(Value::as_str) {
-            Some("input_text" | "text") => {
-                if let Some(map) = part.as_object_mut() {
-                    map.insert("type".to_string(), Value::String("output_text".to_string()));
-                }
-            }
-            _ => {}
-        }
+    if item.get("type").and_then(Value::as_str) == Some("function_call") {
+        normalize_codex_function_call_item(item);
     }
 }
 
@@ -952,36 +936,11 @@ mod tests {
     }
 
     #[test]
-    fn body_value_rewrites_assistant_text_shape_for_codex() {
-        let mut body = json!({
-            "input": [
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [
-                        { "type": "input_text", "text": "from another provider" },
-                        { "type": "text", "text": "legacy text shape" },
-                        { "type": "refusal", "refusal": "no" }
-                    ]
-                },
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": [{ "type": "input_text", "text": "keep user input shape" }]
-                }
-            ]
-        });
-
-        normalize_codex_responses_request(&mut body);
-
-        assert_eq!(body["input"][0]["content"][0]["type"], "output_text");
-        assert_eq!(body["input"][0]["content"][1]["type"], "output_text");
-        assert_eq!(body["input"][0]["content"][2]["type"], "refusal");
-        assert_eq!(body["input"][1]["content"][0]["type"], "input_text");
-    }
-
-    #[test]
-    fn body_value_uses_output_text_for_assistant_text_history() {
+    fn body_value_preserves_assistant_text_history() {
+        // An id-less assistant message (nitpicker's only shape — `.message()` sets `id: None`,
+        // including for Alloy histories from non-Responses providers) must survive lowering into a
+        // valid Codex Responses item. rig 0.39 emits the bare-string `AssistantInput` shape, so the
+        // text is carried verbatim as the item's `content`.
         let completion = Completion {
             model: "gpt-5.5".to_string(),
             prompt: Message::user("continue"),
@@ -1004,7 +963,7 @@ mod tests {
             .find(|item| item.get("role").and_then(Value::as_str) == Some("assistant"))
             .unwrap();
 
-        assert_eq!(assistant_message["content"][0]["type"], "output_text");
+        assert_eq!(assistant_message["content"], "previous answer");
     }
 
     #[test]
