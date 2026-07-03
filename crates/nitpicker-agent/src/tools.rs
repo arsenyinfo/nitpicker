@@ -159,12 +159,10 @@ pub fn all_tools() -> HashMap<String, Arc<dyn Tool>> {
 }
 
 pub fn reflect_tools() -> HashMap<String, Arc<dyn Tool>> {
-    let tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ReadFileTool),
-        Arc::new(GlobTool),
-        Arc::new(GrepTool),
-    ];
-    tools.into_iter().map(|tool| (tool.name(), tool)).collect()
+    // Reflection has no repo checkout to run git against, so it gets every tool except git.
+    let mut tools = all_tools();
+    tools.remove("git");
+    tools
 }
 
 pub fn tool_definitions(tools: &HashMap<String, Arc<dyn Tool>>) -> Vec<ToolDefinition> {
@@ -735,6 +733,18 @@ mod tests {
         assert!(check("tag -d v1").is_err());
         // even pure listing forms are rejected — the model is steered to for-each-ref
         assert!(check("branch --list").is_err());
+    }
+
+    #[test]
+    fn reflect_tools_is_all_tools_minus_git() {
+        use std::collections::HashSet;
+        let all: HashSet<String> = super::all_tools().into_keys().collect();
+        let reflect: HashSet<String> = super::reflect_tools().into_keys().collect();
+        assert!(all.contains("git"));
+        // Exact set equality pins the derivation: any tool added to all_tools() that isn't git must
+        // also appear in reflect_tools(), or this fails.
+        let expected: HashSet<String> = all.iter().filter(|k| *k != "git").cloned().collect();
+        assert_eq!(reflect, expected);
     }
 
     #[test]
