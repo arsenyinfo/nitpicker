@@ -18,7 +18,9 @@ pub fn floor_char_boundary(s: &str, pos: usize) -> usize {
     // We need to find a byte that is NOT a continuation byte
     let bytes = s.as_bytes();
     for i in (0..=pos).rev() {
-        if i == 0 || (bytes[i] & 0xC0) != 0x80 {
+        // `i == s.len()` is the end-of-string boundary (matches std's `str::floor_char_boundary`)
+        // and must be checked before indexing, since `bytes[s.len()]` is out of bounds.
+        if i == s.len() || i == 0 || (bytes[i] & 0xC0) != 0x80 {
             return i;
         }
     }
@@ -625,8 +627,19 @@ impl Tool for GitTool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ALLOWED_GIT_SUBCOMMANDS, ReadFileTool, Tool, ensure_readonly_git};
+    use super::{ALLOWED_GIT_SUBCOMMANDS, ReadFileTool, Tool, ensure_readonly_git, floor_char_boundary};
     use serde_json::json;
+
+    #[test]
+    fn floor_char_boundary_handles_end_and_past_end() {
+        // pos beyond the end must not panic and clamps to len (the end is a valid boundary).
+        assert_eq!(floor_char_boundary("héllo", 100), "héllo".len());
+        assert_eq!(floor_char_boundary("abc", 3), 3);
+        assert_eq!(floor_char_boundary("", 5), 0);
+        // 'é' occupies bytes 1..=2; pos 2 is mid-character and floors back to its start (1).
+        assert_eq!(floor_char_boundary("héllo", 2), 1);
+        assert_eq!(floor_char_boundary("héllo", 1), 1);
+    }
 
     /// Mirror the two gates GitTool applies: subcommand allowlist, then read-only argument check.
     fn check(cmd: &str) -> Result<(), String> {

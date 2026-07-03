@@ -22,7 +22,7 @@ use tokio::sync::Semaphore;
 const MAX_CONCURRENT_REVIEWERS: usize = 8;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{error, info, warn};
 
 pub struct ReviewOutcome {
     pub report: String,
@@ -177,13 +177,13 @@ pub async fn run_review(
             }
             Ok(Err(err)) => {
                 rendered.push(format!("## {name} review\n\n*Failed: {err:#}*"));
-                info!(reviewer = %name, error = ?err, "review failed");
+                warn!(reviewer = %name, error = ?err, "review failed");
             }
             Err(err) => {
                 rendered.push(format!(
                     "## {name} review\n\n*Failed (task panicked): {err:#}*"
                 ));
-                info!(reviewer = %name, error = ?err, "reviewer task panicked");
+                error!(reviewer = %name, error = ?err, "reviewer task panicked");
             }
         }
     }

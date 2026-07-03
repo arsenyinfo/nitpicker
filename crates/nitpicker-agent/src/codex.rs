@@ -38,6 +38,23 @@ const EXPIRY_SKEW: Duration = Duration::from_secs(60);
 /// Bound the token refresh so a stalled auth request can't pin the token mutex (and thus every
 /// concurrent completion sharing the client) indefinitely.
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Give up establishing a connection after this long (dead host / no route).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Abort a stalled response: if no bytes arrive for this long, the connection is hung. This is an
+/// idle (per-read) timeout, not a total cap, so a legitimately long streaming turn is not aborted
+/// as long as it keeps making progress — but a hung completion can no longer pin an
+/// `llm_semaphore` permit indefinitely.
+const READ_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Shared reqwest client for the Codex endpoints, configured so a hung connection can't pin a
+/// shared concurrency permit forever (`reqwest::Client::new()` sets no timeouts).
+fn build_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
+        .build()
+        .wrap_err("building Codex HTTP client")
+}
 
 fn user_agent() -> String {
     format!(
@@ -277,7 +294,7 @@ impl CodexClient {
         let path = auth_path()?;
         let tokens = load_tokens(&path)?;
         Ok(Self {
-            http: reqwest::Client::new(),
+            http: build_http_client()?,
             auth_path: path,
             tokens: Mutex::new(tokens),
         })
