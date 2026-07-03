@@ -131,7 +131,9 @@ struct PrMeta {
 
 #[derive(Deserialize)]
 struct PrComment {
-    author: PrCommentAuthor,
+    // A comment from a deleted/ghost GitHub account has `author: null`; keep it optional so one
+    // such comment doesn't fail the whole comments-list deserialize and abort the run.
+    author: Option<PrCommentAuthor>,
     body: String,
 }
 
@@ -467,10 +469,12 @@ fn build_pr_prompt(
     if !comments.is_empty() {
         let mut comments_section = String::from("## PR Comments\n");
         for comment in comments {
-            comments_section.push_str(&format!(
-                "**{}**: {}\n\n",
-                comment.author.login, comment.body
-            ));
+            let login = comment
+                .author
+                .as_ref()
+                .map(|a| a.login.as_str())
+                .unwrap_or("[deleted]");
+            comments_section.push_str(&format!("**{}**: {}\n\n", login, comment.body));
         }
         parts.push(comments_section);
     }
@@ -766,4 +770,21 @@ async fn run_review_inner(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PrComment;
+
+    #[test]
+    fn pr_comments_tolerate_null_author() {
+        // gh represents a deleted/ghost account's comment as `author: null`; one such comment must
+        // not fail the whole comments-list deserialize and abort the run.
+        let comments: Vec<PrComment> = serde_json::from_str(
+            r#"[{"author":null,"body":"hi"},{"author":{"login":"octocat"},"body":"yo"}]"#,
+        )
+        .expect("null author must deserialize");
+        assert!(comments[0].author.is_none());
+        assert_eq!(comments[1].author.as_ref().unwrap().login, "octocat");
+    }
 }
