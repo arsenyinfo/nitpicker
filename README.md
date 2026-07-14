@@ -94,18 +94,18 @@ max_turns = 100        # optional, default: 100
 log_trajectories = false # optional, default: false
 
 [aggregator]
-model = "claude-sonnet-4-6"
+model = "claude-sonnet-5"
 provider = "anthropic"
 max_tokens = 8192        # optional, default: 8192
 
 [[reviewer]]
 name = "claude"          # used in output headers and logs
-model = "claude-sonnet-4-6"
+model = "claude-sonnet-5"
 provider = "anthropic"
 
 [[reviewer]]
 name = "gpt"
-model = "gpt-5.2-codex"
+model = "gpt-5.6-sol"
 provider = "openai_compatible"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
@@ -218,7 +218,7 @@ auth = "agy-keyring"
 
 Under the hood this talks to the Codex subscription endpoint (`chatgpt.com/backend-api/codex/responses`), which speaks the OpenAI Responses API with subscription-specific quirks (a required top-level system prompt, mandatory streaming, `store: false`, no `max_output_tokens`, and encrypted reasoning items round-tripped across turns since nothing is server-side persisted); nitpicker handles all of that transparently. No API-key env var is needed.
 
-Models are your subscription's Codex models (e.g. `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`):
+Models are your subscription's Codex models (e.g. `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`):
 
 ```toml
 [aggregator]
@@ -349,7 +349,7 @@ use nitpicker_agent::prelude::*;
 use std::path::Path;
 
 let client = client_from_env(LLMProvider::Anthropic { base_url: None, api_key_env: None })?;
-let result = AgentBuilder::new("explorer", "claude-sonnet-4-6", "You explore codebases.", client)
+let result = AgentBuilder::new("explorer", "claude-sonnet-5", "You explore codebases.", client)
     .subagent_system_prompt("You are a focused file-reading worker. Report findings concisely.")
     .run("Map the module layout of this repo.", &file_agent_tools(), Path::new("."))
     .await?;
@@ -359,6 +359,13 @@ println!("{}", result.text);
 `file_agent_tools()` is the read-only file/git toolset plus `spawn_subagent`. You control the top-level prompt, the subagent prompt, the toolset, and the client; config-file-driven client construction is available via the `config`/`provider` modules. See `crates/nitpicker-agent/examples/file_agent.rs`.
 
 ## Changelog
+
+**0.8.2** — 2026-07-14 (`nitpicker-agent` 0.1.2)
+- Debate subagents no longer inherit the parent's terminal tools (`submit_verdict`), closing a path where a subagent could overwrite the parent's verdict and falsely converge a debate.
+- History compaction runs under a dedicated summarizer system prompt instead of the agent's role prompt (which ordered tool calls unavailable during summarization); the role prompt is embedded as reference-only material.
+- Project context (`CLAUDE.md`/`AGENTS.md`) is wrapped in a `<context-only>` tag marking it as repository-authored reference, not instructions; literal closing tags in the content are neutralized so it can't forge the boundary.
+- The parallel aggregator now receives the original review task alongside the reviewer outputs.
+- New `ReviewScope` (`Diff`/`Static`): `--analyze` drops change-attribution rules ("post-change code", "fixes the diff landed") in favor of impact-based static-analysis framing across reviewer, validator, and aggregator prompts.
 
 **0.8.1** — 2026-07-03
 - Bumped `rig-core` to 0.39. rig 0.39 lowers assistant text into a valid Responses shape natively (a bare-string `AssistantInput` for the id-less messages nitpicker builds), so the Codex request path no longer rewrites assistant text blocks to `output_text` — it now only normalizes function-call ids and missing `call_id`s. No behavior change.

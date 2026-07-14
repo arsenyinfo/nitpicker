@@ -196,7 +196,7 @@ pub async fn run_review(
     }
 
     let combined = rendered.join("\n\n---\n\n");
-    let reduce_prompt = mode.reduce_prompt(&combined);
+    let reduce_prompt = mode.reduce_prompt(user_prompt, &combined);
 
     let pb_agg = mp.add(ProgressBar::new_spinner());
     pb_agg.set_style(spinner_style);

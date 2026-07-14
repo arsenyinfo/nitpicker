@@ -1,5 +1,6 @@
 use nitpicker_agent::config::Config;
 use crate::debate::{self, DebateMode};
+use crate::prompts::ReviewScope;
 use crate::review::{self, TaskMode};
 use eyre::{Result, WrapErr};
 use serde::Deserialize;
@@ -695,7 +696,7 @@ async fn run_review_inner(
                 max_rounds: args.rounds,
                 max_turns,
                 verbose,
-                mode: DebateMode::Review,
+                mode: DebateMode::Review(ReviewScope::Diff),
                 alloy: use_alloy,
                 format,
             },
@@ -709,7 +710,7 @@ async fn run_review_inner(
             config,
             max_turns,
             verbose,
-            TaskMode::Review,
+            TaskMode::Review(ReviewScope::Diff),
         )
         .await?;
         (outcome.report, std::path::PathBuf::new(), outcome.usage)

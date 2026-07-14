@@ -50,14 +50,15 @@ fn priority_index(name: &str) -> usize {
 static ANTHROPIC: ProviderDef = ProviderDef {
     name: "anthropic",
     provider: "anthropic",
-    model: "claude-sonnet-4-6",
+    model: "claude-sonnet-5",
     base_url: None,
     api_key_env: "ANTHROPIC_API_KEY",
 };
 static OPENAI: ProviderDef = ProviderDef {
     name: "openai",
     provider: "openai",
-    model: "gpt-5.5",
+    // flagship tier; cheaper tiers: gpt-5.6-terra, gpt-5.6-luna
+    model: "gpt-5.6-sol",
     base_url: None,
     api_key_env: "OPENAI_API_KEY",
 };
@@ -243,7 +244,7 @@ fn detect_codex() -> Option<Detected> {
     nitpicker_agent::codex::auth_available().then(|| Detected {
         name: "codex",
         provider: "openai",
-        model: "gpt-5.5".to_string(),
+        model: "gpt-5.6-sol".to_string(),
         base_url: None,
         api_key_env: None,
         auth: Some("codex"),

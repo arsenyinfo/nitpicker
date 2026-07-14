@@ -19,7 +19,7 @@ async fn main() -> eyre::Result<()> {
 
     let result = AgentBuilder::new(
         "explorer",
-        "claude-sonnet-4-6",
+        "claude-sonnet-5",
         "You explore codebases.",
         client,
     )
