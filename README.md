@@ -105,7 +105,7 @@ provider = "anthropic"
 
 [[reviewer]]
 name = "gpt"
-model = "gpt-5.6"
+model = "gpt-5.6-sol"
 provider = "openai_compatible"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
@@ -218,7 +218,7 @@ auth = "agy-keyring"
 
 Under the hood this talks to the Codex subscription endpoint (`chatgpt.com/backend-api/codex/responses`), which speaks the OpenAI Responses API with subscription-specific quirks (a required top-level system prompt, mandatory streaming, `store: false`, no `max_output_tokens`, and encrypted reasoning items round-tripped across turns since nothing is server-side persisted); nitpicker handles all of that transparently. No API-key env var is needed.
 
-Models are your subscription's Codex models (e.g. `gpt-5.6`, `gpt-5.6-terra`, `gpt-5.6-luna`):
+Models are your subscription's Codex models (e.g. `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`):
 
 ```toml
 [aggregator]

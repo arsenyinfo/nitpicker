@@ -57,8 +57,8 @@ static ANTHROPIC: ProviderDef = ProviderDef {
 static OPENAI: ProviderDef = ProviderDef {
     name: "openai",
     provider: "openai",
-    // alias for the flagship tier (gpt-5.6-sol); cheaper tiers: gpt-5.6-terra, gpt-5.6-luna
-    model: "gpt-5.6",
+    // flagship tier; cheaper tiers: gpt-5.6-terra, gpt-5.6-luna
+    model: "gpt-5.6-sol",
     base_url: None,
     api_key_env: "OPENAI_API_KEY",
 };
@@ -244,7 +244,7 @@ fn detect_codex() -> Option<Detected> {
     nitpicker_agent::codex::auth_available().then(|| Detected {
         name: "codex",
         provider: "openai",
-        model: "gpt-5.6".to_string(),
+        model: "gpt-5.6-sol".to_string(),
         base_url: None,
         api_key_env: None,
         auth: Some("codex"),
