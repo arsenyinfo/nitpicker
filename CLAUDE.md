@@ -88,7 +88,7 @@ src/  — `nitpicker` binary (CLI)
   progress.rs     interactive progress formatting + tracing writer bridge for spinner-safe logs
   reflect.rs      Reflect subcommand: analyze saved session trajectories and synthesize improvements
   detect.rs       provider auto-detection for `init`
-  prompts.rs      review/debate/ask prompts (TaskMode, DebateMode)
+  prompts.rs      review/debate/ask prompts (TaskMode, DebateMode, ReviewScope)
   gemini_proxy/   local HTTP proxy server translating Gemini API → Google Code Assist (feature `antigravity`, off by default)
 ```
 
@@ -114,7 +114,7 @@ the override is inherited by nested subagents. `None` ⇒ the built-in generic p
 
 1. `review.rs` spawns one `tokio::task` per `[[reviewer]]` in config
 2. Each task runs `agent.rs::run_agent` — an agentic loop: call LLM → execute tool calls → feed results back → repeat until the model returns text (default max 100 turns, overrideable via config/CLI)
-3. All reviewer outputs are collected, concatenated, and sent to the aggregator model in a single completion call. If **every** reviewer failed, `run_review` bails before the aggregator (a panicked task keeps its name in the report) — synthesizing a verdict from nothing but failure notes would fabricate a confident review; in `pr --json` this surfaces as `status: "error"` and no comment is posted
+3. All reviewer outputs are collected, concatenated, and sent to the aggregator model in a single completion call, prefixed with the original task so the aggregator knows what the run was reviewing. If **every** reviewer failed, `run_review` bails before the aggregator (a panicked task keeps its name in the report) — synthesizing a verdict from nothing but failure notes would fabricate a confident review; in `pr --json` this surfaces as `status: "error"` and no comment is posted
 4. The aggregator's response is printed to stdout. `ReviewOutcome.degraded` (some but not all reviewers failed) makes the default-review/`ask` arms exit 3 after printing — stdout is flushed first since `process::exit` skips teardown (contract: 0 clean / 1 hard failure / 3 degraded; 2 is clap's usage-error code, deliberately unused; `pr`'s exit-code/JSON contract unchanged)
 
 ### Debate flow (default review mode and `ask`)
@@ -126,7 +126,7 @@ the override is inherited by nested subagents. `None` ⇒ the built-in generic p
 5. Interactive text mode shows cast/progress lines while running; non-interactive stdout stays final-verdict-only for subprocess callers. In a terminal, `--verbose` also prints the intermediate debate text and transcript path. `DebateOutcome.degraded` (any turn failed or ended without calling `submit_verdict`, detected at the verdict-store `take()` — `None` means fallback) → exit 3 in the default-review/`ask` arms, same contract as the review flow
 6. Transcript saved to the OS temp dir as `debate-{ts}.md` (topic) or `review-debate-{ts}.md` (code review)
 7. `DebateMode::Topic` (from `ask`) uses Actor/Critic roles and general debate prompts
-8. `DebateMode::Review` (from default review mode) uses Reviewer/Validator roles and code-review-focused prompts
+8. `DebateMode::Review` (from default review mode) uses Reviewer/Validator roles and code-review-focused prompts. Both it and `TaskMode::Review` carry a `ReviewScope` (`Diff` vs `Static`): diff review keeps the change-attribution rules ("post-change code", "fixes the diff landed"), `--analyze` swaps them for impact-based static-analysis framing
 
 **Alloy mode** (`--alloy` / `defaults.alloy = true`): instead of pinning actor and critic to `reviewer[0]`/`reviewer[1]`, builds an `AlloyClient` that randomly selects from all configured reviewer models each turn. Requires ≥ 2 reviewers. Mixed-provider histories must stay provider-portable; the Codex boundary normalizes missing Responses `call_id`s from generic tool-call ids before lowering.
 
@@ -138,6 +138,9 @@ the override is inherited by nested subagents. `None` ⇒ the built-in generic p
 - Concurrent in-flight LLM calls are bounded by a shared `llm_semaphore` (`MAX_CONCURRENT_LLM_CALLS`, default 16), acquired only around each `completion()` call — never held across a subagent spawn, so a blocking acquire bounds account-wide provider concurrency without deadlock. Shared across all reviewers + subagents in `review.rs`; per-turn in `debate.rs` (debate turns never overlap)
 - Reviewers can delegate deeper investigations via `spawn_subagent`
 - Subagent depth is capped at 2 to bound recursion and cost
+- Subagents never inherit the parent's terminal tools (e.g. debate's `submit_verdict`, which writes into parent-owned verdict state and could falsely converge a debate) — they terminate via their own per-run `finish` tool
+- Project context (`CLAUDE.md`/`AGENTS.md`) is appended to the system prompt wrapped in a `<context-only>` tag that marks it as repository-authored reference material, not instructions — it is target-controlled content in `pr` mode
+- Compaction runs under a dedicated summarizer system prompt; the agent's role prompt (which orders tool calls that are unavailable during summarization) is embedded in the compaction request as reference-only material
 - Subagents return results through a hidden `finish(result)` tool; debate agents use `submit_verdict(verdict, agree)` instead. A terminal tool only ends the loop when it **actually ran** (not cycle-blocked, not errored) — a blocked/malformed terminal call never populated the verdict/finish store, so terminating on it would return an empty result; instead the agent gets another turn to retry
 - Repetitive tool-call cycles are blocked, and the agent can force a context reset to break out of loops
 - Session-log appends are serialized by a shared mutex and written as a single buffer (`session.rs`), so a concurrent subagent wave sharing a writer can't interleave partial lines

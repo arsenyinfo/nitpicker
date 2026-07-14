@@ -242,6 +242,10 @@ async fn main() -> Result<()> {
     let config = load_resolved_config(args.common.config.as_deref(), &repo).await?;
     let max_turns = config.max_turns(args.max_turns)?;
 
+    let scope = match args.analyze {
+        Some(_) => prompts::ReviewScope::Static,
+        None => prompts::ReviewScope::Diff,
+    };
     let prompt = if let Some(path) = args.analyze {
         let path_opt = if path.as_os_str().is_empty() {
             None
@@ -278,7 +282,7 @@ async fn main() -> Result<()> {
                 max_rounds: args.rounds,
                 max_turns,
                 verbose: args.common.verbose,
-                mode: debate::DebateMode::Review,
+                mode: debate::DebateMode::Review(scope),
                 alloy: use_alloy,
                 format: output::OutputFormat::Text,
             },
@@ -297,7 +301,7 @@ async fn main() -> Result<()> {
             &config,
             max_turns,
             args.common.verbose,
-            review::TaskMode::Review,
+            review::TaskMode::Review(scope),
         )
         .await?;
         println!("{}", outcome.report);

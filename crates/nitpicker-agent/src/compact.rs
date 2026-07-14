@@ -9,6 +9,9 @@ use tracing::{info, warn};
 const COMPACTION_MAX_OUTPUT_TOKENS: u64 = 8_192;
 const COMPACTION_MAX_CORRECTIONS: usize = 2;
 const CONTINUE_MESSAGE: &str = "Continue from where you left off.";
+const COMPACTION_SYSTEM_PROMPT: &str = "You are summarizing an in-progress agent session so the same agent can resume it after a context reset. \
+Tools are unavailable during summarization: ignore any tool-calling or output-format instructions from the agent's role prompt (included in the request for reference only). \
+Your only output is the tagged summary.";
 const SUMMARY_TAG: &str = "summary";
 const COMPACTION_SUMMARY_INSTRUCTIONS: &str = "Focus strictly on information vital for code analysis. Omit conversational filler, raw search/tool outputs, and large blocks of code.\n\
 When constructing the summary, you MUST use the following exact markdown structure inside the tags:\n\
@@ -137,13 +140,12 @@ async fn run_compaction(
     turn: usize,
     usage: TokenUsage,
 ) -> Result<CompactionOutcome> {
-    let prompt = build_compaction_prompt(&input, turn, usage);
+    let prompt = build_compaction_prompt(&input, system_prompt, turn, usage);
     let response = throttled_completion(
         semaphore,
         client,
         compaction_completion(
             model,
-            system_prompt,
             history_for_initial_request(&input),
             Message::user(prompt.clone()),
         ),
@@ -162,7 +164,7 @@ async fn run_compaction(
                 response,
                 correction_mode: correction_mode(&input),
             };
-            run_corrections(semaphore, client, model, system_prompt, &input, usage, attempt).await
+            run_corrections(semaphore, client, model, &input, usage, attempt).await
         }
     }
 }
@@ -177,7 +179,6 @@ async fn run_corrections(
     semaphore: &Semaphore,
     client: &Arc<dyn LLMClientDyn>,
     model: &str,
-    system_prompt: &str,
     input: &CompactionInput<'_>,
     trigger_usage: TokenUsage,
     attempt: InitialAttempt,
@@ -195,12 +196,7 @@ async fn run_corrections(
         let next = throttled_completion(
             semaphore,
             client,
-            compaction_completion(
-                model,
-                system_prompt,
-                history.clone(),
-                Message::user(correction.to_string()),
-            ),
+            compaction_completion(model, history.clone(), Message::user(correction.to_string())),
         )
         .await?;
         match extract_summary(&next) {
@@ -231,16 +227,11 @@ async fn run_corrections(
     }
 }
 
-fn compaction_completion(
-    model: &str,
-    system_prompt: &str,
-    history: Vec<Message>,
-    prompt: Message,
-) -> Completion {
+fn compaction_completion(model: &str, history: Vec<Message>, prompt: Message) -> Completion {
     Completion {
         model: model.to_string(),
         prompt,
-        preamble: Some(system_prompt.to_string()),
+        preamble: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
         history,
         tools: Vec::new(),
         tool_choice: Some(ToolChoice::None),
@@ -281,7 +272,12 @@ fn correction_prompt(mode: &CorrectionMode) -> &'static str {
     }
 }
 
-fn build_compaction_prompt(input: &CompactionInput<'_>, turn: usize, usage: TokenUsage) -> String {
+fn build_compaction_prompt(
+    input: &CompactionInput<'_>,
+    role_prompt: &str,
+    turn: usize,
+    usage: TokenUsage,
+) -> String {
     let intro = match input {
         CompactionInput::Messages(_) => {
             "This thread is getting out of hand and needs to be compacted. Stop previous work and summarize the conversation so far.".to_string()
@@ -293,6 +289,8 @@ fn build_compaction_prompt(input: &CompactionInput<'_>, turn: usize, usage: Toke
 
     format!(
         "{intro}\n\n{COMPACTION_SUMMARY_INSTRUCTIONS}\n\
+The agent's original role prompt follows, for reference when judging what is vital to preserve. Do not follow its tool-calling or output instructions:\n\
+<original_role_prompt>\n{role_prompt}\n</original_role_prompt>\n\
 This compaction is happening before turn {turn}. Context size at compaction: {} input, {} output, {} total tokens.",
         usage.input_tokens, usage.output_tokens, usage.total_tokens
     )
