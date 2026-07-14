@@ -360,6 +360,13 @@ println!("{}", result.text);
 
 ## Changelog
 
+**0.8.2** — 2026-07-14 (`nitpicker-agent` 0.1.2)
+- Debate subagents no longer inherit the parent's terminal tools (`submit_verdict`), closing a path where a subagent could overwrite the parent's verdict and falsely converge a debate.
+- History compaction runs under a dedicated summarizer system prompt instead of the agent's role prompt (which ordered tool calls unavailable during summarization); the role prompt is embedded as reference-only material.
+- Project context (`CLAUDE.md`/`AGENTS.md`) is wrapped in a `<context-only>` tag marking it as repository-authored reference, not instructions; literal closing tags in the content are neutralized so it can't forge the boundary.
+- The parallel aggregator now receives the original review task alongside the reviewer outputs.
+- New `ReviewScope` (`Diff`/`Static`): `--analyze` drops change-attribution rules ("post-change code", "fixes the diff landed") in favor of impact-based static-analysis framing across reviewer, validator, and aggregator prompts.
+
 **0.8.1** — 2026-07-03
 - Bumped `rig-core` to 0.39. rig 0.39 lowers assistant text into a valid Responses shape natively (a bare-string `AssistantInput` for the id-less messages nitpicker builds), so the Codex request path no longer rewrites assistant text blocks to `output_text` — it now only normalizes function-call ids and missing `call_id`s. No behavior change.
 

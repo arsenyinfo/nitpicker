@@ -1,6 +1,6 @@
 [package]
 name = "nitpicker-agent"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 # Matches the workspace floor; the optional `azure` feature raises it to 1.88 via azure_core.
 rust-version = "1.85"
