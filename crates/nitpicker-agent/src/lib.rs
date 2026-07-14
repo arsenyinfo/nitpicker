@@ -10,7 +10,7 @@
 //!
 //! # async fn run() -> eyre::Result<()> {
 //! let client = client_from_env(LLMProvider::Anthropic { base_url: None, api_key_env: None })?;
-//! let result = AgentBuilder::new("explorer", "claude-sonnet-4-6", "You explore codebases.", client)
+//! let result = AgentBuilder::new("explorer", "claude-sonnet-5", "You explore codebases.", client)
 //!     .subagent_system_prompt("You are a focused file-reading worker. Report findings concisely.")
 //!     .run("Map the module layout of this repo.", &file_agent_tools(), Path::new("."))
 //!     .await?;

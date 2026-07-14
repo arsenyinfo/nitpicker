@@ -94,18 +94,18 @@ max_turns = 100        # optional, default: 100
 log_trajectories = false # optional, default: false
 
 [aggregator]
-model = "claude-sonnet-4-6"
+model = "claude-sonnet-5"
 provider = "anthropic"
 max_tokens = 8192        # optional, default: 8192
 
 [[reviewer]]
 name = "claude"          # used in output headers and logs
-model = "claude-sonnet-4-6"
+model = "claude-sonnet-5"
 provider = "anthropic"
 
 [[reviewer]]
 name = "gpt"
-model = "gpt-5.2-codex"
+model = "gpt-5.6"
 provider = "openai_compatible"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
@@ -218,7 +218,7 @@ auth = "agy-keyring"
 
 Under the hood this talks to the Codex subscription endpoint (`chatgpt.com/backend-api/codex/responses`), which speaks the OpenAI Responses API with subscription-specific quirks (a required top-level system prompt, mandatory streaming, `store: false`, no `max_output_tokens`, and encrypted reasoning items round-tripped across turns since nothing is server-side persisted); nitpicker handles all of that transparently. No API-key env var is needed.
 
-Models are your subscription's Codex models (e.g. `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`):
+Models are your subscription's Codex models (e.g. `gpt-5.6`, `gpt-5.6-terra`, `gpt-5.6-luna`):
 
 ```toml
 [aggregator]
@@ -349,7 +349,7 @@ use nitpicker_agent::prelude::*;
 use std::path::Path;
 
 let client = client_from_env(LLMProvider::Anthropic { base_url: None, api_key_env: None })?;
-let result = AgentBuilder::new("explorer", "claude-sonnet-4-6", "You explore codebases.", client)
+let result = AgentBuilder::new("explorer", "claude-sonnet-5", "You explore codebases.", client)
     .subagent_system_prompt("You are a focused file-reading worker. Report findings concisely.")
     .run("Map the module layout of this repo.", &file_agent_tools(), Path::new("."))
     .await?;
