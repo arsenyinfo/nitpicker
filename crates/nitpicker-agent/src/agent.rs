@@ -117,15 +117,74 @@ struct ToolCallContext<'a> {
     initial_subagent_count: usize,
 }
 
+/// Outcome of a single tool call. The `as_str` values are the on-disk trajectory-log
+/// vocabulary (`session.rs` → `reflect.rs`), so they are part of that format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolCallStatus {
+    Ok,
+    Error,
+    BlockedCycle,
+    /// A subagent spawn was accepted; its own log records the result.
+    Started,
+}
+
+impl ToolCallStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error => "error",
+            Self::BlockedCycle => "blocked_cycle",
+            Self::Started => "started",
+        }
+    }
+}
+
 struct ToolCallOutcome {
     output: String,
     nested_tool_calls: usize,
     repeated_tool_call_blocked: bool,
-    status: &'static str,
+    status: ToolCallStatus,
     spawned_agent: Option<String>,
     subagent_input_tokens: u64,
     subagent_output_tokens: u64,
     subagent_total_tokens: u64,
+}
+
+/// Running totals for one `run_agent` call, folded into every exit path so the three
+/// counters can't drift apart across the loop's four accumulation sites.
+struct RunTotals {
+    usage: TokenUsage,
+    tool_calls: usize,
+    initial_subagent_count: usize,
+}
+
+impl RunTotals {
+    fn new(initial_subagent_count: usize) -> Self {
+        Self {
+            usage: TokenUsage::default(),
+            tool_calls: 0,
+            initial_subagent_count,
+        }
+    }
+
+    fn add_usage(&mut self, usage: TokenUsage) {
+        self.usage.input_tokens = self.usage.input_tokens.saturating_add(usage.input_tokens);
+        self.usage.output_tokens = self.usage.output_tokens.saturating_add(usage.output_tokens);
+        self.usage.total_tokens = self.usage.total_tokens.saturating_add(usage.total_tokens);
+    }
+
+    fn finish(&self, config: &AgentConfig, text: String, turns: usize) -> AgentResult {
+        AgentResult {
+            text,
+            turns,
+            tool_calls: self.tool_calls,
+            subagents_spawned: config.subagent_counter.load(Ordering::Relaxed)
+                - self.initial_subagent_count,
+            total_input_tokens: self.usage.input_tokens,
+            total_output_tokens: self.usage.output_tokens,
+            total_tokens: self.usage.total_tokens,
+        }
+    }
 }
 
 struct PreparedSubagent {
@@ -220,14 +279,11 @@ pub async fn run_agent(
     let mut history = Vec::new();
     let mut prompt = Message::user(initial_message.to_string());
     history.push(prompt.clone());
-    let mut total_input_tokens = 0u64;
-    let mut total_output_tokens = 0u64;
-    let mut total_tokens = 0u64;
     let mut conversation_usage = ConversationUsageWindow::new(config.compact_threshold);
-    let mut total_tool_calls = 0usize;
     let mut empty_response_count = 0usize;
     let mut tool_call_history: VecDeque<String> = VecDeque::new();
     let initial_subagent_count = config.subagent_counter.load(Ordering::Relaxed);
+    let mut totals = RunTotals::new(initial_subagent_count);
     let mut consecutive_blocked_count = 0usize;
     let mut last_subagent: Option<String> = None;
 
@@ -260,10 +316,8 @@ pub async fn run_agent(
                 usage_before_compaction,
             )
             .await?;
-            if let Some(ref c) = compaction {
-                total_input_tokens = total_input_tokens.saturating_add(c.usage.input_tokens);
-                total_output_tokens = total_output_tokens.saturating_add(c.usage.output_tokens);
-                total_tokens = total_tokens.saturating_add(c.usage.total_tokens);
+            if let Some(outcome) = &compaction {
+                totals.add_usage(outcome.usage);
             }
             conversation_usage.reset();
             log_compaction(&config, turn, "threshold", compaction.as_ref()).await;
@@ -297,9 +351,7 @@ pub async fn run_agent(
         // before the subagent spawns below, so blocking on it can't deadlock
         let response =
             throttled_completion(&config.llm_semaphore, &config.client, completion).await?;
-        total_input_tokens = total_input_tokens.saturating_add(response.usage.input_tokens);
-        total_output_tokens = total_output_tokens.saturating_add(response.usage.output_tokens);
-        total_tokens = total_tokens.saturating_add(response.usage.total_tokens);
+        totals.add_usage(response.usage);
         conversation_usage.record(response.usage);
         let selected_model = response.selected_model.clone();
         let assistant_message = response.message();
@@ -307,11 +359,11 @@ pub async fn run_agent(
 
         if let Some(tool_calls) = response.tool_calls() {
             empty_response_count = 0;
-            total_tool_calls += tool_calls.len();
+            totals.tool_calls += tool_calls.len();
             report_progress(
                 &config,
                 turn + 1,
-                total_tool_calls,
+                totals.tool_calls,
                 initial_subagent_count,
                 last_subagent.clone(),
             );
@@ -351,7 +403,7 @@ pub async fn run_agent(
                         work_dir,
                         turn,
                         current_turns: turn + 1,
-                        total_tool_calls,
+                        total_tool_calls: totals.tool_calls,
                         initial_subagent_count,
                     },
                     call.function.name.as_str(),
@@ -376,7 +428,7 @@ pub async fn run_agent(
                 // actually ran: a cycle-blocked or errored call never populated the verdict/finish
                 // store, so terminating here would return an empty result. let the agent retry.
                 if !blocked
-                    && outcome.status != "error"
+                    && outcome.status != ToolCallStatus::Error
                     && config
                         .terminal_tools
                         .iter()
@@ -394,10 +446,12 @@ pub async fn run_agent(
                     subagent_output_tokens,
                     subagent_total_tokens,
                 } = outcome;
-                total_tool_calls += nested_tool_calls;
-                total_input_tokens = total_input_tokens.saturating_add(subagent_input_tokens);
-                total_output_tokens = total_output_tokens.saturating_add(subagent_output_tokens);
-                total_tokens = total_tokens.saturating_add(subagent_total_tokens);
+                totals.tool_calls += nested_tool_calls;
+                totals.add_usage(TokenUsage {
+                    input_tokens: subagent_input_tokens,
+                    output_tokens: subagent_output_tokens,
+                    total_tokens: subagent_total_tokens,
+                });
                 if call.function.name == "spawn_subagent" {
                     last_subagent = None;
                 }
@@ -430,7 +484,7 @@ pub async fn run_agent(
             report_progress(
                 &config,
                 turn + 1,
-                total_tool_calls,
+                totals.tool_calls,
                 initial_subagent_count,
                 last_subagent.clone(),
             );
@@ -447,22 +501,13 @@ pub async fn run_agent(
                         response_input_tokens = response.usage.input_tokens,
                         response_output_tokens = response.usage.output_tokens,
                         response_total_tokens = response.usage.total_tokens,
-                        total_input_tokens,
-                        total_output_tokens,
-                        total_tokens_so_far = total_tokens,
+                        total_input_tokens = totals.usage.input_tokens,
+                        total_output_tokens = totals.usage.output_tokens,
+                        total_tokens_so_far = totals.usage.total_tokens,
                         response_len = result.len(),
                         "subagent finished"
                     );
-                    return Ok(AgentResult {
-                        text: result,
-                        turns: turn + 1,
-                        tool_calls: total_tool_calls,
-                        subagents_spawned: config.subagent_counter.load(Ordering::Relaxed)
-                            - initial_subagent_count,
-                        total_input_tokens,
-                        total_output_tokens,
-                        total_tokens,
-                    });
+                    return Ok(totals.finish(&config, result, turn + 1));
                 }
             }
 
@@ -470,22 +515,13 @@ pub async fn run_agent(
                 info!(
                     agent = %config.name,
                     turn,
-                    total_tool_calls,
-                    total_input_tokens,
-                    total_output_tokens,
-                    total_tokens,
+                    total_tool_calls = totals.tool_calls,
+                    total_input_tokens = totals.usage.input_tokens,
+                    total_output_tokens = totals.usage.output_tokens,
+                    total_tokens = totals.usage.total_tokens,
                     "terminal tool called"
                 );
-                return Ok(AgentResult {
-                    text: String::new(),
-                    turns: turn + 1,
-                    tool_calls: total_tool_calls,
-                    subagents_spawned: config.subagent_counter.load(Ordering::Relaxed)
-                        - initial_subagent_count,
-                    total_input_tokens,
-                    total_output_tokens,
-                    total_tokens,
-                });
+                return Ok(totals.finish(&config, String::new(), turn + 1));
             }
 
             let tool_message = Message::User {
@@ -502,7 +538,6 @@ pub async fn run_agent(
                     consecutive_blocked_count,
                     "forcing compaction to break tool-call cycle"
                 );
-                let usage = conversation_usage.usage();
                 let compaction = compact_history(
                     &config.llm_semaphore,
                     Arc::clone(&config.client),
@@ -511,13 +546,11 @@ pub async fn run_agent(
                     &mut history,
                     &mut prompt,
                     turn + 1,
-                    usage,
+                    conversation_usage.usage(),
                 )
                 .await?;
-                if let Some(ref c) = compaction {
-                    total_input_tokens = total_input_tokens.saturating_add(c.usage.input_tokens);
-                    total_output_tokens = total_output_tokens.saturating_add(c.usage.output_tokens);
-                    total_tokens = total_tokens.saturating_add(c.usage.total_tokens);
+                if let Some(outcome) = &compaction {
+                    totals.add_usage(outcome.usage);
                 }
                 conversation_usage.reset();
                 log_compaction(&config, turn, "cycle_break", compaction.as_ref()).await;
@@ -541,7 +574,7 @@ pub async fn run_agent(
             report_progress(
                 &config,
                 turn + 1,
-                total_tool_calls,
+                totals.tool_calls,
                 initial_subagent_count,
                 last_subagent.clone(),
             );
@@ -566,22 +599,13 @@ pub async fn run_agent(
                 response_input_tokens = response.usage.input_tokens,
                 response_output_tokens = response.usage.output_tokens,
                 response_total_tokens = response.usage.total_tokens,
-                total_input_tokens,
-                total_output_tokens,
-                total_tokens_so_far = total_tokens,
+                total_input_tokens = totals.usage.input_tokens,
+                total_output_tokens = totals.usage.output_tokens,
+                total_tokens_so_far = totals.usage.total_tokens,
                 response_len = text.len(),
                 "finished"
             );
-            return Ok(AgentResult {
-                text,
-                turns: turn + 1,
-                tool_calls: total_tool_calls,
-                subagents_spawned: config.subagent_counter.load(Ordering::Relaxed)
-                    - initial_subagent_count,
-                total_input_tokens,
-                total_output_tokens,
-                total_tokens,
-            });
+            return Ok(totals.finish(&config, text, turn + 1));
         }
     }
 
@@ -813,7 +837,7 @@ async fn execute_tool_call(
             output: msg,
             nested_tool_calls: 0,
             repeated_tool_call_blocked: true,
-            status: "blocked_cycle",
+            status: ToolCallStatus::BlockedCycle,
             spawned_agent: None,
             subagent_input_tokens: 0,
             subagent_output_tokens: 0,
@@ -841,7 +865,7 @@ async fn execute_tool_call(
                     .to_string(),
                 nested_tool_calls: 0,
                 repeated_tool_call_blocked: false,
-                status: "error",
+                status: ToolCallStatus::Error,
                 spawned_agent: None,
                 subagent_input_tokens: 0,
                 subagent_output_tokens: 0,
@@ -873,7 +897,7 @@ async fn execute_tool_call(
                     output: format!("Error: {err}"),
                     nested_tool_calls: 0,
                     repeated_tool_call_blocked: false,
-                    status: "error",
+                    status: ToolCallStatus::Error,
                     spawned_agent: None,
                     subagent_input_tokens: 0,
                     subagent_output_tokens: 0,
@@ -897,7 +921,7 @@ async fn execute_tool_call(
             ctx.turn + 1,
             tool_name,
             &args,
-            "started",
+            ToolCallStatus::Started,
             Some(&prepared.spawned_agent),
             None,
         )
@@ -912,10 +936,9 @@ async fn execute_tool_call(
             .map(|(name, tool)| (name.clone(), Arc::clone(tool)))
             .collect();
         let sub = run_subagent(prepared, &subagent_tools, ctx.work_dir).await;
-        let status = if sub.output.starts_with("Error:") {
-            "error"
-        } else {
-            "ok"
+        let status = match sub.output.starts_with("Error:") {
+            true => ToolCallStatus::Error,
+            false => ToolCallStatus::Ok,
         };
         let outcome = ToolCallOutcome {
             output: sub.output,
@@ -937,7 +960,7 @@ async fn execute_tool_call(
                 output,
                 nested_tool_calls: 0,
                 repeated_tool_call_blocked: false,
-                status: "ok",
+                status: ToolCallStatus::Ok,
                 spawned_agent: None,
                 subagent_input_tokens: 0,
                 subagent_output_tokens: 0,
@@ -949,7 +972,7 @@ async fn execute_tool_call(
                     output: format!("Error: {err}"),
                     nested_tool_calls: 0,
                     repeated_tool_call_blocked: false,
-                    status: "error",
+                    status: ToolCallStatus::Error,
                     spawned_agent: None,
                     subagent_input_tokens: 0,
                     subagent_output_tokens: 0,
@@ -964,7 +987,7 @@ async fn execute_tool_call(
                 output: msg,
                 nested_tool_calls: 0,
                 repeated_tool_call_blocked: false,
-                status: "error",
+                status: ToolCallStatus::Error,
                 spawned_agent: None,
                 subagent_input_tokens: 0,
                 subagent_output_tokens: 0,
@@ -992,7 +1015,7 @@ async fn log_tool_call(
     turn: usize,
     tool_name: &str,
     args: &Value,
-    status: &'static str,
+    status: ToolCallStatus,
     spawned_agent: Option<&str>,
     result: Option<&str>,
 ) {
@@ -1007,7 +1030,7 @@ async fn log_tool_call(
         turn,
         tool: tool_name.to_string(),
         args: args.clone(),
-        status: status.to_string(),
+        status: status.as_str().to_string(),
         spawned_agent: spawned_agent.map(str::to_string),
         result: result.map(str::to_string),
     };
@@ -1028,7 +1051,7 @@ async fn log_compaction(
         turn,
         "compact",
         &json!({ "reason": reason }),
-        "ok",
+        ToolCallStatus::Ok,
         None,
         result,
     )

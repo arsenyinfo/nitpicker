@@ -222,6 +222,97 @@ async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnRes
     })
 }
 
+/// One debater's fixed identity for the whole debate — the per-side inputs that would
+/// otherwise be spelled out twice per round.
+struct DebateSide<'a> {
+    role: &'a str,
+    client: Arc<dyn LLMClientDyn>,
+    compact_threshold: Option<u64>,
+    model: &'a str,
+    system_prompt: &'a str,
+    /// Trajectory filename stem; the round number is appended.
+    session_stem: &'a str,
+}
+
+/// Everything a turn needs that is identical for both sides.
+struct RoundEnv<'a> {
+    mp: &'a MultiProgress,
+    done_style: &'a ProgressStyle,
+    skin: &'a MadSkin,
+    repo: &'a Path,
+    topic: &'a str,
+    project_context: &'a str,
+    session_logger: Option<&'a SessionLogger>,
+    max_turns: usize,
+    verbose: bool,
+    stdout_ok: bool,
+}
+
+/// Run one side's turn for a round: spinner up, agent run, spinner down, optional render.
+async fn run_debate_side(
+    side: &DebateSide<'_>,
+    env: &RoundEnv<'_>,
+    verdicts: &[(String, usize, String)],
+    round: usize,
+) -> Result<DebateTurnResult> {
+    let (pb, _) = make_spinner(env.mp);
+    pb.set_prefix(colored_role_stderr(side.role));
+    pb.set_message(crate::progress::bar_message(format!(
+        "round {round} — debating…"
+    )));
+    let sub_pb = make_sub_spinner(env.mp, &pb);
+    let msg = build_turn_message(env.topic, verdicts, round, side.role);
+    let start = std::time::Instant::now();
+    let progress_pb = pb.clone();
+    let progress_sub_pb = sub_pb.clone();
+    let progress = (!env.verbose).then_some(Arc::new(move |progress: AgentProgress| {
+        progress_pb.set_message(crate::progress::bar_message(format!(
+            "round {round} — debating… ({} turns, {} tool calls, {} subagents)",
+            progress.turns, progress.tool_calls, progress.subagents_spawned
+        )));
+        progress_sub_pb.set_message(crate::progress::detail_message(
+            "    ↳ ",
+            progress.last_subagent.as_deref(),
+        ));
+    })
+        as Arc<dyn Fn(AgentProgress) + Send + Sync>);
+
+    let result = run_debate_turn(DebateTurnRequest {
+        client: Arc::clone(&side.client),
+        compact_threshold: side.compact_threshold,
+        model: side.model,
+        system_prompt: side.system_prompt,
+        initial_message: &msg,
+        max_turns: env.max_turns,
+        work_dir: env.repo,
+        progress,
+        project_context: Some(env.project_context.to_string()),
+        session_writer: env
+            .session_logger
+            .map(|logger| logger.child(format!("{}-{round}.jsonl", side.session_stem))),
+    })
+    .await?;
+
+    let elapsed = start.elapsed().as_secs();
+    sub_pb.finish_and_clear();
+    pb.set_style(env.done_style.clone());
+    pb.finish_with_message(crate::progress::bar_message(format!(
+        "✓ round {round} ({} turns, {} tool calls, {} subagents, {} in, {} out, {} total tokens, {elapsed}s)",
+        result.turns,
+        result.tool_calls,
+        result.subagents_spawned,
+        result.usage.input_tokens,
+        result.usage.output_tokens,
+        result.usage.total_tokens
+    )));
+    if env.verbose && env.stdout_ok && stdout_is_terminal() {
+        println!();
+        env.skin.print_text(&result.verdict.text);
+        println!();
+    }
+    Ok(result)
+}
+
 fn build_turn_message(
     topic: &str,
     verdicts: &[(String, usize, String)],
@@ -444,6 +535,35 @@ pub async fn run_debate(
         println!();
     }
 
+    let actor = DebateSide {
+        role: actor_role,
+        client: actor_client,
+        compact_threshold: actor_compact_threshold,
+        model: &actor_label.alias,
+        system_prompt: &actor_system,
+        session_stem: "review",
+    };
+    let critic = DebateSide {
+        role: critic_role,
+        client: critic_client,
+        compact_threshold: critic_compact_threshold,
+        model: &critic_label.alias,
+        system_prompt: &critic_system,
+        session_stem: "validate",
+    };
+    let env = RoundEnv {
+        mp: &mp,
+        done_style: &done_style,
+        skin: &skin,
+        repo,
+        topic: prompt,
+        project_context: &project_context,
+        session_logger: session_logger.as_ref(),
+        max_turns,
+        verbose,
+        stdout_ok,
+    };
+
     // (role_label, round_number, verdict_text)
     let mut verdicts: Vec<(String, usize, String)> = Vec::new();
     let mut converged = false;
@@ -455,131 +575,22 @@ pub async fn run_debate(
     'debate: for round in 1..=max_rounds {
         final_round = round;
 
-        let (pb, _) = make_spinner(&mp);
-        pb.set_prefix(colored_role_stderr(actor_role));
-        pb.set_message(crate::progress::bar_message(format!(
-            "round {round} — debating…"
-        )));
-        let sub_pb = make_sub_spinner(&mp, &pb);
-        let msg = build_turn_message(prompt, &verdicts, round, actor_role);
-        let start = std::time::Instant::now();
-        let actor_pb = pb.clone();
-        let actor_sub_pb = sub_pb.clone();
-        let actor_progress = (!verbose).then_some(Arc::new(move |progress: AgentProgress| {
-            actor_pb.set_message(crate::progress::bar_message(format!(
-                "round {round} — debating… ({} turns, {} tool calls, {} subagents)",
-                progress.turns, progress.tool_calls, progress.subagents_spawned
-            )));
-            actor_sub_pb.set_message(crate::progress::detail_message(
-                "    ↳ ",
-                progress.last_subagent.as_deref(),
-            ));
-        })
-            as Arc<dyn Fn(AgentProgress) + Send + Sync>);
-        let DebateTurnResult {
-            verdict,
-            turns,
-            tool_calls,
-            subagents_spawned,
-            usage: turn_usage,
-            agent_failed: actor_failed,
-            used_fallback: actor_fallback,
-        } = run_debate_turn(DebateTurnRequest {
-            client: Arc::clone(&actor_client),
-            compact_threshold: actor_compact_threshold,
-            model: &actor_label.alias,
-            system_prompt: &actor_system,
-            initial_message: &msg,
-            max_turns,
-            work_dir: repo,
-            progress: actor_progress,
-            project_context: Some(project_context.clone()),
-            session_writer: session_logger
-                .as_ref()
-                .map(|logger| logger.child(format!("review-{round}.jsonl"))),
-        })
-        .await?;
-        usage.add(turn_usage, subagents_spawned);
-        let elapsed = start.elapsed().as_secs();
-        sub_pb.finish_and_clear();
-        pb.set_style(done_style.clone());
-        pb.finish_with_message(crate::progress::bar_message(format!(
-            "✓ round {round} ({turns} turns, {tool_calls} tool calls, {subagents_spawned} subagents, {} in, {} out, {} total tokens, {elapsed}s)",
-            turn_usage.input_tokens, turn_usage.output_tokens, turn_usage.total_tokens
-        )));
-        if verbose && stdout_ok && stdout_is_terminal() {
-            println!();
-            skin.print_text(&verdict.text);
-            println!();
-        }
-        any_turn_succeeded |= !actor_failed;
-        degraded |= actor_failed || actor_fallback;
-        verdicts.push((actor_role.to_string(), round, verdict.text));
+        let actor_turn = run_debate_side(&actor, &env, &verdicts, round).await?;
+        usage.add(actor_turn.usage, actor_turn.subagents_spawned);
+        any_turn_succeeded |= !actor_turn.agent_failed;
+        degraded |= actor_turn.agent_failed || actor_turn.used_fallback;
+        verdicts.push((actor_role.to_string(), round, actor_turn.verdict.text));
 
-        let (pb, _) = make_spinner(&mp);
-        pb.set_prefix(colored_role_stderr(critic_role));
-        pb.set_message(crate::progress::bar_message(format!(
-            "round {round} — debating…"
-        )));
-        let sub_pb = make_sub_spinner(&mp, &pb);
-        let msg = build_turn_message(prompt, &verdicts, round, critic_role);
-        let start = std::time::Instant::now();
-        let critic_pb = pb.clone();
-        let critic_sub_pb = sub_pb.clone();
-        let critic_progress = (!verbose).then_some(Arc::new(move |progress: AgentProgress| {
-            critic_pb.set_message(crate::progress::bar_message(format!(
-                "round {round} — debating… ({} turns, {} tool calls, {} subagents)",
-                progress.turns, progress.tool_calls, progress.subagents_spawned
-            )));
-            critic_sub_pb.set_message(crate::progress::detail_message(
-                "    ↳ ",
-                progress.last_subagent.as_deref(),
-            ));
-        })
-            as Arc<dyn Fn(AgentProgress) + Send + Sync>);
-        let DebateTurnResult {
-            verdict,
-            turns,
-            tool_calls,
-            subagents_spawned,
-            usage: turn_usage,
-            agent_failed: critic_failed,
-            used_fallback: critic_fallback,
-        } = run_debate_turn(DebateTurnRequest {
-            client: Arc::clone(&critic_client),
-            compact_threshold: critic_compact_threshold,
-            model: &critic_label.alias,
-            system_prompt: &critic_system,
-            initial_message: &msg,
-            max_turns,
-            work_dir: repo,
-            progress: critic_progress,
-            project_context: Some(project_context.clone()),
-            session_writer: session_logger
-                .as_ref()
-                .map(|logger| logger.child(format!("validate-{round}.jsonl"))),
-        })
-        .await?;
-        usage.add(turn_usage, subagents_spawned);
-        let elapsed = start.elapsed().as_secs();
-        sub_pb.finish_and_clear();
-        pb.set_style(done_style.clone());
-        pb.finish_with_message(crate::progress::bar_message(format!(
-            "✓ round {round} ({turns} turns, {tool_calls} tool calls, {subagents_spawned} subagents, {} in, {} out, {} total tokens, {elapsed}s)",
-            turn_usage.input_tokens, turn_usage.output_tokens, turn_usage.total_tokens
-        )));
-        if verbose && stdout_ok && stdout_is_terminal() {
-            println!();
-            skin.print_text(&verdict.text);
-            println!();
-        }
-        any_turn_succeeded |= !critic_failed;
-        degraded |= critic_failed || critic_fallback;
+        let critic_turn = run_debate_side(&critic, &env, &verdicts, round).await?;
+        usage.add(critic_turn.usage, critic_turn.subagents_spawned);
+        any_turn_succeeded |= !critic_turn.agent_failed;
+        degraded |= critic_turn.agent_failed || critic_turn.used_fallback;
         // Convergence requires a real agreement: a critic that agrees with a failed actor's
         // `*Agent failed*` stub (or a failed critic, whose verdict defaults to agree=false) must
         // not end the debate early.
-        let agreed = verdict.agree && !actor_failed && !critic_failed;
-        verdicts.push((critic_role.to_string(), round, verdict.text));
+        let agreed =
+            critic_turn.verdict.agree && !actor_turn.agent_failed && !critic_turn.agent_failed;
+        verdicts.push((critic_role.to_string(), round, critic_turn.verdict.text));
 
         if agreed {
             converged = true;
