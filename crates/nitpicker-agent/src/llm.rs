@@ -2,6 +2,7 @@ use eyre::{Result, WrapErr};
 use rig_core::OneOrMany;
 use rig_core::client::CompletionClient;
 use rig_core::completion::CompletionError;
+use rig_core::completion::message::ReasoningContent;
 use rig_core::completion::message::ToolCall;
 use rig_core::completion::message::ToolChoice;
 use rig_core::completion::{AssistantContent, CompletionModel, Message};
@@ -246,7 +247,75 @@ impl CompletionResponse {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        strip_think_blocks(&raw)
+        let (stripped, unclosed_body) = scan_think_blocks(&raw);
+        // only an *unclosed* block can have hidden an answer; a closed one that leaves nothing
+        // behind is genuinely all-reasoning and must still read as empty so the retry fires.
+        match (stripped.is_empty(), unclosed_body) {
+            (true, Some(start)) => self.recover_unterminated_think(&raw[start..]),
+            _ => stripped,
+        }
+    }
+
+    /// Salvage an answer that an unterminated `<think>` block swallowed whole.
+    ///
+    /// A provider that opens a think block and never closes it leaves its answer inside that
+    /// block, so the scanner drops the answer along with the reasoning and the reply reads as
+    /// empty — four retries and a hard failure for a response that did answer. (Observed on
+    /// MiniMax M3 via OpenRouter, whose whole verdict arrives this way.)
+    ///
+    /// Where the reasoning ends is only knowable when the provider states it: the same providers
+    /// report their reasoning in a structured field, and the block's body repeats it verbatim
+    /// before the answer. So the reasoning is subtracted, never guessed — and when nothing
+    /// matches, this returns empty rather than the body. Returning the body would pass
+    /// chain-of-thought off as the answer *and* silence the empty-response retry that exists for
+    /// precisely that case, turning a recoverable miss into a confidently wrong verdict.
+    fn recover_unterminated_think(&self, body: &str) -> String {
+        let Some(reasoning) = self.reasoning_text() else {
+            return String::new();
+        };
+        let body = body.trim_start();
+        let Some(answer) = body.strip_prefix(reasoning.trim()) else {
+            return String::new();
+        };
+        // The split has to fall on a word boundary. A reasoning string that ends mid-word ("Ver"
+        // against "Verdict: ship it.") is a coincidental byte prefix rather than the duplicated
+        // chain, and honouring it would serve a truncated answer. Requiring whitespace here would
+        // be too strict: real responses run the answer straight on from the reasoning's final
+        // punctuation ("...conventional wisdom." then "## Final Verdict"), with nothing between.
+        let cuts_mid_word = reasoning
+            .trim()
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric)
+            && answer.starts_with(char::is_alphanumeric);
+        match cuts_mid_word {
+            true => String::new(),
+            false => answer.trim().to_string(),
+        }
+    }
+
+    /// The response's structured reasoning, as reported beside the message content.
+    fn reasoning_text(&self) -> Option<String> {
+        let text = self
+            .choice
+            .iter()
+            .filter_map(|content| match content {
+                AssistantContent::Reasoning(reasoning) => Some(&reasoning.content),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|block| match block {
+                ReasoningContent::Text { text, .. } => Some(text.as_str()),
+                // Summary is a paraphrase and Encrypted/Redacted are opaque; none of them appear
+                // verbatim in the block body, so treating them as fragments of it would corrupt
+                // the reconstruction rather than complete it.
+                _ => None,
+            })
+            .collect::<String>();
+        match text.trim().is_empty() {
+            true => None,
+            false => Some(text),
+        }
     }
 }
 
@@ -261,7 +330,12 @@ impl CompletionResponse {
 //   - a stray closing tag at depth 0 is dropped
 // note: this is content-wide, so a review that legitimately quotes a <think> tag in a code
 // snippet will have it stripped too — an accepted tradeoff for clean aggregation.
-fn strip_think_blocks(text: &str) -> String {
+/// The text outside think blocks, plus where the body of an unclosed block begins — the signal
+/// that a provider swallowed its own answer rather than genuinely returning only reasoning.
+///
+/// The offset is reported rather than a bare flag so recovery never re-parses tags: with several
+/// blocks, or a stray closer, "the first `<think>` in the text" is not the one that stayed open.
+fn scan_think_blocks(text: &str) -> (String, Option<usize>) {
     // match `<think` (or `</think` when `close`) + optional whitespace + `>` at the start of
     // `s`, case-insensitively; return the matched byte length. `<thinking>` is not a tag (the
     // char after `think` must be whitespace or `>`).
@@ -279,16 +353,26 @@ fn strip_think_blocks(text: &str) -> String {
 
     let mut out = String::with_capacity(text.len());
     let mut depth: usize = 0;
+    let mut consumed = 0usize;
+    let mut open_body_start = None;
     let mut rest = text;
     while !rest.is_empty() {
         if rest.starts_with('<') {
             if let Some(len) = match_think_tag(rest, false) {
                 depth += 1;
+                consumed += len;
+                if depth == 1 {
+                    open_body_start = Some(consumed);
+                }
                 rest = &rest[len..];
                 continue;
             }
             if let Some(len) = match_think_tag(rest, true) {
                 depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    open_body_start = None;
+                }
+                consumed += len;
                 rest = &rest[len..];
                 continue;
             }
@@ -297,9 +381,14 @@ fn strip_think_blocks(text: &str) -> String {
         if depth == 0 {
             out.push(ch);
         }
+        consumed += ch.len_utf8();
         rest = &rest[ch.len_utf8()..];
     }
-    out.trim().to_string()
+    let unclosed_body = match depth > 0 {
+        true => open_body_start,
+        false => None,
+    };
+    (out.trim().to_string(), unclosed_body)
 }
 
 pub trait LLMClient: Send + Sync {
@@ -1082,7 +1171,139 @@ fn map_gemini_finish_reason(
 mod tests {
     use super::*;
     use rig_core::completion::Usage;
+
+    fn strip_think_blocks(text: &str) -> String {
+        scan_think_blocks(text).0
+    }
     use serde_json::json;
+
+    fn response_with(choice: Vec<AssistantContent>) -> CompletionResponse {
+        CompletionResponse {
+            choice: OneOrMany::many(choice).expect("non-empty choice"),
+            finish_reason: FinishReason::Stop,
+            usage: TokenUsage::default(),
+            selected_model: None,
+        }
+    }
+
+    fn reasoning_item(text: &str) -> AssistantContent {
+        AssistantContent::Reasoning(rig_core::completion::message::Reasoning::new(text))
+    }
+
+    /// MiniMax M3 via OpenRouter opens a `<think>` block and never closes it, putting the answer
+    /// inside — so the depth scanner drops the whole response and four retries fail on a reply
+    /// that carried a verdict. The same response reports its reasoning in a structured field, so
+    /// the reasoning half can be removed exactly rather than guessed at.
+    #[test]
+    fn unterminated_think_keeps_the_answer_and_drops_the_duplicated_reasoning() {
+        let reasoning = "The debate is extremely brief. The Actor suggested `eyre`.";
+        let response = response_with(vec![
+            reasoning_item(reasoning),
+            AssistantContent::text(format!(
+                "<think>\n{reasoning}\n\n### Verdict\n**Agreed: use `eyre` for applications.**"
+            )),
+        ]);
+        assert_eq!(
+            response.text(),
+            "### Verdict\n**Agreed: use `eyre` for applications.**"
+        );
+    }
+
+    /// OpenRouter delivers `reasoning_details` as streaming fragments that are split mid-sentence
+    /// ("...depth of analysis" + " here."), so they must be concatenated with nothing between
+    /// them. Joining with a newline corrupts the text just enough that it no longer matches the
+    /// copy inside the `<think>` block, and the whole reasoning leaks into the answer.
+    #[test]
+    fn fragmented_reasoning_is_concatenated_without_separators() {
+        let response = response_with(vec![
+            reasoning_item("weighing the options"),
+            reasoning_item(" carefully."),
+            AssistantContent::text("<think>\nweighing the options carefully.\n\nVerdict: ship it."),
+        ]);
+        assert_eq!(response.text(), "Verdict: ship it.");
+    }
+
+    /// With no structured reasoning there is no way to tell reasoning from answer. Returning the
+    /// body would both serve chain-of-thought as the verdict and make the response read as
+    /// non-empty, silencing the retry that exists for a reply that never answered.
+    #[test]
+    fn unterminated_think_without_structured_reasoning_stays_empty() {
+        let response = response_with(vec![AssistantContent::text(
+            "<think>\nweighing it up\n\nVerdict: ship it.",
+        )]);
+        assert!(response.text().is_empty());
+    }
+
+    /// A summary is a paraphrase of the chain, not a slice of it, so it cannot be subtracted from
+    /// the body — matching it as a fragment would leave a mangled prefix behind.
+    #[test]
+    fn summary_reasoning_is_not_used_to_split_the_body() {
+        let response = response_with(vec![
+            AssistantContent::Reasoning(rig_core::completion::message::Reasoning::summaries(
+                vec!["brief".to_string()],
+            )),
+            AssistantContent::text("<think>private chain"),
+        ]);
+        assert!(response.text().is_empty());
+    }
+
+    /// A reasoning string that happens to be a byte prefix of the answer must not chop it: "Ver"
+    /// against "Verdict: ship it." would otherwise yield "dict: ship it.".
+    #[test]
+    fn a_prefix_that_cuts_mid_word_is_not_treated_as_reasoning() {
+        let response = response_with(vec![
+            reasoning_item("Ver"),
+            AssistantContent::text("<think>Verdict: ship it."),
+        ]);
+        assert!(response.text().is_empty());
+    }
+
+    /// With several blocks, the one that stayed open is not the first tag in the text. Recovery
+    /// keys off the scanner's offset, so an earlier *closed* block cannot misdirect it.
+    #[test]
+    fn recovery_targets_the_block_that_stayed_open() {
+        let response = response_with(vec![
+            reasoning_item("secret"),
+            AssistantContent::text("<think>old</think>\n<think>secret\n\nFINAL"),
+        ]);
+        assert_eq!(response.text(), "FINAL");
+    }
+
+    /// A stray closing tag at depth 0 is dropped by the scanner and must not be mistaken for the
+    /// opener when recovering.
+    #[test]
+    fn a_stray_closing_tag_does_not_misdirect_recovery() {
+        let response = response_with(vec![
+            reasoning_item("secret"),
+            AssistantContent::text("</think><think>secret\n\nFINAL"),
+        ]);
+        assert_eq!(response.text(), "FINAL");
+    }
+
+    /// A response that is only reasoning still collapses to empty, so the empty-response retry
+    /// keeps working for models that genuinely returned no answer.
+    #[test]
+    fn a_reasoning_only_response_is_still_empty() {
+        let reasoning = "still thinking about it";
+        let response = response_with(vec![
+            reasoning_item(reasoning),
+            AssistantContent::text(format!("<think>\n{reasoning}")),
+        ]);
+        assert!(response.text().is_empty());
+        let closed = response_with(vec![AssistantContent::text(
+            "<think>done deliberating</think>",
+        )]);
+        assert!(closed.text().is_empty());
+    }
+
+    /// A well-formed closed block is untouched by the recovery path.
+    #[test]
+    fn closed_think_block_still_yields_only_the_answer() {
+        let response = response_with(vec![AssistantContent::text(
+            "<think>weighing it up</think>Verdict: ship it.",
+        )]);
+        assert_eq!(response.text(), "Verdict: ship it.");
+    }
 
     /// Mirrors rig's Anthropic mapping: `input_tokens` excludes the cache buckets and
     /// `total_tokens` is their sum plus output (`anthropic/completion.rs`).
@@ -1297,7 +1518,10 @@ mod tests {
     #[test]
     fn gemini_params_none_yields_generation_config_only() {
         let params = build_gemini_additional_params(&gemini_completion(Some(50), None)).unwrap();
-        assert_eq!(params, json!({"generation_config": {"max_output_tokens": 50}}));
+        assert_eq!(
+            params,
+            json!({"generation_config": {"max_output_tokens": 50}})
+        );
     }
 
     #[test]
