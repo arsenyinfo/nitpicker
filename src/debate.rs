@@ -267,7 +267,7 @@ async fn run_debate_side(
     let progress_sub_pb = sub_pb.clone();
     let progress = (!env.verbose).then_some(Arc::new(move |progress: AgentProgress| {
         progress_pb.set_message(crate::progress::bar_message(format!(
-            "round {round} — debating… ({} turns, {} calls, {} subagents)",
+            "round {round} — debating… ({} turns, {} tool calls, {} subagents)",
             progress.turns, progress.tool_calls, progress.subagents_spawned
         )));
         progress_sub_pb.set_message(crate::progress::detail_message(
@@ -296,7 +296,7 @@ async fn run_debate_side(
     sub_pb.finish_and_clear();
     pb.set_style(env.done_style.clone());
     pb.finish_with_message(crate::progress::bar_message(format!(
-        "✓ round {round} ({} turns, {} calls, {} subagents, {}, {} out, {elapsed}s)",
+        "✓ round {round} ({} turns, {} tool calls, {} subagents, {}, {} out, {elapsed}s)",
         result.turns,
         result.tool_calls,
         result.subagents_spawned,

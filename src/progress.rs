@@ -5,7 +5,7 @@ use unicode_width::UnicodeWidthStr;
 
 const DEFAULT_TERMINAL_COLUMNS: usize = 80;
 const PROGRESS_BAR_RESERVED_COLUMNS: usize = 15;
-const MAX_MESSAGE_COLUMNS: usize = 96;
+const MAX_MESSAGE_COLUMNS: usize = 120;
 
 static ACTIVE_PROGRESS: OnceLock<Mutex<Option<Weak<MultiProgress>>>> = OnceLock::new();
 
@@ -130,11 +130,21 @@ pub(crate) fn input_with_cache_share(input_tokens: u64, cached_input_tokens: u64
     }
 }
 
+/// `COLUMNS` is a *shell* variable that zsh and bash do not export, so a child process almost
+/// never sees it — reading only that pinned every message to the 80-column fallback regardless of
+/// the real terminal, which is what truncated the completed-round line. The env var stays as a
+/// first-choice override (tests, CI, deliberate narrowing); otherwise ask the terminal itself.
 fn terminal_columns() -> usize {
     std::env::var("COLUMNS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|columns| *columns > 0)
+        .or_else(|| {
+            console::Term::stderr()
+                .size_checked()
+                .map(|(_rows, columns)| columns as usize)
+                .filter(|columns| *columns > 0)
+        })
         .unwrap_or(DEFAULT_TERMINAL_COLUMNS)
 }
 

@@ -130,7 +130,7 @@ pub async fn run_review(
                 let progress_sub_pb = sub_pb.clone();
                 config.progress = Some(Arc::new(move |progress: AgentProgress| {
                     progress_pb.set_message(crate::progress::bar_message(format!(
-                        "reviewing… ({} turns, {} calls, {} subagents)",
+                        "reviewing… ({} turns, {} tool calls, {} subagents)",
                         progress.turns, progress.tool_calls, progress.subagents_spawned
                     )));
                     progress_sub_pb.set_message(crate::progress::detail_message(
@@ -146,7 +146,7 @@ pub async fn run_review(
             pb.set_style(done);
             match &result {
                 Ok(r) => pb.finish_with_message(crate::progress::bar_message(format!(
-                    "✓ done ({elapsed}s, {} turns, {} calls, {} subagents, {}, {} out)",
+                    "✓ done ({elapsed}s, {} turns, {} tool calls, {} subagents, {}, {} out)",
                     r.turns,
                     r.tool_calls,
                     r.subagents_spawned,

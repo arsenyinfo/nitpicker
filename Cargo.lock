@@ -1974,6 +1974,7 @@ dependencies = [
  "base64",
  "chrono",
  "clap",
+ "console",
  "dirs",
  "eyre",
  "indicatif",
