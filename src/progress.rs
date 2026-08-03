@@ -205,26 +205,20 @@ mod tests {
     }
 
     #[test]
-    fn input_with_cache_share_reports_the_ratio() {
-        assert_eq!(
-            input_with_cache_share(1_038_095, 938_000),
-            "1.0M in · 90% cached"
-        );
-        assert_eq!(input_with_cache_share(1_000, 0), "1.0k in · 0% cached");
-    }
-
-    /// A failed or unmetered turn reports no prompt at all; "0% cached" of nothing would read as a
-    /// caching problem rather than as missing data.
-    #[test]
-    fn input_with_cache_share_omits_the_ratio_without_a_prompt() {
-        assert_eq!(input_with_cache_share(0, 0), "0 in");
-    }
-
-    /// A provider contradicting itself (more cache than prompt) is reported verbatim by
-    /// `TokenUsage`, so the share must still be a percentage rather than exceeding 100.
-    #[test]
-    fn input_with_cache_share_cannot_exceed_one_hundred_percent() {
-        assert_eq!(input_with_cache_share(10, 5_000), "10 in · 100% cached");
+    fn input_with_cache_share_covers_ratio_zero_prompt_and_clamp() {
+        let cases = [
+            (1_038_095, 938_000, "1.0M in · 90% cached"),
+            (1_000, 0, "1.0k in · 0% cached"),
+            // no prompt at all (a failed or unmetered turn): "0% cached" of nothing would read as
+            // a caching problem rather than as missing data, so the ratio is dropped
+            (0, 0, "0 in"),
+            // a provider contradicting itself is reported verbatim by `TokenUsage`, so the share
+            // still has to be a percentage rather than exceed 100
+            (10, 5_000, "10 in · 100% cached"),
+        ];
+        for (input, cached, expected) in cases {
+            assert_eq!(input_with_cache_share(input, cached), expected);
+        }
     }
 
     #[test]

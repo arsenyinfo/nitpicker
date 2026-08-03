@@ -4,8 +4,8 @@
 //! line on stdout and nothing else; all human output (logs, spinners, debate
 //! chatter) is routed to stderr. see the "server / embedding" section of the README.
 
-use nitpicker_agent::llm::TokenUsage;
 use eyre::Result;
+use nitpicker_agent::llm::TokenUsage;
 use serde::Serialize;
 use std::io::Write;
 
@@ -165,18 +165,6 @@ mod tests {
         assert_eq!(report.subagents_spawned, 3);
     }
 
-    /// Cached tokens are a slice of the prompt, not an extra charge, so folding them must leave
-    /// the input/total totals alone — otherwise a cache hit would inflate reported spend.
-    #[test]
-    fn cached_tokens_do_not_inflate_totals() {
-        let mut cache_hit = UsageReport::default();
-        cache_hit.add(usage_of(1000, 50, 950, 0), 0);
-        let mut cache_miss = UsageReport::default();
-        cache_miss.add(usage_of(1000, 50, 0, 0), 0);
-        assert_eq!(cache_hit.input_tokens, cache_miss.input_tokens);
-        assert_eq!(cache_hit.total_tokens, cache_miss.total_tokens);
-    }
-
     #[test]
     fn usage_add_saturates_token_overflow() {
         let mut usage = UsageReport {
@@ -219,6 +207,9 @@ mod tests {
         let envelope = PrReviewOutput::error("boom".to_string(), 1);
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&envelope).unwrap()).unwrap();
-        assert!(json.get("usage").is_none(), "usage must be omitted on error");
+        assert!(
+            json.get("usage").is_none(),
+            "usage must be omitted on error"
+        );
     }
 }

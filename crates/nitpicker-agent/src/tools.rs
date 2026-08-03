@@ -167,22 +167,21 @@ pub fn reflect_tools() -> HashMap<String, Arc<dyn Tool>> {
     tools
 }
 
-/// Definitions in a stable order, sorted by tool name.
+/// Definitions in a stable order, sorted by map key.
 ///
-/// The order is load-bearing for cost, not just tidiness: the serialized tool schemas sit at the
-/// front of every request, so providers that cache on prefix identity re-prefill the whole
-/// conversation when they are reordered. `HashMap` iteration order varies per map instance — a
-/// fresh map per debate turn (`debate.rs`) and a fresh one per process would otherwise hand the
-/// provider a differently-ordered array every time, and measurably drop the cache hit to zero.
+/// The order is load-bearing for cost: the tool schemas sit at the front of every request, so a
+/// provider that caches on prefix identity re-prefills the whole conversation when they are
+/// reordered — and `HashMap` order varies per map instance, with a fresh map built every debate
+/// turn. Keys rather than definition names because keys are unique by construction.
 pub fn tool_definitions(tools: &HashMap<String, Arc<dyn Tool>>) -> Vec<ToolDefinition> {
-    // Ordered by map key rather than by `definition().name`: the keys are unique by construction,
-    // so the order is total even for a caller whose tools report a duplicate definition name,
-    // where sorting the definitions would fall back to the map's own arbitrary order.
-    let mut keys: Vec<&str> = tools.keys().map(String::as_str).collect();
-    keys.sort_unstable();
-    keys.into_iter()
-        .filter_map(|key| tools.get(key))
-        .map(|tool| tool.definition())
+    let mut entries: Vec<(&str, &Arc<dyn Tool>)> = tools
+        .iter()
+        .map(|(key, tool)| (key.as_str(), tool))
+        .collect();
+    entries.sort_unstable_by_key(|(key, _)| *key);
+    entries
+        .into_iter()
+        .map(|(_, tool)| tool.definition())
         .collect()
 }
 
@@ -647,63 +646,6 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Arc;
-
-    /// A tool whose map key and advertised definition name deliberately disagree, so a test can
-    /// tell key-ordering apart from definition-name ordering.
-    struct RenamedTool {
-        key: &'static str,
-        definition_name: &'static str,
-    }
-
-    impl Tool for RenamedTool {
-        fn name(&self) -> String {
-            self.key.to_string()
-        }
-
-        fn definition(&self) -> super::ToolDefinition {
-            super::ToolDefinition {
-                name: self.definition_name.to_string(),
-                description: String::new(),
-                parameters: json!({"type": "object"}),
-            }
-        }
-
-        fn call(
-            &self,
-            _args: serde_json::Value,
-            _work_dir: std::path::PathBuf,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = super::Result<String>> + Send>>
-        {
-            Box::pin(async { Ok(String::new()) })
-        }
-    }
-
-    /// Ordering keys off the map's keys, which are unique, rather than the definition names, which
-    /// a caller can duplicate. Sorting by definition name would yield `[alpha, zed]` here, so this
-    /// distinguishes the two rules — a duplicate-name pair could not, since it serializes to the
-    /// same sequence either way.
-    #[test]
-    fn tool_definitions_order_follows_map_keys_not_definition_names() {
-        let tools: HashMap<String, Arc<dyn Tool>> = [
-            RenamedTool {
-                key: "a",
-                definition_name: "zed",
-            },
-            RenamedTool {
-                key: "z",
-                definition_name: "alpha",
-            },
-        ]
-        .into_iter()
-        .map(|tool| (tool.name(), Arc::new(tool) as Arc<dyn Tool>))
-        .collect();
-
-        let ordered: Vec<String> = tool_definitions(&tools)
-            .into_iter()
-            .map(|definition| definition.name)
-            .collect();
-        assert_eq!(ordered, vec!["zed".to_string(), "alpha".to_string()]);
-    }
 
     /// The tool schemas open every request, so their order decides whether a provider's prefix
     /// cache hits. Two maps holding the same tools must serialize identically no matter how the

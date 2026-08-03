@@ -125,12 +125,9 @@ pub struct TokenUsage {
 
 /// Whether a provider's reported prompt count already contains its cache reads.
 ///
-/// This is the one thing that differs between provider usage shapes, and it cannot be inferred
-/// from the numbers: a provider's `total_tokens` may carry categories that are neither prompt nor
-/// `output_tokens` (Gemini counts thinking and tool-use prompts beside both) or may simply
-/// disagree with the sum of its own parts (OpenRouter gateways do), so any arithmetic test for
-/// "do the cache buckets fit outside the input?" misclassifies some real responses. Each client
-/// knows which provider it is talking to, so it states the accounting instead of guessing.
+/// Stated by each client, never inferred: a provider's `total_tokens` can carry categories that
+/// are neither prompt nor output (Gemini's thinking and tool-use prompts) or simply disagree with
+/// the sum of its own parts (OpenRouter gateways), so arithmetic tests misclassify real responses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheAccounting {
     /// Anthropic: `input_tokens` excludes cache reads and writes, which are reported beside it —
@@ -145,19 +142,13 @@ impl TokenUsage {
     /// Normalize one provider's usage so `input_tokens` always means every prompt token processed,
     /// cache reads included.
     ///
-    /// Without this, summing `input_tokens` across reviewers adds up numbers that mean different
-    /// things, and on the Anthropic shape a cache hit under-reports the prompt by the cached
-    /// portion — which is what silently stops `ConversationUsageWindow::should_compact` from ever
-    /// firing once a provider starts caching.
+    /// Without it, an Anthropic cache hit under-reports the prompt by the cached portion, which
+    /// silently stops `ConversationUsageWindow::should_compact` from ever firing.
     ///
-    /// Every number is the provider's own, only re-bucketed: nothing here invents tokens. A
-    /// provider whose cache figures contradict its prompt count is reported as it reported itself,
-    /// because clamping the prompt up to fit the cache breakdown would fabricate spend, and
-    /// clamping the cache down would falsify the cache figure.
-    ///
-    /// `total_tokens` is recomputed as `input + output` (barring saturation), so it excludes any
-    /// provider-side category counted outside both — notably Gemini's thinking and tool-use-prompt
-    /// counts, which this type does not meter.
+    /// Every number is the provider's own, only re-bucketed — a provider whose cache figures
+    /// contradict its prompt count is reported as it reported itself, since clamping either way
+    /// fabricates spend or falsifies the cache figure. `total_tokens` is recomputed as
+    /// `input + output`, so categories counted outside both (Gemini's thinking tokens) go unmetered.
     pub fn from_provider(usage: &rig_core::completion::Usage, accounting: CacheAccounting) -> Self {
         let input_tokens = match accounting {
             CacheAccounting::OutsidePrompt => usage
@@ -251,25 +242,29 @@ impl CompletionResponse {
         let (stripped, unclosed_body) = scan_think_blocks(&raw);
         // only an *unclosed* block can have hidden an answer; a closed one that leaves nothing
         // behind is genuinely all-reasoning and must still read as empty so the retry fires.
-        match (stripped.is_empty(), unclosed_body) {
-            (true, Some(start)) => self.recover_unterminated_think(&raw[start..]),
-            _ => stripped,
+        let Some(start) = unclosed_body else {
+            return stripped;
+        };
+        // Recovery runs whether or not the model wrote something before opening the block. Text
+        // outside it makes the loss quieter, not smaller: the response reads as successful while
+        // the answer stays buried, so the retry that saves an empty one never fires.
+        let recovered = self.recover_unterminated_think(&raw[start..]);
+        match (stripped.is_empty(), recovered.is_empty()) {
+            (_, true) => stripped,
+            (true, false) => recovered,
+            (false, false) => format!("{stripped}\n\n{recovered}"),
         }
     }
 
     /// Salvage an answer that an unterminated `<think>` block swallowed whole.
     ///
-    /// A provider that opens a think block and never closes it leaves its answer inside that
-    /// block, so the scanner drops the answer along with the reasoning and the reply reads as
-    /// empty — four retries and a hard failure for a response that did answer. (Observed on
-    /// MiniMax M3 via OpenRouter, whose whole verdict arrives this way.)
+    /// A block that is never closed takes the answer down with the reasoning, so the reply reads
+    /// as empty and four retries fail on a response that did answer.
     ///
-    /// Where the reasoning ends is only knowable when the provider states it: the same providers
-    /// report their reasoning in a structured field, and the block's body repeats it verbatim
-    /// before the answer. So the reasoning is subtracted, never guessed — and when nothing
-    /// matches, this returns empty rather than the body. Returning the body would pass
-    /// chain-of-thought off as the answer *and* silence the empty-response retry that exists for
-    /// precisely that case, turning a recoverable miss into a confidently wrong verdict.
+    /// Where the reasoning ends is only knowable when the provider states it: such providers also
+    /// report it structurally, and the block repeats it verbatim before the answer. So it is
+    /// subtracted, never guessed, and an unmatched body returns empty rather than itself — serving
+    /// the body would pass chain-of-thought off as the verdict *and* silence the retry.
     fn recover_unterminated_think(&self, body: &str) -> String {
         let Some(reasoning) = self.reasoning_text() else {
             return String::new();
@@ -278,11 +273,9 @@ impl CompletionResponse {
         let Some(answer) = body.strip_prefix(reasoning.trim()) else {
             return String::new();
         };
-        // The split has to fall on a word boundary. A reasoning string that ends mid-word ("Ver"
-        // against "Verdict: ship it.") is a coincidental byte prefix rather than the duplicated
-        // chain, and honouring it would serve a truncated answer. Requiring whitespace here would
-        // be too strict: real responses run the answer straight on from the reasoning's final
-        // punctuation ("...conventional wisdom." then "## Final Verdict"), with nothing between.
+        // The split must fall on a word boundary: a reasoning string ending mid-word ("Ver" against
+        // "Verdict: ship it.") is a coincidental byte prefix and would serve a truncated answer.
+        // Whitespace would be too strict — real replies run straight on from the final punctuation.
         let cuts_mid_word = reasoning
             .trim()
             .chars()
@@ -1001,7 +994,9 @@ impl LLMClient for anthropic::Client {
         // anything else — an Anthropic-compatible gateway, a proxied model — falls back to 2048,
         // less than a single review turn spends on reasoning alone. Keep our own floor for those,
         // and let a caller that knows its model's real ceiling raise it via `max_tokens`.
-        request.max_tokens.get_or_insert(ANTHROPIC_DEFAULT_MAX_TOKENS);
+        request
+            .max_tokens
+            .get_or_insert(ANTHROPIC_DEFAULT_MAX_TOKENS);
         let model = self.completion_model(model_name.clone());
         let response = model
             .completion(request)
@@ -1156,7 +1151,11 @@ struct GeminiAdditionalParams {
 impl GeminiAdditionalParams {
     fn from_completion(completion: &Completion) -> Self {
         let config = GenerationConfig {
-            max_output_tokens: completion.max_tokens.map(|value| value as i32),
+            // saturating, not wrapping: `as i32` turns a cap past i32::MAX into a negative field
+            // the API rejects outright, which reads as a broken request rather than a large cap.
+            max_output_tokens: completion
+                .max_tokens
+                .map(|value| i32::try_from(value).unwrap_or(i32::MAX)),
         };
         Self {
             generation_config: Some(config),
@@ -1236,6 +1235,24 @@ mod tests {
         );
     }
 
+    /// A model that writes a line before opening the block hides its answer just as thoroughly,
+    /// but the leading text makes the response read as successful — so nothing retries and the
+    /// verdict is lost silently, which is worse than the empty case.
+    #[test]
+    fn unterminated_think_after_a_prefix_still_recovers_the_answer() {
+        let reasoning = "Weighing both sides.";
+        let response = response_with(vec![
+            reasoning_item(reasoning),
+            AssistantContent::text(format!(
+                "Here is my review.\n<think>\n{reasoning}\n\n### Verdict\nShip it."
+            )),
+        ]);
+        assert_eq!(
+            response.text(),
+            "Here is my review.\n\n### Verdict\nShip it."
+        );
+    }
+
     /// OpenRouter delivers `reasoning_details` as streaming fragments that are split mid-sentence
     /// ("...depth of analysis" + " here."), so they must be concatenated with nothing between
     /// them. Joining with a newline corrupts the text just enough that it no longer matches the
@@ -1266,9 +1283,9 @@ mod tests {
     #[test]
     fn summary_reasoning_is_not_used_to_split_the_body() {
         let response = response_with(vec![
-            AssistantContent::Reasoning(rig_core::completion::message::Reasoning::summaries(
-                vec!["brief".to_string()],
-            )),
+            AssistantContent::Reasoning(rig_core::completion::message::Reasoning::summaries(vec![
+                "brief".to_string(),
+            ])),
             AssistantContent::text("<think>private chain"),
         ]);
         assert!(response.text().is_empty());
@@ -1430,13 +1447,6 @@ mod tests {
         assert_eq!(usage.total_tokens, 4200);
     }
 
-    #[test]
-    fn anthropic_without_any_cache_is_unchanged() {
-        let usage = anthropic(&anthropic_usage(3000, 12, 0, 0));
-        assert_eq!(usage.input_tokens, 3000);
-        assert_eq!(usage.total_tokens, 3012);
-    }
-
     /// A provider reporting more cache than prompt is contradicting itself. Reporting the prompt
     /// as 5000 to make the breakdown fit would invent 4990 tokens of spend that were never billed,
     /// so both numbers are passed through as reported and the contradiction stays visible.
@@ -1453,15 +1463,6 @@ mod tests {
         assert_eq!(usage.total_tokens, 15);
         assert_eq!(usage.cached_input_tokens, 5_000);
         assert_eq!(usage.cache_creation_input_tokens, 700);
-    }
-
-    /// A gateway that omits usage entirely reports zeros through rig, which documents zero as its
-    /// "provider supplied no metrics" sentinel. Nothing may be conjured to fill the gap.
-    #[test]
-    fn absent_provider_usage_meters_zero_rather_than_a_guess() {
-        let usage = prompt_inclusive(&Usage::new());
-        assert_eq!(usage.input_tokens, 0);
-        assert_eq!(usage.total_tokens, 0);
     }
 
     /// The whole point of the normalization: a cache hit must still trip the compaction

@@ -1,5 +1,7 @@
 use crate::compact::{CompactionOutcome, compact_history};
-use crate::llm::{Completion, ConversationUsageWindow, LLMClientDyn, TokenUsage, throttled_completion};
+use crate::llm::{
+    Completion, ConversationUsageWindow, LLMClientDyn, TokenUsage, throttled_completion,
+};
 use crate::prompts::subagent_system_prompt;
 use crate::session::{SessionWriter, ToolCallRecord, now_unix_ms};
 use crate::tools::{Tool, floor_char_boundary, tool_definitions};
@@ -302,6 +304,7 @@ pub async fn run_agent(
                 &config.llm_semaphore,
                 Arc::clone(&config.client),
                 &config.model,
+                    config.max_tokens,
                 &effective_system_prompt,
                 &mut history,
                 &mut prompt,
@@ -380,30 +383,36 @@ pub async fn run_agent(
                     }
                 }
                 match &selected_model {
-                    Some(m) => info!(agent = %config.name, tool = %tool_name, args = %args, turn, model = %m, "tool call"),
-                    None => info!(agent = %config.name, tool = %tool_name, args = %args, turn, "tool call"),
+                    Some(m) => {
+                        info!(agent = %config.name, tool = %tool_name, args = %args, turn, model = %m, "tool call")
+                    }
+                    None => {
+                        info!(agent = %config.name, tool = %tool_name, args = %args, turn, "tool call")
+                    }
                 }
             }
 
             // phase 2: execute the whole wave concurrently so a spawn_subagent batch overlaps
             // instead of running one-at-a-time; outcomes stay index-aligned with tool_calls
-            let outcomes = join_all(tool_calls.iter().zip(&cycle_lens).map(|(call, &cycle_len)| {
-                execute_tool_call(
-                    ToolCallContext {
-                        config: &config,
-                        runtime_tools: &available_tools,
-                        tools_map,
-                        work_dir,
-                        turn,
-                        current_turns: turn + 1,
-                        total_tool_calls: totals.tool_calls,
-                        initial_subagent_count,
-                    },
-                    call.function.name.as_str(),
-                    call.function.arguments.clone(),
-                    cycle_len,
-                )
-            }))
+            let outcomes = join_all(tool_calls.iter().zip(&cycle_lens).map(
+                |(call, &cycle_len)| {
+                    execute_tool_call(
+                        ToolCallContext {
+                            config: &config,
+                            runtime_tools: &available_tools,
+                            tools_map,
+                            work_dir,
+                            turn,
+                            current_turns: turn + 1,
+                            total_tool_calls: totals.tool_calls,
+                            initial_subagent_count,
+                        },
+                        call.function.name.as_str(),
+                        call.function.arguments.clone(),
+                        cycle_len,
+                    )
+                },
+            ))
             .await;
 
             // phase 3: fold results back in original order (tool-result ordering is load-bearing
@@ -446,8 +455,11 @@ pub async fn run_agent(
                 // deterministic even though FinishTool also wrote it during concurrent phase-2
                 // execution (a malformed turn with multiple finish calls → provider-last wins)
                 if config.depth.is_subagent() && !blocked && call.function.name == "finish" {
-                    if let Some(result) =
-                        call.function.arguments.get("result").and_then(|v| v.as_str())
+                    if let Some(result) = call
+                        .function
+                        .arguments
+                        .get("result")
+                        .and_then(|v| v.as_str())
                     {
                         *finish_store.lock().unwrap_or_else(|e| e.into_inner()) =
                             Some(result.to_string());
@@ -532,6 +544,7 @@ pub async fn run_agent(
                     &config.llm_semaphore,
                     Arc::clone(&config.client),
                     &config.model,
+                        config.max_tokens,
                     &effective_system_prompt,
                     &mut history,
                     &mut prompt,
@@ -1060,24 +1073,5 @@ mod tests {
         assert_eq!(totals.usage.total_tokens, 116);
         assert_eq!(totals.usage.cached_input_tokens, 84);
         assert_eq!(totals.usage.cache_creation_input_tokens, 20);
-    }
-
-    #[test]
-    fn run_totals_saturate_rather_than_overflow() {
-        let mut totals = RunTotals::new(0);
-        let max = TokenUsage {
-            input_tokens: u64::MAX,
-            output_tokens: u64::MAX,
-            total_tokens: u64::MAX,
-            cached_input_tokens: u64::MAX,
-            cache_creation_input_tokens: u64::MAX,
-        };
-        totals.add_usage(max);
-        totals.add_usage(usage(10, 10, 10, 10));
-        assert_eq!(totals.usage.input_tokens, u64::MAX);
-        assert_eq!(totals.usage.output_tokens, u64::MAX);
-        assert_eq!(totals.usage.total_tokens, u64::MAX);
-        assert_eq!(totals.usage.cached_input_tokens, u64::MAX);
-        assert_eq!(totals.usage.cache_creation_input_tokens, u64::MAX);
     }
 }

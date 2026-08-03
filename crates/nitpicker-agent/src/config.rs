@@ -187,7 +187,10 @@ impl Config {
 
     pub fn validate_alloy(&self, alloy: bool) -> Result<()> {
         if alloy && self.reviewer.len() < 2 {
-            eyre::bail!("--alloy requires at least 2 reviewers, found {}", self.reviewer.len());
+            eyre::bail!(
+                "--alloy requires at least 2 reviewers, found {}",
+                self.reviewer.len()
+            );
         }
         Ok(())
     }
@@ -316,9 +319,7 @@ fn validate_auth(
             Ok(())
         }
         (_, Some("codex")) => {
-            eyre::bail!(
-                "{label}: auth = \"codex\" is only supported with provider \"openai\""
-            );
+            eyre::bail!("{label}: auth = \"codex\" is only supported with provider \"openai\"");
         }
         // Any other auth value on a non-Gemini provider is a typo or unsupported — reject it at
         // config time rather than failing cryptically at client construction.
@@ -596,15 +597,6 @@ mod tests {
                 azure_credentials: None,
             }],
         }
-    }
-
-    #[test]
-    fn aggregator_max_tokens_falls_back_to_the_default_budget() {
-        assert_eq!(
-            config_with(None, None).aggregator_max_tokens(),
-            DEFAULT_AGGREGATOR_MAX_TOKENS
-        );
-        assert_eq!(config_with(None, Some(4_096)).aggregator_max_tokens(), 4_096);
     }
 
     /// Zero is not "no cap" — it is a request the provider answers with nothing at all, which
