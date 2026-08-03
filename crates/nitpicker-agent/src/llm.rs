@@ -105,9 +105,18 @@ pub struct CompletionResponse {
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
 pub struct TokenUsage {
+    /// Every prompt token the provider processed for this call, cache reads included.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Always `input_tokens + output_tokens`.
     pub total_tokens: u64,
+    /// The part of `input_tokens` served from the provider's prompt cache — a breakdown of that
+    /// number, not an additional charge.
+    #[serde(default)]
+    pub cached_input_tokens: u64,
+    /// The part of `input_tokens` the provider wrote into its prompt cache on this call.
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
 }
 
 impl TokenUsage {
@@ -116,6 +125,34 @@ impl TokenUsage {
             input_tokens,
             output_tokens,
             total_tokens: input_tokens.saturating_add(output_tokens),
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        }
+    }
+}
+
+impl From<&rig_core::completion::Usage> for TokenUsage {
+    /// Providers disagree on what `input_tokens` counts: Anthropic reports cache reads separately
+    /// from it, OpenAI folds them into `prompt_tokens`. Summing the raw field across reviewers
+    /// therefore yields a number with no single meaning — and on a cache hit the Anthropic shape
+    /// under-reports the prompt by the cached portion, which is what silently stops
+    /// `ConversationUsageWindow::should_compact` from ever firing.
+    ///
+    /// rig's `total_tokens` counts every token on both shapes, so the prompt size is derived from
+    /// it. `max(input_tokens)` keeps a provider that reports no total (some OpenRouter gateways)
+    /// from collapsing to zero, and `total` is recomputed so `total == input + output` still holds
+    /// for every consumer of this type.
+    fn from(usage: &rig_core::completion::Usage) -> Self {
+        let input_tokens = usage
+            .total_tokens
+            .saturating_sub(usage.output_tokens)
+            .max(usage.input_tokens);
+        Self {
+            input_tokens,
+            output_tokens: usage.output_tokens,
+            total_tokens: input_tokens.saturating_add(usage.output_tokens),
+            cached_input_tokens: usage.cached_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
         }
     }
 }
@@ -145,9 +182,9 @@ impl ConversationUsageWindow {
     }
 
     pub fn record(&mut self, usage: TokenUsage) {
-        // input_tokens from each API response is the full context size for that call,
-        // not just the new tokens — replace rather than accumulate so should_compact()
-        // compares against the actual current context size
+        // Each response reports the whole prompt it was sent, not the new tokens, so replace
+        // rather than accumulate. Note this is the size of the *last* request: tool results
+        // appended after it are not counted until the next response comes back.
         self.usage = usage;
     }
 
@@ -803,15 +840,10 @@ impl LLMClient for openrouter::Client {
         {
             finish_reason = FinishReason::ToolUse;
         }
-        let usage = response
-            .raw_response
-            .usage
-            .map(|u| TokenUsage::new(u.prompt_tokens as u64, u.completion_tokens as u64))
-            .unwrap_or_default();
         Ok(CompletionResponse {
             choice: response.choice,
             finish_reason,
-            usage,
+            usage: TokenUsage::from(&response.usage),
             selected_model: Some(model_name),
         })
     }
@@ -863,7 +895,7 @@ impl LLMClient for anthropic::Client {
         Ok(CompletionResponse {
             choice: response.choice,
             finish_reason,
-            usage: TokenUsage::new(response.usage.input_tokens, response.usage.output_tokens),
+            usage: TokenUsage::from(&response.usage),
             selected_model: Some(model_name),
         })
     }
@@ -898,7 +930,7 @@ impl LLMClient for gemini::Client {
         Ok(CompletionResponse {
             choice: response.choice,
             finish_reason,
-            usage: TokenUsage::new(response.usage.input_tokens, response.usage.output_tokens),
+            usage: TokenUsage::from(&response.usage),
             selected_model: Some(model_name),
         })
     }
@@ -977,7 +1009,7 @@ impl LLMClient for openai::CompletionsClient {
         Ok(CompletionResponse {
             choice: response.choice,
             finish_reason,
-            usage: TokenUsage::new(response.usage.input_tokens, response.usage.output_tokens),
+            usage: TokenUsage::from(&response.usage),
             selected_model: Some(model_name),
         })
     }
@@ -1033,6 +1065,68 @@ fn map_gemini_finish_reason(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn rig_usage(
+        input: u64,
+        output: u64,
+        total: u64,
+        cached: u64,
+        cache_creation: u64,
+    ) -> rig_core::completion::Usage {
+        let mut usage = rig_core::completion::Usage::new();
+        usage.input_tokens = input;
+        usage.output_tokens = output;
+        usage.total_tokens = total;
+        usage.cached_input_tokens = cached;
+        usage.cache_creation_input_tokens = cache_creation;
+        usage
+    }
+
+    /// Anthropic reports a cache hit as a tiny `input_tokens` plus a large `cache_read`, with the
+    /// prompt only recoverable from `total_tokens`. Reading `input_tokens` raw is what let a 3509
+    /// token prompt look like 52 to the compaction window.
+    #[test]
+    fn anthropic_shape_counts_cache_reads_as_prompt() {
+        let usage = TokenUsage::from(&rig_usage(52, 8, 3517, 3456, 0));
+        assert_eq!(usage.input_tokens, 3509);
+        assert_eq!(usage.cached_input_tokens, 3456);
+        assert_eq!(usage.total_tokens, usage.input_tokens + usage.output_tokens);
+    }
+
+    /// OpenAI already folds cache reads into `prompt_tokens`, so the same prompt must not be
+    /// counted twice — `cached_input_tokens` stays a breakdown of `input_tokens`.
+    #[test]
+    fn openai_shape_does_not_double_count_cache_reads() {
+        let usage = TokenUsage::from(&rig_usage(3509, 8, 3517, 3456, 0));
+        assert_eq!(usage.input_tokens, 3509);
+        assert_eq!(usage.cached_input_tokens, 3456);
+        assert_eq!(usage.total_tokens, usage.input_tokens + usage.output_tokens);
+    }
+
+    /// Both shapes above describe the same call, so they must meter identically.
+    #[test]
+    fn provider_shapes_agree_on_the_same_call() {
+        assert_eq!(
+            TokenUsage::from(&rig_usage(52, 8, 3517, 3456, 0)).input_tokens,
+            TokenUsage::from(&rig_usage(3509, 8, 3517, 3456, 0)).input_tokens
+        );
+    }
+
+    /// A gateway that omits usage totals must fall back to the reported input rather than
+    /// metering zero, which would keep `should_compact` from ever firing.
+    #[test]
+    fn missing_provider_total_falls_back_to_reported_input() {
+        let usage = TokenUsage::from(&rig_usage(1200, 40, 0, 0, 0));
+        assert_eq!(usage.input_tokens, 1200);
+        assert_eq!(usage.total_tokens, 1240);
+    }
+
+    #[test]
+    fn cache_creation_tokens_are_carried_through() {
+        let usage = TokenUsage::from(&rig_usage(100, 10, 4200, 0, 4100));
+        assert_eq!(usage.cache_creation_input_tokens, 4100);
+        assert_eq!(usage.input_tokens, 4190);
+    }
 
     /// Reproduce how a provider 401 actually reaches the retry layer: rig surfaces the raw
     /// response body as `ProviderError`, and the per-provider `completion` impls wrap it with

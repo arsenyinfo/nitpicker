@@ -150,9 +150,9 @@ pub async fn run_review(
                     r.turns,
                     r.tool_calls,
                     r.subagents_spawned,
-                    r.total_input_tokens,
-                    r.total_output_tokens,
-                    r.total_tokens
+                    r.usage.input_tokens,
+                    r.usage.output_tokens,
+                    r.usage.total_tokens
                 ))),
                 Err(e) => pb.finish_with_message(crate::progress::bar_message(format!(
                     "✗ failed: {e}"
@@ -170,7 +170,7 @@ pub async fn run_review(
     for (name, handle) in handles {
         match handle.await {
             Ok(Ok(result)) => {
-                usage.add(result.usage(), result.subagents_spawned);
+                usage.add(result.usage, result.subagents_spawned);
                 rendered.push(format!("## {name} review\n\n{}", result.text));
                 success_count += 1;
                 info!(reviewer = %name, "review completed");

@@ -638,7 +638,7 @@ fn to_completion_response(raw: ResponsesResp, model: String) -> Result<Completio
         // rig's `TryFrom` above already errors on an empty response, so `choice` is non-empty here.
         choice: parsed.choice,
         finish_reason,
-        usage: TokenUsage::new(parsed.usage.input_tokens, parsed.usage.output_tokens),
+        usage: TokenUsage::from(&parsed.usage),
         selected_model: Some(model),
     })
 }

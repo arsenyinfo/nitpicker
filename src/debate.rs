@@ -201,7 +201,7 @@ async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnRes
             });
         }
     };
-    let usage = result.usage();
+    let usage = result.usage;
     let stored = verdict_store
         .lock()
         .unwrap_or_else(|e| e.into_inner())

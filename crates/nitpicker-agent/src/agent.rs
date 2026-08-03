@@ -32,21 +32,8 @@ pub struct AgentResult {
     pub turns: usize,
     pub tool_calls: usize,
     pub subagents_spawned: usize,
-    pub total_input_tokens: u64,
-    pub total_output_tokens: u64,
-    pub total_tokens: u64,
-}
-
-impl AgentResult {
-    /// the agent's accumulated token usage (preserving its reported `total_tokens`
-    /// verbatim rather than recomputing from input+output).
-    pub fn usage(&self) -> TokenUsage {
-        TokenUsage {
-            input_tokens: self.total_input_tokens,
-            output_tokens: self.total_output_tokens,
-            total_tokens: self.total_tokens,
-        }
-    }
+    /// Everything this agent spent, with its subagents and compaction calls already folded in.
+    pub usage: TokenUsage,
 }
 
 pub struct AgentProgress {
@@ -145,13 +132,11 @@ struct ToolCallOutcome {
     repeated_tool_call_blocked: bool,
     status: ToolCallStatus,
     spawned_agent: Option<String>,
-    subagent_input_tokens: u64,
-    subagent_output_tokens: u64,
-    subagent_total_tokens: u64,
+    subagent_usage: TokenUsage,
 }
 
-/// Running totals for one `run_agent` call, folded into every exit path so the three
-/// counters can't drift apart across the loop's four accumulation sites.
+/// Running totals for one `run_agent` call, folded into every exit path so the counters
+/// can't drift apart across the loop's four accumulation sites.
 struct RunTotals {
     usage: TokenUsage,
     tool_calls: usize,
@@ -171,6 +156,14 @@ impl RunTotals {
         self.usage.input_tokens = self.usage.input_tokens.saturating_add(usage.input_tokens);
         self.usage.output_tokens = self.usage.output_tokens.saturating_add(usage.output_tokens);
         self.usage.total_tokens = self.usage.total_tokens.saturating_add(usage.total_tokens);
+        self.usage.cached_input_tokens = self
+            .usage
+            .cached_input_tokens
+            .saturating_add(usage.cached_input_tokens);
+        self.usage.cache_creation_input_tokens = self
+            .usage
+            .cache_creation_input_tokens
+            .saturating_add(usage.cache_creation_input_tokens);
     }
 
     fn finish(&self, config: &AgentConfig, text: String, turns: usize) -> AgentResult {
@@ -180,9 +173,7 @@ impl RunTotals {
             tool_calls: self.tool_calls,
             subagents_spawned: config.subagent_counter.load(Ordering::Relaxed)
                 - self.initial_subagent_count,
-            total_input_tokens: self.usage.input_tokens,
-            total_output_tokens: self.usage.output_tokens,
-            total_tokens: self.usage.total_tokens,
+            usage: self.usage,
         }
     }
 }
@@ -197,9 +188,7 @@ struct SubagentOutcome {
     output: String,
     tool_calls: usize,
     spawned_agent: Option<String>,
-    input_tokens: u64,
-    output_tokens: u64,
-    total_tokens: u64,
+    usage: TokenUsage,
 }
 
 impl Tool for FinishTool {
@@ -442,16 +431,10 @@ pub async fn run_agent(
                     repeated_tool_call_blocked: _,
                     status: _,
                     spawned_agent: _,
-                    subagent_input_tokens,
-                    subagent_output_tokens,
-                    subagent_total_tokens,
+                    subagent_usage,
                 } = outcome;
                 totals.tool_calls += nested_tool_calls;
-                totals.add_usage(TokenUsage {
-                    input_tokens: subagent_input_tokens,
-                    output_tokens: subagent_output_tokens,
-                    total_tokens: subagent_total_tokens,
-                });
+                totals.add_usage(subagent_usage);
                 if call.function.name == "spawn_subagent" {
                     last_subagent = None;
                 }
@@ -762,17 +745,13 @@ async fn run_subagent(
             output: result.text,
             tool_calls: result.tool_calls,
             spawned_agent: Some(spawned_agent),
-            input_tokens: result.total_input_tokens,
-            output_tokens: result.total_output_tokens,
-            total_tokens: result.total_tokens,
+            usage: result.usage,
         },
         Err(err) => SubagentOutcome {
             output: format!("Error: {err}"),
             tool_calls: 0,
             spawned_agent: Some(spawned_agent),
-            input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: 0,
+            usage: TokenUsage::default(),
         },
     }
 }
@@ -839,9 +818,7 @@ async fn execute_tool_call(
             repeated_tool_call_blocked: true,
             status: ToolCallStatus::BlockedCycle,
             spawned_agent: None,
-            subagent_input_tokens: 0,
-            subagent_output_tokens: 0,
-            subagent_total_tokens: 0,
+            subagent_usage: TokenUsage::default(),
         };
         log_tool_call(
             ctx.config,
@@ -867,9 +844,7 @@ async fn execute_tool_call(
                 repeated_tool_call_blocked: false,
                 status: ToolCallStatus::Error,
                 spawned_agent: None,
-                subagent_input_tokens: 0,
-                subagent_output_tokens: 0,
-                subagent_total_tokens: 0,
+                subagent_usage: TokenUsage::default(),
             };
             log_tool_call(
                 ctx.config,
@@ -899,9 +874,7 @@ async fn execute_tool_call(
                     repeated_tool_call_blocked: false,
                     status: ToolCallStatus::Error,
                     spawned_agent: None,
-                    subagent_input_tokens: 0,
-                    subagent_output_tokens: 0,
-                    subagent_total_tokens: 0,
+                    subagent_usage: TokenUsage::default(),
                 };
                 log_tool_call(
                     ctx.config,
@@ -946,9 +919,7 @@ async fn execute_tool_call(
             repeated_tool_call_blocked: false,
             status,
             spawned_agent: sub.spawned_agent,
-            subagent_input_tokens: sub.input_tokens,
-            subagent_output_tokens: sub.output_tokens,
-            subagent_total_tokens: sub.total_tokens,
+            subagent_usage: sub.usage,
         };
         return Ok(outcome);
     }
@@ -962,9 +933,7 @@ async fn execute_tool_call(
                 repeated_tool_call_blocked: false,
                 status: ToolCallStatus::Ok,
                 spawned_agent: None,
-                subagent_input_tokens: 0,
-                subagent_output_tokens: 0,
-                subagent_total_tokens: 0,
+                subagent_usage: TokenUsage::default(),
             },
             Err(err) => {
                 debug!(agent = %ctx.config.name, tool = %tool_name, error = %err, "tool error");
@@ -974,9 +943,7 @@ async fn execute_tool_call(
                     repeated_tool_call_blocked: false,
                     status: ToolCallStatus::Error,
                     spawned_agent: None,
-                    subagent_input_tokens: 0,
-                    subagent_output_tokens: 0,
-                    subagent_total_tokens: 0,
+                    subagent_usage: TokenUsage::default(),
                 }
             }
         },
@@ -989,9 +956,7 @@ async fn execute_tool_call(
                 repeated_tool_call_blocked: false,
                 status: ToolCallStatus::Error,
                 spawned_agent: None,
-                subagent_input_tokens: 0,
-                subagent_output_tokens: 0,
-                subagent_total_tokens: 0,
+                subagent_usage: TokenUsage::default(),
             }
         }
     };
