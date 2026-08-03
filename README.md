@@ -307,7 +307,7 @@ Reviews a GitHub PR using its title, description, and diff. Requires the `gh` CL
 - With `URL` (`https://github.com/owner/repo/pull/N`): clones the repo into a temp dir, checks out the PR branch, reviews it, then cleans up
 - By default, posts the review as a PR comment. Pass `--no-comment` to skip posting.
 - `--no-debate`, `--rounds`, and `--max-turns` work the same as in the default review mode
-- `--json` emits a single machine-readable JSON object on stdout (status, PR metadata, models, `report_markdown`, `usage`, …) instead of the human report, with all logs/progress on stderr — handy for calling nitpicker as a subprocess. Exits non-zero on failure, with a `status: "error"` object on stdout. The `usage` block reports aggregate `input_tokens`/`output_tokens`/`total_tokens` and `subagents_spawned` for the run (best-effort: successful completions only).
+- `--json` emits a single machine-readable JSON object on stdout (status, PR metadata, models, `report_markdown`, `usage`, …) instead of the human report, with all logs/progress on stderr — handy for calling nitpicker as a subprocess. Exits non-zero on failure, with a `status: "error"` object on stdout. The `usage` block reports aggregate `input_tokens`/`output_tokens`/`total_tokens`, `cached_input_tokens`/`cache_creation_input_tokens`, and `subagents_spawned` for the run (best-effort: successful completions only). The cache fields are a breakdown of `input_tokens`, not an extra charge — a healthy multi-turn run shows most of its input served from cache.
 
 ### Ask subcommand
 
@@ -359,6 +359,13 @@ println!("{}", result.text);
 `file_agent_tools()` is the read-only file/git toolset plus `spawn_subagent`. You control the top-level prompt, the subagent prompt, the toolset, and the client; config-file-driven client construction is available via the `config`/`provider` modules. See `crates/nitpicker-agent/examples/file_agent.rs`.
 
 ## Changelog
+
+**0.8.3** — 2026-08-03 (`nitpicker-agent` 0.2.0)
+- Tool definitions are now sent in a stable, name-sorted order. They were built from `HashMap::values()`, whose order varies per map instance — and a debate builds a fresh map every turn — so the tool schemas that open every request were reordered constantly. Measured against `api.kimi.com`: reshuffling the array alone drops the provider's prefix-cache read from 3456 tokens to 0, i.e. a full re-prefill of the conversation on every debate turn.
+- Token metering is cache-aware: `TokenUsage` and the `pr --json` `usage` block gain `cached_input_tokens` and `cache_creation_input_tokens`, the interactive progress lines show `N in (M cached)`, and `input_tokens` is normalized across providers (Anthropic reports cache reads separately, OpenAI folds them into `prompt_tokens`). `total_tokens == input_tokens + output_tokens` still holds and `SCHEMA_VERSION` stays 1.
+- Fixes compaction on auto-caching providers: on a cache hit the Anthropic shape under-reports the prompt by the cached portion (a 3509-token prompt reported as 52), so `compact_threshold` was never reached and long runs never compacted.
+- **Breaking (`nitpicker-agent`)**: `AgentResult`'s `total_input_tokens`/`total_output_tokens`/`total_tokens` fields and its `usage()` method are replaced by a single `usage: TokenUsage` field.
+- Bumped `rig-core` to 0.41. rig now drops function-call item ids that aren't provider-native `fc_...` Responses ids, pairing a call to its output by `call_id` alone — the same problem nitpicker solved by prefixing foreign ids, so that normalization is removed.
 
 **0.8.2** — 2026-07-14 (`nitpicker-agent` 0.1.2)
 - Debate subagents no longer inherit the parent's terminal tools (`submit_verdict`), closing a path where a subagent could overwrite the parent's verdict and falsely converge a debate.
