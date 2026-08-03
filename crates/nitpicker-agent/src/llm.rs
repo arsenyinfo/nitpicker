@@ -22,6 +22,7 @@ const BASE_BACKOFF_MS: u64 = 250;
 const MAX_BACKOFF_MS: u64 = 5_000;
 const RATE_LIMIT_BASE_BACKOFF_MS: u64 = 5_000;
 const RATE_LIMIT_MAX_BACKOFF_MS: u64 = 60_000;
+const ANTHROPIC_DEFAULT_MAX_TOKENS: u64 = 8_192;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Completion {
@@ -427,6 +428,22 @@ impl LLMClient for Box<dyn LLMClientDyn> {
     }
 }
 
+/// What the provider said about a response that carried neither text nor a tool call. Without it
+/// an exhausted output budget is indistinguishable from a model that had nothing to say: a
+/// reasoning model spends the whole budget before writing a character and returns empty content
+/// with `MaxTokens`, which is a configuration problem wearing the costume of a broken model.
+fn empty_response_diagnosis(response: &CompletionResponse) -> String {
+    let output_tokens = response.usage.output_tokens;
+    match &response.finish_reason {
+        FinishReason::MaxTokens => format!(
+            "hit the output limit after {output_tokens} tokens without emitting content — \
+             reasoning consumed the whole budget, so raise max_tokens or leave it unset to use \
+             the provider's own limit"
+        ),
+        other => format!("finish_reason {other:?}, {output_tokens} output tokens"),
+    }
+}
+
 pub struct RetryingLLM<C> {
     inner: C,
 }
@@ -447,8 +464,11 @@ impl<C: LLMClient> LLMClient for RetryingLLM<C> {
             match self.inner.completion(completion.clone()).await {
                 Ok(response) => {
                     if response.text().is_empty() && response.tool_calls().is_none() {
+                        let diagnosis = empty_response_diagnosis(&response);
                         if attempt >= MAX_COMPLETION_ATTEMPTS {
-                            eyre::bail!("model returned empty response after {attempt} attempts");
+                            eyre::bail!(
+                                "model returned empty response after {attempt} attempts: {diagnosis}"
+                            );
                         }
                         let backoff = jittered_backoff(attempt, BASE_BACKOFF_MS, MAX_BACKOFF_MS);
                         warn!(
@@ -456,6 +476,7 @@ impl<C: LLMClient> LLMClient for RetryingLLM<C> {
                             attempt,
                             max_attempts = MAX_COMPLETION_ATTEMPTS,
                             backoff_ms = backoff.as_millis(),
+                            diagnosis,
                             "retrying after empty model response"
                         );
                         tokio::time::sleep(backoff).await;
@@ -975,6 +996,12 @@ impl LLMClient for anthropic::Client {
         let model_name = completion.model.clone();
         let mut request: rig_core::completion::CompletionRequest = completion.into();
         request.model = Some(model_name.clone());
+        // Anthropic requires `max_tokens`, so this is the one provider where "no cap" cannot be
+        // expressed. rig fills a per-model default, but only for model names it recognizes;
+        // anything else — an Anthropic-compatible gateway, a proxied model — falls back to 2048,
+        // less than a single review turn spends on reasoning alone. Keep our own floor for those,
+        // and let a caller that knows its model's real ceiling raise it via `max_tokens`.
+        request.max_tokens.get_or_insert(ANTHROPIC_DEFAULT_MAX_TOKENS);
         let model = self.completion_model(model_name.clone());
         let response = model
             .completion(request)

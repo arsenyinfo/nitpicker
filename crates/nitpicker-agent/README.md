@@ -60,6 +60,10 @@ and its `usage()` method are replaced by a single `usage: TokenUsage` field, whi
 `cached_input_tokens` / `cache_creation_input_tokens`. `TokenUsage::input_tokens` now means all
 prompt tokens *including* provider cache reads on every provider (Anthropic previously reported
 them separately), so cost formulas must discount `cached_input_tokens` at the cache-read rate.
+`AgentConfig` also gains `max_tokens: Option<u64>` (`AgentBuilder::max_tokens`), which defaults to
+`None`: turns now send no output cap and get the provider's own per-model limit. A cap budgets
+reasoning *plus* the answer, so one set below what the model reasons through returns empty content
+instead of a shorter answer. Anthropic requires the field, so `None` becomes 8192 there.
 
 ## License
 

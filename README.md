@@ -96,12 +96,13 @@ log_trajectories = false # optional, default: false
 [aggregator]
 model = "claude-sonnet-5"
 provider = "anthropic"
-max_tokens = 8192        # optional, default: 8192
+max_tokens = 16384       # optional, default: 16384
 
 [[reviewer]]
 name = "claude"          # used in output headers and logs
 model = "claude-sonnet-5"
 provider = "anthropic"
+# max_tokens = 32768     # optional, default: unset (the provider's own per-model limit)
 
 [[reviewer]]
 name = "gpt"
@@ -114,6 +115,8 @@ api_key_env = "OPENAI_API_KEY"
 > **Tip:** Use providers that were not used for the initial building of your codebase to enforce diversity of thought.
 
 Unknown config keys are rejected. For example, use `max_tokens` for output length; `token_limit` is not a supported field.
+
+`max_tokens` caps a single response, and on a reasoning model it is a budget for reasoning *plus* the answer — set too low, the model spends it all thinking and returns empty content, which is indistinguishable from a model that said nothing. Reviewers therefore default to no cap (the provider applies its own per-model limit); set one only to bound spend. The aggregator writes one bounded synthesis and defaults to 16384. Anthropic is the exception: its API requires the field, so an unset reviewer cap becomes 8192 there — raise it explicitly if your model reasons past that.
 
 Debate mode is enabled by default for `nitpicker`, `nitpicker ask`, and `nitpicker pr`. Pass `--no-debate` to use parallel aggregation for a single run. Use `[defaults].max_turns` or `--max-turns` to control the per-agent tool-use loop limit.
 
@@ -362,9 +365,11 @@ println!("{}", result.text);
 
 **0.8.3** — 2026-08-03 (`nitpicker-agent` 0.2.0)
 - Tool definitions are now sent in a stable, name-sorted order. They were built from `HashMap::values()`, whose order varies per map instance — and a debate builds a fresh map every turn — so the tool schemas that open every request were reordered constantly. Measured against `api.kimi.com`: reshuffling the array alone drops the provider's prefix-cache read from 3456 tokens to 0, i.e. a full re-prefill of the conversation on every debate turn.
-- Token metering is cache-aware: `TokenUsage` and the `pr --json` `usage` block gain `cached_input_tokens` and `cache_creation_input_tokens`, the interactive progress lines show `N in (M cached)`, and `input_tokens` is normalized across providers (Anthropic reports cache reads separately, OpenAI folds them into `prompt_tokens`). `total_tokens == input_tokens + output_tokens` still holds and `SCHEMA_VERSION` stays 1.
+- Token metering is cache-aware: `TokenUsage` and the `pr --json` `usage` block gain `cached_input_tokens` and `cache_creation_input_tokens`, the interactive progress lines show `1.0M in · 90% cached`, and `input_tokens` is normalized across providers (Anthropic reports cache reads separately, OpenAI folds them into `prompt_tokens`). `total_tokens == input_tokens + output_tokens` still holds and `SCHEMA_VERSION` stays 1.
 - Fixes compaction on auto-caching providers: on a cache hit the Anthropic shape under-reports the prompt by the cached portion (a 3509-token prompt reported as 52), so `compact_threshold` was never reached and long runs never compacted.
-- **Breaking (`nitpicker-agent`)**: `AgentResult`'s `total_input_tokens`/`total_output_tokens`/`total_tokens` fields and its `usage()` method are replaced by a single `usage: TokenUsage` field.
+- Agent turns no longer cap their output at a hardcoded 8192 tokens. A reasoning model spends that budget before writing a character and returns empty content with `finish_reason = max_tokens`, which the retry loop could only read as "the model said nothing" — four attempts, then a hard failure. Measured on `k3-256k` reviewing one file: capped at 8192 it returned nothing twice, 126s and 136s apart (matching the retry gaps in a real run); uncapped it spent 12 827 reasoning tokens before its first character and returned a full review. Reviewers now send no cap and get the provider's own per-model limit, `[[reviewer]].max_tokens` sets one explicitly, and `[aggregator].max_tokens` defaults to 16384.
+- An empty response now says why it was empty — `finish_reason` and the output tokens spent — in both the retry warning and the final error.
+- **Breaking (`nitpicker-agent`)**: `AgentResult`'s `total_input_tokens`/`total_output_tokens`/`total_tokens` fields and its `usage()` method are replaced by a single `usage: TokenUsage` field. `AgentConfig` gains a `max_tokens: Option<u64>` field (`AgentBuilder::max_tokens`).
 - Bumped `rig-core` to 0.41. rig now drops function-call item ids that aren't provider-native `fc_...` Responses ids, pairing a call to its output by `call_id` alone — the same problem nitpicker solved by prefixing foreign ids, so that normalization is removed.
 
 **0.8.2** — 2026-07-14 (`nitpicker-agent` 0.1.2)

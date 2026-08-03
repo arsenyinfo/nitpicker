@@ -215,7 +215,7 @@ pub async fn run_review(
         history: Vec::new(),
         tools: Vec::new(),
         tool_choice: None,
-        max_tokens: agg.max_tokens.or(Some(8192)),
+        max_tokens: Some(config.aggregator_max_tokens()),
         additional_params: None,
     };
     let response = client.completion(completion).await?;
@@ -340,6 +340,7 @@ fn build_agent_config(
         session_agent: "root".to_string(),
         model: reviewer.model.clone(),
         max_turns,
+        max_tokens: reviewer.max_tokens,
         compact_threshold,
         system_prompt: system_prompt.to_string(),
         subagent_system_prompt: None,

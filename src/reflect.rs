@@ -234,6 +234,7 @@ async fn synthesize(
         session_agent: "synthesizer".to_string(),
         model,
         max_turns: 20,
+        max_tokens: None,
         compact_threshold: None,
         system_prompt: REDUCE_PROMPT.to_string(),
         subagent_system_prompt: None,

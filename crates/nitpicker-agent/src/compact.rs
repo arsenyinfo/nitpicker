@@ -6,7 +6,6 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
-const COMPACTION_MAX_OUTPUT_TOKENS: u64 = 8_192;
 const COMPACTION_MAX_CORRECTIONS: usize = 2;
 const CONTINUE_MESSAGE: &str = "Continue from where you left off.";
 const COMPACTION_SYSTEM_PROMPT: &str = "You are summarizing an in-progress agent session so the same agent can resume it after a context reset. \
@@ -235,7 +234,10 @@ fn compaction_completion(model: &str, history: Vec<Message>, prompt: Message) ->
         history,
         tools: Vec::new(),
         tool_choice: Some(ToolChoice::None),
-        max_tokens: Some(COMPACTION_MAX_OUTPUT_TOKENS),
+        // The summary's length is governed by the instructions, not by a token budget: a cap that
+        // reasoning eats returns nothing, and one the summary merely outgrows truncates it past its
+        // closing tag, which only costs a correction round.
+        max_tokens: None,
         additional_params: None,
     }
 }

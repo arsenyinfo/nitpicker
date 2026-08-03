@@ -544,6 +544,7 @@ fn make_reviewer(d: &detect::Detected, prefer_openrouter_free: bool) -> config::
         provider: parse_provider_type(d.provider),
         base_url: d.base_url.clone(),
         api_key_env: d.api_key_env.map(str::to_string),
+        max_tokens: None,
         compact_threshold: None,
         auth: d.auth.map(str::to_string),
         azure_scope: None,

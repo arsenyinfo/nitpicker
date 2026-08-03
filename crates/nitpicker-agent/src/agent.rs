@@ -71,6 +71,10 @@ pub struct AgentConfig {
     pub session_agent: String,
     pub model: String,
     pub max_turns: usize,
+    /// Output cap per turn. `None` (the default) sends none, leaving the provider's own per-model
+    /// limit to apply — a fixed budget is spent on reasoning before a reasoning model writes a
+    /// character, and the empty content that comes back is indistinguishable from silence.
+    pub max_tokens: Option<u64>,
     pub compact_threshold: Option<u64>,
     pub system_prompt: String,
     /// System prompt for spawned subagents. `None` uses the built-in generic prompt
@@ -332,7 +336,7 @@ pub async fn run_agent(
             history: history[..history.len().saturating_sub(1)].to_vec(),
             tools: tool_definitions(&available_tools),
             tool_choice: None,
-            max_tokens: Some(8192),
+            max_tokens: config.max_tokens,
             additional_params: None,
         };
 
@@ -707,6 +711,7 @@ fn prepare_subagent(
         session_agent: spawned_agent.clone(),
         model: parent_config.model.clone(),
         max_turns: parent_config.max_turns,
+        max_tokens: parent_config.max_tokens,
         compact_threshold: parent_config.compact_threshold,
         system_prompt: parent_config
             .subagent_system_prompt

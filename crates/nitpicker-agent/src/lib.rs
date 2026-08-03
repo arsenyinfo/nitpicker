@@ -93,6 +93,7 @@ impl AgentBuilder {
             session_agent: "root".to_string(),
             model: model.into(),
             max_turns: DEFAULT_MAX_TURNS,
+            max_tokens: None,
             compact_threshold: None,
             system_prompt: system_prompt.into(),
             subagent_system_prompt: None,
@@ -117,6 +118,14 @@ impl AgentBuilder {
 
     pub fn compact_threshold(mut self, threshold: u64) -> Self {
         self.config.compact_threshold = Some(threshold);
+        self
+    }
+
+    /// Cap the output of each turn. Unset by default, which leaves the provider's own per-model
+    /// limit to apply; set it only to bound spend, since a cap below what the model reasons
+    /// through returns empty content rather than a shorter answer.
+    pub fn max_tokens(mut self, max_tokens: u64) -> Self {
+        self.config.max_tokens = Some(max_tokens);
         self
     }
 

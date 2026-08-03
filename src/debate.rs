@@ -70,6 +70,7 @@ struct DebateTurnResult {
 struct DebateTurnRequest<'a> {
     client: Arc<dyn LLMClientDyn>,
     compact_threshold: Option<u64>,
+    max_tokens: Option<u64>,
     model: &'a str,
     system_prompt: &'a str,
     initial_message: &'a str,
@@ -157,6 +158,7 @@ async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnRes
         session_agent: "root".to_string(),
         model: request.model.to_string(),
         max_turns: request.max_turns,
+        max_tokens: request.max_tokens,
         compact_threshold: request.compact_threshold,
         system_prompt: request.system_prompt.to_string(),
         subagent_system_prompt: None,
@@ -228,6 +230,7 @@ struct DebateSide<'a> {
     role: &'a str,
     client: Arc<dyn LLMClientDyn>,
     compact_threshold: Option<u64>,
+    max_tokens: Option<u64>,
     model: &'a str,
     system_prompt: &'a str,
     /// Trajectory filename stem; the round number is appended.
@@ -279,6 +282,7 @@ async fn run_debate_side(
     let result = run_debate_turn(DebateTurnRequest {
         client: Arc::clone(&side.client),
         compact_threshold: side.compact_threshold,
+        max_tokens: side.max_tokens,
         model: side.model,
         system_prompt: side.system_prompt,
         initial_message: &msg,
@@ -467,6 +471,10 @@ pub async fn run_debate(
     let critic_label: ModelLabel;
     let actor_compact_threshold: Option<u64>;
     let critic_compact_threshold: Option<u64>;
+    // In alloy mode the client pools every reviewer, so these come from the same two slots the
+    // roles are otherwise pinned to — the existing convention for per-side settings.
+    let actor_max_tokens = actor_cfg.max_tokens;
+    let critic_max_tokens = critic_cfg.max_tokens;
 
     if alloy {
         let mut slots = Vec::new();
@@ -541,6 +549,7 @@ pub async fn run_debate(
         role: actor_role,
         client: actor_client,
         compact_threshold: actor_compact_threshold,
+        max_tokens: actor_max_tokens,
         model: &actor_label.alias,
         system_prompt: &actor_system,
         session_stem: "review",
@@ -549,6 +558,7 @@ pub async fn run_debate(
         role: critic_role,
         client: critic_client,
         compact_threshold: critic_compact_threshold,
+        max_tokens: critic_max_tokens,
         model: &critic_label.alias,
         system_prompt: &critic_system,
         session_stem: "validate",
@@ -624,7 +634,7 @@ pub async fn run_debate(
         history: Vec::new(),
         tools: Vec::new(),
         tool_choice: None,
-        max_tokens: agg_cfg.max_tokens.or(Some(8192)),
+        max_tokens: Some(config.aggregator_max_tokens()),
         additional_params: None,
     };
     let (pb, _) = make_spinner(&mp);
