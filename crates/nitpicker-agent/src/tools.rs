@@ -679,13 +679,20 @@ mod tests {
     }
 
     /// Ordering keys off the map's keys, which are unique, rather than the definition names, which
-    /// a caller can duplicate — where sorting definitions would fall back to the map's arbitrary
-    /// order. Sorting by definition name would yield `[alpha, zed]` here.
+    /// a caller can duplicate. Sorting by definition name would yield `[alpha, zed]` here, so this
+    /// distinguishes the two rules — a duplicate-name pair could not, since it serializes to the
+    /// same sequence either way.
     #[test]
     fn tool_definitions_order_follows_map_keys_not_definition_names() {
         let tools: HashMap<String, Arc<dyn Tool>> = [
-            RenamedTool { key: "a", definition_name: "zed" },
-            RenamedTool { key: "z", definition_name: "alpha" },
+            RenamedTool {
+                key: "a",
+                definition_name: "zed",
+            },
+            RenamedTool {
+                key: "z",
+                definition_name: "alpha",
+            },
         ]
         .into_iter()
         .map(|tool| (tool.name(), Arc::new(tool) as Arc<dyn Tool>))

@@ -110,11 +110,13 @@ pub struct TokenUsage {
     pub output_tokens: u64,
     /// Always `input_tokens + output_tokens`.
     pub total_tokens: u64,
-    /// The part of `input_tokens` served from the provider's prompt cache — a breakdown of that
-    /// number, not an additional charge.
+    /// The part of `input_tokens` the provider served from its prompt cache, as reported — a
+    /// breakdown of that number, not an additional charge. Passed through verbatim, so a provider
+    /// that contradicts itself is visible here rather than papered over.
     #[serde(default)]
     pub cached_input_tokens: u64,
-    /// The part of `input_tokens` the provider wrote into its prompt cache on this call.
+    /// The part of `input_tokens` the provider wrote into its prompt cache on this call, as
+    /// reported.
     #[serde(default)]
     pub cache_creation_input_tokens: u64,
 }
@@ -158,19 +160,22 @@ impl TokenUsage {
     /// portion — which is what silently stops `ConversationUsageWindow::should_compact` from ever
     /// firing once a provider starts caching.
     ///
-    /// `max(cache buckets)` keeps the cache fields a true breakdown of `input_tokens` even if a
-    /// gateway reports them inconsistently. `total_tokens` is recomputed as `input + output`, so it
-    /// excludes any provider-side category counted outside both (notably Gemini's thinking tokens,
-    /// which this type does not meter).
+    /// Every number is the provider's own, only re-bucketed: nothing here invents tokens. A
+    /// provider whose cache figures contradict its prompt count is reported as it reported itself,
+    /// because clamping the prompt up to fit the cache breakdown would fabricate spend, and
+    /// clamping the cache down would falsify the cache figure.
+    ///
+    /// `total_tokens` is recomputed as `input + output` (barring saturation), so it excludes any
+    /// provider-side category counted outside both — notably Gemini's thinking and tool-use-prompt
+    /// counts, which this type does not meter.
     pub fn from_provider(usage: &rig_core::completion::Usage, accounting: CacheAccounting) -> Self {
-        let cache_buckets = usage
-            .cached_input_tokens
-            .saturating_add(usage.cache_creation_input_tokens);
         let input_tokens = match accounting {
-            CacheAccounting::OutsidePrompt => usage.input_tokens.saturating_add(cache_buckets),
+            CacheAccounting::OutsidePrompt => usage
+                .input_tokens
+                .saturating_add(usage.cached_input_tokens)
+                .saturating_add(usage.cache_creation_input_tokens),
             CacheAccounting::InsidePrompt => usage.input_tokens,
-        }
-        .max(cache_buckets);
+        };
         Self {
             input_tokens,
             output_tokens: usage.output_tokens,
@@ -1127,7 +1132,10 @@ mod tests {
 
         assert_eq!(from_anthropic.input_tokens, 3508);
         assert_eq!(from_anthropic.input_tokens, from_openai.input_tokens);
-        assert_eq!(from_anthropic.cached_input_tokens, from_openai.cached_input_tokens);
+        assert_eq!(
+            from_anthropic.cached_input_tokens,
+            from_openai.cached_input_tokens
+        );
         for usage in [from_anthropic, from_openai] {
             assert_eq!(usage.total_tokens, usage.input_tokens + usage.output_tokens);
         }
@@ -1193,18 +1201,31 @@ mod tests {
         assert_eq!(usage.total_tokens, 3012);
     }
 
-    /// `cached_input_tokens` is documented as a slice of `input_tokens`. A gateway contradicting
-    /// its own numbers must not be able to break that.
+    /// A provider reporting more cache than prompt is contradicting itself. Reporting the prompt
+    /// as 5000 to make the breakdown fit would invent 4990 tokens of spend that were never billed,
+    /// so both numbers are passed through as reported and the contradiction stays visible.
     #[test]
-    fn cache_fields_never_exceed_the_prompt_they_break_down() {
+    fn contradictory_cache_metadata_is_not_papered_over() {
         let mut usage = Usage::new();
         usage.input_tokens = 10;
         usage.output_tokens = 5;
         usage.total_tokens = 15;
         usage.cached_input_tokens = 5_000;
+        usage.cache_creation_input_tokens = 700;
         let usage = prompt_inclusive(&usage);
-        assert_eq!(usage.input_tokens, 5_000);
-        assert!(usage.input_tokens >= usage.cached_input_tokens);
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.total_tokens, 15);
+        assert_eq!(usage.cached_input_tokens, 5_000);
+        assert_eq!(usage.cache_creation_input_tokens, 700);
+    }
+
+    /// A gateway that omits usage entirely reports zeros through rig, which documents zero as its
+    /// "provider supplied no metrics" sentinel. Nothing may be conjured to fill the gap.
+    #[test]
+    fn absent_provider_usage_meters_zero_rather_than_a_guess() {
+        let usage = prompt_inclusive(&Usage::new());
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.total_tokens, 0);
     }
 
     /// The whole point of the normalization: a cache hit must still trip the compaction
