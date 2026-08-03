@@ -167,8 +167,18 @@ pub fn reflect_tools() -> HashMap<String, Arc<dyn Tool>> {
     tools
 }
 
+/// Definitions in a stable order, sorted by tool name.
+///
+/// The order is load-bearing for cost, not just tidiness: the serialized tool schemas sit at the
+/// front of every request, so providers that cache on prefix identity re-prefill the whole
+/// conversation when they are reordered. `HashMap` iteration order varies per map instance — a
+/// fresh map per debate turn (`debate.rs`) and a fresh one per process would otherwise hand the
+/// provider a differently-ordered array every time, and measurably drop the cache hit to zero.
 pub fn tool_definitions(tools: &HashMap<String, Arc<dyn Tool>>) -> Vec<ToolDefinition> {
-    tools.values().map(|tool| tool.definition()).collect()
+    let mut definitions: Vec<ToolDefinition> =
+        tools.values().map(|tool| tool.definition()).collect();
+    definitions.sort_by(|a, b| a.name.cmp(&b.name));
+    definitions
 }
 
 pub struct ReadFileTool;
@@ -625,8 +635,50 @@ impl Tool for GitTool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ALLOWED_GIT_SUBCOMMANDS, ReadFileTool, Tool, ensure_readonly_git, floor_char_boundary};
+    use super::{
+        ALLOWED_GIT_SUBCOMMANDS, GitTool, GlobTool, GrepTool, ReadFileTool, Tool,
+        ensure_readonly_git, floor_char_boundary, tool_definitions,
+    };
     use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// The tool schemas open every request, so their order decides whether a provider's prefix
+    /// cache hits. Two maps holding the same tools must serialize identically no matter how the
+    /// map was built — asserting the sorted postcondition rather than comparing two default-seeded
+    /// maps, which can coincide by chance on a set this small.
+    #[test]
+    fn tool_definitions_order_is_independent_of_map_construction() {
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(ReadFileTool),
+            Arc::new(GlobTool),
+            Arc::new(GrepTool),
+            Arc::new(GitTool),
+        ];
+        let names = |map: &HashMap<String, Arc<dyn Tool>>| {
+            tool_definitions(map)
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect::<Vec<_>>()
+        };
+
+        let forward: HashMap<String, Arc<dyn Tool>> = tools
+            .iter()
+            .map(|tool| (tool.name(), Arc::clone(tool)))
+            .collect();
+        let reversed: HashMap<String, Arc<dyn Tool>> = tools
+            .iter()
+            .rev()
+            .map(|tool| (tool.name(), Arc::clone(tool)))
+            .collect();
+
+        let ordered = names(&forward);
+        assert_eq!(ordered, names(&reversed));
+
+        let mut expected: Vec<String> = tools.iter().map(|tool| tool.name()).collect();
+        expected.sort();
+        assert_eq!(ordered, expected);
+    }
 
     #[test]
     fn floor_char_boundary_handles_end_and_past_end() {
