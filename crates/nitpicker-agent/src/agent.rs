@@ -73,9 +73,8 @@ pub struct AgentConfig {
     pub session_agent: String,
     pub model: String,
     pub max_turns: usize,
-    /// Output cap per turn. `None` (the default) sends none, leaving the provider's own per-model
-    /// limit to apply — a fixed budget is spent on reasoning before a reasoning model writes a
-    /// character, and the empty content that comes back is indistinguishable from silence.
+    /// Output cap per turn. `None` (the default) sends none, so the provider's per-model limit
+    /// applies: a fixed budget is spent on reasoning before the model writes a character.
     pub max_tokens: Option<u64>,
     pub compact_threshold: Option<u64>,
     pub system_prompt: String,
@@ -93,6 +92,37 @@ pub struct AgentConfig {
     pub progress: Option<Arc<dyn Fn(AgentProgress) + Send + Sync>>,
     pub project_context: Option<String>,
     pub session_writer: Option<SessionWriter>,
+}
+
+/// Best-effort compaction: a summarizer that fails after its own retries and corrections must not
+/// take the agent with it. Continuing uncompacted may still finish; aborting never does.
+async fn compact_or_continue(
+    config: &AgentConfig,
+    system_prompt: &str,
+    history: &mut Vec<Message>,
+    prompt: &mut Message,
+    turn: usize,
+    usage: TokenUsage,
+) -> Option<CompactionOutcome> {
+    match compact_history(
+        &config.llm_semaphore,
+        Arc::clone(&config.client),
+        &config.model,
+        config.max_tokens,
+        system_prompt,
+        history,
+        prompt,
+        turn,
+        usage,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            warn!(agent = %config.name, turn, "compaction failed ({err}); continuing uncompacted");
+            None
+        }
+    }
 }
 
 struct FinishTool {
@@ -300,18 +330,15 @@ pub async fn run_agent(
                 window_total_tokens = usage_before_compaction.total_tokens,
                 "compaction triggered"
             );
-            let compaction = compact_history(
-                &config.llm_semaphore,
-                Arc::clone(&config.client),
-                &config.model,
-                    config.max_tokens,
+            let compaction = compact_or_continue(
+                &config,
                 &effective_system_prompt,
                 &mut history,
                 &mut prompt,
                 turn + 1,
                 usage_before_compaction,
             )
-            .await?;
+            .await;
             if let Some(outcome) = &compaction {
                 totals.add_usage(outcome.usage);
             }
@@ -540,18 +567,15 @@ pub async fn run_agent(
                     consecutive_blocked_count,
                     "forcing compaction to break tool-call cycle"
                 );
-                let compaction = compact_history(
-                    &config.llm_semaphore,
-                    Arc::clone(&config.client),
-                    &config.model,
-                        config.max_tokens,
+                let compaction = compact_or_continue(
+                    &config,
                     &effective_system_prompt,
                     &mut history,
                     &mut prompt,
                     turn + 1,
                     conversation_usage.usage(),
                 )
-                .await?;
+                .await;
                 if let Some(outcome) = &compaction {
                     totals.add_usage(outcome.usage);
                 }
@@ -1060,9 +1084,8 @@ mod tests {
         }
     }
 
-    /// A subagent wave's cache reads have to reach the parent's totals: `add_usage` is the single
-    /// fold behind every reviewer, subagent and compaction call, so a field it forgets is a field
-    /// that silently reads as zero in the run's report.
+    /// `add_usage` is the single fold behind every reviewer, subagent and compaction call, so a
+    /// field it forgets reads as zero in the run's report.
     #[test]
     fn run_totals_fold_every_usage_field() {
         let mut totals = RunTotals::new(0);

@@ -103,8 +103,8 @@ fn detail_message_for_columns(prefix: &str, detail: Option<&str>, columns: usize
     }
 }
 
-/// Token counts for a progress line, where columns are scarce: `1038095` becomes `1.0M`.
-/// Exact counts stay available in the `info!` logs and the `pr --json` usage block.
+/// Token counts for a progress line, where columns are scarce: `1038095` becomes `1.0M`. Exact
+/// counts stay in the `info!` logs and the `pr --json` usage block.
 pub(crate) fn compact_tokens(tokens: u64) -> String {
     match tokens {
         0..=999 => tokens.to_string(),
@@ -115,10 +115,8 @@ pub(crate) fn compact_tokens(tokens: u64) -> String {
     }
 }
 
-/// The prompt-cache share of a run, as `1.0M in · 90% cached`. A ratio rather than a second token
-/// count: it is what answers "is caching working", and it costs a third of the width. Returns just
-/// the token count when the provider reported no prompt at all, since `0% cached` of nothing is
-/// noise rather than a signal.
+/// The prompt-cache share, as `1.0M in · 90% cached` — a ratio because it answers "is caching
+/// working" in a third of the width. Drops the ratio when no prompt was reported at all.
 pub(crate) fn input_with_cache_share(input_tokens: u64, cached_input_tokens: u64) -> String {
     let compact = compact_tokens(input_tokens);
     match input_tokens {

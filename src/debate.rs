@@ -479,7 +479,11 @@ pub async fn run_debate(
     if alloy {
         let mut slots = Vec::new();
         for r in &config.reviewer {
-            slots.push((build_client(r, proxy_url.as_deref())?, r.model.clone()));
+            slots.push(nitpicker_agent::llm::AlloySlot {
+                client: build_client(r, proxy_url.as_deref())?,
+                model: r.model.clone(),
+                max_tokens: r.max_tokens,
+            });
         }
         let shared: Arc<dyn LLMClientDyn> =
             Arc::new(nitpicker_agent::llm::AlloyClient::new(slots)?);

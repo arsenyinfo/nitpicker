@@ -128,7 +128,7 @@ the override is inherited by nested subagents. `None` ⇒ the built-in generic p
 7. `DebateMode::Topic` (from `ask`) uses Actor/Critic roles and general debate prompts
 8. `DebateMode::Review` (from default review mode) uses Reviewer/Validator roles and code-review-focused prompts. Both it and `TaskMode::Review` carry a `ReviewScope` (`Diff` vs `Static`): diff review keeps the change-attribution rules ("post-change code", "fixes the diff landed"), `--analyze` swaps them for impact-based static-analysis framing
 
-**Alloy mode** (`--alloy` / `defaults.alloy = true`): instead of pinning actor and critic to `reviewer[0]`/`reviewer[1]`, builds an `AlloyClient` that randomly selects from all configured reviewer models each turn. Requires ≥ 2 reviewers. Mixed-provider histories must stay provider-portable; the Codex boundary normalizes missing Responses `call_id`s from generic tool-call ids before lowering.
+**Alloy mode** (`--alloy` / `defaults.alloy = true`): instead of pinning actor and critic to `reviewer[0]`/`reviewer[1]`, builds an `AlloyClient` that randomly selects from all configured reviewer models each turn. Each `AlloySlot` carries its model's own `max_tokens`, applied together with the model at selection — a cap belongs to the model it was set for, not to the role whose turn it is. Requires ≥ 2 reviewers. Mixed-provider histories must stay provider-portable; the Codex boundary normalizes missing Responses `call_id`s from generic tool-call ids before lowering.
 
 ### Agent execution (`agent.rs`)
 
@@ -140,6 +140,7 @@ the override is inherited by nested subagents. `None` ⇒ the built-in generic p
 - Subagent depth is capped at 2 to bound recursion and cost
 - Subagents never inherit the parent's terminal tools (e.g. debate's `submit_verdict`, which writes into parent-owned verdict state and could falsely converge a debate) — they terminate via their own per-run `finish` tool
 - Project context (`CLAUDE.md`/`AGENTS.md`) is appended to the system prompt wrapped in a `<context-only>` tag that marks it as repository-authored reference material, not instructions — it is target-controlled content in `pr` mode
+- Compaction is best-effort (`compact_or_continue`): a summarizer that fails after its own retries and corrections leaves the run uncompacted rather than aborting the agent, since continuing may still finish
 - Compaction runs under a dedicated summarizer system prompt; the agent's role prompt (which orders tool calls that are unavailable during summarization) is embedded in the compaction request as reference-only material
 - Subagents return results through a hidden `finish(result)` tool; debate agents use `submit_verdict(verdict, agree)` instead. A terminal tool only ends the loop when it **actually ran** (not cycle-blocked, not errored) — a blocked/malformed terminal call never populated the verdict/finish store, so terminating on it would return an empty result; instead the agent gets another turn to retry
 - Repetitive tool-call cycles are blocked, and the agent can force a context reset to break out of loops

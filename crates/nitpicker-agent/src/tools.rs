@@ -167,12 +167,10 @@ pub fn reflect_tools() -> HashMap<String, Arc<dyn Tool>> {
     tools
 }
 
-/// Definitions in a stable order, sorted by map key.
+/// Definitions in a stable order, sorted by map key (unique, unlike definition names).
 ///
-/// The order is load-bearing for cost: the tool schemas sit at the front of every request, so a
-/// provider that caches on prefix identity re-prefills the whole conversation when they are
-/// reordered — and `HashMap` order varies per map instance, with a fresh map built every debate
-/// turn. Keys rather than definition names because keys are unique by construction.
+/// Load-bearing for cost: the schemas open every request, so reordering them re-prefills the whole
+/// conversation on a prefix-caching provider — and `HashMap` order varies per map instance.
 pub fn tool_definitions(tools: &HashMap<String, Arc<dyn Tool>>) -> Vec<ToolDefinition> {
     let mut entries: Vec<(&str, &Arc<dyn Tool>)> = tools
         .iter()
@@ -647,10 +645,8 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    /// The tool schemas open every request, so their order decides whether a provider's prefix
-    /// cache hits. Two maps holding the same tools must serialize identically no matter how the
-    /// map was built — asserting the sorted postcondition rather than comparing two default-seeded
-    /// maps, which can coincide by chance on a set this small.
+    /// Two maps holding the same tools must serialize identically however they were built. Asserts
+    /// the sorted postcondition, since two default-seeded maps can coincide by chance.
     #[test]
     fn tool_definitions_order_is_independent_of_map_construction() {
         let tools: Vec<Arc<dyn Tool>> = vec![

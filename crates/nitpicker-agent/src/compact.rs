@@ -51,8 +51,7 @@ enum CorrectionMode {
     WrapSummary,
 }
 
-/// Which model summarizes, and under what output cap — the agent's own, so a reviewer that raised
-/// its cap doesn't hit a lower one the moment its history compacts.
+/// Which model summarizes, under the agent's own cap rather than a separate one.
 #[derive(Clone, Copy)]
 struct CompactionModel<'a> {
     model: &'a str,
@@ -260,9 +259,7 @@ fn compaction_completion(
         history,
         tools: Vec::new(),
         tool_choice: Some(ToolChoice::None),
-        // The agent's own cap, so raising it doesn't stop at the summarizer. Unset (the default)
-        // leaves the summary's length to the instructions: a cap that reasoning eats returns
-        // nothing, and one the summary merely outgrows truncates it past its closing tag.
+        // Unset (the default) leaves the summary's length to the instructions.
         max_tokens: model.max_tokens,
         additional_params: None,
     }

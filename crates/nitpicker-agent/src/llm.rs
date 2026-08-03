@@ -112,43 +112,33 @@ pub struct TokenUsage {
     pub output_tokens: u64,
     /// Always `input_tokens + output_tokens`.
     pub total_tokens: u64,
-    /// The part of `input_tokens` the provider served from its prompt cache, as reported — a
-    /// breakdown of that number, not an additional charge. Passed through verbatim, so a provider
-    /// that contradicts itself is visible here rather than papered over.
+    /// A breakdown of `input_tokens`, not an additional charge. Passed through verbatim.
     #[serde(default)]
     pub cached_input_tokens: u64,
-    /// The part of `input_tokens` the provider wrote into its prompt cache on this call, as
-    /// reported.
+    /// The part of `input_tokens` written into the cache on this call.
     #[serde(default)]
     pub cache_creation_input_tokens: u64,
 }
 
-/// Whether a provider's reported prompt count already contains its cache reads.
-///
-/// Stated by each client, never inferred: a provider's `total_tokens` can carry categories that
-/// are neither prompt nor output (Gemini's thinking and tool-use prompts) or simply disagree with
-/// the sum of its own parts (OpenRouter gateways), so arithmetic tests misclassify real responses.
+/// Whether a provider's reported prompt count already contains its cache reads. Stated by each
+/// client, never inferred: provider totals can carry categories that are neither prompt nor output
+/// (Gemini) or disagree with their own parts (OpenRouter), so arithmetic tests misclassify.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheAccounting {
-    /// Anthropic: `input_tokens` excludes cache reads and writes, which are reported beside it —
-    /// so on a cache hit the reported prompt is a small fraction of what was actually sent.
+    /// Anthropic: cache reads and writes are reported beside `input_tokens`, not within it.
     OutsidePrompt,
-    /// OpenAI (chat and Responses), OpenRouter, Gemini: the reported prompt count already
-    /// includes anything served from cache.
+    /// OpenAI (chat and Responses), OpenRouter, Gemini: cache reads are already in the prompt.
     InsidePrompt,
 }
 
 impl TokenUsage {
-    /// Normalize one provider's usage so `input_tokens` always means every prompt token processed,
-    /// cache reads included.
+    /// Normalize usage so `input_tokens` always means every prompt token processed, cache reads
+    /// included — without it an Anthropic cache hit under-reports the prompt and
+    /// `ConversationUsageWindow::should_compact` never fires.
     ///
-    /// Without it, an Anthropic cache hit under-reports the prompt by the cached portion, which
-    /// silently stops `ConversationUsageWindow::should_compact` from ever firing.
-    ///
-    /// Every number is the provider's own, only re-bucketed — a provider whose cache figures
-    /// contradict its prompt count is reported as it reported itself, since clamping either way
-    /// fabricates spend or falsifies the cache figure. `total_tokens` is recomputed as
-    /// `input + output`, so categories counted outside both (Gemini's thinking tokens) go unmetered.
+    /// Numbers are re-bucketed, never invented: a provider contradicting itself is reported as it
+    /// reported itself. `total_tokens` is `input + output`, so anything counted outside both
+    /// (Gemini's thinking tokens) goes unmetered.
     pub fn from_provider(usage: &rig_core::completion::Usage, accounting: CacheAccounting) -> Self {
         let input_tokens = match accounting {
             CacheAccounting::OutsidePrompt => usage
@@ -240,14 +230,13 @@ impl CompletionResponse {
             .collect::<Vec<_>>()
             .join("\n");
         let (stripped, unclosed_body) = scan_think_blocks(&raw);
-        // only an *unclosed* block can have hidden an answer; a closed one that leaves nothing
-        // behind is genuinely all-reasoning and must still read as empty so the retry fires.
+        // only an *unclosed* block can hide an answer; a closed one that leaves nothing behind is
+        // genuinely all-reasoning and must read as empty so the retry fires.
         let Some(start) = unclosed_body else {
             return stripped;
         };
-        // Recovery runs whether or not the model wrote something before opening the block. Text
-        // outside it makes the loss quieter, not smaller: the response reads as successful while
-        // the answer stays buried, so the retry that saves an empty one never fires.
+        // Recovery runs even with text before the block: that text only makes the loss silent,
+        // since a non-empty response never retries.
         let recovered = self.recover_unterminated_think(&raw[start..]);
         match (stripped.is_empty(), recovered.is_empty()) {
             (_, true) => stripped,
@@ -256,15 +245,11 @@ impl CompletionResponse {
         }
     }
 
-    /// Salvage an answer that an unterminated `<think>` block swallowed whole.
+    /// Salvage an answer that an unterminated `<think>` block swallowed.
     ///
-    /// A block that is never closed takes the answer down with the reasoning, so the reply reads
-    /// as empty and four retries fail on a response that did answer.
-    ///
-    /// Where the reasoning ends is only knowable when the provider states it: such providers also
-    /// report it structurally, and the block repeats it verbatim before the answer. So it is
-    /// subtracted, never guessed, and an unmatched body returns empty rather than itself — serving
-    /// the body would pass chain-of-thought off as the verdict *and* silence the retry.
+    /// Where the reasoning ends is only knowable because the provider also reports it structurally
+    /// and the block repeats it verbatim before the answer, so it is subtracted, never guessed. An
+    /// unmatched body returns empty: serving it would pass chain-of-thought off as the verdict.
     fn recover_unterminated_think(&self, body: &str) -> String {
         let Some(reasoning) = self.reasoning_text() else {
             return String::new();
@@ -273,9 +258,8 @@ impl CompletionResponse {
         let Some(answer) = body.strip_prefix(reasoning.trim()) else {
             return String::new();
         };
-        // The split must fall on a word boundary: a reasoning string ending mid-word ("Ver" against
-        // "Verdict: ship it.") is a coincidental byte prefix and would serve a truncated answer.
-        // Whitespace would be too strict — real replies run straight on from the final punctuation.
+        // Word boundary, not whitespace: reasoning ending mid-word ("Ver" against "Verdict:") is a
+        // coincidental prefix, but real replies do run straight on from the final punctuation.
         let cuts_mid_word = reasoning
             .trim()
             .chars()
@@ -300,9 +284,8 @@ impl CompletionResponse {
             .flatten()
             .filter_map(|block| match block {
                 ReasoningContent::Text { text, .. } => Some(text.as_str()),
-                // Summary is a paraphrase and Encrypted/Redacted are opaque; none of them appear
-                // verbatim in the block body, so treating them as fragments of it would corrupt
-                // the reconstruction rather than complete it.
+                // Summary paraphrases and Encrypted/Redacted are opaque; none appear verbatim in
+                // the block, so they would corrupt the reconstruction rather than complete it.
                 _ => None,
             })
             .collect::<String>();
@@ -324,11 +307,9 @@ impl CompletionResponse {
 //   - a stray closing tag at depth 0 is dropped
 // note: this is content-wide, so a review that legitimately quotes a <think> tag in a code
 // snippet will have it stripped too — an accepted tradeoff for clean aggregation.
-/// The text outside think blocks, plus where the body of an unclosed block begins — the signal
-/// that a provider swallowed its own answer rather than genuinely returning only reasoning.
-///
-/// The offset is reported rather than a bare flag so recovery never re-parses tags: with several
-/// blocks, or a stray closer, "the first `<think>` in the text" is not the one that stayed open.
+/// The text outside think blocks, plus where the body of an unclosed block begins. An offset
+/// rather than a flag so recovery never re-parses tags: with several blocks or a stray closer, the
+/// first `<think>` is not the one that stayed open.
 fn scan_think_blocks(text: &str) -> (String, Option<usize>) {
     // match `<think` (or `</think` when `close`) + optional whitespace + `>` at the start of
     // `s`, case-insensitively; return the matched byte length. `<thinking>` is not a tag (the
@@ -421,10 +402,8 @@ impl LLMClient for Box<dyn LLMClientDyn> {
     }
 }
 
-/// What the provider said about a response that carried neither text nor a tool call. Without it
-/// an exhausted output budget is indistinguishable from a model that had nothing to say: a
-/// reasoning model spends the whole budget before writing a character and returns empty content
-/// with `MaxTokens`, which is a configuration problem wearing the costume of a broken model.
+/// What the provider said about a response carrying neither text nor a tool call. Without it an
+/// exhausted output budget is indistinguishable from a model that had nothing to say.
 fn empty_response_diagnosis(response: &CompletionResponse) -> String {
     let output_tokens = response.usage.output_tokens;
     match &response.finish_reason {
@@ -502,12 +481,19 @@ impl<C: LLMClient> LLMClient for RetryingLLM<C> {
 /// randomly alternates between models within a single agentic loop — see https://xbow.com/blog/alloy-agents
 ///
 /// inner clients must already be wrapped with retry (e.g. via `.with_retry()`); AlloyClient does not add retry itself
+/// One model in the pool, carrying the settings that belong to it rather than to the role.
+pub struct AlloySlot {
+    pub client: Arc<dyn LLMClientDyn>,
+    pub model: String,
+    pub max_tokens: Option<u64>,
+}
+
 pub struct AlloyClient {
-    slots: Vec<(Arc<dyn LLMClientDyn>, String)>,
+    slots: Vec<AlloySlot>,
 }
 
 impl AlloyClient {
-    pub fn new(slots: Vec<(Arc<dyn LLMClientDyn>, String)>) -> Result<Self> {
+    pub fn new(slots: Vec<AlloySlot>) -> Result<Self> {
         if slots.is_empty() {
             eyre::bail!("AlloyClient requires at least one slot");
         }
@@ -525,10 +511,12 @@ impl LLMClientDyn for AlloyClient {
         &self,
         mut completion: Completion,
     ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse>> + Send + '_>> {
-        let (client, model) = &self.slots[self.pick_idx()];
-        completion.model = model.clone();
-        let client = Arc::clone(client);
-        let model = model.clone();
+        let slot = &self.slots[self.pick_idx()];
+        completion.model = slot.model.clone();
+        // the selected model's own cap, not the role's: a cap belongs to the model it was set for
+        completion.max_tokens = slot.max_tokens;
+        let client = Arc::clone(&slot.client);
+        let model = slot.model.clone();
         Box::pin(async move {
             let mut response = client.completion(completion).await?;
             response.selected_model = Some(model);
@@ -989,11 +977,9 @@ impl LLMClient for anthropic::Client {
         let model_name = completion.model.clone();
         let mut request: rig_core::completion::CompletionRequest = completion.into();
         request.model = Some(model_name.clone());
-        // Anthropic requires `max_tokens`, so this is the one provider where "no cap" cannot be
-        // expressed. rig fills a per-model default, but only for model names it recognizes;
-        // anything else — an Anthropic-compatible gateway, a proxied model — falls back to 2048,
-        // less than a single review turn spends on reasoning alone. Keep our own floor for those,
-        // and let a caller that knows its model's real ceiling raise it via `max_tokens`.
+        // Anthropic requires `max_tokens`, so "no cap" cannot be expressed here. rig's own default
+        // covers only model names it recognizes and falls back to 2048 for every compatible
+        // gateway — less than one review turn spends on reasoning.
         request
             .max_tokens
             .get_or_insert(ANTHROPIC_DEFAULT_MAX_TOKENS);
@@ -1151,8 +1137,7 @@ struct GeminiAdditionalParams {
 impl GeminiAdditionalParams {
     fn from_completion(completion: &Completion) -> Self {
         let config = GenerationConfig {
-            // saturating, not wrapping: `as i32` turns a cap past i32::MAX into a negative field
-            // the API rejects outright, which reads as a broken request rather than a large cap.
+            // saturating: `as i32` would turn a cap past i32::MAX into a negative field
             max_output_tokens: completion
                 .max_tokens
                 .map(|value| i32::try_from(value).unwrap_or(i32::MAX)),
@@ -1216,10 +1201,8 @@ mod tests {
         AssistantContent::Reasoning(rig_core::completion::message::Reasoning::new(text))
     }
 
-    /// MiniMax M3 via OpenRouter opens a `<think>` block and never closes it, putting the answer
-    /// inside — so the depth scanner drops the whole response and four retries fail on a reply
-    /// that carried a verdict. The same response reports its reasoning in a structured field, so
-    /// the reasoning half can be removed exactly rather than guessed at.
+    /// The block is never closed, so the scanner drops the verdict with the reasoning — but the
+    /// reasoning is also reported structurally, so it can be subtracted exactly.
     #[test]
     fn unterminated_think_keeps_the_answer_and_drops_the_duplicated_reasoning() {
         let reasoning = "The debate is extremely brief. The Actor suggested `eyre`.";
@@ -1235,9 +1218,8 @@ mod tests {
         );
     }
 
-    /// A model that writes a line before opening the block hides its answer just as thoroughly,
-    /// but the leading text makes the response read as successful — so nothing retries and the
-    /// verdict is lost silently, which is worse than the empty case.
+    /// Leading text hides the answer just as thoroughly, but makes the response read as
+    /// successful — so nothing retries and the verdict is lost silently.
     #[test]
     fn unterminated_think_after_a_prefix_still_recovers_the_answer() {
         let reasoning = "Weighing both sides.";
@@ -1253,10 +1235,8 @@ mod tests {
         );
     }
 
-    /// OpenRouter delivers `reasoning_details` as streaming fragments that are split mid-sentence
-    /// ("...depth of analysis" + " here."), so they must be concatenated with nothing between
-    /// them. Joining with a newline corrupts the text just enough that it no longer matches the
-    /// copy inside the `<think>` block, and the whole reasoning leaks into the answer.
+    /// OpenRouter splits `reasoning_details` mid-sentence, so a newline join stops the fragments
+    /// matching their copy inside the block and the whole chain leaks into the answer.
     #[test]
     fn fragmented_reasoning_is_concatenated_without_separators() {
         let response = response_with(vec![

@@ -64,6 +64,9 @@ them separately), so cost formulas must discount `cached_input_tokens` at the ca
 `None`: turns now send no output cap and get the provider's own per-model limit. A cap budgets
 reasoning *plus* the answer, so one set below what the model reasons through returns empty content
 instead of a shorter answer. Anthropic requires the field, so `None` becomes 8192 there.
+`AgentBuilder::max_tokens` takes `NonZeroU64`, and `AlloyClient::new` takes `Vec<AlloySlot>`
+(`client` / `model` / `max_tokens`) rather than `(client, model)` pairs, so a pooled model is
+capped by its own setting rather than by the calling role's.
 
 ## License
 

@@ -3,10 +3,8 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_MAX_TURNS: usize = 100;
 
-/// The aggregator writes one bounded synthesis and never calls a tool, so a budget is appropriate
-/// there — unlike a reviewer turn, where any fixed cap is spent on reasoning before the model
-/// writes a character. Reviewers therefore default to no cap at all (the provider's own per-model
-/// limit), and both are overridable per entity.
+/// The aggregator writes one bounded synthesis and never calls a tool, so a budget fits there.
+/// Reviewer turns get no cap by default, since any fixed one is spent on reasoning first.
 pub const DEFAULT_AGGREGATOR_MAX_TOKENS: u64 = 16_384;
 
 #[derive(Serialize, Deserialize)]
@@ -67,8 +65,7 @@ pub struct ReviewerConfig {
     pub base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
-    /// Output cap for this reviewer's turns. Unset means no cap: the provider applies its own
-    /// per-model limit, which is the only number that is right for every model.
+    /// Output cap per turn. Unset means no cap: the provider's own per-model limit applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -569,8 +566,7 @@ mod tests {
         assert!(validate_auth("[t]", &ProviderType::OpenRouter, &auth, None, None, None).is_err());
     }
 
-    /// Codex auth needs no env var, so a config built on it validates identically everywhere
-    /// rather than depending on which provider keys happen to be exported.
+    /// Codex auth needs no env var, so this validates the same wherever it runs.
     fn config_with(reviewer_max_tokens: Option<u64>, aggregator_max_tokens: Option<u64>) -> Config {
         Config {
             defaults: None,
@@ -599,8 +595,7 @@ mod tests {
         }
     }
 
-    /// Zero is not "no cap" — it is a request the provider answers with nothing at all, which
-    /// surfaces as an empty-response failure four attempts later. Unset is how no cap is spelled.
+    /// Zero is not "no cap" — the provider answers it with nothing. Unset is how no cap is spelled.
     #[test]
     fn zero_max_tokens_is_rejected_on_both_entities() {
         assert!(config_with(None, None).validate().is_ok());

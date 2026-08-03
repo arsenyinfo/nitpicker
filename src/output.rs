@@ -57,9 +57,7 @@ pub struct UsageReport {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
-    /// the part of `input_tokens` the providers served from their prompt caches — a breakdown of
-    /// that number, not an extra charge. A run that re-prefills instead of hitting cache shows a
-    /// near-zero value here.
+    /// a breakdown of `input_tokens`, not an extra charge; near zero when nothing hits cache
     pub cached_input_tokens: u64,
     /// the part of `input_tokens` written into a provider prompt cache.
     pub cache_creation_input_tokens: u64,

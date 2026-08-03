@@ -484,11 +484,9 @@ fn build_body(completion: &Completion) -> Result<ResponsesBody> {
     Ok(body)
 }
 
-// rig lowers assistant text into a valid Responses shape itself (a bare-string `AssistantInput`
-// when the message has no id — nitpicker's only case — or an `output_text` array when it does),
-// and since 0.41 it also drops function-call item ids that aren't provider-native `fc_...` ids,
-// pairing the call with its output by `call_id` alone. Both rewrites nitpicker used to apply here
-// are therefore upstream now, so serialization needs no post-processing.
+// rig lowers assistant text into a valid Responses shape itself, and since 0.41 also drops
+// function-call item ids that aren't native `fc_...` ids, pairing by `call_id` alone. Both
+// rewrites nitpicker used to apply here are upstream now, so serialization needs no fixups.
 fn build_body_value(completion: &Completion) -> Result<Value> {
     let body = build_body(completion)?;
     serde_json::to_value(&body).wrap_err("serializing Codex Responses request")
@@ -922,9 +920,8 @@ mod tests {
         assert_eq!(assistant_message["content"], "previous answer");
     }
 
-    /// A tool id minted by another provider (an Alloy history replayed into Codex) is not a native
-    /// `fc_...` Responses item id, and the backend rejects those. It must therefore be absent from
-    /// the serialized `function_call`, leaving `call_id` as the sole pairing key to its output.
+    /// A tool id from another provider (an Alloy history replayed into Codex) is not a native
+    /// `fc_...` id, so it must be absent from `function_call` and pair by `call_id` alone.
     #[test]
     fn body_value_omits_foreign_function_call_item_id() {
         let tool_id = "tool_5Xt5WpWtZ6Whah4Z2uZcZO34".to_string();
@@ -1041,8 +1038,7 @@ mod tests {
         let resp = to_completion_response(raw, "gpt-5.4".to_string()).unwrap();
         assert_eq!(resp.text(), "pong");
         assert_eq!(resp.finish_reason, FinishReason::Stop);
-        // The Responses API reports cache reads inside `input_tokens`, so the prompt must not be
-        // inflated by them — and the cache read itself must survive to the metering layer.
+        // cache reads are inside `input_tokens` here, so the prompt must not be inflated by them
         assert_eq!(resp.usage.input_tokens, 5000);
         assert_eq!(resp.usage.cached_input_tokens, 4800);
         assert_eq!(resp.usage.total_tokens, 5001);
