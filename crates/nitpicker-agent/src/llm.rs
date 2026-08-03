@@ -140,18 +140,6 @@ pub enum CacheAccounting {
 }
 
 impl TokenUsage {
-    /// For usage that carries no provider cache data. Values coming from a provider should go
-    /// through [`TokenUsage::from_provider`] instead, which normalizes `input_tokens`.
-    pub fn new(input_tokens: u64, output_tokens: u64) -> Self {
-        Self {
-            input_tokens,
-            output_tokens,
-            total_tokens: input_tokens.saturating_add(output_tokens),
-            cached_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-        }
-    }
-
     /// Normalize one provider's usage so `input_tokens` always means every prompt token processed,
     /// cache reads included.
     ///

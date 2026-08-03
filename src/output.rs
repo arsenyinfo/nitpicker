@@ -142,7 +142,7 @@ pub fn emit_json<T: Serialize>(value: &T) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn usage(input: u64, output: u64, cached: u64, cache_creation: u64) -> TokenUsage {
+    fn usage_of(input: u64, output: u64, cached: u64, cache_creation: u64) -> TokenUsage {
         TokenUsage {
             input_tokens: input,
             output_tokens: output,
@@ -155,8 +155,8 @@ mod tests {
     #[test]
     fn usage_add_folds_tokens_and_subagents() {
         let mut report = UsageReport::default();
-        report.add(usage(100, 30, 80, 20), 2);
-        report.add(usage(10, 5, 4, 0), 1);
+        report.add(usage_of(100, 30, 80, 20), 2);
+        report.add(usage_of(10, 5, 4, 0), 1);
         assert_eq!(report.input_tokens, 110);
         assert_eq!(report.output_tokens, 35);
         assert_eq!(report.total_tokens, 145);
@@ -170,9 +170,9 @@ mod tests {
     #[test]
     fn cached_tokens_do_not_inflate_totals() {
         let mut cache_hit = UsageReport::default();
-        cache_hit.add(usage(1000, 50, 950, 0), 0);
+        cache_hit.add(usage_of(1000, 50, 950, 0), 0);
         let mut cache_miss = UsageReport::default();
-        cache_miss.add(usage(1000, 50, 0, 0), 0);
+        cache_miss.add(usage_of(1000, 50, 0, 0), 0);
         assert_eq!(cache_hit.input_tokens, cache_miss.input_tokens);
         assert_eq!(cache_hit.total_tokens, cache_miss.total_tokens);
     }
@@ -183,14 +183,14 @@ mod tests {
             input_tokens: u64::MAX,
             ..Default::default()
         };
-        usage.add(TokenUsage::new(5, 0), 0);
+        usage.add(usage_of(5, 0, 0, 0), 0);
         assert_eq!(usage.input_tokens, u64::MAX);
     }
 
     #[test]
     fn ok_envelope_serializes_usage_block() {
         let mut report = UsageReport::default();
-        report.add(usage(120_000, 8_000, 96_000, 12_000), 6);
+        report.add(usage_of(120_000, 8_000, 96_000, 12_000), 6);
         let envelope = PrReviewOutput {
             schema_version: SCHEMA_VERSION,
             status: Status::Ok,
