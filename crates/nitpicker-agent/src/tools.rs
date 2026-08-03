@@ -648,6 +648,56 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    /// A tool whose map key and advertised definition name deliberately disagree, so a test can
+    /// tell key-ordering apart from definition-name ordering.
+    struct RenamedTool {
+        key: &'static str,
+        definition_name: &'static str,
+    }
+
+    impl Tool for RenamedTool {
+        fn name(&self) -> String {
+            self.key.to_string()
+        }
+
+        fn definition(&self) -> super::ToolDefinition {
+            super::ToolDefinition {
+                name: self.definition_name.to_string(),
+                description: String::new(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+
+        fn call(
+            &self,
+            _args: serde_json::Value,
+            _work_dir: std::path::PathBuf,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = super::Result<String>> + Send>>
+        {
+            Box::pin(async { Ok(String::new()) })
+        }
+    }
+
+    /// Ordering keys off the map's keys, which are unique, rather than the definition names, which
+    /// a caller can duplicate — where sorting definitions would fall back to the map's arbitrary
+    /// order. Sorting by definition name would yield `[alpha, zed]` here.
+    #[test]
+    fn tool_definitions_order_follows_map_keys_not_definition_names() {
+        let tools: HashMap<String, Arc<dyn Tool>> = [
+            RenamedTool { key: "a", definition_name: "zed" },
+            RenamedTool { key: "z", definition_name: "alpha" },
+        ]
+        .into_iter()
+        .map(|tool| (tool.name(), Arc::new(tool) as Arc<dyn Tool>))
+        .collect();
+
+        let ordered: Vec<String> = tool_definitions(&tools)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert_eq!(ordered, vec!["zed".to_string(), "alpha".to_string()]);
+    }
+
     /// The tool schemas open every request, so their order decides whether a provider's prefix
     /// cache hits. Two maps holding the same tools must serialize identically no matter how the
     /// map was built — asserting the sorted postcondition rather than comparing two default-seeded

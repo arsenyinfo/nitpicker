@@ -23,8 +23,8 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::llm::{
-    Completion, CompletionResponse, FinishReason, LLMClient, LLMClientDyn, TokenUsage,
-    WithRetryExt, mentions_http_status,
+    CacheAccounting, Completion, CompletionResponse, FinishReason, LLMClient, LLMClientDyn,
+    TokenUsage, WithRetryExt, mentions_http_status,
 };
 
 /// Codex CLI's public OAuth client id (PKCE, no secret) — shared with the official CLI.
@@ -638,7 +638,8 @@ fn to_completion_response(raw: ResponsesResp, model: String) -> Result<Completio
         // rig's `TryFrom` above already errors on an empty response, so `choice` is non-empty here.
         choice: parsed.choice,
         finish_reason,
-        usage: TokenUsage::from(&parsed.usage),
+        // the Responses API reports cache reads inside `input_tokens`
+        usage: TokenUsage::from_provider(&parsed.usage, CacheAccounting::InsidePrompt),
         selected_model: Some(model),
     })
 }

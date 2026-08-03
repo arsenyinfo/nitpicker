@@ -119,9 +119,27 @@ pub struct TokenUsage {
     pub cache_creation_input_tokens: u64,
 }
 
+/// Whether a provider's reported prompt count already contains its cache reads.
+///
+/// This is the one thing that differs between provider usage shapes, and it cannot be inferred
+/// from the numbers: a provider's `total_tokens` may carry categories that are neither prompt nor
+/// `output_tokens` (Gemini counts thinking and tool-use prompts beside both) or may simply
+/// disagree with the sum of its own parts (OpenRouter gateways do), so any arithmetic test for
+/// "do the cache buckets fit outside the input?" misclassifies some real responses. Each client
+/// knows which provider it is talking to, so it states the accounting instead of guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheAccounting {
+    /// Anthropic: `input_tokens` excludes cache reads and writes, which are reported beside it —
+    /// so on a cache hit the reported prompt is a small fraction of what was actually sent.
+    OutsidePrompt,
+    /// OpenAI (chat and Responses), OpenRouter, Gemini: the reported prompt count already
+    /// includes anything served from cache.
+    InsidePrompt,
+}
+
 impl TokenUsage {
     /// For usage that carries no provider cache data. Values coming from a provider should go
-    /// through `From<&rig_core::completion::Usage>` instead, which normalizes `input_tokens`.
+    /// through [`TokenUsage::from_provider`] instead, which normalizes `input_tokens`.
     pub fn new(input_tokens: u64, output_tokens: u64) -> Self {
         Self {
             input_tokens,
@@ -131,43 +149,28 @@ impl TokenUsage {
             cache_creation_input_tokens: 0,
         }
     }
-}
 
-impl From<&rig_core::completion::Usage> for TokenUsage {
-    /// Providers disagree on what `input_tokens` counts: Anthropic reports cache reads separately
-    /// from it, OpenAI folds them into `prompt_tokens`. Summing the raw field across reviewers
-    /// therefore yields a number with no single meaning — and on a cache hit the Anthropic shape
-    /// under-reports the prompt by the cached portion, which is what silently stops
-    /// `ConversationUsageWindow::should_compact` from ever firing.
+    /// Normalize one provider's usage so `input_tokens` always means every prompt token processed,
+    /// cache reads included.
     ///
-    /// Rather than hardcode which provider is which, the provider's own `total_tokens` decides:
-    /// the cache buckets are additive only if they fit alongside the reported input inside
-    /// everything that isn't output. On the Anthropic shape they fit exactly; on the OpenAI shape
-    /// they already sit inside `input_tokens`, so adding them would overshoot the total and they
-    /// are left alone. The total is deliberately used only as a bound, never as the answer:
-    /// Gemini's parts don't sum to its total, so deriving the prompt from it would charge thinking
-    /// tokens to the prompt.
+    /// Without this, summing `input_tokens` across reviewers adds up numbers that mean different
+    /// things, and on the Anthropic shape a cache hit under-reports the prompt by the cached
+    /// portion — which is what silently stops `ConversationUsageWindow::should_compact` from ever
+    /// firing once a provider starts caching.
     ///
-    /// `max(cache_buckets)` keeps the cache fields a true breakdown of `input_tokens` even if a
-    /// gateway reports them inconsistently, and `total` is recomputed so `total == input + output`
-    /// holds for every consumer of this type.
-    fn from(usage: &rig_core::completion::Usage) -> Self {
+    /// `max(cache buckets)` keeps the cache fields a true breakdown of `input_tokens` even if a
+    /// gateway reports them inconsistently. `total_tokens` is recomputed as `input + output`, so it
+    /// excludes any provider-side category counted outside both (notably Gemini's thinking tokens,
+    /// which this type does not meter).
+    pub fn from_provider(usage: &rig_core::completion::Usage, accounting: CacheAccounting) -> Self {
         let cache_buckets = usage
             .cached_input_tokens
             .saturating_add(usage.cache_creation_input_tokens);
-        // Tokens inside `total_tokens` that are not prompt: the model's output, plus the thinking
-        // and tool-use-prompt counts Gemini reports beside `output_tokens` rather than inside it.
-        let non_prompt = usage
-            .output_tokens
-            .saturating_add(usage.reasoning_tokens)
-            .saturating_add(usage.tool_use_prompt_tokens);
-        let prompt_budget = usage.total_tokens.saturating_sub(non_prompt);
-        let counted_outside_input =
-            usage.input_tokens.saturating_add(cache_buckets) <= prompt_budget;
-        let input_tokens = match counted_outside_input {
-            true => usage.input_tokens.saturating_add(cache_buckets),
-            false => usage.input_tokens.max(cache_buckets),
-        };
+        let input_tokens = match accounting {
+            CacheAccounting::OutsidePrompt => usage.input_tokens.saturating_add(cache_buckets),
+            CacheAccounting::InsidePrompt => usage.input_tokens,
+        }
+        .max(cache_buckets);
         Self {
             input_tokens,
             output_tokens: usage.output_tokens,
@@ -864,7 +867,7 @@ impl LLMClient for openrouter::Client {
         Ok(CompletionResponse {
             choice: response.choice,
             finish_reason,
-            usage: TokenUsage::from(&response.usage),
+            usage: TokenUsage::from_provider(&response.usage, CacheAccounting::InsidePrompt),
             selected_model: Some(model_name),
         })
     }
@@ -916,7 +919,7 @@ impl LLMClient for anthropic::Client {
         Ok(CompletionResponse {
             choice: response.choice,
             finish_reason,
-            usage: TokenUsage::from(&response.usage),
+            usage: TokenUsage::from_provider(&response.usage, CacheAccounting::OutsidePrompt),
             selected_model: Some(model_name),
         })
     }
@@ -951,7 +954,7 @@ impl LLMClient for gemini::Client {
         Ok(CompletionResponse {
             choice: response.choice,
             finish_reason,
-            usage: TokenUsage::from(&response.usage),
+            usage: TokenUsage::from_provider(&response.usage, CacheAccounting::InsidePrompt),
             selected_model: Some(model_name),
         })
     }
@@ -1030,7 +1033,7 @@ impl LLMClient for openai::CompletionsClient {
         Ok(CompletionResponse {
             choice: response.choice,
             finish_reason,
-            usage: TokenUsage::from(&response.usage),
+            usage: TokenUsage::from_provider(&response.usage, CacheAccounting::InsidePrompt),
             selected_model: Some(model_name),
         })
     }
@@ -1100,84 +1103,98 @@ mod tests {
         usage
     }
 
-    /// Mirrors rig's OpenAI mapping: `prompt_tokens` already contains the cache reads and
-    /// reasoning is part of `completion_tokens` (`openai/completion/mod.rs`).
-    fn openai_usage(prompt: u64, completion: u64, cached: u64, reasoning: u64) -> Usage {
-        let mut usage = Usage::new();
-        usage.input_tokens = prompt;
-        usage.output_tokens = completion;
-        usage.cached_input_tokens = cached;
-        usage.reasoning_tokens = reasoning;
-        usage.total_tokens = prompt + completion;
-        usage
+    fn anthropic(usage: &Usage) -> TokenUsage {
+        TokenUsage::from_provider(usage, CacheAccounting::OutsidePrompt)
     }
 
-    /// The same 3508-token prompt, served from cache, as each provider reports it: Anthropic
-    /// shows `input_tokens: 52` with the rest under `cache_read`, OpenAI shows the whole prompt.
-    /// Both must meter identically, or a mixed-provider run sums numbers that mean different
-    /// things — and the Anthropic shape read raw is what hid 98% of the prompt.
+    fn prompt_inclusive(usage: &Usage) -> TokenUsage {
+        TokenUsage::from_provider(usage, CacheAccounting::InsidePrompt)
+    }
+
+    /// The same 3508-token prompt served from cache, as each provider reports it: Anthropic shows
+    /// `input_tokens: 52` with the rest under `cache_read`, OpenAI shows the whole prompt. Both
+    /// must meter identically, or a mixed-provider run sums numbers that mean different things —
+    /// and the Anthropic shape read raw is what hid 98% of the prompt.
     #[test]
     fn provider_shapes_meter_a_cache_hit_identically() {
-        let anthropic = TokenUsage::from(&anthropic_usage(52, 8, 3456, 0));
-        let openai = TokenUsage::from(&openai_usage(3508, 8, 3456, 0));
-        assert_eq!(anthropic.input_tokens, 3508);
-        assert_eq!(anthropic.input_tokens, openai.input_tokens);
-        assert_eq!(anthropic.cached_input_tokens, openai.cached_input_tokens);
-        for usage in [anthropic, openai] {
+        let from_anthropic = anthropic(&anthropic_usage(52, 8, 3456, 0));
+        let mut openai = Usage::new();
+        openai.input_tokens = 3508;
+        openai.output_tokens = 8;
+        openai.cached_input_tokens = 3456;
+        openai.total_tokens = 3516;
+        let from_openai = prompt_inclusive(&openai);
+
+        assert_eq!(from_anthropic.input_tokens, 3508);
+        assert_eq!(from_anthropic.input_tokens, from_openai.input_tokens);
+        assert_eq!(from_anthropic.cached_input_tokens, from_openai.cached_input_tokens);
+        for usage in [from_anthropic, from_openai] {
             assert_eq!(usage.total_tokens, usage.input_tokens + usage.output_tokens);
         }
     }
 
-    /// Gemini is the shape where `total_tokens` carries tokens that are neither prompt nor
-    /// `output_tokens` — thinking and tool-use prompts are counted beside it, and the parts don't
-    /// even sum to the total. Charging those to the prompt misattributes output-priced tokens as
-    /// input and trips compaction early. Numbers are rig's own non-streaming fixture
-    /// (`gemini/completion.rs`): prompt 40, candidates 30, thoughts 10, tool-use 12, cached 20,
-    /// total 100.
+    /// Gemini reports thinking and tool-use prompts beside both `input_tokens` and
+    /// `output_tokens`, and its parts don't sum to its total — so no arithmetic can tell its shape
+    /// apart from Anthropic's. Numbers are rig's own fixture (`gemini/completion.rs`) with the
+    /// cache lowered to 8, the value that makes the buckets *look* like they fit outside the
+    /// prompt. Charging them would report a 40-token prompt as 48.
     #[test]
-    fn gemini_thinking_tokens_are_not_charged_to_the_prompt() {
+    fn gemini_cache_reads_are_never_added_to_its_prompt() {
         let mut usage = Usage::new();
         usage.input_tokens = 40;
         usage.output_tokens = 30;
         usage.reasoning_tokens = 10;
         usage.tool_use_prompt_tokens = 12;
-        usage.cached_input_tokens = 20;
+        usage.cached_input_tokens = 8;
         usage.total_tokens = 100;
-        let usage = TokenUsage::from(&usage);
+        let usage = prompt_inclusive(&usage);
         assert_eq!(usage.input_tokens, 40);
-        assert_eq!(usage.cached_input_tokens, 20);
+        assert_eq!(usage.cached_input_tokens, 8);
     }
 
-    /// A reasoning model on the OpenAI shape bills thinking inside `completion_tokens`, so the
-    /// prompt must not shrink by it.
+    /// An OpenRouter gateway may report a total larger than prompt + completion. That slack must
+    /// not turn its cache reads — already inside `prompt_tokens` — into extra prompt tokens.
     #[test]
-    fn openai_reasoning_tokens_stay_out_of_the_prompt() {
-        let usage = TokenUsage::from(&openai_usage(3_000, 800, 0, 750));
-        assert_eq!(usage.input_tokens, 3_000);
-        assert_eq!(usage.output_tokens, 800);
+    fn openrouter_total_disagreement_does_not_inflate_the_prompt() {
+        let mut usage = Usage::new();
+        usage.input_tokens = 500;
+        usage.output_tokens = 10;
+        usage.cached_input_tokens = 5;
+        usage.total_tokens = 515;
+        let usage = prompt_inclusive(&usage);
+        assert_eq!(usage.input_tokens, 500);
+        assert_eq!(usage.total_tokens, 510);
     }
 
-    /// A gateway that omits usage totals must fall back to the reported input rather than
-    /// metering zero, which would keep `should_compact` from ever firing.
+    /// A gateway that omits usage totals must still meter the prompt it reported.
     #[test]
-    fn missing_provider_total_falls_back_to_reported_input() {
+    fn missing_provider_total_still_meters_reported_input() {
         let mut usage = Usage::new();
         usage.input_tokens = 1200;
         usage.output_tokens = 40;
-        let usage = TokenUsage::from(&usage);
+        let usage = prompt_inclusive(&usage);
         assert_eq!(usage.input_tokens, 1200);
         assert_eq!(usage.total_tokens, 1240);
     }
 
+    /// Anthropic charges a cache *write* too, and reports it outside `input_tokens` like a read.
     #[test]
-    fn cache_creation_tokens_are_carried_through() {
-        let usage = TokenUsage::from(&anthropic_usage(90, 10, 0, 4100));
+    fn anthropic_cache_writes_count_toward_the_prompt() {
+        let usage = anthropic(&anthropic_usage(90, 10, 0, 4100));
         assert_eq!(usage.cache_creation_input_tokens, 4100);
         assert_eq!(usage.input_tokens, 4190);
+        assert_eq!(usage.total_tokens, 4200);
     }
 
-    /// `cached_input_tokens` is documented as a slice of `input_tokens`. A gateway reporting a
-    /// total that contradicts its own cache numbers must not be able to break that.
+    #[test]
+    fn anthropic_without_any_cache_is_unchanged() {
+        let usage = anthropic(&anthropic_usage(3000, 12, 0, 0));
+        assert_eq!(usage.input_tokens, 3000);
+        assert_eq!(usage.total_tokens, 3012);
+    }
+
+    /// `cached_input_tokens` is documented as a slice of `input_tokens`. A gateway contradicting
+    /// its own numbers must not be able to break that.
     #[test]
     fn cache_fields_never_exceed_the_prompt_they_break_down() {
         let mut usage = Usage::new();
@@ -1185,7 +1202,8 @@ mod tests {
         usage.output_tokens = 5;
         usage.total_tokens = 15;
         usage.cached_input_tokens = 5_000;
-        let usage = TokenUsage::from(&usage);
+        let usage = prompt_inclusive(&usage);
+        assert_eq!(usage.input_tokens, 5_000);
         assert!(usage.input_tokens >= usage.cached_input_tokens);
     }
 
@@ -1194,7 +1212,7 @@ mod tests {
     #[test]
     fn compaction_threshold_sees_the_cached_prompt() {
         let mut window = ConversationUsageWindow::new(Some(3_000));
-        window.record(TokenUsage::from(&anthropic_usage(52, 8, 3456, 0)));
+        window.record(anthropic(&anthropic_usage(52, 8, 3456, 0)));
         assert!(window.should_compact());
     }
 
@@ -1202,9 +1220,10 @@ mod tests {
     /// still decode.
     #[test]
     fn usage_without_cache_fields_still_deserializes() {
-        let usage: TokenUsage =
-            serde_json::from_value(json!({"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}))
-                .expect("legacy usage payload must decode");
+        let usage: TokenUsage = serde_json::from_value(
+            json!({"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}),
+        )
+        .expect("legacy usage payload must decode");
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.cached_input_tokens, 0);
     }

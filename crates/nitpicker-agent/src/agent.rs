@@ -1060,9 +1060,19 @@ mod tests {
     #[test]
     fn run_totals_saturate_rather_than_overflow() {
         let mut totals = RunTotals::new(0);
-        totals.add_usage(usage(u64::MAX, 0, u64::MAX, 0));
-        totals.add_usage(usage(10, 0, 10, 0));
+        let max = TokenUsage {
+            input_tokens: u64::MAX,
+            output_tokens: u64::MAX,
+            total_tokens: u64::MAX,
+            cached_input_tokens: u64::MAX,
+            cache_creation_input_tokens: u64::MAX,
+        };
+        totals.add_usage(max);
+        totals.add_usage(usage(10, 10, 10, 10));
         assert_eq!(totals.usage.input_tokens, u64::MAX);
+        assert_eq!(totals.usage.output_tokens, u64::MAX);
+        assert_eq!(totals.usage.total_tokens, u64::MAX);
         assert_eq!(totals.usage.cached_input_tokens, u64::MAX);
+        assert_eq!(totals.usage.cache_creation_input_tokens, u64::MAX);
     }
 }
