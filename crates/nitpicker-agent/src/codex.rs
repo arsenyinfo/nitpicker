@@ -484,41 +484,14 @@ fn build_body(completion: &Completion) -> Result<ResponsesBody> {
     Ok(body)
 }
 
+// rig lowers assistant text into a valid Responses shape itself (a bare-string `AssistantInput`
+// when the message has no id — nitpicker's only case — or an `output_text` array when it does),
+// and since 0.41 it also drops function-call item ids that aren't provider-native `fc_...` ids,
+// pairing the call with its output by `call_id` alone. Both rewrites nitpicker used to apply here
+// are therefore upstream now, so serialization needs no post-processing.
 fn build_body_value(completion: &Completion) -> Result<Value> {
     let body = build_body(completion)?;
-    let mut value = serde_json::to_value(&body).wrap_err("serializing Codex Responses request")?;
-    normalize_codex_responses_request(&mut value);
-    Ok(value)
-}
-
-fn normalize_codex_responses_request(body: &mut Value) {
-    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
-        return;
-    };
-    for item in items {
-        normalize_codex_input_item(item);
-    }
-}
-
-// rig 0.39 lowers assistant text into a valid Responses shape itself (a bare-string
-// `AssistantInput` when the message has no id — nitpicker's only case — or an `output_text`
-// array when it does), so no assistant-content rewrite is needed here. Only function-call item
-// ids still need the `fc_` normalization for cross-provider (Alloy) replay.
-fn normalize_codex_input_item(item: &mut Value) {
-    if item.get("type").and_then(Value::as_str) == Some("function_call") {
-        normalize_codex_function_call_item(item);
-    }
-}
-
-fn normalize_codex_function_call_item(item: &mut Value) {
-    let replacement = item
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.starts_with("fc_"))
-        .map(|id| format!("fc_{id}"));
-    if let Some(id) = replacement {
-        item["id"] = Value::String(id);
-    }
+    serde_json::to_value(&body).wrap_err("serializing Codex Responses request")
 }
 
 fn normalize_codex_completion_history(completion: &mut Completion) {
@@ -707,24 +680,6 @@ mod tests {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
         let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
         format!("{header}.{payload}.sig")
-    }
-
-    #[test]
-    fn normalize_function_call_id_only_skips_fc_underscore_prefix() {
-        // A non-Codex id that merely starts with the letters "fc" (but not "fc_") must still be
-        // normalized to the `fc_...` shape the backend expects.
-        let mut item = json!({ "id": "fcall_1" });
-        normalize_codex_function_call_item(&mut item);
-        assert_eq!(item["id"], "fc_fcall_1");
-
-        let mut generic = json!({ "id": "toolu_9" });
-        normalize_codex_function_call_item(&mut generic);
-        assert_eq!(generic["id"], "fc_toolu_9");
-
-        // An already-correct id is left untouched (no double-prefixing).
-        let mut already = json!({ "id": "fc_abc" });
-        normalize_codex_function_call_item(&mut already);
-        assert_eq!(already["id"], "fc_abc");
     }
 
     #[test]
@@ -966,8 +921,11 @@ mod tests {
         assert_eq!(assistant_message["content"], "previous answer");
     }
 
+    /// A tool id minted by another provider (an Alloy history replayed into Codex) is not a native
+    /// `fc_...` Responses item id, and the backend rejects those. It must therefore be absent from
+    /// the serialized `function_call`, leaving `call_id` as the sole pairing key to its output.
     #[test]
-    fn body_value_rewrites_function_call_item_id_for_codex() {
+    fn body_value_omits_foreign_function_call_item_id() {
         let tool_id = "tool_5Xt5WpWtZ6Whah4Z2uZcZO34".to_string();
         let completion = Completion {
             model: "gpt-5.5".to_string(),
@@ -1006,8 +964,17 @@ mod tests {
             .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
             .unwrap();
 
-        assert_eq!(function_call["id"], format!("fc_{tool_id}"));
+        assert!(function_call.get("id").is_none());
         assert_eq!(function_call["call_id"], tool_id);
+
+        // The paired tool output must carry the same call_id, or the backend cannot match them.
+        let function_call_output = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+            .unwrap();
+        assert_eq!(function_call_output["call_id"], tool_id);
     }
 
     #[test]

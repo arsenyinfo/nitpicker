@@ -80,6 +80,8 @@ impl From<Completion> for rig_core::completion::CompletionRequest {
             additional_params: value.additional_params,
             output_schema: None,
             tool_choice: value.tool_choice,
+            // local telemetry policy only (`#[serde(skip)]`), never sent to a provider
+            record_telemetry_content: false,
         }
     }
 }
