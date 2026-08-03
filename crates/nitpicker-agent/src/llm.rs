@@ -120,6 +120,8 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
+    /// For usage that carries no provider cache data. Values coming from a provider should go
+    /// through `From<&rig_core::completion::Usage>` instead, which normalizes `input_tokens`.
     pub fn new(input_tokens: u64, output_tokens: u64) -> Self {
         Self {
             input_tokens,
@@ -138,15 +140,34 @@ impl From<&rig_core::completion::Usage> for TokenUsage {
     /// under-reports the prompt by the cached portion, which is what silently stops
     /// `ConversationUsageWindow::should_compact` from ever firing.
     ///
-    /// rig's `total_tokens` counts every token on both shapes, so the prompt size is derived from
-    /// it. `max(input_tokens)` keeps a provider that reports no total (some OpenRouter gateways)
-    /// from collapsing to zero, and `total` is recomputed so `total == input + output` still holds
-    /// for every consumer of this type.
+    /// Rather than hardcode which provider is which, the provider's own `total_tokens` decides:
+    /// the cache buckets are additive only if they fit alongside the reported input inside
+    /// everything that isn't output. On the Anthropic shape they fit exactly; on the OpenAI shape
+    /// they already sit inside `input_tokens`, so adding them would overshoot the total and they
+    /// are left alone. The total is deliberately used only as a bound, never as the answer:
+    /// Gemini's parts don't sum to its total, so deriving the prompt from it would charge thinking
+    /// tokens to the prompt.
+    ///
+    /// `max(cache_buckets)` keeps the cache fields a true breakdown of `input_tokens` even if a
+    /// gateway reports them inconsistently, and `total` is recomputed so `total == input + output`
+    /// holds for every consumer of this type.
     fn from(usage: &rig_core::completion::Usage) -> Self {
-        let input_tokens = usage
-            .total_tokens
-            .saturating_sub(usage.output_tokens)
-            .max(usage.input_tokens);
+        let cache_buckets = usage
+            .cached_input_tokens
+            .saturating_add(usage.cache_creation_input_tokens);
+        // Tokens inside `total_tokens` that are not prompt: the model's output, plus the thinking
+        // and tool-use-prompt counts Gemini reports beside `output_tokens` rather than inside it.
+        let non_prompt = usage
+            .output_tokens
+            .saturating_add(usage.reasoning_tokens)
+            .saturating_add(usage.tool_use_prompt_tokens);
+        let prompt_budget = usage.total_tokens.saturating_sub(non_prompt);
+        let counted_outside_input =
+            usage.input_tokens.saturating_add(cache_buckets) <= prompt_budget;
+        let input_tokens = match counted_outside_input {
+            true => usage.input_tokens.saturating_add(cache_buckets),
+            false => usage.input_tokens.max(cache_buckets),
+        };
         Self {
             input_tokens,
             output_tokens: usage.output_tokens,
@@ -1064,68 +1085,128 @@ fn map_gemini_finish_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rig_core::completion::Usage;
     use serde_json::json;
 
-    fn rig_usage(
-        input: u64,
-        output: u64,
-        total: u64,
-        cached: u64,
-        cache_creation: u64,
-    ) -> rig_core::completion::Usage {
-        let mut usage = rig_core::completion::Usage::new();
+    /// Mirrors rig's Anthropic mapping: `input_tokens` excludes the cache buckets and
+    /// `total_tokens` is their sum plus output (`anthropic/completion.rs`).
+    fn anthropic_usage(input: u64, output: u64, cached: u64, creation: u64) -> Usage {
+        let mut usage = Usage::new();
         usage.input_tokens = input;
         usage.output_tokens = output;
-        usage.total_tokens = total;
         usage.cached_input_tokens = cached;
-        usage.cache_creation_input_tokens = cache_creation;
+        usage.cache_creation_input_tokens = creation;
+        usage.total_tokens = input + cached + creation + output;
         usage
     }
 
-    /// Anthropic reports a cache hit as a tiny `input_tokens` plus a large `cache_read`, with the
-    /// prompt only recoverable from `total_tokens`. Reading `input_tokens` raw is what let a 3509
-    /// token prompt look like 52 to the compaction window.
-    #[test]
-    fn anthropic_shape_counts_cache_reads_as_prompt() {
-        let usage = TokenUsage::from(&rig_usage(52, 8, 3517, 3456, 0));
-        assert_eq!(usage.input_tokens, 3509);
-        assert_eq!(usage.cached_input_tokens, 3456);
-        assert_eq!(usage.total_tokens, usage.input_tokens + usage.output_tokens);
+    /// Mirrors rig's OpenAI mapping: `prompt_tokens` already contains the cache reads and
+    /// reasoning is part of `completion_tokens` (`openai/completion/mod.rs`).
+    fn openai_usage(prompt: u64, completion: u64, cached: u64, reasoning: u64) -> Usage {
+        let mut usage = Usage::new();
+        usage.input_tokens = prompt;
+        usage.output_tokens = completion;
+        usage.cached_input_tokens = cached;
+        usage.reasoning_tokens = reasoning;
+        usage.total_tokens = prompt + completion;
+        usage
     }
 
-    /// OpenAI already folds cache reads into `prompt_tokens`, so the same prompt must not be
-    /// counted twice — `cached_input_tokens` stays a breakdown of `input_tokens`.
+    /// The same 3508-token prompt, served from cache, as each provider reports it: Anthropic
+    /// shows `input_tokens: 52` with the rest under `cache_read`, OpenAI shows the whole prompt.
+    /// Both must meter identically, or a mixed-provider run sums numbers that mean different
+    /// things — and the Anthropic shape read raw is what hid 98% of the prompt.
     #[test]
-    fn openai_shape_does_not_double_count_cache_reads() {
-        let usage = TokenUsage::from(&rig_usage(3509, 8, 3517, 3456, 0));
-        assert_eq!(usage.input_tokens, 3509);
-        assert_eq!(usage.cached_input_tokens, 3456);
-        assert_eq!(usage.total_tokens, usage.input_tokens + usage.output_tokens);
+    fn provider_shapes_meter_a_cache_hit_identically() {
+        let anthropic = TokenUsage::from(&anthropic_usage(52, 8, 3456, 0));
+        let openai = TokenUsage::from(&openai_usage(3508, 8, 3456, 0));
+        assert_eq!(anthropic.input_tokens, 3508);
+        assert_eq!(anthropic.input_tokens, openai.input_tokens);
+        assert_eq!(anthropic.cached_input_tokens, openai.cached_input_tokens);
+        for usage in [anthropic, openai] {
+            assert_eq!(usage.total_tokens, usage.input_tokens + usage.output_tokens);
+        }
     }
 
-    /// Both shapes above describe the same call, so they must meter identically.
+    /// Gemini is the shape where `total_tokens` carries tokens that are neither prompt nor
+    /// `output_tokens` — thinking and tool-use prompts are counted beside it, and the parts don't
+    /// even sum to the total. Charging those to the prompt misattributes output-priced tokens as
+    /// input and trips compaction early. Numbers are rig's own non-streaming fixture
+    /// (`gemini/completion.rs`): prompt 40, candidates 30, thoughts 10, tool-use 12, cached 20,
+    /// total 100.
     #[test]
-    fn provider_shapes_agree_on_the_same_call() {
-        assert_eq!(
-            TokenUsage::from(&rig_usage(52, 8, 3517, 3456, 0)).input_tokens,
-            TokenUsage::from(&rig_usage(3509, 8, 3517, 3456, 0)).input_tokens
-        );
+    fn gemini_thinking_tokens_are_not_charged_to_the_prompt() {
+        let mut usage = Usage::new();
+        usage.input_tokens = 40;
+        usage.output_tokens = 30;
+        usage.reasoning_tokens = 10;
+        usage.tool_use_prompt_tokens = 12;
+        usage.cached_input_tokens = 20;
+        usage.total_tokens = 100;
+        let usage = TokenUsage::from(&usage);
+        assert_eq!(usage.input_tokens, 40);
+        assert_eq!(usage.cached_input_tokens, 20);
+    }
+
+    /// A reasoning model on the OpenAI shape bills thinking inside `completion_tokens`, so the
+    /// prompt must not shrink by it.
+    #[test]
+    fn openai_reasoning_tokens_stay_out_of_the_prompt() {
+        let usage = TokenUsage::from(&openai_usage(3_000, 800, 0, 750));
+        assert_eq!(usage.input_tokens, 3_000);
+        assert_eq!(usage.output_tokens, 800);
     }
 
     /// A gateway that omits usage totals must fall back to the reported input rather than
     /// metering zero, which would keep `should_compact` from ever firing.
     #[test]
     fn missing_provider_total_falls_back_to_reported_input() {
-        let usage = TokenUsage::from(&rig_usage(1200, 40, 0, 0, 0));
+        let mut usage = Usage::new();
+        usage.input_tokens = 1200;
+        usage.output_tokens = 40;
+        let usage = TokenUsage::from(&usage);
         assert_eq!(usage.input_tokens, 1200);
         assert_eq!(usage.total_tokens, 1240);
     }
 
     #[test]
     fn cache_creation_tokens_are_carried_through() {
-        let usage = TokenUsage::from(&rig_usage(100, 10, 4200, 0, 4100));
+        let usage = TokenUsage::from(&anthropic_usage(90, 10, 0, 4100));
         assert_eq!(usage.cache_creation_input_tokens, 4100);
         assert_eq!(usage.input_tokens, 4190);
+    }
+
+    /// `cached_input_tokens` is documented as a slice of `input_tokens`. A gateway reporting a
+    /// total that contradicts its own cache numbers must not be able to break that.
+    #[test]
+    fn cache_fields_never_exceed_the_prompt_they_break_down() {
+        let mut usage = Usage::new();
+        usage.input_tokens = 10;
+        usage.output_tokens = 5;
+        usage.total_tokens = 15;
+        usage.cached_input_tokens = 5_000;
+        let usage = TokenUsage::from(&usage);
+        assert!(usage.input_tokens >= usage.cached_input_tokens);
+    }
+
+    /// The whole point of the normalization: a cache hit must still trip the compaction
+    /// threshold, since the full prompt is what gets re-sent next turn.
+    #[test]
+    fn compaction_threshold_sees_the_cached_prompt() {
+        let mut window = ConversationUsageWindow::new(Some(3_000));
+        window.record(TokenUsage::from(&anthropic_usage(52, 8, 3456, 0)));
+        assert!(window.should_compact());
+    }
+
+    /// The cache fields are `#[serde(default)]` so trajectories written before they existed
+    /// still decode.
+    #[test]
+    fn usage_without_cache_fields_still_deserializes() {
+        let usage: TokenUsage =
+            serde_json::from_value(json!({"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}))
+                .expect("legacy usage payload must decode");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.cached_input_tokens, 0);
     }
 
     /// Reproduce how a provider 401 actually reaches the retry layer: rig surfaces the raw

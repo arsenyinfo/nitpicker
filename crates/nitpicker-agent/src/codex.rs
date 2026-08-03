@@ -1024,11 +1024,11 @@ mod tests {
             "model": "gpt-5.4",
             "output": [],
             "usage": {
-                "input_tokens": 5,
-                "input_tokens_details": { "cached_tokens": 0 },
+                "input_tokens": 5000,
+                "input_tokens_details": { "cached_tokens": 4800 },
                 "output_tokens": 1,
                 "output_tokens_details": { "reasoning_tokens": 0 },
-                "total_tokens": 6
+                "total_tokens": 5001
             }
         });
         let sse = format!(
@@ -1040,7 +1040,11 @@ mod tests {
         let resp = to_completion_response(raw, "gpt-5.4".to_string()).unwrap();
         assert_eq!(resp.text(), "pong");
         assert_eq!(resp.finish_reason, FinishReason::Stop);
-        assert_eq!(resp.usage.input_tokens, 5);
+        // The Responses API reports cache reads inside `input_tokens`, so the prompt must not be
+        // inflated by them — and the cache read itself must survive to the metering layer.
+        assert_eq!(resp.usage.input_tokens, 5000);
+        assert_eq!(resp.usage.cached_input_tokens, 4800);
+        assert_eq!(resp.usage.total_tokens, 5001);
     }
 
     #[test]

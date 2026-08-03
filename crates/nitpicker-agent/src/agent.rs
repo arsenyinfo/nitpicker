@@ -1027,3 +1027,42 @@ async fn log_compaction(
     )
     .await;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn usage(input: u64, output: u64, cached: u64, creation: u64) -> TokenUsage {
+        TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: input + output,
+            cached_input_tokens: cached,
+            cache_creation_input_tokens: creation,
+        }
+    }
+
+    /// A subagent wave's cache reads have to reach the parent's totals: `add_usage` is the single
+    /// fold behind every reviewer, subagent and compaction call, so a field it forgets is a field
+    /// that silently reads as zero in the run's report.
+    #[test]
+    fn run_totals_fold_every_usage_field() {
+        let mut totals = RunTotals::new(0);
+        totals.add_usage(usage(100, 10, 80, 20));
+        totals.add_usage(usage(5, 1, 4, 0));
+        assert_eq!(totals.usage.input_tokens, 105);
+        assert_eq!(totals.usage.output_tokens, 11);
+        assert_eq!(totals.usage.total_tokens, 116);
+        assert_eq!(totals.usage.cached_input_tokens, 84);
+        assert_eq!(totals.usage.cache_creation_input_tokens, 20);
+    }
+
+    #[test]
+    fn run_totals_saturate_rather_than_overflow() {
+        let mut totals = RunTotals::new(0);
+        totals.add_usage(usage(u64::MAX, 0, u64::MAX, 0));
+        totals.add_usage(usage(10, 0, 10, 0));
+        assert_eq!(totals.usage.input_tokens, u64::MAX);
+        assert_eq!(totals.usage.cached_input_tokens, u64::MAX);
+    }
+}

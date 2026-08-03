@@ -175,10 +175,15 @@ pub fn reflect_tools() -> HashMap<String, Arc<dyn Tool>> {
 /// fresh map per debate turn (`debate.rs`) and a fresh one per process would otherwise hand the
 /// provider a differently-ordered array every time, and measurably drop the cache hit to zero.
 pub fn tool_definitions(tools: &HashMap<String, Arc<dyn Tool>>) -> Vec<ToolDefinition> {
-    let mut definitions: Vec<ToolDefinition> =
-        tools.values().map(|tool| tool.definition()).collect();
-    definitions.sort_by(|a, b| a.name.cmp(&b.name));
-    definitions
+    // Ordered by map key rather than by `definition().name`: the keys are unique by construction,
+    // so the order is total even for a caller whose tools report a duplicate definition name,
+    // where sorting the definitions would fall back to the map's own arbitrary order.
+    let mut keys: Vec<&str> = tools.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    keys.into_iter()
+        .filter_map(|key| tools.get(key))
+        .map(|tool| tool.definition())
+        .collect()
 }
 
 pub struct ReadFileTool;
@@ -675,7 +680,8 @@ mod tests {
         let ordered = names(&forward);
         assert_eq!(ordered, names(&reversed));
 
-        let mut expected: Vec<String> = tools.iter().map(|tool| tool.name()).collect();
+        // pins the ordering key: the map's (unique) keys, not the map's iteration order
+        let mut expected: Vec<String> = forward.keys().cloned().collect();
         expected.sort();
         assert_eq!(ordered, expected);
     }

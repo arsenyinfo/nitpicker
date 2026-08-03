@@ -53,6 +53,14 @@ See `examples/file_agent.rs` for a runnable version.
 - `antigravity` — compiles in the Gemini-proxy client hook + config validation (the proxy
   server itself lives in the `nitpicker` binary).
 
+## Breaking changes
+
+**0.2.0** — `AgentResult`'s `total_input_tokens` / `total_output_tokens` / `total_tokens` fields
+and its `usage()` method are replaced by a single `usage: TokenUsage` field, which also carries
+`cached_input_tokens` / `cache_creation_input_tokens`. `TokenUsage::input_tokens` now means all
+prompt tokens *including* provider cache reads on every provider (Anthropic previously reported
+them separately), so cost formulas must discount `cached_input_tokens` at the cache-read rate.
+
 ## License
 
 MIT
