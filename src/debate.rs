@@ -1,18 +1,18 @@
+use crate::output::UsageReport;
+pub use crate::prompts::DebateMode;
+use eyre::Result;
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use nitpicker_agent::agent::{
     AgentConfig, AgentDepth, AgentProgress, MAX_CONCURRENT_LLM_CALLS, add_spawn_subagent_tool,
     run_agent,
 };
 use nitpicker_agent::config::{Config, ReviewerConfig};
 use nitpicker_agent::llm::{Completion, LLMClientDyn, TokenUsage};
-use crate::output::UsageReport;
-pub use crate::prompts::DebateMode;
 #[cfg(feature = "antigravity")]
 use nitpicker_agent::provider::config_needs_gemini_proxy;
 use nitpicker_agent::provider::{build_aggregator_client, build_reviewer_client};
 use nitpicker_agent::session::{AggregationRecord, SessionLogger, SessionWriter};
 use nitpicker_agent::tools::{Tool, all_tools};
-use eyre::Result;
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rig_core::completion::Message;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -267,15 +267,14 @@ async fn run_debate_side(
     let progress_sub_pb = sub_pb.clone();
     let progress = (!env.verbose).then_some(Arc::new(move |progress: AgentProgress| {
         progress_pb.set_message(crate::progress::bar_message(format!(
-            "round {round} — debating… ({} turns, {} tool calls, {} subagents)",
+            "round {round} — debating… ({} turns, {} calls, {} subagents)",
             progress.turns, progress.tool_calls, progress.subagents_spawned
         )));
         progress_sub_pb.set_message(crate::progress::detail_message(
             "    ↳ ",
             progress.last_subagent.as_deref(),
         ));
-    })
-        as Arc<dyn Fn(AgentProgress) + Send + Sync>);
+    }) as Arc<dyn Fn(AgentProgress) + Send + Sync>);
 
     let result = run_debate_turn(DebateTurnRequest {
         client: Arc::clone(&side.client),
@@ -297,14 +296,15 @@ async fn run_debate_side(
     sub_pb.finish_and_clear();
     pb.set_style(env.done_style.clone());
     pb.finish_with_message(crate::progress::bar_message(format!(
-        "✓ round {round} ({} turns, {} tool calls, {} subagents, {} in ({} cached), {} out, {} total tokens, {elapsed}s)",
+        "✓ round {round} ({} turns, {} calls, {} subagents, {}, {} out, {elapsed}s)",
         result.turns,
         result.tool_calls,
         result.subagents_spawned,
-        result.usage.input_tokens,
-        result.usage.cached_input_tokens,
-        result.usage.output_tokens,
-        result.usage.total_tokens
+        crate::progress::input_with_cache_share(
+            result.usage.input_tokens,
+            result.usage.cached_input_tokens
+        ),
+        crate::progress::compact_tokens(result.usage.output_tokens)
     )));
     if env.verbose && env.stdout_ok && stdout_is_terminal() {
         println!();
@@ -473,7 +473,8 @@ pub async fn run_debate(
         for r in &config.reviewer {
             slots.push((build_client(r, proxy_url.as_deref())?, r.model.clone()));
         }
-        let shared: Arc<dyn LLMClientDyn> = Arc::new(nitpicker_agent::llm::AlloyClient::new(slots)?);
+        let shared: Arc<dyn LLMClientDyn> =
+            Arc::new(nitpicker_agent::llm::AlloyClient::new(slots)?);
         actor_client = Arc::clone(&shared);
         critic_client = shared;
         let label = ModelLabel::alloy(config.reviewer.iter().map(|r| r.model.as_str()));

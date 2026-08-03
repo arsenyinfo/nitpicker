@@ -1,18 +1,18 @@
+use crate::output::UsageReport;
+pub use crate::prompts::TaskMode;
+use eyre::Result;
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use nitpicker_agent::agent::{
     AgentConfig, AgentDepth, AgentProgress, AgentResult, MAX_CONCURRENT_LLM_CALLS,
     add_spawn_subagent_tool, run_agent,
 };
 use nitpicker_agent::config::{Config, ReviewerConfig};
 use nitpicker_agent::llm::{Completion, FinishReason};
-use crate::output::UsageReport;
-pub use crate::prompts::TaskMode;
 #[cfg(feature = "antigravity")]
 use nitpicker_agent::provider::config_needs_gemini_proxy;
 use nitpicker_agent::provider::{build_aggregator_client, build_reviewer_client};
 use nitpicker_agent::session::{AggregationRecord, SessionLogger, sanitize_path_component};
 use nitpicker_agent::tools::{all_tools, floor_char_boundary, is_binary_file};
-use eyre::Result;
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rig_core::completion::Message;
 use std::path::Path;
 use std::sync::Arc;
@@ -130,7 +130,7 @@ pub async fn run_review(
                 let progress_sub_pb = sub_pb.clone();
                 config.progress = Some(Arc::new(move |progress: AgentProgress| {
                     progress_pb.set_message(crate::progress::bar_message(format!(
-                        "reviewing… ({} turns, {} tool calls, {} subagents)",
+                        "reviewing… ({} turns, {} calls, {} subagents)",
                         progress.turns, progress.tool_calls, progress.subagents_spawned
                     )));
                     progress_sub_pb.set_message(crate::progress::detail_message(
@@ -146,14 +146,15 @@ pub async fn run_review(
             pb.set_style(done);
             match &result {
                 Ok(r) => pb.finish_with_message(crate::progress::bar_message(format!(
-                    "✓ done ({elapsed}s, {} turns, {} tool calls, {} subagents, {} in ({} cached), {} out, {} total tokens)",
+                    "✓ done ({elapsed}s, {} turns, {} calls, {} subagents, {}, {} out)",
                     r.turns,
                     r.tool_calls,
                     r.subagents_spawned,
-                    r.usage.input_tokens,
-                    r.usage.cached_input_tokens,
-                    r.usage.output_tokens,
-                    r.usage.total_tokens
+                    crate::progress::input_with_cache_share(
+                        r.usage.input_tokens,
+                        r.usage.cached_input_tokens
+                    ),
+                    crate::progress::compact_tokens(r.usage.output_tokens)
                 ))),
                 Err(e) => pb.finish_with_message(crate::progress::bar_message(format!(
                     "✗ failed: {e}"

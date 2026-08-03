@@ -103,6 +103,33 @@ fn detail_message_for_columns(prefix: &str, detail: Option<&str>, columns: usize
     }
 }
 
+/// Token counts for a progress line, where columns are scarce: `1038095` becomes `1.0M`.
+/// Exact counts stay available in the `info!` logs and the `pr --json` usage block.
+pub(crate) fn compact_tokens(tokens: u64) -> String {
+    match tokens {
+        0..=999 => tokens.to_string(),
+        // one decimal only while it carries information: 3.5k, then 938k, then 1.0M
+        1_000..=9_999 => format!("{:.1}k", tokens as f64 / 1_000.0),
+        10_000..=999_999 => format!("{}k", tokens / 1_000),
+        _ => format!("{:.1}M", tokens as f64 / 1_000_000.0),
+    }
+}
+
+/// The prompt-cache share of a run, as `1.0M in · 90% cached`. A ratio rather than a second token
+/// count: it is what answers "is caching working", and it costs a third of the width. Returns just
+/// the token count when the provider reported no prompt at all, since `0% cached` of nothing is
+/// noise rather than a signal.
+pub(crate) fn input_with_cache_share(input_tokens: u64, cached_input_tokens: u64) -> String {
+    let compact = compact_tokens(input_tokens);
+    match input_tokens {
+        0 => format!("{compact} in"),
+        _ => {
+            let share = cached_input_tokens.min(input_tokens) * 100 / input_tokens;
+            format!("{compact} in · {share}% cached")
+        }
+    }
+}
+
 fn terminal_columns() -> usize {
     std::env::var("COLUMNS")
         .ok()
@@ -152,6 +179,43 @@ fn normalize_whitespace(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_tokens_switches_unit_at_each_boundary() {
+        assert_eq!(compact_tokens(0), "0");
+        assert_eq!(compact_tokens(999), "999");
+        assert_eq!(compact_tokens(1_000), "1.0k");
+        assert_eq!(compact_tokens(3_509), "3.5k");
+        assert_eq!(compact_tokens(9_999), "10.0k");
+        assert_eq!(compact_tokens(10_000), "10k");
+        assert_eq!(compact_tokens(938_000), "938k");
+        assert_eq!(compact_tokens(999_999), "999k");
+        assert_eq!(compact_tokens(1_038_095), "1.0M");
+        assert_eq!(compact_tokens(2_275_854), "2.3M");
+    }
+
+    #[test]
+    fn input_with_cache_share_reports_the_ratio() {
+        assert_eq!(
+            input_with_cache_share(1_038_095, 938_000),
+            "1.0M in · 90% cached"
+        );
+        assert_eq!(input_with_cache_share(1_000, 0), "1.0k in · 0% cached");
+    }
+
+    /// A failed or unmetered turn reports no prompt at all; "0% cached" of nothing would read as a
+    /// caching problem rather than as missing data.
+    #[test]
+    fn input_with_cache_share_omits_the_ratio_without_a_prompt() {
+        assert_eq!(input_with_cache_share(0, 0), "0 in");
+    }
+
+    /// A provider contradicting itself (more cache than prompt) is reported verbatim by
+    /// `TokenUsage`, so the share must still be a percentage rather than exceeding 100.
+    #[test]
+    fn input_with_cache_share_cannot_exceed_one_hundred_percent() {
+        assert_eq!(input_with_cache_share(10, 5_000), "10 in · 100% cached");
+    }
 
     #[test]
     fn bar_message_reserves_progress_columns() {
