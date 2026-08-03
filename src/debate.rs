@@ -297,11 +297,12 @@ async fn run_debate_side(
     sub_pb.finish_and_clear();
     pb.set_style(env.done_style.clone());
     pb.finish_with_message(crate::progress::bar_message(format!(
-        "✓ round {round} ({} turns, {} tool calls, {} subagents, {} in, {} out, {} total tokens, {elapsed}s)",
+        "✓ round {round} ({} turns, {} tool calls, {} subagents, {} in ({} cached), {} out, {} total tokens, {elapsed}s)",
         result.turns,
         result.tool_calls,
         result.subagents_spawned,
         result.usage.input_tokens,
+        result.usage.cached_input_tokens,
         result.usage.output_tokens,
         result.usage.total_tokens
     )));

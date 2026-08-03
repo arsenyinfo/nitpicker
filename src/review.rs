@@ -146,11 +146,12 @@ pub async fn run_review(
             pb.set_style(done);
             match &result {
                 Ok(r) => pb.finish_with_message(crate::progress::bar_message(format!(
-                    "✓ done ({elapsed}s, {} turns, {} tool calls, {} subagents, {} in, {} out, {} total tokens)",
+                    "✓ done ({elapsed}s, {} turns, {} tool calls, {} subagents, {} in ({} cached), {} out, {} total tokens)",
                     r.turns,
                     r.tool_calls,
                     r.subagents_spawned,
                     r.usage.input_tokens,
+                    r.usage.cached_input_tokens,
                     r.usage.output_tokens,
                     r.usage.total_tokens
                 ))),

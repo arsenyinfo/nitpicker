@@ -484,9 +484,11 @@ pub async fn run_agent(
                         response_input_tokens = response.usage.input_tokens,
                         response_output_tokens = response.usage.output_tokens,
                         response_total_tokens = response.usage.total_tokens,
+                        response_cached_input_tokens = response.usage.cached_input_tokens,
                         total_input_tokens = totals.usage.input_tokens,
                         total_output_tokens = totals.usage.output_tokens,
                         total_tokens_so_far = totals.usage.total_tokens,
+                        total_cached_input_tokens = totals.usage.cached_input_tokens,
                         response_len = result.len(),
                         "subagent finished"
                     );
@@ -502,6 +504,7 @@ pub async fn run_agent(
                     total_input_tokens = totals.usage.input_tokens,
                     total_output_tokens = totals.usage.output_tokens,
                     total_tokens = totals.usage.total_tokens,
+                    total_cached_input_tokens = totals.usage.cached_input_tokens,
                     "terminal tool called"
                 );
                 return Ok(totals.finish(&config, String::new(), turn + 1));
@@ -582,9 +585,11 @@ pub async fn run_agent(
                 response_input_tokens = response.usage.input_tokens,
                 response_output_tokens = response.usage.output_tokens,
                 response_total_tokens = response.usage.total_tokens,
+                response_cached_input_tokens = response.usage.cached_input_tokens,
                 total_input_tokens = totals.usage.input_tokens,
                 total_output_tokens = totals.usage.output_tokens,
                 total_tokens_so_far = totals.usage.total_tokens,
+                total_cached_input_tokens = totals.usage.cached_input_tokens,
                 response_len = text.len(),
                 "finished"
             );
