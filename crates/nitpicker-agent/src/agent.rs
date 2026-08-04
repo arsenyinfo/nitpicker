@@ -94,17 +94,70 @@ pub struct AgentConfig {
     pub session_writer: Option<SessionWriter>,
 }
 
+enum Compaction {
+    Done(CompactionOutcome),
+    /// Ran with nothing to summarize.
+    Skipped,
+    Failed(String),
+}
+
+impl Compaction {
+    /// Only a compaction that actually shrank the history may clear the window. This is observable
+    /// at the cycle-break site alone, which `continue`s past `conversation_usage.record(...)`:
+    /// there the reset was the whole retry signal, and dropping it left the next turn to carry on
+    /// with the history compaction had failed to shrink. The threshold site falls through to its
+    /// completion, which re-measures the prompt either way.
+    fn resets_usage_window(&self) -> bool {
+        !matches!(self, Self::Failed(_))
+    }
+
+    /// Failure is recorded as a failed tool call — logging it as `ok` with no summary makes
+    /// `reflect` count and render it as a success.
+    fn trajectory_fields(&self) -> (ToolCallStatus, Option<&str>) {
+        match self {
+            Self::Done(outcome) => (ToolCallStatus::Ok, Some(outcome.summary.as_str())),
+            Self::Skipped => (ToolCallStatus::Ok, None),
+            Self::Failed(error) => (ToolCallStatus::Error, Some(error.as_str())),
+        }
+    }
+}
+
+/// A compaction error chain can carry the summarizer's whole non-conforming response, and the
+/// trajectory is read back into memory whole. `reflect` renders at most this much of it anyway.
+const MAX_TRAJECTORY_ERROR_BYTES: usize = 2_000;
+
+fn truncate_for_trajectory(mut error: String) -> String {
+    let boundary = floor_char_boundary(&error, MAX_TRAJECTORY_ERROR_BYTES);
+    match boundary < error.len() {
+        true => {
+            let omitted = error.len() - boundary;
+            error.truncate(boundary);
+            error.push_str(&format!("... truncated; {omitted} bytes omitted"));
+            error
+        }
+        false => error,
+    }
+}
+
 /// Best-effort compaction: a summarizer that fails after its own retries and corrections must not
 /// take the agent with it. Continuing uncompacted may still finish; aborting never does.
-async fn compact_or_continue(
+// carries the loop's compaction state to one place so the window/trajectory decisions can't drift
+// between the two call sites; not worth a struct
+#[allow(clippy::too_many_arguments)]
+async fn compact_and_account(
     config: &AgentConfig,
+    reason: &'static str,
     system_prompt: &str,
     history: &mut Vec<Message>,
     prompt: &mut Message,
     turn: usize,
-    usage: TokenUsage,
-) -> Option<CompactionOutcome> {
-    match compact_history(
+    conversation_usage: &mut ConversationUsageWindow,
+    totals: &mut RunTotals,
+) {
+    // compaction happens *before* the next turn runs, so it is named for that turn; the trajectory
+    // keeps logging the loop index it was reached from
+    let compaction_turn = turn + 1;
+    let compaction = match compact_history(
         &config.llm_semaphore,
         Arc::clone(&config.client),
         &config.model,
@@ -112,17 +165,27 @@ async fn compact_or_continue(
         system_prompt,
         history,
         prompt,
-        turn,
-        usage,
+        compaction_turn,
+        conversation_usage.usage(),
     )
     .await
     {
-        Ok(outcome) => outcome,
+        Ok(Some(outcome)) => Compaction::Done(outcome),
+        Ok(None) => Compaction::Skipped,
         Err(err) => {
-            warn!(agent = %config.name, turn, "compaction failed ({err}); continuing uncompacted");
-            None
+            let error = truncate_for_trajectory(format!("{err:#}"));
+            warn!(agent = %config.name, turn = compaction_turn, "compaction failed ({error}); continuing uncompacted");
+            Compaction::Failed(error)
         }
+    };
+    match &compaction {
+        Compaction::Done(outcome) => totals.add_usage(outcome.usage),
+        Compaction::Skipped | Compaction::Failed(_) => {}
     }
+    if compaction.resets_usage_window() {
+        conversation_usage.reset();
+    }
+    log_compaction(config, turn, reason, &compaction).await;
 }
 
 struct FinishTool {
@@ -330,20 +393,17 @@ pub async fn run_agent(
                 window_total_tokens = usage_before_compaction.total_tokens,
                 "compaction triggered"
             );
-            let compaction = compact_or_continue(
+            compact_and_account(
                 &config,
+                "threshold",
                 &effective_system_prompt,
                 &mut history,
                 &mut prompt,
-                turn + 1,
-                usage_before_compaction,
+                turn,
+                &mut conversation_usage,
+                &mut totals,
             )
             .await;
-            if let Some(outcome) = &compaction {
-                totals.add_usage(outcome.usage);
-            }
-            conversation_usage.reset();
-            log_compaction(&config, turn, "threshold", compaction.as_ref()).await;
         }
 
         if is_final_turn {
@@ -567,20 +627,17 @@ pub async fn run_agent(
                     consecutive_blocked_count,
                     "forcing compaction to break tool-call cycle"
                 );
-                let compaction = compact_or_continue(
+                compact_and_account(
                     &config,
+                    "cycle_break",
                     &effective_system_prompt,
                     &mut history,
                     &mut prompt,
-                    turn + 1,
-                    conversation_usage.usage(),
+                    turn,
+                    &mut conversation_usage,
+                    &mut totals,
                 )
                 .await;
-                if let Some(outcome) = &compaction {
-                    totals.add_usage(outcome.usage);
-                }
-                conversation_usage.reset();
-                log_compaction(&config, turn, "cycle_break", compaction.as_ref()).await;
                 let cycle_break_msg = Message::user(
                     "Note: you were stuck in a repetitive tool-call loop. \
                      Avoid repeating the same tool calls. Try a different approach."
@@ -1055,15 +1112,15 @@ async fn log_compaction(
     config: &AgentConfig,
     turn: usize,
     reason: &'static str,
-    outcome: Option<&CompactionOutcome>,
+    compaction: &Compaction,
 ) {
-    let result = outcome.map(|value| value.summary.as_str());
+    let (status, result) = compaction.trajectory_fields();
     log_tool_call(
         config,
         turn,
         "compact",
         &json!({ "reason": reason }),
-        ToolCallStatus::Ok,
+        status,
         None,
         result,
     )
@@ -1096,5 +1153,59 @@ mod tests {
         assert_eq!(totals.usage.total_tokens, 116);
         assert_eq!(totals.usage.cached_input_tokens, 84);
         assert_eq!(totals.usage.cache_creation_input_tokens, 20);
+    }
+
+    fn compacted(summary: &str) -> Compaction {
+        Compaction::Done(CompactionOutcome {
+            usage: usage(10, 5, 0, 0),
+            summary: summary.to_string(),
+            trigger_usage: usage(900, 100, 0, 0),
+        })
+    }
+
+    /// The cycle-break site `continue`s past `record`, so there this decision is the whole retry
+    /// signal: a window cleared after a failure leaves the next turn carrying the history
+    /// compaction did not shrink.
+    #[test]
+    fn a_retained_window_still_re_fires_compaction() {
+        let mut window = ConversationUsageWindow::new(Some(1_000));
+        window.record(usage(2_000, 100, 0, 0));
+        assert!(window.should_compact());
+
+        assert!(!Compaction::Failed("boom".to_string()).resets_usage_window());
+        assert!(window.should_compact());
+
+        assert!(compacted("summary").resets_usage_window());
+        window.reset();
+        assert!(!window.should_compact());
+    }
+
+    /// `reflect` keys on the serialized status, so the wire value is the contract here — an
+    /// unremarkable `ok` is what made a swallowed failure render as a success.
+    #[test]
+    fn failed_compaction_is_recorded_as_a_failed_tool_call() {
+        let fields = |compaction: &Compaction| {
+            let (status, result) = compaction.trajectory_fields();
+            (status.as_str(), result.map(str::to_string))
+        };
+        assert_eq!(
+            fields(&compacted("summary")),
+            ("ok", Some("summary".to_string()))
+        );
+        assert_eq!(fields(&Compaction::Skipped), ("ok", None));
+        assert_eq!(
+            fields(&Compaction::Failed("boom".to_string())),
+            ("error", Some("boom".to_string()))
+        );
+    }
+
+    #[test]
+    fn trajectory_errors_are_capped() {
+        let short = "boom".to_string();
+        assert_eq!(truncate_for_trajectory(short.clone()), short);
+
+        let long = truncate_for_trajectory("é".repeat(MAX_TRAJECTORY_ERROR_BYTES));
+        assert!(long.starts_with(&"é".repeat(MAX_TRAJECTORY_ERROR_BYTES / 2)));
+        assert!(long.ends_with("bytes omitted"));
     }
 }
