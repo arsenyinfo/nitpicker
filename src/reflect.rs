@@ -1,19 +1,17 @@
+use eyre::Result;
 use nitpicker_agent::agent::{AgentConfig, AgentDepth, MAX_CONCURRENT_LLM_CALLS, run_agent};
 use nitpicker_agent::config::Config;
 use nitpicker_agent::llm::{Completion, LLMClientDyn, throttled_completion};
 use nitpicker_agent::provider::build_reviewer_client;
 use nitpicker_agent::session::{AggregationRecord, ToolCallRecord};
 use nitpicker_agent::tools::{floor_char_boundary, reflect_tools};
-use eyre::Result;
 use rig_core::completion::Message;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
-
-
 
 const MAP_PROMPT: &str = "\
 You are analyzing a nitpicker code review session — a multi-agent LLM-based code reviewer.
@@ -213,7 +211,9 @@ async fn analyze_session(
         max_tokens: Some(1024),
         additional_params: None,
     };
-    Ok(throttled_completion(&semaphore, &client, completion).await?.text())
+    Ok(throttled_completion(&semaphore, &client, completion)
+        .await?
+        .text())
 }
 
 async fn synthesize(
@@ -252,13 +252,7 @@ async fn synthesize(
         session_writer: None,
     };
 
-    let result = run_agent(
-        config,
-        &body,
-        &tools_map,
-        repo,
-    )
-    .await?;
+    let result = run_agent(config, &body, &tools_map, repo).await?;
 
     Ok(result.text)
 }
@@ -274,8 +268,8 @@ pub async fn run_reflect(args: ReflectArgs) -> Result<()> {
     let dir = match args.sessions_dir {
         Some(d) => d,
         None => {
-            let home = dirs::home_dir()
-                .ok_or_else(|| eyre::eyre!("failed to resolve home directory"))?;
+            let home =
+                dirs::home_dir().ok_or_else(|| eyre::eyre!("failed to resolve home directory"))?;
             home.join(".nitpicker").join("sessions")
         }
     };
@@ -329,7 +323,9 @@ pub async fn run_reflect(args: ReflectArgs) -> Result<()> {
 
     let cfg = &args.config;
 
-    let first_reviewer = cfg.reviewer.first()
+    let first_reviewer = cfg
+        .reviewer
+        .first()
         .ok_or_else(|| eyre::eyre!("config must have at least one reviewer"))?;
     let map_model = first_reviewer.model.clone();
     let map_client = build_reviewer_client(first_reviewer, None)?;
@@ -353,7 +349,8 @@ pub async fn run_reflect(args: ReflectArgs) -> Result<()> {
         let model = map_model.clone();
         let client = Arc::clone(&map_client);
         let semaphore = Arc::clone(&map_semaphore);
-        let handle = tokio::spawn(async move { analyze_session(md, model, client, semaphore).await });
+        let handle =
+            tokio::spawn(async move { analyze_session(md, model, client, semaphore).await });
         handles.push((name, handle));
     }
 
@@ -370,7 +367,13 @@ pub async fn run_reflect(args: ReflectArgs) -> Result<()> {
     }
 
     info!("synthesizing with {}…", reduce_model);
-    let report = synthesize(analyses, reduce_model.clone(), Arc::clone(&reduce_client), &args.repo).await?;
+    let report = synthesize(
+        analyses,
+        reduce_model.clone(),
+        Arc::clone(&reduce_client),
+        &args.repo,
+    )
+    .await?;
 
     println!("{report}");
 

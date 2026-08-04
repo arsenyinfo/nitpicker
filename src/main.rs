@@ -197,7 +197,10 @@ async fn main() -> Result<()> {
                 .await?;
                 println!("{}", outcome.report);
                 if common.verbose {
-                    eprintln!("\nTranscript saved to: {}", outcome.transcript_path.display());
+                    eprintln!(
+                        "\nTranscript saved to: {}",
+                        outcome.transcript_path.display()
+                    );
                 }
                 exit_if_degraded(outcome.degraded);
                 return Ok(());
@@ -290,7 +293,10 @@ async fn main() -> Result<()> {
         .await?;
         println!("{}", outcome.report);
         if args.common.verbose {
-            eprintln!("\nTranscript saved to: {}", outcome.transcript_path.display());
+            eprintln!(
+                "\nTranscript saved to: {}",
+                outcome.transcript_path.display()
+            );
         }
         exit_if_degraded(outcome.degraded);
         Ok(())

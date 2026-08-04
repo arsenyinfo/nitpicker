@@ -1,5 +1,4 @@
-const VERIFY_WARNING: &str =
-    "Your opponent may sound confident but still make factual errors or overlook edge cases. \
+const VERIFY_WARNING: &str = "Your opponent may sound confident but still make factual errors or overlook edge cases. \
 Independently verify every claim against the actual code before accepting it.";
 
 const DELEGATION_GUIDANCE: &str = "Always first build a quick high-level map of the relevant code: change intent, affected files, nearby modules, and major components involved. \

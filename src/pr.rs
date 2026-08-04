@@ -1,8 +1,8 @@
-use nitpicker_agent::config::Config;
 use crate::debate::{self, DebateMode};
 use crate::prompts::ReviewScope;
 use crate::review::{self, TaskMode};
 use eyre::{Result, WrapErr};
+use nitpicker_agent::config::Config;
 use serde::Deserialize;
 use sha2::Digest;
 use std::path::{Path, PathBuf};

@@ -308,7 +308,10 @@ mod tests {
             "toolConfig": { "functionCallingConfig": { "mode": "AUTO" } }
         });
         let req: GeminiRequest = serde_json::from_value(body).unwrap();
-        assert!(req.system_instruction.is_some(), "systemInstruction dropped");
+        assert!(
+            req.system_instruction.is_some(),
+            "systemInstruction dropped"
+        );
         assert!(req.tool_config.is_some(), "toolConfig dropped");
         let cfg = req.generation_config.expect("generationConfig dropped");
         assert_eq!(cfg.max_output_tokens, Some(42));

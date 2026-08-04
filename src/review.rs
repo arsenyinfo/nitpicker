@@ -156,9 +156,9 @@ pub async fn run_review(
                     ),
                     crate::progress::compact_tokens(r.usage.output_tokens)
                 ))),
-                Err(e) => pb.finish_with_message(crate::progress::bar_message(format!(
-                    "✗ failed: {e}"
-                ))),
+                Err(e) => {
+                    pb.finish_with_message(crate::progress::bar_message(format!("✗ failed: {e}")))
+                }
             }
             result
         });

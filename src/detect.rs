@@ -44,7 +44,10 @@ const PROVIDER_ORDER: &[&str] = &[
 ];
 
 fn priority_index(name: &str) -> usize {
-    PROVIDER_ORDER.iter().position(|&n| n == name).unwrap_or(usize::MAX)
+    PROVIDER_ORDER
+        .iter()
+        .position(|&n| n == name)
+        .unwrap_or(usize::MAX)
 }
 
 static ANTHROPIC: ProviderDef = ProviderDef {
@@ -106,7 +109,14 @@ static MINIMAX: ProviderDef = ProviderDef {
 };
 
 static ENV_PROVIDERS: &[&ProviderDef] = &[
-    &ANTHROPIC, &OPENAI, &GEMINI_API, &MISTRAL, &OPENROUTER, &KIMI, &ZAI, &MINIMAX,
+    &ANTHROPIC,
+    &OPENAI,
+    &GEMINI_API,
+    &MISTRAL,
+    &OPENROUTER,
+    &KIMI,
+    &ZAI,
+    &MINIMAX,
 ];
 
 fn opencode_name_to_provider(name: &str) -> Option<&'static ProviderDef> {
@@ -147,17 +157,13 @@ pub async fn detect_all() -> Vec<Detected> {
 
     // env vars for known providers (dedup by provider name)
     for &def in ENV_PROVIDERS {
-        if std::env::var(def.api_key_env).is_ok()
-            && !detected.iter().any(|d| d.name == def.name)
-        {
+        if std::env::var(def.api_key_env).is_ok() && !detected.iter().any(|d| d.name == def.name) {
             detected.push(from_def(def, "env var"));
         }
     }
 
     // GOOGLE_AI_API_KEY as alias for GEMINI_API_KEY
-    if std::env::var("GOOGLE_AI_API_KEY").is_ok()
-        && !detected.iter().any(|d| d.name == "gemini")
-    {
+    if std::env::var("GOOGLE_AI_API_KEY").is_ok() && !detected.iter().any(|d| d.name == "gemini") {
         detected.push(Detected {
             name: "gemini",
             provider: "gemini",
@@ -338,8 +344,7 @@ fn ollama_detected(model: String, source: &'static str) -> Detected {
 }
 
 fn find_ollama_installed_model() -> Option<String> {
-    let manifests = dirs::home_dir()?
-        .join(".ollama/models/manifests/registry.ollama.ai/library");
+    let manifests = dirs::home_dir()?.join(".ollama/models/manifests/registry.ollama.ai/library");
     std::fs::read_dir(manifests)
         .ok()?
         .flatten()
@@ -418,7 +423,11 @@ fn detect_databricks() -> Option<Detected> {
         .or_else(read_databricks_host_from_cfg)?;
 
     let base_url = format!("{}/serving-endpoints", host.trim_end_matches('/'));
-    let source = if has_token { "env var" } else { "databricks CLI" };
+    let source = if has_token {
+        "env var"
+    } else {
+        "databricks CLI"
+    };
 
     Some(Detected {
         name: "databricks",

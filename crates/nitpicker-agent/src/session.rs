@@ -47,7 +47,8 @@ impl SessionLogger {
             return Ok(None);
         }
 
-        let home = dirs::home_dir().ok_or_else(|| eyre::eyre!("failed to resolve home directory"))?;
+        let home =
+            dirs::home_dir().ok_or_else(|| eyre::eyre!("failed to resolve home directory"))?;
         let ts = now_unix_ms();
         let pid = std::process::id();
         let root = home
@@ -95,9 +96,9 @@ impl SessionWriter {
     pub async fn append_tool_call(&self, record: &ToolCallRecord) -> Result<()> {
         let path = self.root.join(&self.relative_path);
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .wrap_err_with(|| format!("failed to create session log dir {}", parent.display()))?;
+            tokio::fs::create_dir_all(parent).await.wrap_err_with(|| {
+                format!("failed to create session log dir {}", parent.display())
+            })?;
         }
         let mut buf = serde_json::to_vec(record)?;
         buf.push(b'\n');
