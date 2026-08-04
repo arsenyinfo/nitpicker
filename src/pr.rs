@@ -678,7 +678,10 @@ async fn run_review_inner(
 
     let format = args.output_format();
     let diff_context = crate::detect_diff_context(repo)?;
-    let full_prompt = build_pr_prompt(meta, comments, &diff_context, args.prompt.as_deref());
+    let full_prompt = crate::context::append_to_prompt(
+        build_pr_prompt(meta, comments, &diff_context, args.prompt.as_deref()),
+        &crate::context::load_context_files(&args.common.context_file)?,
+    );
     let max_turns = config.max_turns(args.max_turns)?;
 
     let use_alloy = args.alloy || config.default_alloy();

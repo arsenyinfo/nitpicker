@@ -5,6 +5,7 @@ use tracing_subscriber::EnvFilter;
 
 use nitpicker_agent::{config, openrouter};
 
+mod context;
 mod debate;
 mod detect;
 #[cfg(feature = "antigravity")]
@@ -27,6 +28,11 @@ struct CommonArgs {
 
     #[arg(long, short)]
     verbose: bool,
+
+    /// Read a file into the prompt verbatim; repeatable. Unlike the agents' own tools, this is not
+    /// confined to the repo, so it can carry design notes or working docs that live outside it.
+    #[arg(long = "context-file", value_name = "PATH")]
+    context_file: Vec<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -166,6 +172,10 @@ async fn main() -> Result<()> {
                 eyre::bail!("--repo must point to a git repository (missing .git)");
             }
             let config = load_resolved_config(common.config.as_deref(), &repo).await?;
+            let topic = context::append_to_prompt(
+                topic,
+                &context::load_context_files(&common.context_file)?,
+            );
             let max_turns = config.max_turns(max_turns)?;
             let use_alloy = alloy || config.default_alloy();
             config.validate_alloy(use_alloy)?;
@@ -263,6 +273,10 @@ async fn main() -> Result<()> {
             None => base,
         }
     };
+    let prompt = context::append_to_prompt(
+        prompt,
+        &context::load_context_files(&args.common.context_file)?,
+    );
 
     let use_alloy = args.alloy || config.default_alloy();
     config.validate_alloy(use_alloy)?;

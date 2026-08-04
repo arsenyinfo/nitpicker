@@ -288,20 +288,35 @@ nitpicker init [--global] [--free]
 ### Review (default)
 
 ```
---repo <PATH>      git repository to review [default: .]
---config <PATH>    config file [default: <repo>/nitpicker.toml, then ~/.nitpicker/config.toml]
---prompt <TEXT>    review instructions (optional, has a sensible default)
---analyze [PATH]   analyze existing code instead of reviewing changes
---no-debate        use parallel aggregation instead of actor-critic debate
---rounds <N>       maximum debate rounds [default: 5]
---max-turns <N>    maximum tool-use turns per agent or debate turn [default: 100 via config]
--v, --verbose      show info-level logs (hidden by default)
+--repo <PATH>          git repository to review [default: .]
+--config <PATH>        config file [default: <repo>/nitpicker.toml, then ~/.nitpicker/config.toml]
+--prompt <TEXT>        review instructions (optional, has a sensible default)
+--context-file <PATH>  inject a file's contents into the prompt; repeatable
+--analyze [PATH]       analyze existing code instead of reviewing changes
+--no-debate            use parallel aggregation instead of actor-critic debate
+--rounds <N>           maximum debate rounds [default: 5]
+--max-turns <N>        maximum tool-use turns per agent or debate turn [default: 100 via config]
+-v, --verbose          show info-level logs (hidden by default)
 ```
+
+#### `--context-file`
+
+The agents' own tools are sandboxed to the repository, so they cannot open a design doc that lives
+outside it. `--context-file` reads such a file directly into the prompt:
+
+```bash
+nitpicker --context-file ~/notes/migration-plan.md --context-file /tmp/rfc.md
+```
+
+Available on the default review mode, `ask`, and `pr`. Files are injected in the order given, after
+the task and any `--prompt` text. Total size is capped at 256 KiB across all files; a missing,
+binary, or non-UTF-8 file is an error, raised before any model is called. Because the contents are
+placed in the task prompt rather than the system prompt, spawned subagents do not inherit them.
 
 ### PR subcommand
 
 ```
-nitpicker pr [URL] [--no-comment] [--no-debate] [--rounds N] [--max-turns N] [--prompt TEXT] [--repo .] [--config PATH] [--json] [-v]
+nitpicker pr [URL] [--no-comment] [--no-debate] [--rounds N] [--max-turns N] [--prompt TEXT] [--context-file PATH] [--repo .] [--config PATH] [--json] [-v]
 ```
 
 Reviews a GitHub PR using its title, description, and diff. Requires the `gh` CLI (`gh auth login` to authenticate).
@@ -315,7 +330,7 @@ Reviews a GitHub PR using its title, description, and diff. Requires the `gh` CL
 ### Ask subcommand
 
 ```
-nitpicker ask [--no-debate] [--rounds N] [--max-turns N] [--repo .] [--config PATH] [-v] <topic>
+nitpicker ask [--no-debate] [--rounds N] [--max-turns N] [--context-file PATH] [--repo .] [--config PATH] [-v] <topic>
 ```
 
  Runs agents on a free-form question instead of a code diff. By default, two agents take turns as Actor/Critic before a meta-reviewer concludes. Pass `--no-debate` to switch to the parallel reviewer plus aggregator flow.
@@ -354,14 +369,10 @@ use std::path::Path;
 let client = client_from_env(LLMProvider::Anthropic { base_url: None, api_key_env: None })?;
 let result = AgentBuilder::new("explorer", "claude-sonnet-5", "You explore codebases.", client)
     .subagent_system_prompt("You are a focused file-reading worker. Report findings concisely.")
-    .run("Map the module layout of this repo.", &file_agent_tools(), Path::new("."))
-    .await?;
-println!("{}", result.text);
-```
-
-`file_agent_tools()` is the read-only file/git toolset plus `spawn_subagent`. You control the top-level prompt, the subagent prompt, the toolset, and the client; config-file-driven client construction is available via the `config`/`provider` modules. See `crates/nitpicker-agent/examples/file_agent.rs`.
-
 ## Changelog
+
+**0.8.4** — 2026-08-10
+- New `--context-file <PATH>` flag (repeatable) injects out-of-repo files (capped at 256 KiB in total) into the task prompt for review, `ask`, and `pr`.
 
 **0.8.3** — 2026-08-03 (`nitpicker-agent` 0.2.0)
 - **Stable Tool Definitions**: Send tool definitions in name-sorted order to preserve request prefix determinism and maximize provider prompt-cache hits across turns.
