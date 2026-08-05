@@ -172,7 +172,12 @@ async fn main() -> Result<()> {
     // which is an acceptable catastrophic-failure signal for the consumer.
     match args.command {
         Some(Command::Init { global, free }) => {
-            let path = init_config_path(global)?;
+            // the global flags parse here too; `init` generates a config, so honoring --config
+            // would be nonsense — reject it rather than silently ignore it
+            if args.common.config.is_some() {
+                eyre::bail!("--config has no effect on init, which generates a config file");
+            }
+            let path = init_config_path(global, &args.common.repo)?;
             if path.exists() {
                 eyre::bail!("{} already exists", path.display());
             }
@@ -660,13 +665,15 @@ fn print_init_hints(detected: &[detect::Detected]) {
     }
 }
 
-fn init_config_path(global: bool) -> Result<PathBuf> {
+fn init_config_path(global: bool, repo: &Path) -> Result<PathBuf> {
     if global {
         let home =
             dirs::home_dir().ok_or_else(|| eyre::eyre!("failed to resolve home directory"))?;
         Ok(home.join(".nitpicker").join("config.toml"))
     } else {
-        Ok(Path::new("nitpicker.toml").to_path_buf())
+        // --repo is a global flag, so `init --repo <dir>` must target that repo's root
+        // rather than silently writing into the cwd
+        Ok(repo.join("nitpicker.toml"))
     }
 }
 
@@ -895,6 +902,12 @@ mod tests {
         assert!(!args.common.verbose);
         assert_eq!(args.common.repo, PathBuf::from("/x"));
         assert_eq!(args.common.config, Some(PathBuf::from("/c.toml")));
+    }
+
+    #[test]
+    fn init_writes_into_the_repo_named_by_the_global_repo_flag() {
+        let path = init_config_path(false, Path::new("/some/repo")).unwrap();
+        assert_eq!(path, PathBuf::from("/some/repo/nitpicker.toml"));
     }
 
     #[test]
