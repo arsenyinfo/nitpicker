@@ -6,7 +6,6 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
-const COMPACTION_MAX_OUTPUT_TOKENS: u64 = 8_192;
 const COMPACTION_MAX_CORRECTIONS: usize = 2;
 const CONTINUE_MESSAGE: &str = "Continue from where you left off.";
 const COMPACTION_SYSTEM_PROMPT: &str = "You are summarizing an in-progress agent session so the same agent can resume it after a context reset. \
@@ -33,7 +32,8 @@ When constructing the summary, you MUST use the following exact markdown structu
 </summary>\n\
 Return EXACTLY ONE tagged block starting with <summary> and ending with </summary>. Do not include any text, pleasantries, or explanations outside of these tags.";
 const MISSING_SUMMARY_CORRECTION: &str = "Your response is missing the required <summary>...</summary> block. Reply with ONLY the tagged summary block and nothing else outside the tags.";
-const WRAP_SUMMARY_CORRECTION: &str = "Wrap your entire response in <summary>...</summary> tags and output nothing outside them.";
+const WRAP_SUMMARY_CORRECTION: &str =
+    "Wrap your entire response in <summary>...</summary> tags and output nothing outside them.";
 
 pub struct CompactionOutcome {
     pub usage: TokenUsage,
@@ -51,12 +51,20 @@ enum CorrectionMode {
     WrapSummary,
 }
 
+/// Which model summarizes, under the agent's own cap rather than a separate one.
+#[derive(Clone, Copy)]
+struct CompactionModel<'a> {
+    model: &'a str,
+    max_tokens: Option<u64>,
+}
+
 // threads the shared throttle semaphore alongside the existing client/history args; not worth a struct
 #[allow(clippy::too_many_arguments)]
 pub async fn compact_history(
     semaphore: &Semaphore,
     client: Arc<dyn LLMClientDyn>,
     model: &str,
+    max_tokens: Option<u64>,
     system_prompt: &str,
     history: &mut Vec<Message>,
     prompt: &mut Message,
@@ -67,8 +75,16 @@ pub async fn compact_history(
         return Ok(None);
     }
 
-    let outcome =
-        summarize_history(semaphore, client, model, system_prompt, history, turn, usage).await?;
+    let outcome = summarize_history(
+        semaphore,
+        client,
+        CompactionModel { model, max_tokens },
+        system_prompt,
+        history,
+        turn,
+        usage,
+    )
+    .await?;
     let continue_msg = Message::user(CONTINUE_MESSAGE.to_string());
     *history = vec![
         Message::user(format!(
@@ -94,7 +110,7 @@ pub async fn compact_history(
 async fn summarize_history(
     semaphore: &Semaphore,
     client: Arc<dyn LLMClientDyn>,
-    model: &str,
+    model: CompactionModel<'_>,
     system_prompt: &str,
     thread: &[Message],
     turn: usize,
@@ -134,7 +150,7 @@ async fn summarize_history(
 async fn run_compaction(
     semaphore: &Semaphore,
     client: &Arc<dyn LLMClientDyn>,
-    model: &str,
+    model: CompactionModel<'_>,
     system_prompt: &str,
     input: CompactionInput<'_>,
     turn: usize,
@@ -178,7 +194,7 @@ struct InitialAttempt {
 async fn run_corrections(
     semaphore: &Semaphore,
     client: &Arc<dyn LLMClientDyn>,
-    model: &str,
+    model: CompactionModel<'_>,
     input: &CompactionInput<'_>,
     trigger_usage: TokenUsage,
     attempt: InitialAttempt,
@@ -196,7 +212,11 @@ async fn run_corrections(
         let next = throttled_completion(
             semaphore,
             client,
-            compaction_completion(model, history.clone(), Message::user(correction.to_string())),
+            compaction_completion(
+                model,
+                history.clone(),
+                Message::user(correction.to_string()),
+            ),
         )
         .await?;
         match extract_summary(&next) {
@@ -227,15 +247,20 @@ async fn run_corrections(
     }
 }
 
-fn compaction_completion(model: &str, history: Vec<Message>, prompt: Message) -> Completion {
+fn compaction_completion(
+    model: CompactionModel<'_>,
+    history: Vec<Message>,
+    prompt: Message,
+) -> Completion {
     Completion {
-        model: model.to_string(),
+        model: model.model.to_string(),
         prompt,
         preamble: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
         history,
         tools: Vec::new(),
         tool_choice: Some(ToolChoice::None),
-        max_tokens: Some(COMPACTION_MAX_OUTPUT_TOKENS),
+        // Unset (the default) leaves the summary's length to the instructions.
+        max_tokens: model.max_tokens,
         additional_params: None,
     }
 }

@@ -23,8 +23,8 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::llm::{
-    Completion, CompletionResponse, FinishReason, LLMClient, LLMClientDyn, TokenUsage,
-    WithRetryExt, mentions_http_status,
+    CacheAccounting, Completion, CompletionResponse, FinishReason, LLMClient, LLMClientDyn,
+    TokenUsage, WithRetryExt, mentions_http_status,
 };
 
 /// Codex CLI's public OAuth client id (PKCE, no secret) — shared with the official CLI.
@@ -484,41 +484,12 @@ fn build_body(completion: &Completion) -> Result<ResponsesBody> {
     Ok(body)
 }
 
+// rig lowers assistant text into a valid Responses shape itself, and since 0.41 also drops
+// function-call item ids that aren't native `fc_...` ids, pairing by `call_id` alone. Both
+// rewrites nitpicker used to apply here are upstream now, so serialization needs no fixups.
 fn build_body_value(completion: &Completion) -> Result<Value> {
     let body = build_body(completion)?;
-    let mut value = serde_json::to_value(&body).wrap_err("serializing Codex Responses request")?;
-    normalize_codex_responses_request(&mut value);
-    Ok(value)
-}
-
-fn normalize_codex_responses_request(body: &mut Value) {
-    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
-        return;
-    };
-    for item in items {
-        normalize_codex_input_item(item);
-    }
-}
-
-// rig 0.39 lowers assistant text into a valid Responses shape itself (a bare-string
-// `AssistantInput` when the message has no id — nitpicker's only case — or an `output_text`
-// array when it does), so no assistant-content rewrite is needed here. Only function-call item
-// ids still need the `fc_` normalization for cross-provider (Alloy) replay.
-fn normalize_codex_input_item(item: &mut Value) {
-    if item.get("type").and_then(Value::as_str) == Some("function_call") {
-        normalize_codex_function_call_item(item);
-    }
-}
-
-fn normalize_codex_function_call_item(item: &mut Value) {
-    let replacement = item
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.starts_with("fc_"))
-        .map(|id| format!("fc_{id}"));
-    if let Some(id) = replacement {
-        item["id"] = Value::String(id);
-    }
+    serde_json::to_value(&body).wrap_err("serializing Codex Responses request")
 }
 
 fn normalize_codex_completion_history(completion: &mut Completion) {
@@ -665,7 +636,8 @@ fn to_completion_response(raw: ResponsesResp, model: String) -> Result<Completio
         // rig's `TryFrom` above already errors on an empty response, so `choice` is non-empty here.
         choice: parsed.choice,
         finish_reason,
-        usage: TokenUsage::new(parsed.usage.input_tokens, parsed.usage.output_tokens),
+        // the Responses API reports cache reads inside `input_tokens`
+        usage: TokenUsage::from_provider(&parsed.usage, CacheAccounting::InsidePrompt),
         selected_model: Some(model),
     })
 }
@@ -707,24 +679,6 @@ mod tests {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
         let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
         format!("{header}.{payload}.sig")
-    }
-
-    #[test]
-    fn normalize_function_call_id_only_skips_fc_underscore_prefix() {
-        // A non-Codex id that merely starts with the letters "fc" (but not "fc_") must still be
-        // normalized to the `fc_...` shape the backend expects.
-        let mut item = json!({ "id": "fcall_1" });
-        normalize_codex_function_call_item(&mut item);
-        assert_eq!(item["id"], "fc_fcall_1");
-
-        let mut generic = json!({ "id": "toolu_9" });
-        normalize_codex_function_call_item(&mut generic);
-        assert_eq!(generic["id"], "fc_toolu_9");
-
-        // An already-correct id is left untouched (no double-prefixing).
-        let mut already = json!({ "id": "fc_abc" });
-        normalize_codex_function_call_item(&mut already);
-        assert_eq!(already["id"], "fc_abc");
     }
 
     #[test]
@@ -966,8 +920,10 @@ mod tests {
         assert_eq!(assistant_message["content"], "previous answer");
     }
 
+    /// A tool id from another provider (an Alloy history replayed into Codex) is not a native
+    /// `fc_...` id, so it must be absent from `function_call` and pair by `call_id` alone.
     #[test]
-    fn body_value_rewrites_function_call_item_id_for_codex() {
+    fn body_value_omits_foreign_function_call_item_id() {
         let tool_id = "tool_5Xt5WpWtZ6Whah4Z2uZcZO34".to_string();
         let completion = Completion {
             model: "gpt-5.5".to_string(),
@@ -1006,8 +962,17 @@ mod tests {
             .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
             .unwrap();
 
-        assert_eq!(function_call["id"], format!("fc_{tool_id}"));
+        assert!(function_call.get("id").is_none());
         assert_eq!(function_call["call_id"], tool_id);
+
+        // The paired tool output must carry the same call_id, or the backend cannot match them.
+        let function_call_output = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+            .unwrap();
+        assert_eq!(function_call_output["call_id"], tool_id);
     }
 
     #[test]
@@ -1057,11 +1022,11 @@ mod tests {
             "model": "gpt-5.4",
             "output": [],
             "usage": {
-                "input_tokens": 5,
-                "input_tokens_details": { "cached_tokens": 0 },
+                "input_tokens": 5000,
+                "input_tokens_details": { "cached_tokens": 4800 },
                 "output_tokens": 1,
                 "output_tokens_details": { "reasoning_tokens": 0 },
-                "total_tokens": 6
+                "total_tokens": 5001
             }
         });
         let sse = format!(
@@ -1073,7 +1038,10 @@ mod tests {
         let resp = to_completion_response(raw, "gpt-5.4".to_string()).unwrap();
         assert_eq!(resp.text(), "pong");
         assert_eq!(resp.finish_reason, FinishReason::Stop);
-        assert_eq!(resp.usage.input_tokens, 5);
+        // cache reads are inside `input_tokens` here, so the prompt must not be inflated by them
+        assert_eq!(resp.usage.input_tokens, 5000);
+        assert_eq!(resp.usage.cached_input_tokens, 4800);
+        assert_eq!(resp.usage.total_tokens, 5001);
     }
 
     #[test]

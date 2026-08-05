@@ -2,6 +2,7 @@ use eyre::{Result, WrapErr};
 use rig_core::OneOrMany;
 use rig_core::client::CompletionClient;
 use rig_core::completion::CompletionError;
+use rig_core::completion::message::ReasoningContent;
 use rig_core::completion::message::ToolCall;
 use rig_core::completion::message::ToolChoice;
 use rig_core::completion::{AssistantContent, CompletionModel, Message};
@@ -21,6 +22,7 @@ const BASE_BACKOFF_MS: u64 = 250;
 const MAX_BACKOFF_MS: u64 = 5_000;
 const RATE_LIMIT_BASE_BACKOFF_MS: u64 = 5_000;
 const RATE_LIMIT_MAX_BACKOFF_MS: u64 = 60_000;
+const ANTHROPIC_DEFAULT_MAX_TOKENS: u64 = 8_192;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Completion {
@@ -80,6 +82,8 @@ impl From<Completion> for rig_core::completion::CompletionRequest {
             additional_params: value.additional_params,
             output_schema: None,
             tool_choice: value.tool_choice,
+            // local telemetry policy only (`#[serde(skip)]`), never sent to a provider
+            record_telemetry_content: false,
         }
     }
 }
@@ -103,17 +107,52 @@ pub struct CompletionResponse {
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
 pub struct TokenUsage {
+    /// Every prompt token the provider processed for this call, cache reads included.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Always `input_tokens + output_tokens`.
     pub total_tokens: u64,
+    /// A breakdown of `input_tokens`, not an additional charge. Passed through verbatim.
+    #[serde(default)]
+    pub cached_input_tokens: u64,
+    /// The part of `input_tokens` written into the cache on this call.
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+}
+
+/// Whether a provider's reported prompt count already contains its cache reads. Stated by each
+/// client, never inferred: provider totals can carry categories that are neither prompt nor output
+/// (Gemini) or disagree with their own parts (OpenRouter), so arithmetic tests misclassify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheAccounting {
+    /// Anthropic: cache reads and writes are reported beside `input_tokens`, not within it.
+    OutsidePrompt,
+    /// OpenAI (chat and Responses), OpenRouter, Gemini: cache reads are already in the prompt.
+    InsidePrompt,
 }
 
 impl TokenUsage {
-    pub fn new(input_tokens: u64, output_tokens: u64) -> Self {
+    /// Normalize usage so `input_tokens` always means every prompt token processed, cache reads
+    /// included — without it an Anthropic cache hit under-reports the prompt and
+    /// `ConversationUsageWindow::should_compact` never fires.
+    ///
+    /// Numbers are re-bucketed, never invented: a provider contradicting itself is reported as it
+    /// reported itself. `total_tokens` is `input + output`, so anything counted outside both
+    /// (Gemini's thinking tokens) goes unmetered.
+    pub fn from_provider(usage: &rig_core::completion::Usage, accounting: CacheAccounting) -> Self {
+        let input_tokens = match accounting {
+            CacheAccounting::OutsidePrompt => usage
+                .input_tokens
+                .saturating_add(usage.cached_input_tokens)
+                .saturating_add(usage.cache_creation_input_tokens),
+            CacheAccounting::InsidePrompt => usage.input_tokens,
+        };
         Self {
             input_tokens,
-            output_tokens,
-            total_tokens: input_tokens.saturating_add(output_tokens),
+            output_tokens: usage.output_tokens,
+            total_tokens: input_tokens.saturating_add(usage.output_tokens),
+            cached_input_tokens: usage.cached_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
         }
     }
 }
@@ -143,9 +182,9 @@ impl ConversationUsageWindow {
     }
 
     pub fn record(&mut self, usage: TokenUsage) {
-        // input_tokens from each API response is the full context size for that call,
-        // not just the new tokens — replace rather than accumulate so should_compact()
-        // compares against the actual current context size
+        // Each response reports the whole prompt it was sent, not the new tokens, so replace
+        // rather than accumulate. Note this is the size of the *last* request: tool results
+        // appended after it are not counted until the next response comes back.
         self.usage = usage;
     }
 
@@ -190,7 +229,70 @@ impl CompletionResponse {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        strip_think_blocks(&raw)
+        let (stripped, unclosed_body) = scan_think_blocks(&raw);
+        // only an *unclosed* block can hide an answer; a closed one that leaves nothing behind is
+        // genuinely all-reasoning and must read as empty so the retry fires.
+        let Some(start) = unclosed_body else {
+            return stripped;
+        };
+        // Recovery runs even with text before the block: that text only makes the loss silent,
+        // since a non-empty response never retries.
+        let recovered = self.recover_unterminated_think(&raw[start..]);
+        match (stripped.is_empty(), recovered.is_empty()) {
+            (_, true) => stripped,
+            (true, false) => recovered,
+            (false, false) => format!("{stripped}\n\n{recovered}"),
+        }
+    }
+
+    /// Salvage an answer that an unterminated `<think>` block swallowed.
+    ///
+    /// Where the reasoning ends is only knowable because the provider also reports it structurally
+    /// and the block repeats it verbatim before the answer, so it is subtracted, never guessed. An
+    /// unmatched body returns empty: serving it would pass chain-of-thought off as the verdict.
+    fn recover_unterminated_think(&self, body: &str) -> String {
+        let Some(reasoning) = self.reasoning_text() else {
+            return String::new();
+        };
+        let body = body.trim_start();
+        let Some(answer) = body.strip_prefix(reasoning.trim()) else {
+            return String::new();
+        };
+        // Word boundary, not whitespace: reasoning ending mid-word ("Ver" against "Verdict:") is a
+        // coincidental prefix, but real replies do run straight on from the final punctuation.
+        let cuts_mid_word = reasoning
+            .trim()
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric)
+            && answer.starts_with(char::is_alphanumeric);
+        match cuts_mid_word {
+            true => String::new(),
+            false => answer.trim().to_string(),
+        }
+    }
+
+    /// The response's structured reasoning, as reported beside the message content.
+    fn reasoning_text(&self) -> Option<String> {
+        let text = self
+            .choice
+            .iter()
+            .filter_map(|content| match content {
+                AssistantContent::Reasoning(reasoning) => Some(&reasoning.content),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|block| match block {
+                ReasoningContent::Text { text, .. } => Some(text.as_str()),
+                // Summary paraphrases and Encrypted/Redacted are opaque; none appear verbatim in
+                // the block, so they would corrupt the reconstruction rather than complete it.
+                _ => None,
+            })
+            .collect::<String>();
+        match text.trim().is_empty() {
+            true => None,
+            false => Some(text),
+        }
     }
 }
 
@@ -205,7 +307,10 @@ impl CompletionResponse {
 //   - a stray closing tag at depth 0 is dropped
 // note: this is content-wide, so a review that legitimately quotes a <think> tag in a code
 // snippet will have it stripped too — an accepted tradeoff for clean aggregation.
-fn strip_think_blocks(text: &str) -> String {
+/// The text outside think blocks, plus where the body of an unclosed block begins. An offset
+/// rather than a flag so recovery never re-parses tags: with several blocks or a stray closer, the
+/// first `<think>` is not the one that stayed open.
+fn scan_think_blocks(text: &str) -> (String, Option<usize>) {
     // match `<think` (or `</think` when `close`) + optional whitespace + `>` at the start of
     // `s`, case-insensitively; return the matched byte length. `<thinking>` is not a tag (the
     // char after `think` must be whitespace or `>`).
@@ -223,16 +328,26 @@ fn strip_think_blocks(text: &str) -> String {
 
     let mut out = String::with_capacity(text.len());
     let mut depth: usize = 0;
+    let mut consumed = 0usize;
+    let mut open_body_start = None;
     let mut rest = text;
     while !rest.is_empty() {
         if rest.starts_with('<') {
             if let Some(len) = match_think_tag(rest, false) {
                 depth += 1;
+                consumed += len;
+                if depth == 1 {
+                    open_body_start = Some(consumed);
+                }
                 rest = &rest[len..];
                 continue;
             }
             if let Some(len) = match_think_tag(rest, true) {
                 depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    open_body_start = None;
+                }
+                consumed += len;
                 rest = &rest[len..];
                 continue;
             }
@@ -241,9 +356,14 @@ fn strip_think_blocks(text: &str) -> String {
         if depth == 0 {
             out.push(ch);
         }
+        consumed += ch.len_utf8();
         rest = &rest[ch.len_utf8()..];
     }
-    out.trim().to_string()
+    let unclosed_body = match depth > 0 {
+        true => open_body_start,
+        false => None,
+    };
+    (out.trim().to_string(), unclosed_body)
 }
 
 pub trait LLMClient: Send + Sync {
@@ -282,6 +402,20 @@ impl LLMClient for Box<dyn LLMClientDyn> {
     }
 }
 
+/// What the provider said about a response carrying neither text nor a tool call. Without it an
+/// exhausted output budget is indistinguishable from a model that had nothing to say.
+fn empty_response_diagnosis(response: &CompletionResponse) -> String {
+    let output_tokens = response.usage.output_tokens;
+    match &response.finish_reason {
+        FinishReason::MaxTokens => format!(
+            "hit the output limit after {output_tokens} tokens without emitting content — \
+             reasoning consumed the whole budget, so raise max_tokens or leave it unset to use \
+             the provider's own limit"
+        ),
+        other => format!("finish_reason {other:?}, {output_tokens} output tokens"),
+    }
+}
+
 pub struct RetryingLLM<C> {
     inner: C,
 }
@@ -302,8 +436,11 @@ impl<C: LLMClient> LLMClient for RetryingLLM<C> {
             match self.inner.completion(completion.clone()).await {
                 Ok(response) => {
                     if response.text().is_empty() && response.tool_calls().is_none() {
+                        let diagnosis = empty_response_diagnosis(&response);
                         if attempt >= MAX_COMPLETION_ATTEMPTS {
-                            eyre::bail!("model returned empty response after {attempt} attempts");
+                            eyre::bail!(
+                                "model returned empty response after {attempt} attempts: {diagnosis}"
+                            );
                         }
                         let backoff = jittered_backoff(attempt, BASE_BACKOFF_MS, MAX_BACKOFF_MS);
                         warn!(
@@ -311,6 +448,7 @@ impl<C: LLMClient> LLMClient for RetryingLLM<C> {
                             attempt,
                             max_attempts = MAX_COMPLETION_ATTEMPTS,
                             backoff_ms = backoff.as_millis(),
+                            diagnosis,
                             "retrying after empty model response"
                         );
                         tokio::time::sleep(backoff).await;
@@ -343,12 +481,19 @@ impl<C: LLMClient> LLMClient for RetryingLLM<C> {
 /// randomly alternates between models within a single agentic loop — see https://xbow.com/blog/alloy-agents
 ///
 /// inner clients must already be wrapped with retry (e.g. via `.with_retry()`); AlloyClient does not add retry itself
+/// One model in the pool, carrying the settings that belong to it rather than to the role.
+pub struct AlloySlot {
+    pub client: Arc<dyn LLMClientDyn>,
+    pub model: String,
+    pub max_tokens: Option<u64>,
+}
+
 pub struct AlloyClient {
-    slots: Vec<(Arc<dyn LLMClientDyn>, String)>,
+    slots: Vec<AlloySlot>,
 }
 
 impl AlloyClient {
-    pub fn new(slots: Vec<(Arc<dyn LLMClientDyn>, String)>) -> Result<Self> {
+    pub fn new(slots: Vec<AlloySlot>) -> Result<Self> {
         if slots.is_empty() {
             eyre::bail!("AlloyClient requires at least one slot");
         }
@@ -366,10 +511,12 @@ impl LLMClientDyn for AlloyClient {
         &self,
         mut completion: Completion,
     ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse>> + Send + '_>> {
-        let (client, model) = &self.slots[self.pick_idx()];
-        completion.model = model.clone();
-        let client = Arc::clone(client);
-        let model = model.clone();
+        let slot = &self.slots[self.pick_idx()];
+        completion.model = slot.model.clone();
+        // the selected model's own cap, not the role's: a cap belongs to the model it was set for
+        completion.max_tokens = slot.max_tokens;
+        let client = Arc::clone(&slot.client);
+        let model = slot.model.clone();
         Box::pin(async move {
             let mut response = client.completion(completion).await?;
             response.selected_model = Some(model);
@@ -801,15 +948,10 @@ impl LLMClient for openrouter::Client {
         {
             finish_reason = FinishReason::ToolUse;
         }
-        let usage = response
-            .raw_response
-            .usage
-            .map(|u| TokenUsage::new(u.prompt_tokens as u64, u.completion_tokens as u64))
-            .unwrap_or_default();
         Ok(CompletionResponse {
             choice: response.choice,
             finish_reason,
-            usage,
+            usage: TokenUsage::from_provider(&response.usage, CacheAccounting::InsidePrompt),
             selected_model: Some(model_name),
         })
     }
@@ -835,6 +977,12 @@ impl LLMClient for anthropic::Client {
         let model_name = completion.model.clone();
         let mut request: rig_core::completion::CompletionRequest = completion.into();
         request.model = Some(model_name.clone());
+        // Anthropic requires `max_tokens`, so "no cap" cannot be expressed here. rig's own default
+        // covers only model names it recognizes and falls back to 2048 for every compatible
+        // gateway — less than one review turn spends on reasoning.
+        request
+            .max_tokens
+            .get_or_insert(ANTHROPIC_DEFAULT_MAX_TOKENS);
         let model = self.completion_model(model_name.clone());
         let response = model
             .completion(request)
@@ -861,7 +1009,7 @@ impl LLMClient for anthropic::Client {
         Ok(CompletionResponse {
             choice: response.choice,
             finish_reason,
-            usage: TokenUsage::new(response.usage.input_tokens, response.usage.output_tokens),
+            usage: TokenUsage::from_provider(&response.usage, CacheAccounting::OutsidePrompt),
             selected_model: Some(model_name),
         })
     }
@@ -896,7 +1044,7 @@ impl LLMClient for gemini::Client {
         Ok(CompletionResponse {
             choice: response.choice,
             finish_reason,
-            usage: TokenUsage::new(response.usage.input_tokens, response.usage.output_tokens),
+            usage: TokenUsage::from_provider(&response.usage, CacheAccounting::InsidePrompt),
             selected_model: Some(model_name),
         })
     }
@@ -975,7 +1123,7 @@ impl LLMClient for openai::CompletionsClient {
         Ok(CompletionResponse {
             choice: response.choice,
             finish_reason,
-            usage: TokenUsage::new(response.usage.input_tokens, response.usage.output_tokens),
+            usage: TokenUsage::from_provider(&response.usage, CacheAccounting::InsidePrompt),
             selected_model: Some(model_name),
         })
     }
@@ -989,7 +1137,10 @@ struct GeminiAdditionalParams {
 impl GeminiAdditionalParams {
     fn from_completion(completion: &Completion) -> Self {
         let config = GenerationConfig {
-            max_output_tokens: completion.max_tokens.map(|value| value as i32),
+            // saturating: `as i32` would turn a cap past i32::MAX into a negative field
+            max_output_tokens: completion
+                .max_tokens
+                .map(|value| i32::try_from(value).unwrap_or(i32::MAX)),
         };
         Self {
             generation_config: Some(config),
@@ -1030,7 +1181,290 @@ fn map_gemini_finish_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rig_core::completion::Usage;
+
+    fn strip_think_blocks(text: &str) -> String {
+        scan_think_blocks(text).0
+    }
     use serde_json::json;
+
+    fn response_with(choice: Vec<AssistantContent>) -> CompletionResponse {
+        CompletionResponse {
+            choice: OneOrMany::many(choice).expect("non-empty choice"),
+            finish_reason: FinishReason::Stop,
+            usage: TokenUsage::default(),
+            selected_model: None,
+        }
+    }
+
+    fn reasoning_item(text: &str) -> AssistantContent {
+        AssistantContent::Reasoning(rig_core::completion::message::Reasoning::new(text))
+    }
+
+    /// The block is never closed, so the scanner drops the verdict with the reasoning — but the
+    /// reasoning is also reported structurally, so it can be subtracted exactly.
+    #[test]
+    fn unterminated_think_keeps_the_answer_and_drops_the_duplicated_reasoning() {
+        let reasoning = "The debate is extremely brief. The Actor suggested `eyre`.";
+        let response = response_with(vec![
+            reasoning_item(reasoning),
+            AssistantContent::text(format!(
+                "<think>\n{reasoning}\n\n### Verdict\n**Agreed: use `eyre` for applications.**"
+            )),
+        ]);
+        assert_eq!(
+            response.text(),
+            "### Verdict\n**Agreed: use `eyre` for applications.**"
+        );
+    }
+
+    /// Leading text hides the answer just as thoroughly, but makes the response read as
+    /// successful — so nothing retries and the verdict is lost silently.
+    #[test]
+    fn unterminated_think_after_a_prefix_still_recovers_the_answer() {
+        let reasoning = "Weighing both sides.";
+        let response = response_with(vec![
+            reasoning_item(reasoning),
+            AssistantContent::text(format!(
+                "Here is my review.\n<think>\n{reasoning}\n\n### Verdict\nShip it."
+            )),
+        ]);
+        assert_eq!(
+            response.text(),
+            "Here is my review.\n\n### Verdict\nShip it."
+        );
+    }
+
+    /// OpenRouter splits `reasoning_details` mid-sentence, so a newline join stops the fragments
+    /// matching their copy inside the block and the whole chain leaks into the answer.
+    #[test]
+    fn fragmented_reasoning_is_concatenated_without_separators() {
+        let response = response_with(vec![
+            reasoning_item("weighing the options"),
+            reasoning_item(" carefully."),
+            AssistantContent::text("<think>\nweighing the options carefully.\n\nVerdict: ship it."),
+        ]);
+        assert_eq!(response.text(), "Verdict: ship it.");
+    }
+
+    /// With no structured reasoning there is no way to tell reasoning from answer. Returning the
+    /// body would both serve chain-of-thought as the verdict and make the response read as
+    /// non-empty, silencing the retry that exists for a reply that never answered.
+    #[test]
+    fn unterminated_think_without_structured_reasoning_stays_empty() {
+        let response = response_with(vec![AssistantContent::text(
+            "<think>\nweighing it up\n\nVerdict: ship it.",
+        )]);
+        assert!(response.text().is_empty());
+    }
+
+    /// A summary is a paraphrase of the chain, not a slice of it, so it cannot be subtracted from
+    /// the body — matching it as a fragment would leave a mangled prefix behind.
+    #[test]
+    fn summary_reasoning_is_not_used_to_split_the_body() {
+        let response = response_with(vec![
+            AssistantContent::Reasoning(rig_core::completion::message::Reasoning::summaries(vec![
+                "brief".to_string(),
+            ])),
+            AssistantContent::text("<think>private chain"),
+        ]);
+        assert!(response.text().is_empty());
+    }
+
+    /// A reasoning string that happens to be a byte prefix of the answer must not chop it: "Ver"
+    /// against "Verdict: ship it." would otherwise yield "dict: ship it.".
+    #[test]
+    fn a_prefix_that_cuts_mid_word_is_not_treated_as_reasoning() {
+        let response = response_with(vec![
+            reasoning_item("Ver"),
+            AssistantContent::text("<think>Verdict: ship it."),
+        ]);
+        assert!(response.text().is_empty());
+    }
+
+    /// With several blocks, the one that stayed open is not the first tag in the text. Recovery
+    /// keys off the scanner's offset, so an earlier *closed* block cannot misdirect it.
+    #[test]
+    fn recovery_targets_the_block_that_stayed_open() {
+        let response = response_with(vec![
+            reasoning_item("secret"),
+            AssistantContent::text("<think>old</think>\n<think>secret\n\nFINAL"),
+        ]);
+        assert_eq!(response.text(), "FINAL");
+    }
+
+    /// A stray closing tag at depth 0 is dropped by the scanner and must not be mistaken for the
+    /// opener when recovering.
+    #[test]
+    fn a_stray_closing_tag_does_not_misdirect_recovery() {
+        let response = response_with(vec![
+            reasoning_item("secret"),
+            AssistantContent::text("</think><think>secret\n\nFINAL"),
+        ]);
+        assert_eq!(response.text(), "FINAL");
+    }
+
+    /// A response that is only reasoning still collapses to empty, so the empty-response retry
+    /// keeps working for models that genuinely returned no answer.
+    #[test]
+    fn a_reasoning_only_response_is_still_empty() {
+        let reasoning = "still thinking about it";
+        let response = response_with(vec![
+            reasoning_item(reasoning),
+            AssistantContent::text(format!("<think>\n{reasoning}")),
+        ]);
+        assert!(response.text().is_empty());
+        let closed = response_with(vec![AssistantContent::text(
+            "<think>done deliberating</think>",
+        )]);
+        assert!(closed.text().is_empty());
+    }
+
+    /// A well-formed closed block is untouched by the recovery path.
+    #[test]
+    fn closed_think_block_still_yields_only_the_answer() {
+        let response = response_with(vec![AssistantContent::text(
+            "<think>weighing it up</think>Verdict: ship it.",
+        )]);
+        assert_eq!(response.text(), "Verdict: ship it.");
+    }
+
+    /// Mirrors rig's Anthropic mapping: `input_tokens` excludes the cache buckets and
+    /// `total_tokens` is their sum plus output (`anthropic/completion.rs`).
+    fn anthropic_usage(input: u64, output: u64, cached: u64, creation: u64) -> Usage {
+        let mut usage = Usage::new();
+        usage.input_tokens = input;
+        usage.output_tokens = output;
+        usage.cached_input_tokens = cached;
+        usage.cache_creation_input_tokens = creation;
+        usage.total_tokens = input + cached + creation + output;
+        usage
+    }
+
+    fn anthropic(usage: &Usage) -> TokenUsage {
+        TokenUsage::from_provider(usage, CacheAccounting::OutsidePrompt)
+    }
+
+    fn prompt_inclusive(usage: &Usage) -> TokenUsage {
+        TokenUsage::from_provider(usage, CacheAccounting::InsidePrompt)
+    }
+
+    /// The same 3508-token prompt served from cache, as each provider reports it: Anthropic shows
+    /// `input_tokens: 52` with the rest under `cache_read`, OpenAI shows the whole prompt. Both
+    /// must meter identically, or a mixed-provider run sums numbers that mean different things —
+    /// and the Anthropic shape read raw is what hid 98% of the prompt.
+    #[test]
+    fn provider_shapes_meter_a_cache_hit_identically() {
+        let from_anthropic = anthropic(&anthropic_usage(52, 8, 3456, 0));
+        let mut openai = Usage::new();
+        openai.input_tokens = 3508;
+        openai.output_tokens = 8;
+        openai.cached_input_tokens = 3456;
+        openai.total_tokens = 3516;
+        let from_openai = prompt_inclusive(&openai);
+
+        assert_eq!(from_anthropic.input_tokens, 3508);
+        assert_eq!(from_anthropic.input_tokens, from_openai.input_tokens);
+        assert_eq!(
+            from_anthropic.cached_input_tokens,
+            from_openai.cached_input_tokens
+        );
+        for usage in [from_anthropic, from_openai] {
+            assert_eq!(usage.total_tokens, usage.input_tokens + usage.output_tokens);
+        }
+    }
+
+    /// Gemini reports thinking and tool-use prompts beside both `input_tokens` and
+    /// `output_tokens`, and its parts don't sum to its total — so no arithmetic can tell its shape
+    /// apart from Anthropic's. Numbers are rig's own fixture (`gemini/completion.rs`) with the
+    /// cache lowered to 8, the value that makes the buckets *look* like they fit outside the
+    /// prompt. Charging them would report a 40-token prompt as 48.
+    #[test]
+    fn gemini_cache_reads_are_never_added_to_its_prompt() {
+        let mut usage = Usage::new();
+        usage.input_tokens = 40;
+        usage.output_tokens = 30;
+        usage.reasoning_tokens = 10;
+        usage.tool_use_prompt_tokens = 12;
+        usage.cached_input_tokens = 8;
+        usage.total_tokens = 100;
+        let usage = prompt_inclusive(&usage);
+        assert_eq!(usage.input_tokens, 40);
+        assert_eq!(usage.cached_input_tokens, 8);
+    }
+
+    /// An OpenRouter gateway may report a total larger than prompt + completion. That slack must
+    /// not turn its cache reads — already inside `prompt_tokens` — into extra prompt tokens.
+    #[test]
+    fn openrouter_total_disagreement_does_not_inflate_the_prompt() {
+        let mut usage = Usage::new();
+        usage.input_tokens = 500;
+        usage.output_tokens = 10;
+        usage.cached_input_tokens = 5;
+        usage.total_tokens = 515;
+        let usage = prompt_inclusive(&usage);
+        assert_eq!(usage.input_tokens, 500);
+        assert_eq!(usage.total_tokens, 510);
+    }
+
+    /// A gateway that omits usage totals must still meter the prompt it reported.
+    #[test]
+    fn missing_provider_total_still_meters_reported_input() {
+        let mut usage = Usage::new();
+        usage.input_tokens = 1200;
+        usage.output_tokens = 40;
+        let usage = prompt_inclusive(&usage);
+        assert_eq!(usage.input_tokens, 1200);
+        assert_eq!(usage.total_tokens, 1240);
+    }
+
+    /// Anthropic charges a cache *write* too, and reports it outside `input_tokens` like a read.
+    #[test]
+    fn anthropic_cache_writes_count_toward_the_prompt() {
+        let usage = anthropic(&anthropic_usage(90, 10, 0, 4100));
+        assert_eq!(usage.cache_creation_input_tokens, 4100);
+        assert_eq!(usage.input_tokens, 4190);
+        assert_eq!(usage.total_tokens, 4200);
+    }
+
+    /// A provider reporting more cache than prompt is contradicting itself. Reporting the prompt
+    /// as 5000 to make the breakdown fit would invent 4990 tokens of spend that were never billed,
+    /// so both numbers are passed through as reported and the contradiction stays visible.
+    #[test]
+    fn contradictory_cache_metadata_is_not_papered_over() {
+        let mut usage = Usage::new();
+        usage.input_tokens = 10;
+        usage.output_tokens = 5;
+        usage.total_tokens = 15;
+        usage.cached_input_tokens = 5_000;
+        usage.cache_creation_input_tokens = 700;
+        let usage = prompt_inclusive(&usage);
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.total_tokens, 15);
+        assert_eq!(usage.cached_input_tokens, 5_000);
+        assert_eq!(usage.cache_creation_input_tokens, 700);
+    }
+
+    /// The whole point of the normalization: a cache hit must still trip the compaction
+    /// threshold, since the full prompt is what gets re-sent next turn.
+    #[test]
+    fn compaction_threshold_sees_the_cached_prompt() {
+        let mut window = ConversationUsageWindow::new(Some(3_000));
+        window.record(anthropic(&anthropic_usage(52, 8, 3456, 0)));
+        assert!(window.should_compact());
+    }
+
+    /// The cache fields are `#[serde(default)]` so trajectories written before they existed
+    /// still decode.
+    #[test]
+    fn usage_without_cache_fields_still_deserializes() {
+        let usage: TokenUsage = serde_json::from_value(
+            json!({"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}),
+        )
+        .expect("legacy usage payload must decode");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.cached_input_tokens, 0);
+    }
 
     /// Reproduce how a provider 401 actually reaches the retry layer: rig surfaces the raw
     /// response body as `ProviderError`, and the per-provider `completion` impls wrap it with
@@ -1092,7 +1526,10 @@ mod tests {
     #[test]
     fn gemini_params_none_yields_generation_config_only() {
         let params = build_gemini_additional_params(&gemini_completion(Some(50), None)).unwrap();
-        assert_eq!(params, json!({"generation_config": {"max_output_tokens": 50}}));
+        assert_eq!(
+            params,
+            json!({"generation_config": {"max_output_tokens": 50}})
+        );
     }
 
     #[test]

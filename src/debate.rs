@@ -1,18 +1,18 @@
+use crate::output::UsageReport;
+pub use crate::prompts::DebateMode;
+use eyre::Result;
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use nitpicker_agent::agent::{
     AgentConfig, AgentDepth, AgentProgress, MAX_CONCURRENT_LLM_CALLS, add_spawn_subagent_tool,
     run_agent,
 };
 use nitpicker_agent::config::{Config, ReviewerConfig};
 use nitpicker_agent::llm::{Completion, LLMClientDyn, TokenUsage};
-use crate::output::UsageReport;
-pub use crate::prompts::DebateMode;
 #[cfg(feature = "antigravity")]
 use nitpicker_agent::provider::config_needs_gemini_proxy;
 use nitpicker_agent::provider::{build_aggregator_client, build_reviewer_client};
 use nitpicker_agent::session::{AggregationRecord, SessionLogger, SessionWriter};
 use nitpicker_agent::tools::{Tool, all_tools};
-use eyre::Result;
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rig_core::completion::Message;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -70,6 +70,7 @@ struct DebateTurnResult {
 struct DebateTurnRequest<'a> {
     client: Arc<dyn LLMClientDyn>,
     compact_threshold: Option<u64>,
+    max_tokens: Option<u64>,
     model: &'a str,
     system_prompt: &'a str,
     initial_message: &'a str,
@@ -157,6 +158,7 @@ async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnRes
         session_agent: "root".to_string(),
         model: request.model.to_string(),
         max_turns: request.max_turns,
+        max_tokens: request.max_tokens,
         compact_threshold: request.compact_threshold,
         system_prompt: request.system_prompt.to_string(),
         subagent_system_prompt: None,
@@ -201,7 +203,7 @@ async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnRes
             });
         }
     };
-    let usage = result.usage();
+    let usage = result.usage;
     let stored = verdict_store
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -228,6 +230,7 @@ struct DebateSide<'a> {
     role: &'a str,
     client: Arc<dyn LLMClientDyn>,
     compact_threshold: Option<u64>,
+    max_tokens: Option<u64>,
     model: &'a str,
     system_prompt: &'a str,
     /// Trajectory filename stem; the round number is appended.
@@ -274,12 +277,12 @@ async fn run_debate_side(
             "    ↳ ",
             progress.last_subagent.as_deref(),
         ));
-    })
-        as Arc<dyn Fn(AgentProgress) + Send + Sync>);
+    }) as Arc<dyn Fn(AgentProgress) + Send + Sync>);
 
     let result = run_debate_turn(DebateTurnRequest {
         client: Arc::clone(&side.client),
         compact_threshold: side.compact_threshold,
+        max_tokens: side.max_tokens,
         model: side.model,
         system_prompt: side.system_prompt,
         initial_message: &msg,
@@ -297,13 +300,15 @@ async fn run_debate_side(
     sub_pb.finish_and_clear();
     pb.set_style(env.done_style.clone());
     pb.finish_with_message(crate::progress::bar_message(format!(
-        "✓ round {round} ({} turns, {} tool calls, {} subagents, {} in, {} out, {} total tokens, {elapsed}s)",
+        "✓ round {round} ({} turns, {} tool calls, {} subagents, {}, {} out, {elapsed}s)",
         result.turns,
         result.tool_calls,
         result.subagents_spawned,
-        result.usage.input_tokens,
-        result.usage.output_tokens,
-        result.usage.total_tokens
+        crate::progress::input_with_cache_share(
+            result.usage.input_tokens,
+            result.usage.cached_input_tokens
+        ),
+        crate::progress::compact_tokens(result.usage.output_tokens)
     )));
     if env.verbose && env.stdout_ok && stdout_is_terminal() {
         println!();
@@ -466,13 +471,22 @@ pub async fn run_debate(
     let critic_label: ModelLabel;
     let actor_compact_threshold: Option<u64>;
     let critic_compact_threshold: Option<u64>;
+    // In alloy mode the client pools every reviewer, so these come from the same two slots the
+    // roles are otherwise pinned to — the existing convention for per-side settings.
+    let actor_max_tokens = actor_cfg.max_tokens;
+    let critic_max_tokens = critic_cfg.max_tokens;
 
     if alloy {
         let mut slots = Vec::new();
         for r in &config.reviewer {
-            slots.push((build_client(r, proxy_url.as_deref())?, r.model.clone()));
+            slots.push(nitpicker_agent::llm::AlloySlot {
+                client: build_client(r, proxy_url.as_deref())?,
+                model: r.model.clone(),
+                max_tokens: r.max_tokens,
+            });
         }
-        let shared: Arc<dyn LLMClientDyn> = Arc::new(nitpicker_agent::llm::AlloyClient::new(slots)?);
+        let shared: Arc<dyn LLMClientDyn> =
+            Arc::new(nitpicker_agent::llm::AlloyClient::new(slots)?);
         actor_client = Arc::clone(&shared);
         critic_client = shared;
         let label = ModelLabel::alloy(config.reviewer.iter().map(|r| r.model.as_str()));
@@ -539,6 +553,7 @@ pub async fn run_debate(
         role: actor_role,
         client: actor_client,
         compact_threshold: actor_compact_threshold,
+        max_tokens: actor_max_tokens,
         model: &actor_label.alias,
         system_prompt: &actor_system,
         session_stem: "review",
@@ -547,6 +562,7 @@ pub async fn run_debate(
         role: critic_role,
         client: critic_client,
         compact_threshold: critic_compact_threshold,
+        max_tokens: critic_max_tokens,
         model: &critic_label.alias,
         system_prompt: &critic_system,
         session_stem: "validate",
@@ -622,7 +638,7 @@ pub async fn run_debate(
         history: Vec::new(),
         tools: Vec::new(),
         tool_choice: None,
-        max_tokens: agg_cfg.max_tokens.or(Some(8192)),
+        max_tokens: Some(config.aggregator_max_tokens()),
         additional_params: None,
     };
     let (pb, _) = make_spinner(&mp);

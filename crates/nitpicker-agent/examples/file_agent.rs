@@ -40,7 +40,7 @@ async fn main() -> eyre::Result<()> {
     println!("{}\n", result.text);
     eprintln!(
         "[turns={} tool_calls={} subagents={} tokens={}]",
-        result.turns, result.tool_calls, result.subagents_spawned, result.total_tokens
+        result.turns, result.tool_calls, result.subagents_spawned, result.usage.total_tokens
     );
     Ok(())
 }

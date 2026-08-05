@@ -1,18 +1,18 @@
+use crate::output::UsageReport;
+pub use crate::prompts::TaskMode;
+use eyre::Result;
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use nitpicker_agent::agent::{
     AgentConfig, AgentDepth, AgentProgress, AgentResult, MAX_CONCURRENT_LLM_CALLS,
     add_spawn_subagent_tool, run_agent,
 };
 use nitpicker_agent::config::{Config, ReviewerConfig};
 use nitpicker_agent::llm::{Completion, FinishReason};
-use crate::output::UsageReport;
-pub use crate::prompts::TaskMode;
 #[cfg(feature = "antigravity")]
 use nitpicker_agent::provider::config_needs_gemini_proxy;
 use nitpicker_agent::provider::{build_aggregator_client, build_reviewer_client};
 use nitpicker_agent::session::{AggregationRecord, SessionLogger, sanitize_path_component};
 use nitpicker_agent::tools::{all_tools, floor_char_boundary, is_binary_file};
-use eyre::Result;
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rig_core::completion::Message;
 use std::path::Path;
 use std::sync::Arc;
@@ -146,17 +146,19 @@ pub async fn run_review(
             pb.set_style(done);
             match &result {
                 Ok(r) => pb.finish_with_message(crate::progress::bar_message(format!(
-                    "✓ done ({elapsed}s, {} turns, {} tool calls, {} subagents, {} in, {} out, {} total tokens)",
+                    "✓ done ({elapsed}s, {} turns, {} tool calls, {} subagents, {}, {} out)",
                     r.turns,
                     r.tool_calls,
                     r.subagents_spawned,
-                    r.total_input_tokens,
-                    r.total_output_tokens,
-                    r.total_tokens
+                    crate::progress::input_with_cache_share(
+                        r.usage.input_tokens,
+                        r.usage.cached_input_tokens
+                    ),
+                    crate::progress::compact_tokens(r.usage.output_tokens)
                 ))),
-                Err(e) => pb.finish_with_message(crate::progress::bar_message(format!(
-                    "✗ failed: {e}"
-                ))),
+                Err(e) => {
+                    pb.finish_with_message(crate::progress::bar_message(format!("✗ failed: {e}")))
+                }
             }
             result
         });
@@ -170,7 +172,7 @@ pub async fn run_review(
     for (name, handle) in handles {
         match handle.await {
             Ok(Ok(result)) => {
-                usage.add(result.usage(), result.subagents_spawned);
+                usage.add(result.usage, result.subagents_spawned);
                 rendered.push(format!("## {name} review\n\n{}", result.text));
                 success_count += 1;
                 info!(reviewer = %name, "review completed");
@@ -213,7 +215,7 @@ pub async fn run_review(
         history: Vec::new(),
         tools: Vec::new(),
         tool_choice: None,
-        max_tokens: agg.max_tokens.or(Some(8192)),
+        max_tokens: Some(config.aggregator_max_tokens()),
         additional_params: None,
     };
     let response = client.completion(completion).await?;
@@ -338,6 +340,7 @@ fn build_agent_config(
         session_agent: "root".to_string(),
         model: reviewer.model.clone(),
         max_turns,
+        max_tokens: reviewer.max_tokens,
         compact_threshold,
         system_prompt: system_prompt.to_string(),
         subagent_system_prompt: None,

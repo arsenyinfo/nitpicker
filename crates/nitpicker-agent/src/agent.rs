@@ -1,5 +1,7 @@
 use crate::compact::{CompactionOutcome, compact_history};
-use crate::llm::{Completion, ConversationUsageWindow, LLMClientDyn, TokenUsage, throttled_completion};
+use crate::llm::{
+    Completion, ConversationUsageWindow, LLMClientDyn, TokenUsage, throttled_completion,
+};
 use crate::prompts::subagent_system_prompt;
 use crate::session::{SessionWriter, ToolCallRecord, now_unix_ms};
 use crate::tools::{Tool, floor_char_boundary, tool_definitions};
@@ -32,21 +34,8 @@ pub struct AgentResult {
     pub turns: usize,
     pub tool_calls: usize,
     pub subagents_spawned: usize,
-    pub total_input_tokens: u64,
-    pub total_output_tokens: u64,
-    pub total_tokens: u64,
-}
-
-impl AgentResult {
-    /// the agent's accumulated token usage (preserving its reported `total_tokens`
-    /// verbatim rather than recomputing from input+output).
-    pub fn usage(&self) -> TokenUsage {
-        TokenUsage {
-            input_tokens: self.total_input_tokens,
-            output_tokens: self.total_output_tokens,
-            total_tokens: self.total_tokens,
-        }
-    }
+    /// Everything this agent spent, with its subagents and compaction calls already folded in.
+    pub usage: TokenUsage,
 }
 
 pub struct AgentProgress {
@@ -84,6 +73,9 @@ pub struct AgentConfig {
     pub session_agent: String,
     pub model: String,
     pub max_turns: usize,
+    /// Output cap per turn. `None` (the default) sends none, so the provider's per-model limit
+    /// applies: a fixed budget is spent on reasoning before the model writes a character.
+    pub max_tokens: Option<u64>,
     pub compact_threshold: Option<u64>,
     pub system_prompt: String,
     /// System prompt for spawned subagents. `None` uses the built-in generic prompt
@@ -100,6 +92,100 @@ pub struct AgentConfig {
     pub progress: Option<Arc<dyn Fn(AgentProgress) + Send + Sync>>,
     pub project_context: Option<String>,
     pub session_writer: Option<SessionWriter>,
+}
+
+enum Compaction {
+    Done(CompactionOutcome),
+    /// Ran with nothing to summarize.
+    Skipped,
+    Failed(String),
+}
+
+impl Compaction {
+    /// Only a compaction that actually shrank the history may clear the window. This is observable
+    /// at the cycle-break site alone, which `continue`s past `conversation_usage.record(...)`:
+    /// there the reset was the whole retry signal, and dropping it left the next turn to carry on
+    /// with the history compaction had failed to shrink. The threshold site falls through to its
+    /// completion, which re-measures the prompt either way.
+    fn resets_usage_window(&self) -> bool {
+        !matches!(self, Self::Failed(_))
+    }
+
+    /// Failure is recorded as a failed tool call — logging it as `ok` with no summary makes
+    /// `reflect` count and render it as a success.
+    fn trajectory_fields(&self) -> (ToolCallStatus, Option<&str>) {
+        match self {
+            Self::Done(outcome) => (ToolCallStatus::Ok, Some(outcome.summary.as_str())),
+            Self::Skipped => (ToolCallStatus::Ok, None),
+            Self::Failed(error) => (ToolCallStatus::Error, Some(error.as_str())),
+        }
+    }
+}
+
+/// A compaction error chain can carry the summarizer's whole non-conforming response, and the
+/// trajectory is read back into memory whole. `reflect` renders at most this much of it anyway.
+const MAX_TRAJECTORY_ERROR_BYTES: usize = 2_000;
+
+fn truncate_for_trajectory(mut error: String) -> String {
+    let boundary = floor_char_boundary(&error, MAX_TRAJECTORY_ERROR_BYTES);
+    match boundary < error.len() {
+        true => {
+            let omitted = error.len() - boundary;
+            error.truncate(boundary);
+            error.push_str(&format!("... truncated; {omitted} bytes omitted"));
+            error
+        }
+        false => error,
+    }
+}
+
+/// Best-effort compaction: a summarizer that fails after its own retries and corrections must not
+/// take the agent with it. Continuing uncompacted may still finish; aborting never does.
+// carries the loop's compaction state to one place so the window/trajectory decisions can't drift
+// between the two call sites; not worth a struct
+#[allow(clippy::too_many_arguments)]
+async fn compact_and_account(
+    config: &AgentConfig,
+    reason: &'static str,
+    system_prompt: &str,
+    history: &mut Vec<Message>,
+    prompt: &mut Message,
+    turn: usize,
+    conversation_usage: &mut ConversationUsageWindow,
+    totals: &mut RunTotals,
+) {
+    // compaction happens *before* the next turn runs, so it is named for that turn; the trajectory
+    // keeps logging the loop index it was reached from
+    let compaction_turn = turn + 1;
+    let compaction = match compact_history(
+        &config.llm_semaphore,
+        Arc::clone(&config.client),
+        &config.model,
+        config.max_tokens,
+        system_prompt,
+        history,
+        prompt,
+        compaction_turn,
+        conversation_usage.usage(),
+    )
+    .await
+    {
+        Ok(Some(outcome)) => Compaction::Done(outcome),
+        Ok(None) => Compaction::Skipped,
+        Err(err) => {
+            let error = truncate_for_trajectory(format!("{err:#}"));
+            warn!(agent = %config.name, turn = compaction_turn, "compaction failed ({error}); continuing uncompacted");
+            Compaction::Failed(error)
+        }
+    };
+    match &compaction {
+        Compaction::Done(outcome) => totals.add_usage(outcome.usage),
+        Compaction::Skipped | Compaction::Failed(_) => {}
+    }
+    if compaction.resets_usage_window() {
+        conversation_usage.reset();
+    }
+    log_compaction(config, turn, reason, &compaction).await;
 }
 
 struct FinishTool {
@@ -145,13 +231,11 @@ struct ToolCallOutcome {
     repeated_tool_call_blocked: bool,
     status: ToolCallStatus,
     spawned_agent: Option<String>,
-    subagent_input_tokens: u64,
-    subagent_output_tokens: u64,
-    subagent_total_tokens: u64,
+    subagent_usage: TokenUsage,
 }
 
-/// Running totals for one `run_agent` call, folded into every exit path so the three
-/// counters can't drift apart across the loop's four accumulation sites.
+/// Running totals for one `run_agent` call, folded into every exit path so the counters
+/// can't drift apart across the loop's four accumulation sites.
 struct RunTotals {
     usage: TokenUsage,
     tool_calls: usize,
@@ -171,6 +255,14 @@ impl RunTotals {
         self.usage.input_tokens = self.usage.input_tokens.saturating_add(usage.input_tokens);
         self.usage.output_tokens = self.usage.output_tokens.saturating_add(usage.output_tokens);
         self.usage.total_tokens = self.usage.total_tokens.saturating_add(usage.total_tokens);
+        self.usage.cached_input_tokens = self
+            .usage
+            .cached_input_tokens
+            .saturating_add(usage.cached_input_tokens);
+        self.usage.cache_creation_input_tokens = self
+            .usage
+            .cache_creation_input_tokens
+            .saturating_add(usage.cache_creation_input_tokens);
     }
 
     fn finish(&self, config: &AgentConfig, text: String, turns: usize) -> AgentResult {
@@ -180,9 +272,7 @@ impl RunTotals {
             tool_calls: self.tool_calls,
             subagents_spawned: config.subagent_counter.load(Ordering::Relaxed)
                 - self.initial_subagent_count,
-            total_input_tokens: self.usage.input_tokens,
-            total_output_tokens: self.usage.output_tokens,
-            total_tokens: self.usage.total_tokens,
+            usage: self.usage,
         }
     }
 }
@@ -197,9 +287,7 @@ struct SubagentOutcome {
     output: String,
     tool_calls: usize,
     spawned_agent: Option<String>,
-    input_tokens: u64,
-    output_tokens: u64,
-    total_tokens: u64,
+    usage: TokenUsage,
 }
 
 impl Tool for FinishTool {
@@ -305,22 +393,17 @@ pub async fn run_agent(
                 window_total_tokens = usage_before_compaction.total_tokens,
                 "compaction triggered"
             );
-            let compaction = compact_history(
-                &config.llm_semaphore,
-                Arc::clone(&config.client),
-                &config.model,
+            compact_and_account(
+                &config,
+                "threshold",
                 &effective_system_prompt,
                 &mut history,
                 &mut prompt,
-                turn + 1,
-                usage_before_compaction,
+                turn,
+                &mut conversation_usage,
+                &mut totals,
             )
-            .await?;
-            if let Some(outcome) = &compaction {
-                totals.add_usage(outcome.usage);
-            }
-            conversation_usage.reset();
-            log_compaction(&config, turn, "threshold", compaction.as_ref()).await;
+            .await;
         }
 
         if is_final_turn {
@@ -343,7 +426,7 @@ pub async fn run_agent(
             history: history[..history.len().saturating_sub(1)].to_vec(),
             tools: tool_definitions(&available_tools),
             tool_choice: None,
-            max_tokens: Some(8192),
+            max_tokens: config.max_tokens,
             additional_params: None,
         };
 
@@ -387,30 +470,36 @@ pub async fn run_agent(
                     }
                 }
                 match &selected_model {
-                    Some(m) => info!(agent = %config.name, tool = %tool_name, args = %args, turn, model = %m, "tool call"),
-                    None => info!(agent = %config.name, tool = %tool_name, args = %args, turn, "tool call"),
+                    Some(m) => {
+                        info!(agent = %config.name, tool = %tool_name, args = %args, turn, model = %m, "tool call")
+                    }
+                    None => {
+                        info!(agent = %config.name, tool = %tool_name, args = %args, turn, "tool call")
+                    }
                 }
             }
 
             // phase 2: execute the whole wave concurrently so a spawn_subagent batch overlaps
             // instead of running one-at-a-time; outcomes stay index-aligned with tool_calls
-            let outcomes = join_all(tool_calls.iter().zip(&cycle_lens).map(|(call, &cycle_len)| {
-                execute_tool_call(
-                    ToolCallContext {
-                        config: &config,
-                        runtime_tools: &available_tools,
-                        tools_map,
-                        work_dir,
-                        turn,
-                        current_turns: turn + 1,
-                        total_tool_calls: totals.tool_calls,
-                        initial_subagent_count,
-                    },
-                    call.function.name.as_str(),
-                    call.function.arguments.clone(),
-                    cycle_len,
-                )
-            }))
+            let outcomes = join_all(tool_calls.iter().zip(&cycle_lens).map(
+                |(call, &cycle_len)| {
+                    execute_tool_call(
+                        ToolCallContext {
+                            config: &config,
+                            runtime_tools: &available_tools,
+                            tools_map,
+                            work_dir,
+                            turn,
+                            current_turns: turn + 1,
+                            total_tool_calls: totals.tool_calls,
+                            initial_subagent_count,
+                        },
+                        call.function.name.as_str(),
+                        call.function.arguments.clone(),
+                        cycle_len,
+                    )
+                },
+            ))
             .await;
 
             // phase 3: fold results back in original order (tool-result ordering is load-bearing
@@ -442,16 +531,10 @@ pub async fn run_agent(
                     repeated_tool_call_blocked: _,
                     status: _,
                     spawned_agent: _,
-                    subagent_input_tokens,
-                    subagent_output_tokens,
-                    subagent_total_tokens,
+                    subagent_usage,
                 } = outcome;
                 totals.tool_calls += nested_tool_calls;
-                totals.add_usage(TokenUsage {
-                    input_tokens: subagent_input_tokens,
-                    output_tokens: subagent_output_tokens,
-                    total_tokens: subagent_total_tokens,
-                });
+                totals.add_usage(subagent_usage);
                 if call.function.name == "spawn_subagent" {
                     last_subagent = None;
                 }
@@ -459,8 +542,11 @@ pub async fn run_agent(
                 // deterministic even though FinishTool also wrote it during concurrent phase-2
                 // execution (a malformed turn with multiple finish calls → provider-last wins)
                 if config.depth.is_subagent() && !blocked && call.function.name == "finish" {
-                    if let Some(result) =
-                        call.function.arguments.get("result").and_then(|v| v.as_str())
+                    if let Some(result) = call
+                        .function
+                        .arguments
+                        .get("result")
+                        .and_then(|v| v.as_str())
                     {
                         *finish_store.lock().unwrap_or_else(|e| e.into_inner()) =
                             Some(result.to_string());
@@ -501,9 +587,11 @@ pub async fn run_agent(
                         response_input_tokens = response.usage.input_tokens,
                         response_output_tokens = response.usage.output_tokens,
                         response_total_tokens = response.usage.total_tokens,
+                        response_cached_input_tokens = response.usage.cached_input_tokens,
                         total_input_tokens = totals.usage.input_tokens,
                         total_output_tokens = totals.usage.output_tokens,
                         total_tokens_so_far = totals.usage.total_tokens,
+                        total_cached_input_tokens = totals.usage.cached_input_tokens,
                         response_len = result.len(),
                         "subagent finished"
                     );
@@ -519,6 +607,7 @@ pub async fn run_agent(
                     total_input_tokens = totals.usage.input_tokens,
                     total_output_tokens = totals.usage.output_tokens,
                     total_tokens = totals.usage.total_tokens,
+                    total_cached_input_tokens = totals.usage.cached_input_tokens,
                     "terminal tool called"
                 );
                 return Ok(totals.finish(&config, String::new(), turn + 1));
@@ -538,22 +627,17 @@ pub async fn run_agent(
                     consecutive_blocked_count,
                     "forcing compaction to break tool-call cycle"
                 );
-                let compaction = compact_history(
-                    &config.llm_semaphore,
-                    Arc::clone(&config.client),
-                    &config.model,
+                compact_and_account(
+                    &config,
+                    "cycle_break",
                     &effective_system_prompt,
                     &mut history,
                     &mut prompt,
-                    turn + 1,
-                    conversation_usage.usage(),
+                    turn,
+                    &mut conversation_usage,
+                    &mut totals,
                 )
-                .await?;
-                if let Some(outcome) = &compaction {
-                    totals.add_usage(outcome.usage);
-                }
-                conversation_usage.reset();
-                log_compaction(&config, turn, "cycle_break", compaction.as_ref()).await;
+                .await;
                 let cycle_break_msg = Message::user(
                     "Note: you were stuck in a repetitive tool-call loop. \
                      Avoid repeating the same tool calls. Try a different approach."
@@ -599,9 +683,11 @@ pub async fn run_agent(
                 response_input_tokens = response.usage.input_tokens,
                 response_output_tokens = response.usage.output_tokens,
                 response_total_tokens = response.usage.total_tokens,
+                response_cached_input_tokens = response.usage.cached_input_tokens,
                 total_input_tokens = totals.usage.input_tokens,
                 total_output_tokens = totals.usage.output_tokens,
                 total_tokens_so_far = totals.usage.total_tokens,
+                total_cached_input_tokens = totals.usage.cached_input_tokens,
                 response_len = text.len(),
                 "finished"
             );
@@ -719,6 +805,7 @@ fn prepare_subagent(
         session_agent: spawned_agent.clone(),
         model: parent_config.model.clone(),
         max_turns: parent_config.max_turns,
+        max_tokens: parent_config.max_tokens,
         compact_threshold: parent_config.compact_threshold,
         system_prompt: parent_config
             .subagent_system_prompt
@@ -762,17 +849,13 @@ async fn run_subagent(
             output: result.text,
             tool_calls: result.tool_calls,
             spawned_agent: Some(spawned_agent),
-            input_tokens: result.total_input_tokens,
-            output_tokens: result.total_output_tokens,
-            total_tokens: result.total_tokens,
+            usage: result.usage,
         },
         Err(err) => SubagentOutcome {
             output: format!("Error: {err}"),
             tool_calls: 0,
             spawned_agent: Some(spawned_agent),
-            input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: 0,
+            usage: TokenUsage::default(),
         },
     }
 }
@@ -839,9 +922,7 @@ async fn execute_tool_call(
             repeated_tool_call_blocked: true,
             status: ToolCallStatus::BlockedCycle,
             spawned_agent: None,
-            subagent_input_tokens: 0,
-            subagent_output_tokens: 0,
-            subagent_total_tokens: 0,
+            subagent_usage: TokenUsage::default(),
         };
         log_tool_call(
             ctx.config,
@@ -867,9 +948,7 @@ async fn execute_tool_call(
                 repeated_tool_call_blocked: false,
                 status: ToolCallStatus::Error,
                 spawned_agent: None,
-                subagent_input_tokens: 0,
-                subagent_output_tokens: 0,
-                subagent_total_tokens: 0,
+                subagent_usage: TokenUsage::default(),
             };
             log_tool_call(
                 ctx.config,
@@ -899,9 +978,7 @@ async fn execute_tool_call(
                     repeated_tool_call_blocked: false,
                     status: ToolCallStatus::Error,
                     spawned_agent: None,
-                    subagent_input_tokens: 0,
-                    subagent_output_tokens: 0,
-                    subagent_total_tokens: 0,
+                    subagent_usage: TokenUsage::default(),
                 };
                 log_tool_call(
                     ctx.config,
@@ -946,9 +1023,7 @@ async fn execute_tool_call(
             repeated_tool_call_blocked: false,
             status,
             spawned_agent: sub.spawned_agent,
-            subagent_input_tokens: sub.input_tokens,
-            subagent_output_tokens: sub.output_tokens,
-            subagent_total_tokens: sub.total_tokens,
+            subagent_usage: sub.usage,
         };
         return Ok(outcome);
     }
@@ -962,9 +1037,7 @@ async fn execute_tool_call(
                 repeated_tool_call_blocked: false,
                 status: ToolCallStatus::Ok,
                 spawned_agent: None,
-                subagent_input_tokens: 0,
-                subagent_output_tokens: 0,
-                subagent_total_tokens: 0,
+                subagent_usage: TokenUsage::default(),
             },
             Err(err) => {
                 debug!(agent = %ctx.config.name, tool = %tool_name, error = %err, "tool error");
@@ -974,9 +1047,7 @@ async fn execute_tool_call(
                     repeated_tool_call_blocked: false,
                     status: ToolCallStatus::Error,
                     spawned_agent: None,
-                    subagent_input_tokens: 0,
-                    subagent_output_tokens: 0,
-                    subagent_total_tokens: 0,
+                    subagent_usage: TokenUsage::default(),
                 }
             }
         },
@@ -989,9 +1060,7 @@ async fn execute_tool_call(
                 repeated_tool_call_blocked: false,
                 status: ToolCallStatus::Error,
                 spawned_agent: None,
-                subagent_input_tokens: 0,
-                subagent_output_tokens: 0,
-                subagent_total_tokens: 0,
+                subagent_usage: TokenUsage::default(),
             }
         }
     };
@@ -1043,17 +1112,100 @@ async fn log_compaction(
     config: &AgentConfig,
     turn: usize,
     reason: &'static str,
-    outcome: Option<&CompactionOutcome>,
+    compaction: &Compaction,
 ) {
-    let result = outcome.map(|value| value.summary.as_str());
+    let (status, result) = compaction.trajectory_fields();
     log_tool_call(
         config,
         turn,
         "compact",
         &json!({ "reason": reason }),
-        ToolCallStatus::Ok,
+        status,
         None,
         result,
     )
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn usage(input: u64, output: u64, cached: u64, creation: u64) -> TokenUsage {
+        TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: input + output,
+            cached_input_tokens: cached,
+            cache_creation_input_tokens: creation,
+        }
+    }
+
+    /// `add_usage` is the single fold behind every reviewer, subagent and compaction call, so a
+    /// field it forgets reads as zero in the run's report.
+    #[test]
+    fn run_totals_fold_every_usage_field() {
+        let mut totals = RunTotals::new(0);
+        totals.add_usage(usage(100, 10, 80, 20));
+        totals.add_usage(usage(5, 1, 4, 0));
+        assert_eq!(totals.usage.input_tokens, 105);
+        assert_eq!(totals.usage.output_tokens, 11);
+        assert_eq!(totals.usage.total_tokens, 116);
+        assert_eq!(totals.usage.cached_input_tokens, 84);
+        assert_eq!(totals.usage.cache_creation_input_tokens, 20);
+    }
+
+    fn compacted(summary: &str) -> Compaction {
+        Compaction::Done(CompactionOutcome {
+            usage: usage(10, 5, 0, 0),
+            summary: summary.to_string(),
+            trigger_usage: usage(900, 100, 0, 0),
+        })
+    }
+
+    /// The cycle-break site `continue`s past `record`, so there this decision is the whole retry
+    /// signal: a window cleared after a failure leaves the next turn carrying the history
+    /// compaction did not shrink.
+    #[test]
+    fn a_retained_window_still_re_fires_compaction() {
+        let mut window = ConversationUsageWindow::new(Some(1_000));
+        window.record(usage(2_000, 100, 0, 0));
+        assert!(window.should_compact());
+
+        assert!(!Compaction::Failed("boom".to_string()).resets_usage_window());
+        assert!(window.should_compact());
+
+        assert!(compacted("summary").resets_usage_window());
+        window.reset();
+        assert!(!window.should_compact());
+    }
+
+    /// `reflect` keys on the serialized status, so the wire value is the contract here — an
+    /// unremarkable `ok` is what made a swallowed failure render as a success.
+    #[test]
+    fn failed_compaction_is_recorded_as_a_failed_tool_call() {
+        let fields = |compaction: &Compaction| {
+            let (status, result) = compaction.trajectory_fields();
+            (status.as_str(), result.map(str::to_string))
+        };
+        assert_eq!(
+            fields(&compacted("summary")),
+            ("ok", Some("summary".to_string()))
+        );
+        assert_eq!(fields(&Compaction::Skipped), ("ok", None));
+        assert_eq!(
+            fields(&Compaction::Failed("boom".to_string())),
+            ("error", Some("boom".to_string()))
+        );
+    }
+
+    #[test]
+    fn trajectory_errors_are_capped() {
+        let short = "boom".to_string();
+        assert_eq!(truncate_for_trajectory(short.clone()), short);
+
+        let long = truncate_for_trajectory("é".repeat(MAX_TRAJECTORY_ERROR_BYTES));
+        assert!(long.starts_with(&"é".repeat(MAX_TRAJECTORY_ERROR_BYTES / 2)));
+        assert!(long.ends_with("bytes omitted"));
+    }
 }

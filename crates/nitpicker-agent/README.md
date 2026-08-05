@@ -53,6 +53,14 @@ See `examples/file_agent.rs` for a runnable version.
 - `antigravity` — compiles in the Gemini-proxy client hook + config validation (the proxy
   server itself lives in the `nitpicker` binary).
 
+## Breaking changes
+
+**0.2.0**
+- Replaced `AgentResult` token fields (`total_input_tokens`, `total_output_tokens`, `total_tokens`) and `usage()` method with `usage: TokenUsage`, which includes `cached_input_tokens` and `cache_creation_input_tokens`.
+- `TokenUsage::input_tokens` now includes provider cache reads across all providers.
+- Added `max_tokens: Option<u64>` to `AgentConfig` (defaults to `None`, using provider per-model limits; Anthropic defaults to 8192). `AgentBuilder::max_tokens` takes `NonZeroU64`.
+- `AlloyClient::new` now takes `Vec<AlloySlot>` (`client`, `model`, `max_tokens`) to scope output caps per pooled model.
+
 ## License
 
 MIT

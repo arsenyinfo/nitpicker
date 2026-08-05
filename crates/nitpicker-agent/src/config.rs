@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_MAX_TURNS: usize = 100;
 
+/// The aggregator writes one bounded synthesis and never calls a tool, so a budget fits there.
+/// Reviewer turns get no cap by default, since any fixed one is spent on reasoning first.
+pub const DEFAULT_AGGREGATOR_MAX_TOKENS: u64 = 16_384;
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -61,6 +65,9 @@ pub struct ReviewerConfig {
     pub base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    /// Output cap per turn. Unset means no cap: the provider's own per-model limit applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compact_threshold: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -149,6 +156,16 @@ impl Config {
                     reviewer.name
                 );
             }
+            if reviewer.max_tokens == Some(0) {
+                eyre::bail!(
+                    "reviewer {}: max_tokens must be greater than 0",
+                    reviewer.name
+                );
+            }
+        }
+
+        if self.aggregator.max_tokens == Some(0) {
+            eyre::bail!("[aggregator].max_tokens must be greater than 0");
         }
 
         if self.defaults.as_ref().and_then(|d| d.compact_threshold) == Some(0) {
@@ -167,7 +184,10 @@ impl Config {
 
     pub fn validate_alloy(&self, alloy: bool) -> Result<()> {
         if alloy && self.reviewer.len() < 2 {
-            eyre::bail!("--alloy requires at least 2 reviewers, found {}", self.reviewer.len());
+            eyre::bail!(
+                "--alloy requires at least 2 reviewers, found {}",
+                self.reviewer.len()
+            );
         }
         Ok(())
     }
@@ -209,6 +229,12 @@ impl Config {
             .as_ref()
             .and_then(|d| d.log_trajectories)
             .unwrap_or(false)
+    }
+
+    pub fn aggregator_max_tokens(&self) -> u64 {
+        self.aggregator
+            .max_tokens
+            .unwrap_or(DEFAULT_AGGREGATOR_MAX_TOKENS)
     }
 
     pub fn reviewer_compact_threshold(&self, reviewer: &ReviewerConfig) -> Option<u64> {
@@ -290,9 +316,7 @@ fn validate_auth(
             Ok(())
         }
         (_, Some("codex")) => {
-            eyre::bail!(
-                "{label}: auth = \"codex\" is only supported with provider \"openai\""
-            );
+            eyre::bail!("{label}: auth = \"codex\" is only supported with provider \"openai\"");
         }
         // Any other auth value on a non-Gemini provider is a typo or unsupported — reject it at
         // config time rather than failing cryptically at client construction.
@@ -542,6 +566,43 @@ mod tests {
         assert!(validate_auth("[t]", &ProviderType::OpenRouter, &auth, None, None, None).is_err());
     }
 
+    /// Codex auth needs no env var, so this validates the same wherever it runs.
+    fn config_with(reviewer_max_tokens: Option<u64>, aggregator_max_tokens: Option<u64>) -> Config {
+        Config {
+            defaults: None,
+            aggregator: AggregatorConfig {
+                model: "gpt-5.4".to_string(),
+                provider: ProviderType::OpenAi,
+                base_url: None,
+                api_key_env: None,
+                max_tokens: aggregator_max_tokens,
+                auth: Some("codex".to_string()),
+                azure_scope: None,
+                azure_credentials: None,
+            },
+            reviewer: vec![ReviewerConfig {
+                name: "r".to_string(),
+                model: "gpt-5.4".to_string(),
+                provider: ProviderType::OpenAi,
+                base_url: None,
+                api_key_env: None,
+                max_tokens: reviewer_max_tokens,
+                compact_threshold: None,
+                auth: Some("codex".to_string()),
+                azure_scope: None,
+                azure_credentials: None,
+            }],
+        }
+    }
+
+    /// Zero is not "no cap" — the provider answers it with nothing. Unset is how no cap is spelled.
+    #[test]
+    fn zero_max_tokens_is_rejected_on_both_entities() {
+        assert!(config_with(None, None).validate().is_ok());
+        assert!(config_with(Some(0), None).validate().is_err());
+        assert!(config_with(None, Some(0)).validate().is_err());
+    }
+
     #[test]
     fn codex_auth_requires_no_env_var() {
         let reviewer = ReviewerConfig {
@@ -550,6 +611,7 @@ mod tests {
             provider: ProviderType::OpenAi,
             base_url: None,
             api_key_env: None,
+            max_tokens: None,
             compact_threshold: None,
             auth: Some("codex".to_string()),
             azure_scope: None,

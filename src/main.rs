@@ -197,7 +197,10 @@ async fn main() -> Result<()> {
                 .await?;
                 println!("{}", outcome.report);
                 if common.verbose {
-                    eprintln!("\nTranscript saved to: {}", outcome.transcript_path.display());
+                    eprintln!(
+                        "\nTranscript saved to: {}",
+                        outcome.transcript_path.display()
+                    );
                 }
                 exit_if_degraded(outcome.degraded);
                 return Ok(());
@@ -290,7 +293,10 @@ async fn main() -> Result<()> {
         .await?;
         println!("{}", outcome.report);
         if args.common.verbose {
-            eprintln!("\nTranscript saved to: {}", outcome.transcript_path.display());
+            eprintln!(
+                "\nTranscript saved to: {}",
+                outcome.transcript_path.display()
+            );
         }
         exit_if_degraded(outcome.degraded);
         Ok(())
@@ -544,6 +550,7 @@ fn make_reviewer(d: &detect::Detected, prefer_openrouter_free: bool) -> config::
         provider: parse_provider_type(d.provider),
         base_url: d.base_url.clone(),
         api_key_env: d.api_key_env.map(str::to_string),
+        max_tokens: None,
         compact_threshold: None,
         auth: d.auth.map(str::to_string),
         azure_scope: None,

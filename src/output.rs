@@ -4,8 +4,8 @@
 //! line on stdout and nothing else; all human output (logs, spinners, debate
 //! chatter) is routed to stderr. see the "server / embedding" section of the README.
 
-use nitpicker_agent::llm::TokenUsage;
 use eyre::Result;
+use nitpicker_agent::llm::TokenUsage;
 use serde::Serialize;
 use std::io::Write;
 
@@ -57,6 +57,10 @@ pub struct UsageReport {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
+    /// a breakdown of `input_tokens`, not an extra charge; near zero when nothing hits cache
+    pub cached_input_tokens: u64,
+    /// the part of `input_tokens` written into a provider prompt cache.
+    pub cache_creation_input_tokens: u64,
     pub subagents_spawned: usize,
 }
 
@@ -66,6 +70,12 @@ impl UsageReport {
         self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
         self.total_tokens = self.total_tokens.saturating_add(usage.total_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(usage.cached_input_tokens);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .saturating_add(usage.cache_creation_input_tokens);
         self.subagents_spawned += subagents_spawned;
     }
 }
@@ -130,15 +140,27 @@ pub fn emit_json<T: Serialize>(value: &T) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn usage_of(input: u64, output: u64, cached: u64, cache_creation: u64) -> TokenUsage {
+        TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: input + output,
+            cached_input_tokens: cached,
+            cache_creation_input_tokens: cache_creation,
+        }
+    }
+
     #[test]
     fn usage_add_folds_tokens_and_subagents() {
-        let mut usage = UsageReport::default();
-        usage.add(TokenUsage::new(100, 30), 2);
-        usage.add(TokenUsage::new(10, 5), 1);
-        assert_eq!(usage.input_tokens, 110);
-        assert_eq!(usage.output_tokens, 35);
-        assert_eq!(usage.total_tokens, 145);
-        assert_eq!(usage.subagents_spawned, 3);
+        let mut report = UsageReport::default();
+        report.add(usage_of(100, 30, 80, 20), 2);
+        report.add(usage_of(10, 5, 4, 0), 1);
+        assert_eq!(report.input_tokens, 110);
+        assert_eq!(report.output_tokens, 35);
+        assert_eq!(report.total_tokens, 145);
+        assert_eq!(report.cached_input_tokens, 84);
+        assert_eq!(report.cache_creation_input_tokens, 20);
+        assert_eq!(report.subagents_spawned, 3);
     }
 
     #[test]
@@ -147,14 +169,14 @@ mod tests {
             input_tokens: u64::MAX,
             ..Default::default()
         };
-        usage.add(TokenUsage::new(5, 0), 0);
+        usage.add(usage_of(5, 0, 0, 0), 0);
         assert_eq!(usage.input_tokens, u64::MAX);
     }
 
     #[test]
     fn ok_envelope_serializes_usage_block() {
-        let mut usage = UsageReport::default();
-        usage.add(TokenUsage::new(120000, 8000), 6);
+        let mut report = UsageReport::default();
+        report.add(usage_of(120_000, 8_000, 96_000, 12_000), 6);
         let envelope = PrReviewOutput {
             schema_version: SCHEMA_VERSION,
             status: Status::Ok,
@@ -162,7 +184,7 @@ mod tests {
             mode: None,
             models: None,
             report_markdown: None,
-            usage: Some(usage),
+            usage: Some(report),
             comment_posted: false,
             duration_ms: 1,
             error: None,
@@ -171,7 +193,10 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&envelope).unwrap()).unwrap();
         assert_eq!(json["usage"]["input_tokens"], 120000);
         assert_eq!(json["usage"]["output_tokens"], 8000);
+        // schema v1 consumers may rely on this identity; the cache keys are additive
         assert_eq!(json["usage"]["total_tokens"], 128000);
+        assert_eq!(json["usage"]["cached_input_tokens"], 96000);
+        assert_eq!(json["usage"]["cache_creation_input_tokens"], 12000);
         assert_eq!(json["usage"]["subagents_spawned"], 6);
     }
 
@@ -180,6 +205,9 @@ mod tests {
         let envelope = PrReviewOutput::error("boom".to_string(), 1);
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&envelope).unwrap()).unwrap();
-        assert!(json.get("usage").is_none(), "usage must be omitted on error");
+        assert!(
+            json.get("usage").is_none(),
+            "usage must be omitted on error"
+        );
     }
 }
