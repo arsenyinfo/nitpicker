@@ -369,6 +369,13 @@ use std::path::Path;
 let client = client_from_env(LLMProvider::Anthropic { base_url: None, api_key_env: None })?;
 let result = AgentBuilder::new("explorer", "claude-sonnet-5", "You explore codebases.", client)
     .subagent_system_prompt("You are a focused file-reading worker. Report findings concisely.")
+    .run("Map the module layout of this repo.", &file_agent_tools(), Path::new("."))
+    .await?;
+println!("{}", result.text);
+```
+
+`file_agent_tools()` is the read-only file/git toolset plus `spawn_subagent`. You control the top-level prompt, the subagent prompt, the toolset, and the client; config-file-driven client construction is available via the `config`/`provider` modules. See `crates/nitpicker-agent/examples/file_agent.rs`.
+
 ## Changelog
 
 **0.8.4** — 2026-08-10
