@@ -6,7 +6,7 @@ use nitpicker_agent::agent::{
     AgentConfig, AgentDepth, AgentProgress, MAX_CONCURRENT_LLM_CALLS, add_spawn_subagent_tool,
     run_agent,
 };
-use nitpicker_agent::config::{Config, ReviewerConfig};
+use nitpicker_agent::config::Config;
 use nitpicker_agent::llm::{Completion, LLMClientDyn, TokenUsage};
 use nitpicker_agent::provider::{build_aggregator_client, build_reviewer_client};
 use nitpicker_agent::session::{AggregationRecord, SessionLogger, SessionWriter};
@@ -396,13 +396,6 @@ fn make_sub_spinner(mp: &MultiProgress, pb: &ProgressBar) -> ProgressBar {
     sub
 }
 
-fn build_client(
-    reviewer: &ReviewerConfig,
-    proxy_url: Option<&str>,
-) -> Result<Arc<dyn LLMClientDyn>> {
-    build_reviewer_client(reviewer, proxy_url)
-}
-
 pub struct DebateOptions {
     pub max_rounds: usize,
     pub max_turns: usize,
@@ -468,7 +461,7 @@ pub async fn run_debate(
         let mut slots = Vec::new();
         for r in &config.reviewer {
             slots.push(nitpicker_agent::llm::AlloySlot {
-                client: build_client(r, proxy_url.as_deref())?,
+                client: build_reviewer_client(r, proxy_url.as_deref())?,
                 model: r.model.clone(),
                 max_tokens: r.max_tokens,
             });
@@ -486,8 +479,8 @@ pub async fn run_debate(
         actor_compact_threshold = config.reviewer_compact_threshold(actor_cfg);
         critic_compact_threshold = config.reviewer_compact_threshold(critic_cfg);
     } else {
-        actor_client = build_client(actor_cfg, proxy_url.as_deref())?;
-        critic_client = build_client(critic_cfg, proxy_url.as_deref())?;
+        actor_client = build_reviewer_client(actor_cfg, proxy_url.as_deref())?;
+        critic_client = build_reviewer_client(critic_cfg, proxy_url.as_deref())?;
         actor_label = ModelLabel::plain(&actor_cfg.model);
         critic_label = ModelLabel::plain(&critic_cfg.model);
         actor_compact_threshold = config.reviewer_compact_threshold(actor_cfg);
