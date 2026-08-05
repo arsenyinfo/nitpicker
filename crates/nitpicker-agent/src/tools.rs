@@ -501,23 +501,19 @@ async fn search_file(
 ) -> Result<()> {
     use tokio::io::AsyncReadExt;
 
-    // Open file and check first 8KB for binary content before reading full file
     let mut file = fs::File::open(path).await?;
-    let mut buffer = [0u8; 8192];
-    let bytes_read = file.read(&mut buffer).await?;
-
-    // Check for null bytes in the sample (binary file indicator)
-    if buffer[..bytes_read].contains(&0) {
+    let probe = BinaryProbe::read_from(&mut file).await?;
+    if probe.is_binary() {
         return Ok(()); // Skip binary files silently
     }
 
-    // Read the rest of the file
+    // Read the rest of the file from the same handle, continuing after the probe
     let mut remaining = Vec::new();
     file.read_to_end(&mut remaining).await?;
 
     // Combine sample + remaining into full content
-    let mut full_content = Vec::with_capacity(bytes_read + remaining.len());
-    full_content.extend_from_slice(&buffer[..bytes_read]);
+    let mut full_content = Vec::with_capacity(probe.bytes().len() + remaining.len());
+    full_content.extend_from_slice(probe.bytes());
     full_content.extend_from_slice(&remaining);
 
     // Convert to string and search
@@ -548,14 +544,36 @@ fn glob_to_regex(pattern: &str) -> Result<Regex> {
         .map_err(|e| eyre::eyre!("invalid file_glob {pattern:?}: {e}"))
 }
 
+/// One read of up to 8 KiB from the handle's current position; a NUL byte in the sample marks
+/// the file binary. The sample is kept so a caller that goes on reading the same handle can
+/// splice it back instead of re-opening (`search_file` does exactly that).
+struct BinaryProbe {
+    sample: [u8; 8192],
+    len: usize,
+}
+
+impl BinaryProbe {
+    async fn read_from(file: &mut fs::File) -> std::io::Result<Self> {
+        use tokio::io::AsyncReadExt;
+        let mut sample = [0u8; 8192];
+        let len = file.read(&mut sample).await?;
+        Ok(Self { sample, len })
+    }
+
+    fn is_binary(&self) -> bool {
+        self.sample[..self.len].contains(&0)
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.sample[..self.len]
+    }
+}
+
 /// Check if a file is binary by reading the first 8 KiB and checking for null bytes.
 /// Returns `true` if binary, `false` if text, or an error if the file cannot be read.
 pub async fn is_binary_file(path: &Path) -> std::io::Result<bool> {
-    use tokio::io::AsyncReadExt;
     let mut file = fs::File::open(path).await?;
-    let mut buffer = [0u8; 8192];
-    let bytes_read = file.read(&mut buffer).await?;
-    Ok(buffer[..bytes_read].contains(&0)) // null byte = binary
+    Ok(BinaryProbe::read_from(&mut file).await?.is_binary())
 }
 
 pub struct GitTool;
@@ -636,8 +654,9 @@ impl Tool for GitTool {
 mod tests {
     use super::{
         ALLOWED_GIT_SUBCOMMANDS, GitTool, GlobTool, GrepTool, ReadFileTool, Tool,
-        ensure_readonly_git, floor_char_boundary, tool_definitions,
+        ensure_readonly_git, floor_char_boundary, is_binary_file, search_file, tool_definitions,
     };
+    use regex::Regex;
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -782,6 +801,71 @@ mod tests {
             err,
             "file is not valid UTF-8; read_file only supports text files"
         );
+    }
+
+    #[tokio::test]
+    async fn binary_probe_checks_only_the_first_8_kib() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let nul_early = dir.path().join("early.bin");
+        std::fs::write(&nul_early, b"head\0tail").unwrap();
+        assert!(is_binary_file(&nul_early).await.unwrap());
+
+        let text = dir.path().join("text.txt");
+        std::fs::write(&text, "plain text").unwrap();
+        assert!(!is_binary_file(&text).await.unwrap());
+
+        // the probe window is the first 8 KiB only; a NUL past it does not flag the file
+        let nul_late = dir.path().join("late.txt");
+        let mut bytes = vec![b'x'; 8192];
+        bytes.push(0);
+        std::fs::write(&nul_late, &bytes).unwrap();
+        assert!(!is_binary_file(&nul_late).await.unwrap());
+    }
+
+    /// grep probes the first 8 KiB from the same handle it then keeps reading, splicing the
+    /// sample back in front of the remainder. Losing the sample breaks a match that straddles
+    /// the boundary; duplicating it doubles a line inside the window; not continuing past the
+    /// probe loses later matches.
+    #[tokio::test]
+    async fn grep_reassembles_the_probe_sample_without_loss_or_duplication() {
+        let dir = tempfile::tempdir().unwrap();
+        let work_dir = dir.path().canonicalize().unwrap();
+
+        let mut content = String::from("EARLY marker line\n");
+        content.push_str(&"a".repeat(8188 - content.len()));
+        content.push_str("STRADDLE"); // bytes 8188..8196 span the 8192 probe boundary
+        content.push_str("\nBEYOND the probe window\n");
+        let path = work_dir.join("big.txt");
+        std::fs::write(&path, &content).unwrap();
+
+        for (pattern, why) in [
+            ("EARLY", "a duplicated sample would match this line twice"),
+            ("STRADDLE", "a lost sample would break the boundary-straddling match"),
+            ("BEYOND", "the same handle must keep reading past the probe"),
+        ] {
+            let regex = Regex::new(pattern).unwrap();
+            let mut results = Vec::new();
+            search_file(&path, &regex, &work_dir, &mut results)
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1, "{pattern}: {why}");
+        }
+    }
+
+    #[tokio::test]
+    async fn grep_skips_binary_files_silently() {
+        let dir = tempfile::tempdir().unwrap();
+        let work_dir = dir.path().canonicalize().unwrap();
+        let path = work_dir.join("bin.dat");
+        std::fs::write(&path, b"match\0me").unwrap();
+
+        let regex = Regex::new("match").unwrap();
+        let mut results = Vec::new();
+        search_file(&path, &regex, &work_dir, &mut results)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
     }
 
     #[test]
