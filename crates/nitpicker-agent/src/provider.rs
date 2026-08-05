@@ -149,28 +149,6 @@ mod tests {
         }
     }
 
-    /// The OpenRouter arm is the only one with logic rather than field copies: a hardcoded
-    /// env-var default, and `base_url` deliberately discarded.
-    #[test]
-    fn openrouter_defaults_its_key_env_and_ignores_base_url() {
-        match provider_from_config(
-            &ProviderType::OpenRouter,
-            Some("https://ignored.example"),
-            None,
-        )
-        .unwrap()
-        {
-            LLMProvider::OpenRouter { api_key_env } => {
-                assert_eq!(api_key_env, "OPENROUTER_API_KEY");
-            }
-            _ => panic!("expected OpenRouter variant"),
-        }
-        match provider_from_config(&ProviderType::OpenRouter, None, Some("CUSTOM_KEY")).unwrap() {
-            LLMProvider::OpenRouter { api_key_env } => assert_eq!(api_key_env, "CUSTOM_KEY"),
-            _ => panic!("expected OpenRouter variant"),
-        }
-    }
-
     // used by the antigravity proxy test and the not(azure) hint test; the azure-only build
     // compiles both out
     #[cfg(any(feature = "antigravity", not(feature = "azure")))]

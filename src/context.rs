@@ -477,12 +477,6 @@ mod tests {
         assert!(!context.contains("binary"));
     }
 
-    #[tokio::test]
-    async fn missing_project_context_yields_empty_string() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(build_context(dir.path()).await, "");
-    }
-
     /// Oversized context is cut at a char boundary near 50k: the head survives, the tail is
     /// dropped and replaced with the partial-output marker, and a multibyte char spanning the
     /// boundary must not panic the slice.

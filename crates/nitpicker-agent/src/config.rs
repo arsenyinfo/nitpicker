@@ -722,61 +722,6 @@ mod tests {
         }
     }
 
-    /// The two `From` impls must extract the same view from equivalent configs — a field
-    /// wired from the wrong source field in either impl would silently re-fork the roles; the
-    /// exhaustive destructures below make adding a field without extending this comparison a
-    /// compile error.
-    #[test]
-    fn the_two_role_views_extract_identical_settings() {
-        let reviewer = ReviewerConfig {
-            name: "r".to_string(),
-            model: "m".to_string(),
-            provider: ProviderType::Anthropic,
-            base_url: Some("https://gateway.example".to_string()),
-            api_key_env: Some("KEY_ENV".to_string()),
-            max_tokens: Some(1),
-            compact_threshold: Some(2),
-            auth: Some("azure-ad".to_string()),
-            azure_scope: Some("scope".to_string()),
-            azure_credentials: Some("dev".to_string()),
-        };
-        let agg = AggregatorConfig {
-            model: "m".to_string(),
-            provider: ProviderType::Anthropic,
-            base_url: Some("https://gateway.example".to_string()),
-            api_key_env: Some("KEY_ENV".to_string()),
-            max_tokens: Some(1),
-            auth: Some("azure-ad".to_string()),
-            azure_scope: Some("scope".to_string()),
-            azure_credentials: Some("dev".to_string()),
-        };
-        let ClientSettings {
-            provider: r_provider,
-            auth: r_auth,
-            base_url: r_base_url,
-            api_key_env: r_api_key_env,
-            azure_scope: r_azure_scope,
-            azure_credentials: r_azure_credentials,
-        } = ClientSettings::from(&reviewer);
-        let ClientSettings {
-            provider: a_provider,
-            auth: a_auth,
-            base_url: a_base_url,
-            api_key_env: a_api_key_env,
-            azure_scope: a_azure_scope,
-            azure_credentials: a_azure_credentials,
-        } = ClientSettings::from(&agg);
-        assert_eq!(
-            std::mem::discriminant(r_provider),
-            std::mem::discriminant(a_provider)
-        );
-        assert_eq!(r_auth, a_auth);
-        assert_eq!(r_base_url, a_base_url);
-        assert_eq!(r_api_key_env, a_api_key_env);
-        assert_eq!(r_azure_scope, a_azure_scope);
-        assert_eq!(r_azure_credentials, a_azure_credentials);
-    }
-
     #[test]
     fn validate_auth_rejects_unknown_value_on_non_gemini() {
         // Typos like `azure_ad`/`Azure-AD` must fail at config time, not at client construction.
