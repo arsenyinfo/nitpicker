@@ -174,8 +174,10 @@ don't flatten `ContextFileArgs`, so `--context-file` after them is a parse error
 silent no-op; before them it is ignored like every other root-only flag.
 
 Loading is eager and total-budgeted (`MAX_TOTAL_BYTES`, 256 KiB): only regular files are accepted
-(a FIFO or device node would block or stream without bound — checked by stat before open, since
-opening a FIFO read-only already blocks), each file is read through a bounded reader capped at the
+(a FIFO or device node would block or stream without bound). The check is an fstat on the opened
+fd, not a stat on the path — stat-then-open leaves a race where the path is swapped for a FIFO and
+the open itself blocks; on unix the open uses `O_NONBLOCK` (harmless for regular-file reads) so
+even a raced-in FIFO opens instantly and is then rejected. Each file is read through a bounded reader capped at the
 remaining budget + 1 byte so an oversized file fails fast instead of being buffered whole, and the
 budget meters the **serialized block** (escaped contents + fence + path + separator, via
 `render_block`) rather than raw file bytes — so wrapper overhead is charged and empty files are not

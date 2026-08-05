@@ -29,10 +29,15 @@ pub(crate) fn load_context_files(paths: &[PathBuf]) -> Result<Vec<ContextFile>> 
     let mut files = Vec::with_capacity(paths.len());
 
     for path in paths {
-        let metadata = std::fs::metadata(path)
+        // a FIFO or device node would block or stream without bound. The check must be an
+        // fstat on the opened fd — a stat on the path then a plain open leaves a race where
+        // the path is swapped for a FIFO and the open itself blocks until a writer appears
+        // (`open_context_file` opens with O_NONBLOCK on unix so even that cannot hang).
+        let handle = open_context_file(path)
             .wrap_err_with(|| format!("cannot read --context-file {}", path.display()))?;
-        // a FIFO or device node would block or stream without bound; stat before open, since
-        // opening a FIFO read-only already blocks until a writer appears
+        let metadata = handle
+            .metadata()
+            .wrap_err_with(|| format!("cannot read --context-file {}", path.display()))?;
         if !metadata.is_file() {
             eyre::bail!("--context-file {} is not a regular file", path.display());
         }
@@ -41,8 +46,9 @@ pub(crate) fn load_context_files(paths: &[PathBuf]) -> Result<Vec<ContextFile>> 
         // oversized file fails fast instead of being read whole
         let remaining = MAX_TOTAL_BYTES - total;
         let mut bytes = Vec::new();
-        std::fs::File::open(path)
-            .and_then(|f| f.take(remaining as u64 + 1).read_to_end(&mut bytes))
+        handle
+            .take(remaining as u64 + 1)
+            .read_to_end(&mut bytes)
             .wrap_err_with(|| format!("cannot read --context-file {}", path.display()))?;
         if bytes.len() > remaining {
             eyre::bail!(
@@ -77,6 +83,23 @@ pub(crate) fn load_context_files(paths: &[PathBuf]) -> Result<Vec<ContextFile>> 
     }
 
     Ok(files)
+}
+
+// O_NONBLOCK makes opening a FIFO with no writer return instantly instead of blocking forever;
+// reads from a regular file are unaffected by the flag, and the fstat above rejects everything
+// that is not a regular file before any read happens
+#[cfg(unix)]
+fn open_context_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_context_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
 }
 
 fn render_block(file: &ContextFile) -> String {
@@ -209,6 +232,22 @@ mod tests {
     #[test]
     fn a_non_regular_file_is_rejected() {
         assert!(load_context_files(&[PathBuf::from("/dev/null")]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_rejected_without_blocking() {
+        // a plain blocking open of a writerless FIFO hangs forever — if the O_NONBLOCK guard
+        // regresses, this test hangs rather than failing, which the suite timeout surfaces
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        assert!(load_context_files(&[fifo]).is_err());
     }
 
     #[test]
