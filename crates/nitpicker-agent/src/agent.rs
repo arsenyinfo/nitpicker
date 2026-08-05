@@ -70,6 +70,9 @@ impl AgentDepth {
 
 pub struct AgentConfig {
     pub name: String,
+    /// Label stamped on this agent's trajectory records. Must be unique within a session
+    /// directory: `reflect` merges every file by timestamp, so colliding labels conflate
+    /// distinct agents in the merged trace.
     pub session_agent: String,
     pub model: String,
     pub max_turns: usize,
@@ -154,8 +157,9 @@ async fn compact_and_account(
     conversation_usage: &mut ConversationUsageWindow,
     totals: &mut RunTotals,
 ) {
-    // compaction happens *before* the next turn runs, so it is named for that turn — in the
-    // tracing warn and the trajectory alike, matching the 1-based numbers tool records use
+    // turn + 1 matches the 1-based vocabulary tool records use, in the tracing warn and the
+    // trajectory alike: at the threshold site it names the turn about to run; at the
+    // cycle-break site it aligns with the blocked calls (logged turn + 1) that triggered it
     let compaction_turn = turn + 1;
     let compaction = match compact_history(
         &config.llm_semaphore,
@@ -287,6 +291,8 @@ struct SubagentOutcome {
     tool_calls: usize,
     spawned_agent: Option<String>,
     usage: TokenUsage,
+    /// `run_agent` itself failed — as opposed to a legitimate result that starts with "Error:".
+    failed: bool,
 }
 
 impl Tool for FinishTool {
@@ -850,12 +856,14 @@ async fn run_subagent(
             tool_calls: result.tool_calls,
             spawned_agent: Some(spawned_agent),
             usage: result.usage,
+            failed: false,
         },
         Err(err) => SubagentOutcome {
             output: format!("Error: {err}"),
             tool_calls: 0,
             spawned_agent: Some(spawned_agent),
             usage: TokenUsage::default(),
+            failed: true,
         },
     }
 }
@@ -1015,14 +1023,16 @@ async fn execute_tool_call(
             false => ToolCallStatus::Ok,
         };
         // a successful subagent's own log records its result, but a failed one's trace just
-        // stops — without a completion record here the failure is invisible to `reflect`
-        if status == ToolCallStatus::Error {
+        // stops — without a completion record here the failure is invisible to `reflect`.
+        // Gated on the real run_agent error, not the "Error:" prefix sniff: a legitimate
+        // finish text starting with "Error:" must not plant a contradictory error record.
+        if sub.failed {
             log_tool_call(
                 ctx.config,
                 ctx.turn + 1,
                 tool_name,
                 &args,
-                status,
+                ToolCallStatus::Error,
                 sub.spawned_agent.as_deref(),
                 Some(&truncate_for_trajectory(sub.output.clone())),
             )

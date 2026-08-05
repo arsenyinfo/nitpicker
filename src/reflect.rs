@@ -66,13 +66,15 @@ fn truncate(s: &str, max: usize) -> String {
 
 /// Icon per trajectory-log status (`agent.rs::ToolCallStatus::as_str`). Every status needs its
 /// own glyph: rendering "started" (a spawn whose result lives in the subagent's own records) or
-/// "blocked_cycle" as ✗ teaches the analysis model that those calls failed.
+/// "blocked_cycle" as ✗ teaches the analysis model that those calls failed. Unknown vocabulary
+/// gets its own glyph too — aliasing a future status to ✗ would silently recreate that bug.
 fn status_icon(status: &str) -> &'static str {
     match status {
         "ok" => "✓",
+        "error" => "✗",
         "started" => "▶",
         "blocked_cycle" => "⊘",
-        _ => "✗",
+        _ => "?",
     }
 }
 
@@ -398,13 +400,13 @@ mod tests {
 
     #[test]
     fn each_trajectory_status_classifies_distinctly() {
-        let statuses = ["ok", "started", "blocked_cycle", "error"];
+        // the four known statuses plus the unknown fallback must all stay distinguishable —
+        // in particular an unrecognized future status must not masquerade as a failure
+        let statuses = ["ok", "started", "blocked_cycle", "error", "unknown"];
         for (i, a) in statuses.iter().enumerate() {
             for b in &statuses[i + 1..] {
                 assert_ne!(status_icon(a), status_icon(b), "{a} vs {b}");
             }
         }
-        // unknown vocabulary falls back to the failure glyph rather than inventing a state
-        assert_eq!(status_icon("unknown"), status_icon("error"));
     }
 }
