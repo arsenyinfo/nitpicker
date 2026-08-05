@@ -153,14 +153,15 @@ async fn compact_and_account(
     system_prompt: &str,
     history: &mut Vec<Message>,
     prompt: &mut Message,
-    turn: usize,
+    upcoming_turn: usize,
     conversation_usage: &mut ConversationUsageWindow,
     totals: &mut RunTotals,
 ) {
-    // turn + 1 matches the 1-based vocabulary tool records use, in the tracing warn and the
-    // trajectory alike: at the threshold site it names the turn about to run; at the
-    // cycle-break site it aligns with the blocked calls (logged turn + 1) that triggered it
-    let compaction_turn = turn + 1;
+    // `upcoming_turn` is the loop index of the turn this compaction precedes (the threshold
+    // site fires at the top of its iteration, cycle-break at the bottom, so it passes +1);
+    // +1 again converts to the 1-based vocabulary tool records and the "before turn N"
+    // summary prose use, so the record names the turn it precedes at both sites
+    let compaction_turn = upcoming_turn + 1;
     let compaction = match compact_history(
         &config.llm_semaphore,
         Arc::clone(&config.client),
@@ -637,7 +638,7 @@ pub async fn run_agent(
                     &effective_system_prompt,
                     &mut history,
                     &mut prompt,
-                    turn,
+                    turn + 1,
                     &mut conversation_usage,
                     &mut totals,
                 )
@@ -1018,14 +1019,14 @@ async fn execute_tool_call(
             .map(|(name, tool)| (name.clone(), Arc::clone(tool)))
             .collect();
         let sub = run_subagent(prepared, &subagent_tools, ctx.work_dir).await;
-        let status = match sub.output.starts_with("Error:") {
+        // typed from run_subagent's Ok/Err — a legitimate finish text that happens to start
+        // with "Error:" is not a failure
+        let status = match sub.failed {
             true => ToolCallStatus::Error,
             false => ToolCallStatus::Ok,
         };
-        // a successful subagent's own log records its result, but a failed one's trace just
-        // stops — without a completion record here the failure is invisible to `reflect`.
-        // Gated on the real run_agent error, not the "Error:" prefix sniff: a legitimate
-        // finish text starting with "Error:" must not plant a contradictory error record.
+        // a successful subagent's own records carry its result, but a failed one's trace just
+        // stops — without a completion record here the failure is invisible to `reflect`
         if sub.failed {
             log_tool_call(
                 ctx.config,

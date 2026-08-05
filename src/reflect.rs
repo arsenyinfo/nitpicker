@@ -88,8 +88,9 @@ fn format_session(session: &SessionData) -> String {
     lines.push(format!("# Session: {}", session.name));
     lines.push(format!("- Status: {status}"));
     lines.push(format!("- Agents: {}", session.agent_names().join(", ")));
+    // records, not calls: a failed spawn contributes a started/error lifecycle pair
     lines.push(format!(
-        "- Tool calls: {}, errors: {}",
+        "- Records: {}, errors: {}",
         session.records.len(),
         session.error_count()
     ));
@@ -397,6 +398,37 @@ pub async fn run_reflect(args: ReflectArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sessions from before the identity/turn-vocabulary changes ("root"/"subagent-N" labels,
+    /// 0-based compact turns) must keep loading next to new-format files, merged by timestamp
+    /// with labels preserved verbatim.
+    #[test]
+    fn load_session_merges_old_and_new_format_files_by_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("reviewer-old.jsonl"),
+            concat!(
+                r#"{"ts_unix_ms":2,"agent":"root","depth":0,"turn":0,"tool":"compact","args":{},"status":"ok"}"#,
+                "\n",
+                r#"{"ts_unix_ms":1,"agent":"subagent-1","depth":1,"turn":1,"tool":"grep","args":{},"status":"ok"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("reviewer-1-x.jsonl"),
+            concat!(
+                r#"{"ts_unix_ms":3,"agent":"reviewer-1-x","depth":0,"turn":2,"tool":"spawn_subagent","args":{},"status":"started","spawned_agent":"reviewer-1-x/subagent-1"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let session = load_session(dir.path()).unwrap();
+        let agents: Vec<&str> = session.records.iter().map(|r| r.agent.as_str()).collect();
+        assert_eq!(agents, ["subagent-1", "root", "reviewer-1-x"]);
+        assert!(!session.is_complete());
+    }
 
     #[test]
     fn each_trajectory_status_classifies_distinctly() {
