@@ -68,17 +68,19 @@ pub async fn run_review(
     let gemini_proxy = crate::proxy::GeminiProxy::maybe_start(config).await?;
     let proxy_url = gemini_proxy.url();
 
-    for reviewer in &config.reviewer {
+    for (index, reviewer) in config.reviewer.iter().enumerate() {
         let tools_map = tools.clone();
         let repo = repo.to_path_buf();
         let name = reviewer.name.clone();
         let subagent_counter = Arc::new(AtomicUsize::new(0));
-        let session_writer = session_logger.as_ref().map(|logger| {
-            logger.child(format!("reviewer-{}.jsonl", sanitize_path_component(&name)))
-        });
+        let session_agent = reviewer_session_agent(index, &name);
+        let session_writer = session_logger
+            .as_ref()
+            .map(|logger| logger.child(format!("{session_agent}.jsonl")));
         let agent_config = build_agent_config(
             config,
             reviewer,
+            session_agent,
             &system_prompt,
             max_turns,
             proxy_url.as_deref(),
@@ -235,11 +237,19 @@ pub async fn run_review(
     })
 }
 
+/// Trajectory identity for one reviewer: the file stem and every record's `agent` field. The
+/// config index keeps it unique even when reviewer names collide or sanitize to the same stem —
+/// `reflect` merges all of a session's files by timestamp, so the label is the only separator.
+fn reviewer_session_agent(index: usize, name: &str) -> String {
+    format!("reviewer-{}-{}", index + 1, sanitize_path_component(name))
+}
+
 // internal single-call-site builder; the args are distinct per-reviewer handles, not worth a struct
 #[allow(clippy::too_many_arguments)]
 fn build_agent_config(
     config: &Config,
     reviewer: &ReviewerConfig,
+    session_agent: String,
     system_prompt: &str,
     max_turns: usize,
     proxy_url: Option<&str>,
@@ -252,7 +262,7 @@ fn build_agent_config(
 
     Ok(AgentConfig {
         name: reviewer.name.clone(),
-        session_agent: "root".to_string(),
+        session_agent,
         model: reviewer.model.clone(),
         max_turns,
         max_tokens: reviewer.max_tokens,
@@ -270,4 +280,21 @@ fn build_agent_config(
         project_context: None,
         session_writer,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two unnamed (or same-named) reviewers must still get distinct trajectory identities —
+    /// before the index they shared one file stem AND one record label, interleaving
+    /// indistinguishably.
+    #[test]
+    fn colliding_reviewer_names_get_distinct_session_agents() {
+        assert_ne!(reviewer_session_agent(0, ""), reviewer_session_agent(1, ""));
+        assert_ne!(
+            reviewer_session_agent(0, "claude"),
+            reviewer_session_agent(1, "claude")
+        );
+    }
 }

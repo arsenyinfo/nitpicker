@@ -789,7 +789,9 @@ fn prepare_subagent(
         .subagent_counter
         .fetch_add(1, Ordering::Relaxed)
         + 1;
-    let spawned_agent = format!("subagent-{subagent_id}");
+    // namespaced under the parent's identity: the counter is only unique within one agent tree,
+    // and `reflect` merges every trajectory file in the session by timestamp
+    let spawned_agent = format!("{}/subagent-{subagent_id}", parent_config.session_agent);
     report_progress(
         parent_config,
         parent_turns,
