@@ -80,6 +80,44 @@ pub struct ReviewerConfig {
     pub azure_credentials: Option<String>,
 }
 
+/// Borrowed view over the connection fields `ReviewerConfig` and `AggregatorConfig` share, so
+/// env-var selection (here) and client construction (`provider.rs`) are written once instead
+/// of per role.
+pub(crate) struct ClientSettings<'a> {
+    pub(crate) provider: &'a ProviderType,
+    pub(crate) auth: Option<&'a str>,
+    pub(crate) base_url: Option<&'a str>,
+    pub(crate) api_key_env: Option<&'a str>,
+    pub(crate) azure_scope: Option<&'a str>,
+    pub(crate) azure_credentials: Option<&'a str>,
+}
+
+impl<'a> From<&'a ReviewerConfig> for ClientSettings<'a> {
+    fn from(reviewer: &'a ReviewerConfig) -> Self {
+        Self {
+            provider: &reviewer.provider,
+            auth: reviewer.auth.as_deref(),
+            base_url: reviewer.base_url.as_deref(),
+            api_key_env: reviewer.api_key_env.as_deref(),
+            azure_scope: reviewer.azure_scope.as_deref(),
+            azure_credentials: reviewer.azure_credentials.as_deref(),
+        }
+    }
+}
+
+impl<'a> From<&'a AggregatorConfig> for ClientSettings<'a> {
+    fn from(agg: &'a AggregatorConfig) -> Self {
+        Self {
+            provider: &agg.provider,
+            auth: agg.auth.as_deref(),
+            base_url: agg.base_url.as_deref(),
+            api_key_env: agg.api_key_env.as_deref(),
+            azure_scope: agg.azure_scope.as_deref(),
+            azure_credentials: agg.azure_credentials.as_deref(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub enum ProviderType {
     #[serde(rename = "anthropic", alias = "anthropic_compatible")]
@@ -126,7 +164,7 @@ impl Config {
             self.aggregator.azure_credentials.as_deref(),
         )?;
 
-        if let Some(env) = required_env_var_aggregator(&self.aggregator) {
+        if let Some(env) = required_env_var(ClientSettings::from(&self.aggregator)) {
             check_env_var(env)
                 .map_err(|_| eyre::eyre!("[aggregator]: env var {env} is not set"))?;
         }
@@ -145,7 +183,7 @@ impl Config {
                 reviewer.api_key_env.as_deref(),
                 reviewer.azure_credentials.as_deref(),
             )?;
-            if let Some(env) = required_env_var_reviewer(reviewer) {
+            if let Some(env) = required_env_var(ClientSettings::from(reviewer)) {
                 check_env_var(env).map_err(|_| {
                     eyre::eyre!("reviewer {}: env var {env} is not set", reviewer.name)
                 })?;
@@ -385,46 +423,27 @@ fn is_local_server(base_url: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
-fn required_env_var_reviewer(reviewer: &ReviewerConfig) -> Option<&str> {
-    if matches!(reviewer.provider, ProviderType::Gemini) && is_gemini_proxy_auth(&reviewer.auth) {
+fn required_env_var<'a>(settings: ClientSettings<'a>) -> Option<&'a str> {
+    if matches!(settings.provider, ProviderType::Gemini) && is_gemini_proxy_auth(settings.auth) {
         return None;
     }
-    if is_azure_ad_auth(reviewer.auth.as_deref()) {
+    if is_azure_ad_auth(settings.auth) {
         return None;
     }
-    if is_codex_auth(reviewer.auth.as_deref()) {
+    if is_codex_auth(settings.auth) {
         return None;
     }
-    if is_local_server(reviewer.base_url.as_deref()) {
+    if is_local_server(settings.base_url) {
         return None;
     }
-    if let Some(env) = &reviewer.api_key_env {
-        return Some(env.as_str());
+    if let Some(env) = settings.api_key_env {
+        return Some(env);
     }
-    default_env_var(&reviewer.provider)
+    default_env_var(settings.provider)
 }
 
-fn required_env_var_aggregator(agg: &AggregatorConfig) -> Option<&str> {
-    if matches!(agg.provider, ProviderType::Gemini) && is_gemini_proxy_auth(&agg.auth) {
-        return None;
-    }
-    if is_azure_ad_auth(agg.auth.as_deref()) {
-        return None;
-    }
-    if is_codex_auth(agg.auth.as_deref()) {
-        return None;
-    }
-    if is_local_server(agg.base_url.as_deref()) {
-        return None;
-    }
-    if let Some(env) = &agg.api_key_env {
-        return Some(env.as_str());
-    }
-    default_env_var(&agg.provider)
-}
-
-fn is_gemini_proxy_auth(auth: &Option<String>) -> bool {
-    matches!(auth.as_deref(), Some("agy-keyring"))
+fn is_gemini_proxy_auth(auth: Option<&str>) -> bool {
+    matches!(auth, Some("agy-keyring"))
 }
 
 /// Canonical check shared with `provider.rs` (the client-build path), kept here next to the
@@ -617,7 +636,7 @@ mod tests {
             azure_scope: None,
             azure_credentials: None,
         };
-        assert_eq!(required_env_var_reviewer(&reviewer), None);
+        assert_eq!(required_env_var(ClientSettings::from(&reviewer)), None);
         let agg = AggregatorConfig {
             model: "gpt-5.4".to_string(),
             provider: ProviderType::OpenAi,
@@ -628,7 +647,149 @@ mod tests {
             azure_scope: None,
             azure_credentials: None,
         };
-        assert_eq!(required_env_var_aggregator(&agg), None);
+        assert_eq!(required_env_var(ClientSettings::from(&agg)), None);
+    }
+
+    /// The five short-circuit branches and their precedence, exercised through both role
+    /// functions. The collision rows matter most: a regression that reorders the checks
+    /// (e.g. explicit `api_key_env` consulted before proxy/local short-circuits) passes a
+    /// membership-only table but fails these.
+    #[test]
+    fn required_env_var_branch_table_and_precedence() {
+        fn check(
+            make_provider: fn() -> ProviderType,
+            auth: Option<&str>,
+            base_url: Option<&str>,
+            api_key_env: Option<&str>,
+            expected: Option<&str>,
+        ) {
+            let reviewer = ReviewerConfig {
+                name: String::new(),
+                model: String::new(),
+                provider: make_provider(),
+                base_url: base_url.map(str::to_string),
+                api_key_env: api_key_env.map(str::to_string),
+                max_tokens: None,
+                compact_threshold: None,
+                auth: auth.map(str::to_string),
+                azure_scope: None,
+                azure_credentials: None,
+            };
+            let agg = AggregatorConfig {
+                model: String::new(),
+                provider: make_provider(),
+                base_url: base_url.map(str::to_string),
+                api_key_env: api_key_env.map(str::to_string),
+                max_tokens: None,
+                auth: auth.map(str::to_string),
+                azure_scope: None,
+                azure_credentials: None,
+            };
+            assert_eq!(
+                required_env_var(ClientSettings::from(&reviewer)),
+                expected,
+                "reviewer: auth={auth:?} base_url={base_url:?} api_key_env={api_key_env:?}"
+            );
+            assert_eq!(
+                required_env_var(ClientSettings::from(&agg)),
+                expected,
+                "aggregator: auth={auth:?} base_url={base_url:?} api_key_env={api_key_env:?}"
+            );
+        }
+
+        // gemini proxy auth short-circuits, even over an explicit env
+        check(|| ProviderType::Gemini, Some("agy-keyring"), None, None, None);
+        check(
+            || ProviderType::Gemini,
+            Some("agy-keyring"),
+            None,
+            Some("EXPLICIT"),
+            None,
+        );
+        // ... but only on gemini: the same auth on another provider falls through
+        check(
+            || ProviderType::OpenAi,
+            Some("agy-keyring"),
+            None,
+            None,
+            Some("OPENAI_API_KEY"),
+        );
+        // azure-ad and codex auth need no key, even with an explicit env configured
+        check(
+            || ProviderType::OpenAi,
+            Some("azure-ad"),
+            Some("https://foundry.example/openai/v1"),
+            Some("EXPLICIT"),
+            None,
+        );
+        check(|| ProviderType::OpenAi, Some("codex"), None, Some("EXPLICIT"), None);
+        // a local server needs no key, even with an explicit env configured
+        check(
+            || ProviderType::OpenAi,
+            None,
+            Some("http://localhost:1234/v1"),
+            Some("EXPLICIT"),
+            None,
+        );
+        check(
+            || ProviderType::OpenAi,
+            None,
+            Some("http://127.0.0.1:1234/v1"),
+            None,
+            None,
+        );
+        // a non-local base_url does not bypass the key: explicit env wins over the default
+        check(
+            || ProviderType::Anthropic,
+            None,
+            Some("https://gateway.example"),
+            Some("EXPLICIT"),
+            Some("EXPLICIT"),
+        );
+        // the per-provider default table
+        check(|| ProviderType::Anthropic, None, None, None, Some("ANTHROPIC_API_KEY"));
+        check(|| ProviderType::Gemini, None, None, None, Some("GEMINI_API_KEY"));
+        check(|| ProviderType::OpenAi, None, None, None, Some("OPENAI_API_KEY"));
+        check(|| ProviderType::OpenRouter, None, None, None, Some("OPENROUTER_API_KEY"));
+    }
+
+    /// The two `From` impls must extract the same view from equivalent configs — a field
+    /// added to one adapter but not the other would silently re-fork the roles.
+    #[test]
+    fn the_two_role_views_extract_identical_settings() {
+        let reviewer = ReviewerConfig {
+            name: "r".to_string(),
+            model: "m".to_string(),
+            provider: ProviderType::Anthropic,
+            base_url: Some("https://gateway.example".to_string()),
+            api_key_env: Some("KEY_ENV".to_string()),
+            max_tokens: Some(1),
+            compact_threshold: Some(2),
+            auth: Some("azure-ad".to_string()),
+            azure_scope: Some("scope".to_string()),
+            azure_credentials: Some("dev".to_string()),
+        };
+        let agg = AggregatorConfig {
+            model: "m".to_string(),
+            provider: ProviderType::Anthropic,
+            base_url: Some("https://gateway.example".to_string()),
+            api_key_env: Some("KEY_ENV".to_string()),
+            max_tokens: Some(1),
+            auth: Some("azure-ad".to_string()),
+            azure_scope: Some("scope".to_string()),
+            azure_credentials: Some("dev".to_string()),
+        };
+        let rv = ClientSettings::from(&reviewer);
+        let av = ClientSettings::from(&agg);
+        assert_eq!(
+            std::mem::discriminant(rv.provider),
+            std::mem::discriminant(av.provider)
+        );
+        assert_eq!(rv.auth, av.auth);
+        assert_eq!(rv.base_url, av.base_url);
+        assert_eq!(rv.api_key_env, av.api_key_env);
+        assert_eq!(rv.azure_scope, av.azure_scope);
+        assert_eq!(rv.azure_credentials, av.azure_credentials);
     }
 
     #[test]
