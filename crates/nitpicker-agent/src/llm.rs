@@ -929,7 +929,7 @@ impl LLMClient for openrouter::Client {
             .completion(request)
             .await
             .map_err(|e| normalize_openrouter_completion_error(&e))?;
-        let mut finish_reason = response
+        let finish_reason = response
             .raw_response
             .choices
             .first()
@@ -941,13 +941,7 @@ impl LLMClient for openrouter::Client {
                 other => FinishReason::Other(other.to_string()),
             })
             .unwrap_or(FinishReason::None);
-        if response
-            .choice
-            .iter()
-            .any(|content| matches!(content, AssistantContent::ToolCall(_)))
-        {
-            finish_reason = FinishReason::ToolUse;
-        }
+        let finish_reason = resolve_finish_reason(&response.choice, finish_reason);
         Ok(CompletionResponse {
             choice: response.choice,
             finish_reason,
@@ -988,7 +982,7 @@ impl LLMClient for anthropic::Client {
             .completion(request)
             .await
             .wrap_err_with(|| format!("Anthropic completion failed for model '{model_name}'"))?;
-        let mut finish_reason = response
+        let finish_reason = response
             .raw_response
             .stop_reason
             .clone()
@@ -999,13 +993,7 @@ impl LLMClient for anthropic::Client {
                 other => FinishReason::Other(other.to_string()),
             })
             .unwrap_or(FinishReason::None);
-        if response
-            .choice
-            .iter()
-            .any(|content| matches!(content, AssistantContent::ToolCall(_)))
-        {
-            finish_reason = FinishReason::ToolUse;
-        }
+        let finish_reason = resolve_finish_reason(&response.choice, finish_reason);
         Ok(CompletionResponse {
             choice: response.choice,
             finish_reason,
@@ -1027,20 +1015,14 @@ impl LLMClient for gemini::Client {
             .completion(request)
             .await
             .wrap_err_with(|| format!("Gemini completion failed for model '{model_name}'"))?;
-        let mut finish_reason = response
+        let finish_reason = response
             .raw_response
             .candidates
             .first()
             .and_then(|candidate| candidate.finish_reason.clone())
             .map(map_gemini_finish_reason)
             .unwrap_or(FinishReason::None);
-        if response
-            .choice
-            .iter()
-            .any(|content| matches!(content, AssistantContent::ToolCall(_)))
-        {
-            finish_reason = FinishReason::ToolUse;
-        }
+        let finish_reason = resolve_finish_reason(&response.choice, finish_reason);
         Ok(CompletionResponse {
             choice: response.choice,
             finish_reason,
@@ -1102,7 +1084,7 @@ impl LLMClient for openai::CompletionsClient {
             .completion(request)
             .await
             .wrap_err_with(|| format!("OpenAI completion failed for model '{model_name}'"))?;
-        let mut finish_reason = response
+        let finish_reason = response
             .raw_response
             .choices
             .first()
@@ -1113,13 +1095,7 @@ impl LLMClient for openai::CompletionsClient {
                 other => FinishReason::Other(other.to_string()),
             })
             .unwrap_or(FinishReason::None);
-        if response
-            .choice
-            .iter()
-            .any(|content| matches!(content, AssistantContent::ToolCall(_)))
-        {
-            finish_reason = FinishReason::ToolUse;
-        }
+        let finish_reason = resolve_finish_reason(&response.choice, finish_reason);
         Ok(CompletionResponse {
             choice: response.choice,
             finish_reason,
@@ -1164,6 +1140,22 @@ fn build_gemini_additional_params(completion: &Completion) -> Result<Value> {
 struct GenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<i32>,
+}
+
+/// A structured tool call in the choice overrides the wire finish reason: providers can pair
+/// tool calls with `stop`-like reasons, and `CompletionResponse::tool_calls()` only surfaces
+/// calls when the reason is `ToolUse`.
+fn resolve_finish_reason(
+    choice: &OneOrMany<AssistantContent>,
+    wire_reason: FinishReason,
+) -> FinishReason {
+    match choice
+        .iter()
+        .any(|content| matches!(content, AssistantContent::ToolCall(_)))
+    {
+        true => FinishReason::ToolUse,
+        false => wire_reason,
+    }
 }
 
 fn map_gemini_finish_reason(
@@ -1732,5 +1724,48 @@ mod tests {
         // a genuine 4xx with no 5xx in the chain is still non-retryable.
         let pure_4xx = wrapped_provider_error(r#"{"statusCode":403,"message":"forbidden"}"#);
         assert!(is_non_retryable_client_error(&pure_4xx));
+    }
+
+    fn tool_call_content() -> AssistantContent {
+        use rig_core::completion::message::ToolFunction;
+        AssistantContent::ToolCall(ToolCall::new(
+            "call-1".to_string(),
+            ToolFunction::new("read_file".to_string(), serde_json::json!({ "path": "x" })),
+        ))
+    }
+
+    /// Providers can pair tool calls with `stop`-like wire reasons; `tool_calls()` only
+    /// surfaces calls under `ToolUse`, so the override losing would silently end the agent loop.
+    #[test]
+    fn a_structured_tool_call_overrides_any_wire_finish_reason() {
+        let alone = OneOrMany::one(tool_call_content());
+        let beside_text = OneOrMany::many(vec![
+            AssistantContent::text("narration before the call"),
+            tool_call_content(),
+        ])
+        .expect("two items");
+        for choice in [alone, beside_text] {
+            for wire in [
+                FinishReason::Stop,
+                FinishReason::MaxTokens,
+                FinishReason::None,
+                FinishReason::Other("length_capped".to_string()),
+            ] {
+                assert_eq!(resolve_finish_reason(&choice, wire), FinishReason::ToolUse);
+            }
+        }
+    }
+
+    #[test]
+    fn without_tool_calls_the_wire_finish_reason_stands() {
+        let choice = OneOrMany::one(AssistantContent::text("done"));
+        for wire in [
+            FinishReason::Stop,
+            FinishReason::MaxTokens,
+            FinishReason::None,
+            FinishReason::Other("content_filter".to_string()),
+        ] {
+            assert_eq!(resolve_finish_reason(&choice, wire.clone()), wire);
+        }
     }
 }

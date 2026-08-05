@@ -88,8 +88,9 @@ src/  — `nitpicker` binary (CLI)
   progress.rs     interactive progress formatting + tracing writer bridge for spinner-safe logs
   reflect.rs      Reflect subcommand: analyze saved session trajectories and synthesize improvements
   detect.rs       provider auto-detection for `init`
-  context.rs      `--context-file` loading + prompt injection (ContextFile, load_context_files, append_to_prompt)
+  context.rs      `--context-file` loading + prompt injection (ContextFile, load_context_files, append_to_prompt) and project-context discovery (build_context: CLAUDE.md/AGENTS.md)
   prompts.rs      review/debate/ask prompts (TaskMode, DebateMode, ReviewScope)
+  proxy.rs        owning handle for the optional Gemini proxy (GeminiProxy::maybe_start/url); inert when `antigravity` is off
   gemini_proxy/   local HTTP proxy server translating Gemini API → Google Code Assist (feature `antigravity`, off by default)
 ```
 
@@ -255,7 +256,7 @@ Tool outputs are intentionally a bit self-describing: `read_file` includes file/
 
 ### Gemini AG2 proxy (`gemini_proxy/`)
 
-Gated behind the off-by-default `antigravity` cargo feature. The whole module compiles out when the feature is off, which drops `axum`, `keyring`, and `uuid` from the default build; `provider.rs`/`review.rs`/`debate.rs` thread only the proxy's base URL (`Option<&str>`) downstream so their signatures compile feature-off, and the proxy predicates (`*_needs_gemini_proxy`, `ProviderType::is_gemini`) plus `create_gemini_client_with_proxy` and `detect::detect_agy_keyring` are all `#[cfg(feature = "antigravity")]`. The config validator bails with a `--features antigravity` hint if `auth = "agy-keyring"` is configured without it (mirrors the azure gate). Combined with a size-tuned `[profile.release]` (`opt-level = "z"`, `lto = "thin"`, `strip = true`; `panic` left at `unwind`), the default release binary is ~8.7M (down from ~16M).
+Gated behind the off-by-default `antigravity` cargo feature. The whole module compiles out when the feature is off, which drops `axum`, `keyring`, and `uuid` from the default build; `src/proxy.rs::GeminiProxy` owns the optional startup (an inert handle feature-off) and `provider.rs`/`review.rs`/`debate.rs` thread only its base URL (`Option<&str>`/`Option<String>`) downstream so their signatures compile feature-off, and the proxy predicates (`*_needs_gemini_proxy`, `ProviderType::is_gemini`) plus `create_gemini_client_with_proxy` and `detect::detect_agy_keyring` are all `#[cfg(feature = "antigravity")]`. The config validator bails with a `--features antigravity` hint if `auth = "agy-keyring"` is configured without it (mirrors the azure gate). Combined with a size-tuned `[profile.release]` (`opt-level = "z"`, `lto = "thin"`, `strip = true`; `panic` left at `unwind`), the default release binary is ~8.7M (down from ~16M).
 
 When `auth = "agy-keyring"` is set for a Gemini reviewer/aggregator (feature-on), nitpicker:
 1. Runs a local axum HTTP server on a random port

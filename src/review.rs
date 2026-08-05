@@ -8,11 +8,9 @@ use nitpicker_agent::agent::{
 };
 use nitpicker_agent::config::{Config, ReviewerConfig};
 use nitpicker_agent::llm::{Completion, FinishReason};
-#[cfg(feature = "antigravity")]
-use nitpicker_agent::provider::config_needs_gemini_proxy;
 use nitpicker_agent::provider::{build_aggregator_client, build_reviewer_client};
 use nitpicker_agent::session::{AggregationRecord, SessionLogger, sanitize_path_component};
-use nitpicker_agent::tools::{all_tools, floor_char_boundary, is_binary_file};
+use nitpicker_agent::tools::all_tools;
 use rig_core::completion::Message;
 use std::path::Path;
 use std::sync::Arc;
@@ -46,7 +44,7 @@ pub async fn run_review(
     if let Some(logger) = &session_logger {
         info!(path = %logger.root().display(), "trajectory logging enabled");
     }
-    let context = build_context(repo).await;
+    let context = crate::context::build_context(repo).await;
     let system_prompt = mode.system_prompt();
     let initial_message = mode.initial_message(user_prompt);
     let mut handles = Vec::new();
@@ -65,20 +63,10 @@ pub async fn run_review(
         .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", ""]);
     let done_style = ProgressStyle::with_template("  {prefix:<12} {msg}").unwrap();
 
-    // the proxy client stays bound for the whole function so its local server outlives the
+    // the proxy handle stays bound for the whole function so its local server outlives the
     // reviewers; only its base URL is threaded downstream (see build_reviewer_client).
-    #[cfg(feature = "antigravity")]
-    let gemini_proxy = match config_needs_gemini_proxy(config) {
-        true => {
-            info!("Starting Gemini proxy (agy-keyring)");
-            Some(crate::gemini_proxy::GeminiProxyClient::new().await?)
-        }
-        false => None,
-    };
-    #[cfg(feature = "antigravity")]
-    let proxy_url: Option<String> = gemini_proxy.as_ref().map(|p| p.base_url());
-    #[cfg(not(feature = "antigravity"))]
-    let proxy_url: Option<String> = None;
+    let gemini_proxy = crate::proxy::GeminiProxy::maybe_start(config).await?;
+    let proxy_url = gemini_proxy.url();
 
     for reviewer in &config.reviewer {
         let tools_map = tools.clone();
@@ -245,79 +233,6 @@ pub async fn run_review(
         usage,
         degraded: success_count < reviewer_count,
     })
-}
-
-const MAX_CONTEXT_SIZE: usize = 50_000;
-
-pub async fn build_context(repo: &Path) -> String {
-    let mut context = String::new();
-
-    let repo_canonical = match tokio::fs::canonicalize(repo).await {
-        Ok(p) => p,
-        Err(_) => {
-            tracing::warn!("Failed to canonicalize repo path, skipping context files");
-            return context;
-        }
-    };
-
-    for filename in ["CLAUDE.md", "AGENTS.md"] {
-        let path = repo_canonical.join(filename);
-
-        if !path.starts_with(&repo_canonical) {
-            tracing::warn!("Context file path escapes repo root: {}", filename);
-            continue;
-        }
-
-        let metadata = match tokio::fs::metadata(&path).await {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                tracing::warn!("Cannot access context file {}: {}", filename, e);
-                continue;
-            }
-        };
-
-        if !metadata.is_file() {
-            continue;
-        }
-
-        match is_binary_file(&path).await {
-            Ok(true) => {
-                tracing::warn!("Context file appears to be binary, skipping: {}", filename);
-                continue;
-            }
-            Ok(false) => {}
-            Err(e) => {
-                tracing::warn!("Cannot check if context file is binary {}: {}", filename, e);
-                continue;
-            }
-        }
-
-        match tokio::fs::read_to_string(&path).await {
-            Ok(content) => {
-                let content = if content.len() > MAX_CONTEXT_SIZE {
-                    let boundary = floor_char_boundary(&content, MAX_CONTEXT_SIZE);
-                    format!(
-                        "{}\n... truncated ({} chars)",
-                        &content[..boundary],
-                        content.len()
-                    )
-                } else {
-                    content
-                };
-                context.push_str("## Project Context (from ");
-                context.push_str(filename);
-                context.push_str(")\n\n");
-                context.push_str(&content);
-                break;
-            }
-            Err(e) => {
-                tracing::warn!("Failed to read context file {}: {}", filename, e);
-            }
-        }
-    }
-
-    context
 }
 
 // internal single-call-site builder; the args are distinct per-reviewer handles, not worth a struct

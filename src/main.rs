@@ -14,6 +14,7 @@ mod output;
 mod pr;
 mod progress;
 mod prompts;
+mod proxy;
 mod reflect;
 mod review;
 

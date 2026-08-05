@@ -536,9 +536,41 @@ async fn run_pr_inner(
     let config = crate::load_resolved_config(common.config.as_deref(), &common.repo).await?;
     check_gh()?;
 
-    let verbose = common.verbose;
-    let user_repo = common
-        .repo
+    let prepared = prepare_pr(&args, &common.repo)?;
+
+    // `prepared` drops at the end of this scope, after the review completes: HEAD is restored
+    // (panic- and early-error-safe), then the temp dir removed, while the lock is still held —
+    // see the field order on `PreparedPr`.
+    run_review_inner(
+        &prepared,
+        &args,
+        &context_files,
+        &config,
+        common.verbose,
+        start,
+    )
+    .await
+}
+
+/// Everything the prep phase (flow resolution → lock → checkout/clone → metadata) hands to the
+/// review phase. The guard field order is load-bearing: struct fields drop in DECLARATION
+/// order, so restore-guard → tempdir → lock reproduces the prep locals' reverse-drop order —
+/// HEAD is restored, then the temp dir removed, while the lock is still held.
+struct PreparedPr {
+    repo: PathBuf,
+    url_for_gh: Option<String>,
+    pr_number: Option<u32>,
+    meta: PrMeta,
+    comments: Vec<PrComment>,
+    // set when we switch branches in the user's own repo; its Drop restores HEAD on the way out
+    // (including on panic/early-error), so it must outlive the whole review
+    _restore_guard: Option<BranchRestoreGuard>,
+    _tmpdir_guard: Option<tempfile::TempDir>,
+    _lock: Option<PrLock>,
+}
+
+fn prepare_pr(args: &PrArgs, repo_arg: &Path) -> Result<PreparedPr> {
+    let user_repo = repo_arg
         .canonicalize()
         .wrap_err("failed to canonicalize --repo path")?;
     let user_has_git = user_repo.join(".git").exists();
@@ -647,40 +679,38 @@ async fn run_pr_inner(
             }
         };
 
+    // if anything from here on fails (e.g. the comments fetch), the locals above drop in
+    // reverse declaration order — HEAD restored, temp dir removed, lock released last — the
+    // same teardown the returned struct encodes in its field order
     let comments = fetch_pr_comments(url_for_gh.as_deref(), &repo)?;
 
-    // _restore_guard's Drop restores the user's HEAD (panic- and early-error-safe). It drops at the
-    // end of this scope, after the review completes and before `_lock`, so restore happens while
-    // the lock is still held.
-    run_review_inner(
-        &repo,
-        url_for_gh.as_deref(),
+    Ok(PreparedPr {
+        repo,
+        url_for_gh,
         pr_number,
-        &args,
-        &context_files,
-        &config,
-        verbose,
-        &meta,
-        &comments,
-        start,
-    )
-    .await
+        meta,
+        comments,
+        _restore_guard,
+        _tmpdir_guard,
+        _lock,
+    })
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_review_inner(
-    repo: &Path,
-    url_for_gh: Option<&str>,
-    pr_number: Option<u32>,
+    prepared: &PreparedPr,
     args: &PrArgs,
     context_files: &[PathBuf],
     config: &Config,
     verbose: bool,
-    meta: &PrMeta,
-    comments: &[PrComment],
     start: std::time::Instant,
 ) -> Result<()> {
     use crate::output::{OutputFormat, PrInfo, PrReviewOutput, ReviewMode, Status};
+
+    let repo = prepared.repo.as_path();
+    let url_for_gh = prepared.url_for_gh.as_deref();
+    let pr_number = prepared.pr_number;
+    let meta = &prepared.meta;
+    let comments: &[PrComment] = &prepared.comments;
 
     const FOOTER: &str =
         "\n\n---\n🔍 Reviewed by [nitpicker](https://github.com/arsenyinfo/nitpicker)";
@@ -787,7 +817,9 @@ async fn run_review_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::PrComment;
+    use super::{BranchRestoreGuard, HeadState, PrComment, get_head_state};
+    use std::path::Path;
+    use std::process::Command;
 
     #[test]
     fn pr_comments_tolerate_null_author() {
@@ -799,5 +831,88 @@ mod tests {
         .expect("null author must deserialize");
         assert!(comments[0].author.is_none());
         assert_eq!(comments[1].author.as_ref().unwrap().login, "octocat");
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_repo(repo: &Path) {
+        git(repo, &["init", "-b", "main"]);
+        git(
+            repo,
+            &[
+                "-c",
+                "user.email=t@test",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "one",
+            ],
+        );
+    }
+
+    /// The guard's Drop is the only thing standing between a panic/early error and the user
+    /// stranded on nitpicker's PR branch — it must switch back to the branch it captured.
+    #[test]
+    fn branch_restore_guard_switches_back_to_the_original_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        init_repo(&repo);
+
+        let head = get_head_state(&repo).unwrap();
+        assert!(matches!(&head, HeadState::Branch(b) if b == "main"));
+
+        git(&repo, &["switch", "-c", "nitpicker/pr-1"]);
+        drop(BranchRestoreGuard {
+            repo: repo.clone(),
+            head,
+        });
+
+        match get_head_state(&repo).unwrap() {
+            HeadState::Branch(b) => assert_eq!(b, "main"),
+            HeadState::Detached(_) => panic!("expected to be back on the main branch"),
+        }
+    }
+
+    /// A detached HEAD must be restored with `switch --detach` (plain `git switch` refuses a
+    /// bare commit) — the failure mode is the user silently left on the PR branch. Exercised
+    /// through the guard's Drop, the path production actually takes.
+    #[test]
+    fn dropping_the_guard_re_detaches_onto_the_original_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        init_repo(&repo);
+
+        git(&repo, &["switch", "--detach", "HEAD"]);
+        let head = get_head_state(&repo).unwrap();
+        let original_sha = match &head {
+            HeadState::Detached(sha) => sha.clone(),
+            HeadState::Branch(_) => panic!("expected a detached HEAD"),
+        };
+
+        git(&repo, &["switch", "main"]);
+        drop(BranchRestoreGuard {
+            repo: repo.clone(),
+            head,
+        });
+
+        match get_head_state(&repo).unwrap() {
+            HeadState::Detached(sha) => assert_eq!(sha, original_sha),
+            HeadState::Branch(_) => panic!("expected HEAD re-detached onto the original commit"),
+        }
     }
 }

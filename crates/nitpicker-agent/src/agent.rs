@@ -228,7 +228,6 @@ impl ToolCallStatus {
 struct ToolCallOutcome {
     output: String,
     nested_tool_calls: usize,
-    repeated_tool_call_blocked: bool,
     status: ToolCallStatus,
     spawned_agent: Option<String>,
     subagent_usage: TokenUsage,
@@ -507,7 +506,7 @@ pub async fn run_agent(
             let mut results = Vec::with_capacity(tool_calls.len());
             for (call, outcome) in tool_calls.iter().zip(outcomes) {
                 let outcome = outcome?;
-                let blocked = outcome.repeated_tool_call_blocked;
+                let blocked = outcome.status == ToolCallStatus::BlockedCycle;
                 if blocked {
                     consecutive_blocked_count += 1;
                 } else {
@@ -528,7 +527,6 @@ pub async fn run_agent(
                 let ToolCallOutcome {
                     mut output,
                     nested_tool_calls,
-                    repeated_tool_call_blocked: _,
                     status: _,
                     spawned_agent: _,
                     subagent_usage,
@@ -919,7 +917,6 @@ async fn execute_tool_call(
         let outcome = ToolCallOutcome {
             output: msg,
             nested_tool_calls: 0,
-            repeated_tool_call_blocked: true,
             status: ToolCallStatus::BlockedCycle,
             spawned_agent: None,
             subagent_usage: TokenUsage::default(),
@@ -945,7 +942,6 @@ async fn execute_tool_call(
                 output: "Error: subagent depth limit reached; cannot spawn another subagent"
                     .to_string(),
                 nested_tool_calls: 0,
-                repeated_tool_call_blocked: false,
                 status: ToolCallStatus::Error,
                 spawned_agent: None,
                 subagent_usage: TokenUsage::default(),
@@ -975,7 +971,6 @@ async fn execute_tool_call(
                 let outcome = ToolCallOutcome {
                     output: format!("Error: {err}"),
                     nested_tool_calls: 0,
-                    repeated_tool_call_blocked: false,
                     status: ToolCallStatus::Error,
                     spawned_agent: None,
                     subagent_usage: TokenUsage::default(),
@@ -1020,7 +1015,6 @@ async fn execute_tool_call(
         let outcome = ToolCallOutcome {
             output: sub.output,
             nested_tool_calls: sub.tool_calls,
-            repeated_tool_call_blocked: false,
             status,
             spawned_agent: sub.spawned_agent,
             subagent_usage: sub.usage,
@@ -1034,7 +1028,6 @@ async fn execute_tool_call(
             Ok(output) => ToolCallOutcome {
                 output,
                 nested_tool_calls: 0,
-                repeated_tool_call_blocked: false,
                 status: ToolCallStatus::Ok,
                 spawned_agent: None,
                 subagent_usage: TokenUsage::default(),
@@ -1044,7 +1037,6 @@ async fn execute_tool_call(
                 ToolCallOutcome {
                     output: format!("Error: {err}"),
                     nested_tool_calls: 0,
-                    repeated_tool_call_blocked: false,
                     status: ToolCallStatus::Error,
                     spawned_agent: None,
                     subagent_usage: TokenUsage::default(),
@@ -1057,7 +1049,6 @@ async fn execute_tool_call(
             ToolCallOutcome {
                 output: msg,
                 nested_tool_calls: 0,
-                repeated_tool_call_blocked: false,
                 status: ToolCallStatus::Error,
                 spawned_agent: None,
                 subagent_usage: TokenUsage::default(),
