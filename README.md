@@ -282,7 +282,7 @@ Optional per-reviewer/aggregator fields:
 nitpicker [OPTIONS]
 nitpicker ask [--no-debate] [--rounds N] [--max-turns N] [OPTIONS] <topic>
 nitpicker pr [URL] [--no-comment] [--no-debate] [--rounds N] [--max-turns N] [OPTIONS]
-nitpicker init [--global] [--free]
+nitpicker init [--global] [--free] [--repo <DIR>]
 ```
 
 ### Review (default)

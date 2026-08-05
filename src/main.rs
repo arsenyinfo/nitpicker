@@ -97,7 +97,7 @@ struct Args {
 enum Command {
     /// Generate a nitpicker config template
     Init {
-        /// Write to ~/.nitpicker/config.toml instead of ./nitpicker.toml
+        /// Write to ~/.nitpicker/config.toml instead of <repo>/nitpicker.toml
         #[arg(long)]
         global: bool,
 

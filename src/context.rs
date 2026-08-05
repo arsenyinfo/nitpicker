@@ -237,8 +237,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_fifo_is_rejected_without_blocking() {
-        // a plain blocking open of a writerless FIFO hangs forever — if the O_NONBLOCK guard
-        // regresses, this test hangs rather than failing, which the suite timeout surfaces
         let dir = tempfile::tempdir().unwrap();
         let fifo = dir.path().join("pipe");
         let status = std::process::Command::new("mkfifo")
@@ -247,7 +245,17 @@ mod tests {
             .unwrap();
         assert!(status.success());
 
-        assert!(load_context_files(&[fifo]).is_err());
+        // a plain blocking open of a writerless FIFO hangs forever and the test harness has no
+        // per-test timeout, so run the load on a watchdog thread: a regression of the
+        // O_NONBLOCK guard fails deterministically instead of hanging the suite
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(load_context_files(&[fifo]).is_err());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(rejected) => assert!(rejected),
+            Err(_) => panic!("opening a writerless FIFO blocked — O_NONBLOCK guard regressed"),
+        }
     }
 
     #[test]
