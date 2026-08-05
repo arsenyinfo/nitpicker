@@ -282,26 +282,43 @@ Optional per-reviewer/aggregator fields:
 nitpicker [OPTIONS]
 nitpicker ask [--no-debate] [--rounds N] [--max-turns N] [OPTIONS] <topic>
 nitpicker pr [URL] [--no-comment] [--no-debate] [--rounds N] [--max-turns N] [OPTIONS]
-nitpicker init [--global] [--free]
+nitpicker init [--global] [--free] [--repo <DIR>]
 ```
 
 ### Review (default)
 
 ```
---repo <PATH>      git repository to review [default: .]
---config <PATH>    config file [default: <repo>/nitpicker.toml, then ~/.nitpicker/config.toml]
---prompt <TEXT>    review instructions (optional, has a sensible default)
---analyze [PATH]   analyze existing code instead of reviewing changes
---no-debate        use parallel aggregation instead of actor-critic debate
---rounds <N>       maximum debate rounds [default: 5]
---max-turns <N>    maximum tool-use turns per agent or debate turn [default: 100 via config]
--v, --verbose      show info-level logs (hidden by default)
+--repo <PATH>          git repository to review [default: .]
+--config <PATH>        config file [default: <repo>/nitpicker.toml, then ~/.nitpicker/config.toml]
+--prompt <TEXT>        review instructions (optional, has a sensible default)
+--context-file <PATH>  inject a file's contents into the prompt; repeatable
+--analyze [PATH]       analyze existing code instead of reviewing changes
+--no-debate            use parallel aggregation instead of actor-critic debate
+--rounds <N>           maximum debate rounds [default: 5]
+--max-turns <N>        maximum tool-use turns per agent or debate turn [default: 100 via config]
+-v, --verbose          show info-level logs (hidden by default)
 ```
+
+#### `--context-file`
+
+The agents' own tools are sandboxed to the repository, so they cannot open a design doc that lives
+outside it. `--context-file` reads such a file directly into the prompt:
+
+```bash
+nitpicker --context-file ~/notes/migration-plan.md --context-file /tmp/rfc.md
+```
+
+Available on the default review mode, `ask`, and `pr`; the flag may be given before or after the
+subcommand. Files are injected verbatim, in the order given, after the task and any `--prompt`
+text. Total injected size — contents plus each block's wrapper — is capped at 256 KiB; a missing,
+non-regular (FIFO, device node), binary, or non-UTF-8 file is an error, raised before any model is
+called. Because the contents are placed in the task prompt rather than the system prompt, spawned
+subagents do not inherit them.
 
 ### PR subcommand
 
 ```
-nitpicker pr [URL] [--no-comment] [--no-debate] [--rounds N] [--max-turns N] [--prompt TEXT] [--repo .] [--config PATH] [--json] [-v]
+nitpicker pr [URL] [--no-comment] [--no-debate] [--rounds N] [--max-turns N] [--prompt TEXT] [--context-file PATH] [--repo .] [--config PATH] [--json] [-v]
 ```
 
 Reviews a GitHub PR using its title, description, and diff. Requires the `gh` CLI (`gh auth login` to authenticate).
@@ -315,7 +332,7 @@ Reviews a GitHub PR using its title, description, and diff. Requires the `gh` CL
 ### Ask subcommand
 
 ```
-nitpicker ask [--no-debate] [--rounds N] [--max-turns N] [--repo .] [--config PATH] [-v] <topic>
+nitpicker ask [--no-debate] [--rounds N] [--max-turns N] [--context-file PATH] [--repo .] [--config PATH] [-v] <topic>
 ```
 
  Runs agents on a free-form question instead of a code diff. By default, two agents take turns as Actor/Critic before a meta-reviewer concludes. Pass `--no-debate` to switch to the parallel reviewer plus aggregator flow.
@@ -363,7 +380,11 @@ println!("{}", result.text);
 
 ## Changelog
 
-**0.8.3** — 2026-08-03 (`nitpicker-agent` 0.2.0)
+**0.8.4** — 2026-08-05
+- New `--context-file <PATH>` flag (repeatable) injects out-of-repo files (regular files only, capped at 256 KiB in total including block wrappers) into the task prompt for review, `ask`, and `pr`; accepted before or after the subcommand.
+- `--repo`, `--config`, and `-v`/`--verbose` are now global flags: accepted before or after a subcommand, no longer silently ignored in the root position. `init` honors `--repo` as the directory to write `nitpicker.toml` into, and rejects `--config`.
+
+**0.8.3** — 2026-08-05 (`nitpicker-agent` 0.2.0)
 - **Stable Tool Definitions**: Send tool definitions in name-sorted order to preserve request prefix determinism and maximize provider prompt-cache hits across turns.
 - **Cache-Aware Token Metering**: Added `cached_input_tokens` and `cache_creation_input_tokens` to `TokenUsage` and `pr --json`, normalized `input_tokens` across provider cache shapes (fixing compaction triggers on auto-caching providers), and updated progress display (e.g. `1.0M in · 90% cached`).
 - **Flexible Output Caps**: Removed hardcoded 8192-token output caps on agent turns and compaction (preventing reasoning models from exhausting token budgets on internal thinking before emitting output). Added `max_tokens` configuration per reviewer (`None` uses provider default; aggregator defaults to 16,384).

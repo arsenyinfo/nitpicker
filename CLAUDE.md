@@ -88,6 +88,7 @@ src/  — `nitpicker` binary (CLI)
   progress.rs     interactive progress formatting + tracing writer bridge for spinner-safe logs
   reflect.rs      Reflect subcommand: analyze saved session trajectories and synthesize improvements
   detect.rs       provider auto-detection for `init`
+  context.rs      `--context-file` loading + prompt injection (ContextFile, load_context_files, append_to_prompt)
   prompts.rs      review/debate/ask prompts (TaskMode, DebateMode, ReviewScope)
   gemini_proxy/   local HTTP proxy server translating Gemini API → Google Code Assist (feature `antigravity`, off by default)
 ```
@@ -157,6 +158,44 @@ the override is inherited by nested subagents. `None` ⇒ the built-in generic p
 6. `build_pr_prompt` assembles the review prompt from PR title + body + PR comments + diff context + optional `--prompt`.
 7. Review runs via `debate::run_debate` by default, or `review::run_review` with `--no-debate`. Unless `--no-comment`, result is posted back via `gh pr comment`.
 8. Output is governed by the `--json` flag (on `PrArgs`, scoped to `pr` only) which maps to the internal `OutputFormat` enum: `Text` keeps the legacy human stdout (report printed, then comment posted); `Json` posts the comment first (so its outcome is reflected in `comment_posted`), then writes one `PrReviewOutput` line to stdout via `output::emit_json` (which flushes before the caller's `process::exit`). In JSON mode, `debate.rs` suppresses its cast-line/verdict `println!`s and the `termimad` verdict rendering (threaded via `DebateOptions.format`), and tracing is always routed to stderr — so stdout stays a single clean JSON object. The envelope's `usage` block (`UsageReport`: `input_tokens`/`output_tokens`/`total_tokens`/`cached_input_tokens`/`cache_creation_input_tokens`/`subagents_spawned`) is aggregated from the run: `review::run_review` returns a `ReviewOutcome` and `debate::run_debate` a `DebateOutcome`, each folding every reviewer/debate-turn `AgentResult` (subagents + compaction already folded in) plus the aggregator/meta completion — whose usage was previously discarded — via `UsageReport::add`. It is **best-effort** metering: tokens are sourced only from successful `CompletionResponse`s, so a failed reviewer/subagent or a discarded retry contributes 0 (a lower bound on spend, not an exact meter). `usage` is `None` in the `status: "error"` envelope. The cache keys are additive — `SCHEMA_VERSION` stays at 1 since existing consumers that ignore unknown keys are unaffected — but note `input_tokens` itself changed meaning in 0.8.3 on the Anthropic path (it now includes cache reads), so a consumer computing cost must discount `cached_input_tokens` at the provider's cache-read rate rather than charging the whole prompt. Subprocess caveats (for callers): `gh` auth/rate-limit is shared across processes, `--repo` must be an existing dir, kill via process-group on timeout (blocking `git`/`gh` children don't get the signal otherwise), and set `log_trajectories=false` to avoid per-run session writes.
+
+### Context files (`context.rs`)
+
+`--context-file <PATH>` (repeatable) injects a file the agents' tools cannot reach — those are
+canonicalize-sandboxed to the repo, so a design doc living outside it is otherwise unreadable. The
+flag lives in `ContextFileArgs`, flattened into `Args` (root), `Command::Ask`, and `PrArgs`, and the
+root and subcommand vectors are concatenated root-first (= command-line order) at each use site, so
+the flag works before or after the subcommand. It is deliberately **not** a clap `global` arg:
+global propagation keeps one winning occurrence list (the subcommand's), so a repeatable flag split
+around the subcommand would silently drop the root's values. The scalar shared flags (`--repo`,
+`--config`, `-v`) *are* global — declared once on `CommonArgs` at the root, readable from
+`Args.common` regardless of position (`run_pr` receives them as a parameter). `init`/`reflect`
+don't flatten `ContextFileArgs`, so `--context-file` after them is a parse error rather than a
+silent no-op; before them it is ignored like every other root-only flag.
+
+Loading is eager and total-budgeted (`MAX_TOTAL_BYTES`, 256 KiB): only regular files are accepted
+(a FIFO or device node would block or stream without bound). The check is an fstat on the opened
+fd, not a stat on the path — stat-then-open leaves a race where the path is swapped for a FIFO and
+the open itself blocks; on unix the open uses `O_NONBLOCK` (harmless for regular-file reads) so
+even a raced-in FIFO opens instantly and is then rejected. Each file is read through a bounded reader capped at the
+remaining budget + 1 byte so an oversized file fails fast instead of being buffered whole, and the
+budget meters the **serialized block** (escaped contents + fence + path + separator, via
+`render_block`) rather than raw file bytes — so wrapper overhead is charged and empty files are not
+free. Missing, non-regular, over-budget, binary (null-byte guard, mirroring the tool sandbox's),
+and non-UTF-8 files are hard errors, so a bad path fails before any model call. Contents are
+injected verbatim — no trimming; the only mutation is the closing-tag neutralization below.
+
+`append_to_prompt` appends the blocks to the **task prompt**, not the
+system prompt — these are per-run material with the same lifetime as `--prompt`, whereas
+`project_context` (`CLAUDE.md`/`AGENTS.md`) is a single slot that propagates to subagents. The
+consequence, deliberate: **subagents do not see context files**.
+
+Each file is wrapped in `<context_file path="…">`, with the literal closing tag neutralized in the
+contents and `"` escaped in the path attribute — the same breakout that `run_agent` guards against
+for `<context-only>`. Injection happens at three call sites (`main.rs` review arm, `main.rs` ask arm,
+`pr.rs::run_review_inner`) by wrapping an already-assembled prompt string, so no prompt builder had
+to change shape. In `pr` mode the load happens at the injection site rather than at entry, so a bad
+path surfaces after the clone/checkout but still before the first model call.
 
 ### Reflect flow (`reflect.rs`)
 

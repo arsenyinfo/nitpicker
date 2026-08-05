@@ -91,7 +91,7 @@ pub struct PrArgs {
     /// Full GitHub PR URL (https://github.com/owner/repo/pull/N)
     pub url: Option<String>,
     #[command(flatten)]
-    pub common: crate::CommonArgs,
+    pub context: crate::ContextFileArgs,
     #[arg(long)]
     pub prompt: Option<String>,
     #[arg(long)]
@@ -501,13 +501,17 @@ enum PrFlow {
     },
 }
 
-pub async fn run_pr(args: PrArgs) -> Result<()> {
+pub async fn run_pr(
+    args: PrArgs,
+    common: crate::CommonArgs,
+    context_files: Vec<PathBuf>,
+) -> Result<()> {
     let start = std::time::Instant::now();
     let format = args.output_format();
     // in json mode every failure (incl. config loading) must still leave a
     // parseable object on stdout and exit non-zero; text mode keeps the
     // eyre-to-stderr behavior.
-    match run_pr_inner(args, start).await {
+    match run_pr_inner(args, common, context_files, start).await {
         Ok(()) => Ok(()),
         Err(e) => match format {
             crate::output::OutputFormat::Text => Err(e),
@@ -523,14 +527,17 @@ pub async fn run_pr(args: PrArgs) -> Result<()> {
     }
 }
 
-async fn run_pr_inner(args: PrArgs, start: std::time::Instant) -> Result<()> {
-    let config =
-        crate::load_resolved_config(args.common.config.as_deref(), &args.common.repo).await?;
+async fn run_pr_inner(
+    args: PrArgs,
+    common: crate::CommonArgs,
+    context_files: Vec<PathBuf>,
+    start: std::time::Instant,
+) -> Result<()> {
+    let config = crate::load_resolved_config(common.config.as_deref(), &common.repo).await?;
     check_gh()?;
 
-    let verbose = args.common.verbose;
-    let user_repo = args
-        .common
+    let verbose = common.verbose;
+    let user_repo = common
         .repo
         .canonicalize()
         .wrap_err("failed to canonicalize --repo path")?;
@@ -650,6 +657,7 @@ async fn run_pr_inner(args: PrArgs, start: std::time::Instant) -> Result<()> {
         url_for_gh.as_deref(),
         pr_number,
         &args,
+        &context_files,
         &config,
         verbose,
         &meta,
@@ -665,6 +673,7 @@ async fn run_review_inner(
     url_for_gh: Option<&str>,
     pr_number: Option<u32>,
     args: &PrArgs,
+    context_files: &[PathBuf],
     config: &Config,
     verbose: bool,
     meta: &PrMeta,
@@ -678,7 +687,10 @@ async fn run_review_inner(
 
     let format = args.output_format();
     let diff_context = crate::detect_diff_context(repo)?;
-    let full_prompt = build_pr_prompt(meta, comments, &diff_context, args.prompt.as_deref());
+    let full_prompt = crate::context::append_to_prompt(
+        build_pr_prompt(meta, comments, &diff_context, args.prompt.as_deref()),
+        &crate::context::load_context_files(context_files)?,
+    );
     let max_turns = config.max_turns(args.max_turns)?;
 
     let use_alloy = args.alloy || config.default_alloy();
