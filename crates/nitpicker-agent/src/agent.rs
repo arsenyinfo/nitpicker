@@ -1012,6 +1012,20 @@ async fn execute_tool_call(
             true => ToolCallStatus::Error,
             false => ToolCallStatus::Ok,
         };
+        // a successful subagent's own log records its result, but a failed one's trace just
+        // stops — without a completion record here the failure is invisible to `reflect`
+        if status == ToolCallStatus::Error {
+            log_tool_call(
+                ctx.config,
+                ctx.turn + 1,
+                tool_name,
+                &args,
+                status,
+                sub.spawned_agent.as_deref(),
+                Some(&truncate_for_trajectory(sub.output.clone())),
+            )
+            .await;
+        }
         let outcome = ToolCallOutcome {
             output: sub.output,
             nested_tool_calls: sub.tool_calls,
