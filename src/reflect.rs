@@ -64,6 +64,18 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Icon per trajectory-log status (`agent.rs::ToolCallStatus::as_str`). Every status needs its
+/// own glyph: rendering "started" (a spawn whose result lives in the subagent's own records) or
+/// "blocked_cycle" as ✗ teaches the analysis model that those calls failed.
+fn status_icon(status: &str) -> &'static str {
+    match status {
+        "ok" => "✓",
+        "started" => "▶",
+        "blocked_cycle" => "⊘",
+        _ => "✗",
+    }
+}
+
 fn format_session(session: &SessionData) -> String {
     let mut lines = Vec::new();
     let status = if session.is_complete() {
@@ -98,7 +110,7 @@ fn format_session(session: &SessionData) -> String {
     for r in &session.records {
         let args = truncate(&r.args.to_string(), 20000);
         let indent = "  ".repeat(r.depth);
-        let icon = if r.status == "ok" { "✓" } else { "✗" };
+        let icon = status_icon(&r.status);
         lines.push(format!(
             "{indent}{icon} [{}] turn {}: {}({args})",
             r.agent, r.turn, r.tool
@@ -378,4 +390,21 @@ pub async fn run_reflect(args: ReflectArgs) -> Result<()> {
     println!("{report}");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_trajectory_status_classifies_distinctly() {
+        let statuses = ["ok", "started", "blocked_cycle", "error"];
+        for (i, a) in statuses.iter().enumerate() {
+            for b in &statuses[i + 1..] {
+                assert_ne!(status_icon(a), status_icon(b), "{a} vs {b}");
+            }
+        }
+        // unknown vocabulary falls back to the failure glyph rather than inventing a state
+        assert_eq!(status_icon("unknown"), status_icon("error"));
+    }
 }
