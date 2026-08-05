@@ -172,11 +172,8 @@ pub fn reflect_tools() -> HashMap<String, Arc<dyn Tool>> {
 /// Load-bearing for cost: the schemas open every request, so reordering them re-prefills the whole
 /// conversation on a prefix-caching provider — and `HashMap` order varies per map instance.
 pub fn tool_definitions(tools: &HashMap<String, Arc<dyn Tool>>) -> Vec<ToolDefinition> {
-    let mut entries: Vec<(&str, &Arc<dyn Tool>)> = tools
-        .iter()
-        .map(|(key, tool)| (key.as_str(), tool))
-        .collect();
-    entries.sort_unstable_by_key(|(key, _)| *key);
+    let mut entries: Vec<(&String, &Arc<dyn Tool>)> = tools.iter().collect();
+    entries.sort_unstable_by_key(|(key, _)| key.as_str());
     entries
         .into_iter()
         .map(|(_, tool)| tool.definition())

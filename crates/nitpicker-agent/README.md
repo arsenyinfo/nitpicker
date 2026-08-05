@@ -55,18 +55,11 @@ See `examples/file_agent.rs` for a runnable version.
 
 ## Breaking changes
 
-**0.2.0** — `AgentResult`'s `total_input_tokens` / `total_output_tokens` / `total_tokens` fields
-and its `usage()` method are replaced by a single `usage: TokenUsage` field, which also carries
-`cached_input_tokens` / `cache_creation_input_tokens`. `TokenUsage::input_tokens` now means all
-prompt tokens *including* provider cache reads on every provider (Anthropic previously reported
-them separately), so cost formulas must discount `cached_input_tokens` at the cache-read rate.
-`AgentConfig` also gains `max_tokens: Option<u64>` (`AgentBuilder::max_tokens`), which defaults to
-`None`: turns now send no output cap and get the provider's own per-model limit. A cap budgets
-reasoning *plus* the answer, so one set below what the model reasons through returns empty content
-instead of a shorter answer. Anthropic requires the field, so `None` becomes 8192 there.
-`AgentBuilder::max_tokens` takes `NonZeroU64`, and `AlloyClient::new` takes `Vec<AlloySlot>`
-(`client` / `model` / `max_tokens`) rather than `(client, model)` pairs, so a pooled model is
-capped by its own setting rather than by the calling role's.
+**0.2.0**
+- Replaced `AgentResult` token fields (`total_input_tokens`, `total_output_tokens`, `total_tokens`) and `usage()` method with `usage: TokenUsage`, which includes `cached_input_tokens` and `cache_creation_input_tokens`.
+- `TokenUsage::input_tokens` now includes provider cache reads across all providers.
+- Added `max_tokens: Option<u64>` to `AgentConfig` (defaults to `None`, using provider per-model limits; Anthropic defaults to 8192). `AgentBuilder::max_tokens` takes `NonZeroU64`.
+- `AlloyClient::new` now takes `Vec<AlloySlot>` (`client`, `model`, `max_tokens`) to scope output caps per pooled model.
 
 ## License
 

@@ -364,111 +364,61 @@ println!("{}", result.text);
 ## Changelog
 
 **0.8.3** — 2026-08-03 (`nitpicker-agent` 0.2.0)
-- Tool definitions are now sent in a stable, name-sorted order. They were built from `HashMap::values()`, whose order varies per map instance — and a debate builds a fresh map every turn — so the tool schemas that open every request were reordered constantly. Measured against `api.kimi.com`: reshuffling the array alone drops the provider's prefix-cache read from 3456 tokens to 0, i.e. a full re-prefill of the conversation on every debate turn.
-- Token metering is cache-aware: `TokenUsage` and the `pr --json` `usage` block gain `cached_input_tokens` and `cache_creation_input_tokens`, the interactive progress lines show `1.0M in · 90% cached`, and `input_tokens` is normalized across providers (Anthropic reports cache reads separately, OpenAI folds them into `prompt_tokens`). `total_tokens == input_tokens + output_tokens` still holds and `SCHEMA_VERSION` stays 1.
-- Fixes compaction on auto-caching providers: on a cache hit the Anthropic shape under-reports the prompt by the cached portion (a 3509-token prompt reported as 52), so `compact_threshold` was never reached and long runs never compacted.
-- Agent turns and compaction no longer cap their output at a hardcoded 8192 tokens. A reasoning model spends that budget before writing a character and returns empty content with `finish_reason = max_tokens`, which the retry loop could only read as "the model said nothing" — four attempts, then a hard failure. Measured on `k3-256k` reviewing one file: capped at 8192 it returned nothing twice, 126s and 136s apart; uncapped it spent 12 827 reasoning tokens before its first character and returned a full review. Reviewers now send no cap and get the provider's own per-model limit, `[[reviewer]].max_tokens` sets one explicitly, and `[aggregator].max_tokens` defaults to 16384.
-- An empty response reports `finish_reason` and the output tokens spent, in both the retry warning and the final error — unless the provider returned literally nothing (no content, no reasoning, no tool call), which rig rejects before nitpicker sees the metadata.
-- An unterminated `<think>` block is now recovered even when the model wrote something before opening it. Previously only a response that was *entirely* one unclosed block was salvaged; a leading line made the reply look successful while the verdict stayed buried, with no retry.
-- Compaction is best-effort: a summarizer that fails after its retries and corrections no longer aborts the whole reviewer. It inherits the agent's cap, so raising `max_tokens` reaches the summarizer too. A compaction that fails while breaking a tool-call cycle is now retried on the next turn instead of being skipped for one, and any failed compaction is logged in the session trajectory as an error rather than as a summary-less success.
-- Alloy slots carry their own `max_tokens`, applied with the model at selection, so a pooled model is never capped by whichever role's turn it happens to be serving.
-- **Breaking (`nitpicker-agent`)**: `AgentResult`'s `total_input_tokens`/`total_output_tokens`/`total_tokens` fields and its `usage()` method are replaced by a single `usage: TokenUsage` field. `AgentConfig` gains a `max_tokens: Option<u64>` field; `AgentBuilder::max_tokens` takes `NonZeroU64`, and `AlloyClient::new` takes `Vec<AlloySlot>` instead of `(client, model)` pairs.
-- Bumped `rig-core` to 0.41. rig now drops function-call item ids that aren't provider-native `fc_...` Responses ids, pairing a call to its output by `call_id` alone — the same problem nitpicker solved by prefixing foreign ids, so that normalization is removed.
+- **Stable Tool Definitions**: Send tool definitions in name-sorted order to preserve request prefix determinism and maximize provider prompt-cache hits across turns.
+- **Cache-Aware Token Metering**: Added `cached_input_tokens` and `cache_creation_input_tokens` to `TokenUsage` and `pr --json`, normalized `input_tokens` across provider cache shapes (fixing compaction triggers on auto-caching providers), and updated progress display (e.g. `1.0M in · 90% cached`).
+- **Flexible Output Caps**: Removed hardcoded 8192-token output caps on agent turns and compaction (preventing reasoning models from exhausting token budgets on internal thinking before emitting output). Added `max_tokens` configuration per reviewer (`None` uses provider default; aggregator defaults to 16,384).
+- **Improved Empty Response Diagnostics**: Surfaced `finish_reason` and token usage when retrying empty responses.
+- **Unterminated Think Block Salvage**: Improved parsing to recover verdicts buried after unclosed `<think>` tags even when preceding content is present.
+- **Resilient Compaction**: Made history compaction best-effort so a summarizer failure no longer aborts the review run.
+- **Alloy Slot Cap Isolation**: Scoped `max_tokens` per model in `AlloyClient` pools.
+- **Dependency & Cleanup**: Bumped `rig-core` to 0.41 and removed redundant `fc_` tool call ID normalization.
+- **Breaking (`nitpicker-agent`)**: Replaced `AgentResult` token fields with `usage: TokenUsage`. `AlloyClient::new` now takes `Vec<AlloySlot>`.
 
 **0.8.2** — 2026-07-14 (`nitpicker-agent` 0.1.2)
-- Debate subagents no longer inherit the parent's terminal tools (`submit_verdict`), closing a path where a subagent could overwrite the parent's verdict and falsely converge a debate.
-- History compaction runs under a dedicated summarizer system prompt instead of the agent's role prompt (which ordered tool calls unavailable during summarization); the role prompt is embedded as reference-only material.
-- Project context (`CLAUDE.md`/`AGENTS.md`) is wrapped in a `<context-only>` tag marking it as repository-authored reference, not instructions; literal closing tags in the content are neutralized so it can't forge the boundary.
-- The parallel aggregator now receives the original review task alongside the reviewer outputs.
-- New `ReviewScope` (`Diff`/`Static`): `--analyze` drops change-attribution rules ("post-change code", "fixes the diff landed") in favor of impact-based static-analysis framing across reviewer, validator, and aggregator prompts.
+- Prevent debate subagents from inheriting `submit_verdict` tools to avoid premature convergence.
+- Run history compaction under a dedicated summarizer system prompt.
+- Wrap project context (`CLAUDE.md`/`AGENTS.md`) in `<context-only>` tags and pass task to parallel aggregator.
+- Added `ReviewScope` (`Diff`/`Static`) and `--analyze` static-analysis mode.
 
 **0.8.1** — 2026-07-03
-- Bumped `rig-core` to 0.39. rig 0.39 lowers assistant text into a valid Responses shape natively (a bare-string `AssistantInput` for the id-less messages nitpicker builds), so the Codex request path no longer rewrites assistant text blocks to `output_text` — it now only normalizes function-call ids and missing `call_id`s. No behavior change.
+- Bumped `rig-core` to 0.39; simplified Codex assistant text normalization.
 
 **0.8.0** — 2026-06-16
-- Split the agentic core into a separate publishable library crate, [`nitpicker-agent`](crates/nitpicker-agent) (`crates/nitpicker-agent`). The `nitpicker` binary now depends on it; behavior is unchanged. The library exposes the agent loop, file/git tools, and provider-agnostic LLM clients without the CLI/review/PR machinery — see "Using the agent as a library" above.
-- Added `AgentConfig::subagent_system_prompt` so callers can customize the prompt spawned subagents run with (propagates through nested spawns); `None` keeps the previous generic prompt.
+- Extracted core agent logic into published [`nitpicker-agent`](crates/nitpicker-agent) crate.
+- Added `subagent_system_prompt` customization to `AgentConfig`.
 
 **0.7.1** — 2026-06-14
-- Default review and `ask` now exit 3 for degraded verdicts after printing/flushing the report; 0 = clean, 1 = hard failure, 3 = degraded. `pr` keeps its existing JSON/exit-code contract.
-- Interactive debate/review progress is cleaner: model cast lines are shown only for terminal text runs, piped/JSON stdout stays final-output-only, and long subagent/status lines are truncated before they can wrap and corrupt the spinner redraw.
-- Fixed `--alloy` with Codex mixed into the reviewer pool by normalizing Responses `call_id`s, function-call item ids, and assistant text block shapes before Codex request sending.
-- Audit fixes: hardened git tool path/flag sandboxing, reject all-failed reviews instead of fabricating verdicts, fixed retry/auth classification for provider error bodies, honored Gemini `base_url`/`api_key_env`, and made `pr` locking/checkout safer.
+- Exit 3 for degraded review/ask verdicts; refined interactive progress rendering.
+- Audit fixes: hardened git tool sandboxing, provider auth/retry error classification, and `pr` checkout safety.
 
 **0.7.0** — 2026-06-07
-- Added research-only `auth = "codex"` for the `openai` provider, reusing the Codex CLI ChatGPT subscription token read-only, refreshing in memory, handling subscription Responses API quirks, and surfacing a commented reviewer from `nitpicker init` when detected.
-- Fixed Codex multi-turn reasoning with `store: false` by requesting/replaying `reasoning.encrypted_content` instead of unresolved `rs_...` item ids.
-- Gated Antigravity keyring auth behind the off-by-default `antigravity` feature, slimmed the default release binary, and bumped `rig-core` to 0.38.
+- Added research `auth = "codex"` for OpenAI provider using local Codex CLI OAuth tokens.
+- Fixed Codex multi-turn reasoning and gated keyring auth under `antigravity` feature flag.
 
 **0.6.3** — 2026-06-06
-- Audit fixes: (1) **git tool security** — the read-only allowlist gated only the subcommand, allowing file writes (`diff --output=<path>`) and ref mutation (`branch`/`tag`) against the user's real repo in `pr` in-place mode; `branch`/`tag` are replaced by the safe-by-construction `for-each-ref`/`show-ref` plumbing and `--output`/`-o` is blocked. (2) **detached-HEAD restore** in `pr` mode was broken and not panic-safe, stranding the user on `nitpicker/pr-N`; now restored via `git switch --detach` from a `Drop` guard. (3) **retry classifier** misread `code` as a substring (`error decoding…404` → permanent 4xx, retries lost); keys are now whole-word matched and 5xx-nested-4xx stays retryable. (4) **debate** no longer records an empty verdict when a terminal tool call is blocked/malformed.
+- Security audit fixes: restricted git subcommands (`for-each-ref`/`show-ref`), panic-safe detached HEAD restore, retry classifier matching.
 
 **0.6.2** — 2026-06-05
-- `nitpicker pr --json` emits a single machine-readable JSON object on stdout, making the binary embeddable as a subprocess from a backend that lets users review public GitHub PRs. stdout carries only the JSON envelope (status, PR metadata, mode, models, `report_markdown`, `comment_posted`, `duration_ms`); all human output (logs, spinners, debate text) is routed to stderr. Failures — bad URL, `gh`/`git` errors, config-loading errors — still emit a `status: "error"` object on stdout and exit non-zero. Tracing now always writes to stderr (even in text mode). Debate transcripts are only written to the temp dir under `--verbose`.
-- Fixed `pr --clone` denying every file read on macOS: the temp clone dir is now canonicalized so the workspace root matches the symlink-resolved (`/var` → `/private/var`) paths the file tools check against.
+- `nitpicker pr --json` emits machine-readable output on stdout with logs/spinners on stderr.
+- Fixed macOS symlink workspace canonicalization under `pr --clone`.
 
 **0.6.1** — 2026-06-05
-- Subagent waves now run **concurrently**. Previously a turn's `spawn_subagent` calls executed one-at-a-time, so a wide swarm turned directly into wall-clock — the main driver of review time varying wildly (minutes to hours) on similar inputs. A turn's tool calls now run in parallel via `join_all`, so subagent breadth no longer scales latency. Concurrent in-flight LLM calls are bounded by a shared global semaphore (default 16) acquired only around each provider call, so the swarm throttles to the provider instead of firing every request at once. Review prompts now bias fanning out all disjoint threads as one broad up-front wave rather than dribbling out serial waves. Session-log appends are serialized so a concurrent wave can't interleave partial lines.
+- Concurrent subagent execution: run `spawn_subagent` calls in parallel via `join_all` bounded by a global semaphore (default 16).
 
 **0.6.0** — 2026-06-02
-- Added `auth = "azure-ad"` for the `openai` and `anthropic` providers: authenticate to Azure AI Foundry-hosted models with a refreshing Azure AD (Entra ID) bearer token instead of a static key. Token acquisition uses the Azure SDK (`DefaultAzureCredential`-style chain) and is transparently refreshed before expiry. New optional config fields `azure_scope` and `azure_credentials` (the latter mirrors `AZURE_TOKEN_CREDENTIALS`: `dev`/`prod`/auto). Gated behind the off-by-default `azure` cargo feature (build with `--features azure`; requires Rust 1.88+). See [Azure AD section](#azure-ad-azure-ai-foundry).
-- `auth = "azure-ad"` configs are validated up front: `Config::validate` now requires a non-empty `base_url`, rejects an unknown credential mode (including a bogus `AZURE_TOKEN_CREDENTIALS` env-var fallback), and surfaces typo'd `auth` values on any non-Gemini provider instead of failing cryptically at the first LLM call. An empty/whitespace `azure_scope` now falls back to the default scope rather than failing late. Retry/401 classification was fixed to inspect the full error chain (robust to compact-JSON status bodies), so token-expiry 401s actually trigger a refresh-and-retry — and a burst of concurrent 401s collapses to a single token refresh. Status classification keys on the code appearing in an HTTP-status context, so an incidental number in an error body (e.g. `400 tokens`) isn't mistaken for the response status, and a whitespace-padded `base_url` is trimmed to match validation.
+- Added `auth = "azure-ad"` support for OpenAI/Anthropic providers via Entra ID bearer tokens (gated under `azure` feature flag).
 
 **0.5.1** — 2026-05-25
-- `pr` checkout safety: skip checkout when already on PR head, new `--clone` flag to force a fresh temp clone, lock now acquired before any git mutation and works correctly on macOS
-- Temp-clone PR review uses partial clone (`--filter=blob:none`) so the diff base is always reachable
+- PR checkout safety improvements, `--clone` flag, partial clones (`--filter=blob:none`).
 
 **0.5.0** — 2026-05-24
-- Added `auth = "agy-keyring"` for the Gemini provider: reads the Antigravity (`agy`) CLI OAuth token from the system keyring and routes through AG2's CloudCode SSE endpoint. Treat as research only — AG2 ToS Section 6 prohibits third-party OAuth clients and Google has been actively suspending paid accounts for this pattern in 2026. See README warning before using.
-- **Breaking:** removed the legacy `auth = "oauth"` browser flow and the `nitpicker --gemini-oauth` CLI flag. The flow had been broken since the proxy was retargeted at AG2 (the matching AG2 client_secret is not public, so token exchange could not complete). The config validator now rejects `auth = "oauth"` with a migration hint to `agy-keyring` or `GEMINI_API_KEY`.
+- Added `auth = "agy-keyring"` for Gemini; removed legacy `auth = "oauth"`.
 
 **0.4.0** — 2026-05-17
-- Alloy mode (`--alloy` / `defaults.alloy = true`): pools all reviewer models into a shared random-selection pool so every debate turn can draw from any configured model (based on [XBOW technique](https://xbow.com/blog/alloy-agents))
+- Added Alloy mode (`--alloy`) to pool reviewer models into a shared random-selection pool.
 
-**0.3.3** — 2026-05-11: 
-- init --free flag for OpenRouter free model auto-selection
+**0.3.0 – 0.3.3** — 2026-05-06 – 2026-05-11
+- OpenRouter free model auto-selection (`init --free`), trajectory logging, `reflect` analysis tool.
 
-**0.3.2** — 2026-05-11
-- More reliable support for free OpenRouter models
-- Compaction mechanism improvements
-
-**0.3.1** — 2026-05-07
-- Better tool guidance and self-describing tool outputs
-- Review prompts now encourage short plans, earlier subagent delegation, and stricter evidence checks
-
-**0.3.0** — 2026-05-06
-- Session trajectory logging plus internal `reflect` analysis tooling
-- Minor fixes, including graceful shutdown once turns are exhausted and allowing `pr` to review a URL from a non-git cwd
-
-**0.2.3** — 2026-05-01
-- Better `nitpicker init` experience and minor bug fixes
-
-**0.2.2** — 2026-04-30
-- Session artifacts now capture tool trajectories and final aggregation output for debugging
-- Default CLI output now stays focused on the final synthesized review unless `--verbose` is enabled
-
-**0.2.1** — 2026-04-30
-- First class support for OpenRouter: new provider type, and experimental free auto-selection mode
-- Minor bug fixes (breaking the cycle, temperature params)
-
-**0.2.0** — 2026-04-28
-- PR comments are now included in the review prompt for full context
-- Per-repo file lock prevents concurrent `nitpicker pr` runs on the same repository
-- Atomic lock acquisition with stale lock detection (no TOCTOU race)
-
-**0.1.4** — 2026-04-23
-- Proactive conversation compaction to prevent context overflow mid-review
-- Claude Opus 4.7 compatibility fix
-- Base branch detection fix for repos with `master` as default
-
-**0.1.3** — 2026-04-22
-- Bounded subagent runtime for debate and review
-- Configurable turn limits (`--max-turns`, `[defaults].max_turns`)
-- Kimi repeating tool-call fix
-
-**0.1.2** — 2026-03-15
-- `pr` subcommand: review GitHub PRs and post result as comment
-- Debate synthesis posted as PR comment
-- Three-dot diff for accurate stale-branch diffs
-- Global config (`nitpicker init --global`)
-- Rate limit handling with backoff
+**0.1.2 – 0.2.3** — 2026-03-15 – 2026-05-01
+- PR review subcommand, debate mode synthesis, proactive conversation compaction, bounded subagent runtime, atomic file locks.
