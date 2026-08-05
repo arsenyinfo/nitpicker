@@ -154,8 +154,8 @@ async fn compact_and_account(
     conversation_usage: &mut ConversationUsageWindow,
     totals: &mut RunTotals,
 ) {
-    // compaction happens *before* the next turn runs, so it is named for that turn; the trajectory
-    // keeps logging the loop index it was reached from
+    // compaction happens *before* the next turn runs, so it is named for that turn — in the
+    // tracing warn and the trajectory alike, matching the 1-based numbers tool records use
     let compaction_turn = turn + 1;
     let compaction = match compact_history(
         &config.llm_semaphore,
@@ -185,7 +185,7 @@ async fn compact_and_account(
     if compaction.resets_usage_window() {
         conversation_usage.reset();
     }
-    log_compaction(config, turn, reason, &compaction).await;
+    log_compaction(config, compaction_turn, reason, &compaction).await;
 }
 
 struct FinishTool {
