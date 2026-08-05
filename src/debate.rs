@@ -76,6 +76,9 @@ struct DebateTurnRequest<'a> {
     work_dir: &'a Path,
     progress: Option<Arc<dyn Fn(AgentProgress) + Send + Sync>>,
     project_context: Option<String>,
+    /// Trajectory identity (`<side>-<round>`, the writer's file stem): `reflect` merges all of a
+    /// session's files by timestamp, so the record label is what keeps turns distinguishable.
+    session_agent: String,
     session_writer: Option<SessionWriter>,
 }
 
@@ -153,7 +156,7 @@ async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnRes
     let subagent_counter = Arc::new(AtomicUsize::new(0));
     let config = AgentConfig {
         name: format!("debate-{}", request.model),
-        session_agent: "root".to_string(),
+        session_agent: request.session_agent,
         model: request.model.to_string(),
         max_turns: request.max_turns,
         max_tokens: request.max_tokens,
@@ -277,6 +280,7 @@ async fn run_debate_side(
         ));
     }) as Arc<dyn Fn(AgentProgress) + Send + Sync>);
 
+    let session_agent = format!("{}-{round}", side.session_stem);
     let result = run_debate_turn(DebateTurnRequest {
         client: Arc::clone(&side.client),
         compact_threshold: side.compact_threshold,
@@ -290,7 +294,8 @@ async fn run_debate_side(
         project_context: Some(env.project_context.to_string()),
         session_writer: env
             .session_logger
-            .map(|logger| logger.child(format!("{}-{round}.jsonl", side.session_stem))),
+            .map(|logger| logger.child(format!("{session_agent}.jsonl"))),
+        session_agent,
     })
     .await?;
 

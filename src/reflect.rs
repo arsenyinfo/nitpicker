@@ -64,6 +64,20 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Icon per trajectory-log status (`agent.rs::ToolCallStatus::as_str`). Every status needs its
+/// own glyph: rendering "started" (a spawn whose result lives in the subagent's own records) or
+/// "blocked_cycle" as ✗ teaches the analysis model that those calls failed. Unknown vocabulary
+/// gets its own glyph too — aliasing a future status to ✗ would silently recreate that bug.
+fn status_icon(status: &str) -> &'static str {
+    match status {
+        "ok" => "✓",
+        "error" => "✗",
+        "started" => "▶",
+        "blocked_cycle" => "⊘",
+        _ => "?",
+    }
+}
+
 fn format_session(session: &SessionData) -> String {
     let mut lines = Vec::new();
     let status = if session.is_complete() {
@@ -74,8 +88,9 @@ fn format_session(session: &SessionData) -> String {
     lines.push(format!("# Session: {}", session.name));
     lines.push(format!("- Status: {status}"));
     lines.push(format!("- Agents: {}", session.agent_names().join(", ")));
+    // records, not calls: a failed spawn contributes a started/error lifecycle pair
     lines.push(format!(
-        "- Tool calls: {}, errors: {}",
+        "- Records: {}, errors: {}",
         session.records.len(),
         session.error_count()
     ));
@@ -98,7 +113,7 @@ fn format_session(session: &SessionData) -> String {
     for r in &session.records {
         let args = truncate(&r.args.to_string(), 20000);
         let indent = "  ".repeat(r.depth);
-        let icon = if r.status == "ok" { "✓" } else { "✗" };
+        let icon = status_icon(&r.status);
         lines.push(format!(
             "{indent}{icon} [{}] turn {}: {}({args})",
             r.agent, r.turn, r.tool
@@ -378,4 +393,55 @@ pub async fn run_reflect(args: ReflectArgs) -> Result<()> {
     println!("{report}");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// load_session pools every file in the session by timestamp and discards filenames — the
+    /// record's `agent` label must survive the merge verbatim, since it is the only thing left
+    /// attributing interleaved records to their agents.
+    #[test]
+    fn load_session_merges_files_by_timestamp_preserving_agent_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("reviewer-1-x.jsonl"),
+            concat!(
+                r#"{"ts_unix_ms":2,"agent":"reviewer-1-x","depth":0,"turn":1,"tool":"spawn_subagent","args":{},"status":"started","spawned_agent":"reviewer-1-x/subagent-1"}"#,
+                "\n",
+                r#"{"ts_unix_ms":3,"agent":"reviewer-1-x/subagent-1","depth":1,"turn":1,"tool":"grep","args":{},"status":"ok"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("reviewer-2-x.jsonl"),
+            concat!(
+                r#"{"ts_unix_ms":1,"agent":"reviewer-2-x","depth":0,"turn":1,"tool":"read_file","args":{},"status":"ok"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let session = load_session(dir.path()).unwrap();
+        let agents: Vec<&str> = session.records.iter().map(|r| r.agent.as_str()).collect();
+        assert_eq!(
+            agents,
+            ["reviewer-2-x", "reviewer-1-x", "reviewer-1-x/subagent-1"]
+        );
+        assert!(!session.is_complete());
+    }
+
+    #[test]
+    fn each_trajectory_status_classifies_distinctly() {
+        // the four known statuses plus the unknown fallback must all stay distinguishable —
+        // in particular an unrecognized future status must not masquerade as a failure
+        let statuses = ["ok", "started", "blocked_cycle", "error", "unknown"];
+        for (i, a) in statuses.iter().enumerate() {
+            for b in &statuses[i + 1..] {
+                assert_ne!(status_icon(a), status_icon(b), "{a} vs {b}");
+            }
+        }
+    }
 }

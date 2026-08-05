@@ -70,6 +70,9 @@ impl AgentDepth {
 
 pub struct AgentConfig {
     pub name: String,
+    /// Label stamped on this agent's trajectory records. Must be unique within a session
+    /// directory: `reflect` merges every file by timestamp, so colliding labels conflate
+    /// distinct agents in the merged trace.
     pub session_agent: String,
     pub model: String,
     pub max_turns: usize,
@@ -150,13 +153,15 @@ async fn compact_and_account(
     system_prompt: &str,
     history: &mut Vec<Message>,
     prompt: &mut Message,
-    turn: usize,
+    upcoming_turn: usize,
     conversation_usage: &mut ConversationUsageWindow,
     totals: &mut RunTotals,
 ) {
-    // compaction happens *before* the next turn runs, so it is named for that turn; the trajectory
-    // keeps logging the loop index it was reached from
-    let compaction_turn = turn + 1;
+    // `upcoming_turn` is the loop index of the turn this compaction precedes (the threshold
+    // site fires at the top of its iteration, cycle-break at the bottom, so it passes +1);
+    // +1 again converts to the 1-based vocabulary tool records and the "before turn N"
+    // summary prose use, so the record names the turn it precedes at both sites
+    let compaction_turn = upcoming_turn + 1;
     let compaction = match compact_history(
         &config.llm_semaphore,
         Arc::clone(&config.client),
@@ -185,7 +190,7 @@ async fn compact_and_account(
     if compaction.resets_usage_window() {
         conversation_usage.reset();
     }
-    log_compaction(config, turn, reason, &compaction).await;
+    log_compaction(config, compaction_turn, reason, &compaction).await;
 }
 
 struct FinishTool {
@@ -287,6 +292,8 @@ struct SubagentOutcome {
     tool_calls: usize,
     spawned_agent: Option<String>,
     usage: TokenUsage,
+    /// `run_agent` itself failed — as opposed to a legitimate result that starts with "Error:".
+    failed: bool,
 }
 
 impl Tool for FinishTool {
@@ -631,7 +638,7 @@ pub async fn run_agent(
                     &effective_system_prompt,
                     &mut history,
                     &mut prompt,
-                    turn,
+                    turn + 1,
                     &mut conversation_usage,
                     &mut totals,
                 )
@@ -789,7 +796,9 @@ fn prepare_subagent(
         .subagent_counter
         .fetch_add(1, Ordering::Relaxed)
         + 1;
-    let spawned_agent = format!("subagent-{subagent_id}");
+    // namespaced under the parent's identity: the counter is only unique within one agent tree,
+    // and `reflect` merges every trajectory file in the session by timestamp
+    let spawned_agent = format!("{}/subagent-{subagent_id}", parent_config.session_agent);
     report_progress(
         parent_config,
         parent_turns,
@@ -848,12 +857,14 @@ async fn run_subagent(
             tool_calls: result.tool_calls,
             spawned_agent: Some(spawned_agent),
             usage: result.usage,
+            failed: false,
         },
         Err(err) => SubagentOutcome {
             output: format!("Error: {err}"),
             tool_calls: 0,
             spawned_agent: Some(spawned_agent),
             usage: TokenUsage::default(),
+            failed: true,
         },
     }
 }
@@ -1008,10 +1019,26 @@ async fn execute_tool_call(
             .map(|(name, tool)| (name.clone(), Arc::clone(tool)))
             .collect();
         let sub = run_subagent(prepared, &subagent_tools, ctx.work_dir).await;
-        let status = match sub.output.starts_with("Error:") {
+        // typed from run_subagent's Ok/Err — a legitimate finish text that happens to start
+        // with "Error:" is not a failure
+        let status = match sub.failed {
             true => ToolCallStatus::Error,
             false => ToolCallStatus::Ok,
         };
+        // a successful subagent's own records carry its result, but a failed one's trace just
+        // stops — without a completion record here the failure is invisible to `reflect`
+        if sub.failed {
+            log_tool_call(
+                ctx.config,
+                ctx.turn + 1,
+                tool_name,
+                &args,
+                ToolCallStatus::Error,
+                sub.spawned_agent.as_deref(),
+                Some(&truncate_for_trajectory(sub.output.clone())),
+            )
+            .await;
+        }
         let outcome = ToolCallOutcome {
             output: sub.output,
             nested_tool_calls: sub.tool_calls,

@@ -111,6 +111,10 @@ impl SessionWriter {
             .await
             .wrap_err_with(|| format!("failed to open session log {}", path.display()))?;
         file.write_all(&buf).await?;
+        // tokio's write_all returns once bytes are handed to the background blocking write;
+        // without the flush a real I/O error is dropped with the file handle, and a
+        // process::exit right after append can lose the final record
+        file.flush().await?;
         Ok(())
     }
 }
@@ -135,5 +139,43 @@ pub fn sanitize_path_component(value: &str) -> String {
         "agent".to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The record must be on disk, whole, by the time `append_tool_call` returns — exit paths
+    /// that skip teardown (`process::exit`) rely on it.
+    #[tokio::test]
+    async fn appended_record_is_durable_and_parseable_on_return() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = SessionWriter {
+            root: Arc::new(dir.path().to_path_buf()),
+            relative_path: PathBuf::from("agent.jsonl"),
+            write_lock: Arc::new(Mutex::new(())),
+        };
+        let record = ToolCallRecord {
+            ts_unix_ms: 1,
+            agent: "reviewer-1-x".to_string(),
+            depth: 0,
+            turn: 1,
+            tool: "read_file".to_string(),
+            args: serde_json::json!({"path": "a.rs"}),
+            status: "ok".to_string(),
+            spawned_agent: None,
+            result: None,
+        };
+        writer.append_tool_call(&record).await.unwrap();
+        writer.append_tool_call(&record).await.unwrap();
+
+        let content = std::fs::read_to_string(dir.path().join("agent.jsonl")).unwrap();
+        let lines: Vec<ToolCallRecord> = content
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].agent, "reviewer-1-x");
     }
 }
