@@ -17,22 +17,41 @@ mod prompts;
 mod reflect;
 mod review;
 
-/// Flags shared between the default review mode and the ask subcommand.
+/// Flags shared across the default review mode and the subcommands. Declared once here and
+/// marked `global`, so they are accepted before or after a subcommand and always land in
+/// `Args.common` — per-subcommand copies would be independent namespaces, and a flag parsed
+/// into the copy an arm doesn't read would be silently dropped.
 #[derive(Debug, ClapArgs)]
 struct CommonArgs {
-    #[arg(long, default_value = ".")]
+    #[arg(long, global = true, default_value = ".")]
     repo: PathBuf,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     config: Option<PathBuf>,
 
-    #[arg(long, short)]
+    #[arg(long, short, global = true)]
     verbose: bool,
+}
 
+/// `--context-file`, kept out of the global `CommonArgs` deliberately: clap propagates a global
+/// arg by keeping one winning occurrence list (the subcommand's), so a repeatable flag split
+/// around the subcommand would silently drop the root's values. Instead this struct is flattened
+/// at the root and into `ask`/`pr`, and the two vectors are concatenated root-first (= the
+/// command-line order) at each use site.
+#[derive(Debug, ClapArgs)]
+struct ContextFileArgs {
     /// Read a file into the prompt verbatim; repeatable. Unlike the agents' own tools, this is not
     /// confined to the repo, so it can carry design notes or working docs that live outside it.
     #[arg(long = "context-file", value_name = "PATH")]
     context_file: Vec<PathBuf>,
+}
+
+fn merged_context_files(root: &ContextFileArgs, sub: &ContextFileArgs) -> Vec<PathBuf> {
+    root.context_file
+        .iter()
+        .chain(&sub.context_file)
+        .cloned()
+        .collect()
 }
 
 #[derive(Debug, Parser)]
@@ -43,6 +62,9 @@ struct Args {
 
     #[command(flatten)]
     common: CommonArgs,
+
+    #[command(flatten)]
+    context: ContextFileArgs,
 
     #[arg(
         long,
@@ -86,7 +108,7 @@ enum Command {
     /// Ask multiple LLM agents a free-form question about the codebase
     Ask {
         #[command(flatten)]
-        common: CommonArgs,
+        context: ContextFileArgs,
         /// Question or topic to discuss
         topic: String,
         /// Disable actor-critic debate and use parallel aggregation instead
@@ -119,9 +141,7 @@ enum Command {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let verbose = args.common.verbose
-        || matches!(&args.command, Some(Command::Ask { common, .. }) if common.verbose)
-        || matches!(&args.command, Some(Command::Pr(a)) if a.common.verbose);
+    let verbose = args.common.verbose;
     let is_reflect = matches!(&args.command, Some(Command::Reflect { .. }));
     let default_level = if verbose || is_reflect {
         "info"
@@ -160,21 +180,21 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Command::Ask {
-            common,
+            context,
             topic,
             no_debate,
             alloy,
             rounds,
             max_turns,
         }) => {
-            let repo = common.repo.canonicalize()?;
+            let repo = args.common.repo.canonicalize()?;
             if !repo.join(".git").is_dir() {
                 eyre::bail!("--repo must point to a git repository (missing .git)");
             }
-            let config = load_resolved_config(common.config.as_deref(), &repo).await?;
+            let config = load_resolved_config(args.common.config.as_deref(), &repo).await?;
             let topic = context::append_to_prompt(
                 topic,
-                &context::load_context_files(&common.context_file)?,
+                &context::load_context_files(&merged_context_files(&args.context, &context))?,
             );
             let max_turns = config.max_turns(max_turns)?;
             let use_alloy = alloy || config.default_alloy();
@@ -198,7 +218,7 @@ async fn main() -> Result<()> {
                     debate::DebateOptions {
                         max_rounds: rounds,
                         max_turns,
-                        verbose: common.verbose,
+                        verbose: args.common.verbose,
                         mode: debate::DebateMode::Topic,
                         alloy: use_alloy,
                         format: output::OutputFormat::Text,
@@ -206,7 +226,7 @@ async fn main() -> Result<()> {
                 )
                 .await?;
                 println!("{}", outcome.report);
-                if common.verbose {
+                if args.common.verbose {
                     eprintln!(
                         "\nTranscript saved to: {}",
                         outcome.transcript_path.display()
@@ -221,7 +241,7 @@ async fn main() -> Result<()> {
                 &topic,
                 &config,
                 max_turns,
-                common.verbose,
+                args.common.verbose,
                 review::TaskMode::Ask,
             )
             .await?;
@@ -230,8 +250,9 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Command::Pr(pr_args)) => {
+            let context_files = merged_context_files(&args.context, &pr_args.context);
             // config loading happens inside run_pr so its failures honor --format json too
-            return pr::run_pr(pr_args).await;
+            return pr::run_pr(pr_args, args.common, context_files).await;
         }
         Some(Command::Reflect { sessions_dir, n }) => {
             let repo = args.common.repo.canonicalize()?;
@@ -275,7 +296,7 @@ async fn main() -> Result<()> {
     };
     let prompt = context::append_to_prompt(
         prompt,
-        &context::load_context_files(&args.common.context_file)?,
+        &context::load_context_files(&args.context.context_file)?,
     );
 
     let use_alloy = args.alloy || config.default_alloy();
@@ -788,4 +809,101 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<String> {
         eyre::bail!("git {}: {}", args.join(" "), stderr.trim());
     }
     Ok(String::from_utf8(output.stdout)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Args::command().debug_assert();
+    }
+
+    fn parse(argv: &[&str]) -> Args {
+        Args::try_parse_from(argv).expect("argv parses")
+    }
+
+    fn ask_context(args: &Args) -> Vec<PathBuf> {
+        match &args.command {
+            Some(Command::Ask { context, .. }) => merged_context_files(&args.context, context),
+            _ => panic!("expected ask subcommand"),
+        }
+    }
+
+    fn pr_context(args: &Args) -> Vec<PathBuf> {
+        match &args.command {
+            Some(Command::Pr(pr_args)) => merged_context_files(&args.context, &pr_args.context),
+            _ => panic!("expected pr subcommand"),
+        }
+    }
+
+    #[test]
+    fn context_file_before_the_subcommand_reaches_ask() {
+        let args = parse(&["nitpicker", "--context-file", "/a", "ask", "topic"]);
+        assert_eq!(ask_context(&args), [PathBuf::from("/a")]);
+    }
+
+    #[test]
+    fn context_file_after_the_subcommand_reaches_ask() {
+        let args = parse(&["nitpicker", "ask", "--context-file", "/a", "topic"]);
+        assert_eq!(ask_context(&args), [PathBuf::from("/a")]);
+    }
+
+    #[test]
+    fn context_files_split_around_the_subcommand_merge_in_cli_order() {
+        let args = parse(&[
+            "nitpicker",
+            "--context-file",
+            "/a",
+            "ask",
+            "--context-file",
+            "/b",
+            "topic",
+        ]);
+        assert_eq!(
+            ask_context(&args),
+            [PathBuf::from("/a"), PathBuf::from("/b")]
+        );
+
+        let args = parse(&[
+            "nitpicker",
+            "--context-file",
+            "/a",
+            "pr",
+            "--context-file",
+            "/b",
+        ]);
+        assert_eq!(
+            pr_context(&args),
+            [PathBuf::from("/a"), PathBuf::from("/b")]
+        );
+    }
+
+    #[test]
+    fn global_scalars_land_in_common_from_either_side_of_the_subcommand() {
+        let args = parse(&["nitpicker", "-v", "--repo", "/x", "ask", "topic"]);
+        assert!(args.common.verbose);
+        assert_eq!(args.common.repo, PathBuf::from("/x"));
+
+        let args = parse(&["nitpicker", "ask", "topic", "--repo", "/x", "-v"]);
+        assert!(args.common.verbose);
+        assert_eq!(args.common.repo, PathBuf::from("/x"));
+
+        let args = parse(&["nitpicker", "pr", "--repo", "/x", "--config", "/c.toml"]);
+        assert!(!args.common.verbose);
+        assert_eq!(args.common.repo, PathBuf::from("/x"));
+        assert_eq!(args.common.config, Some(PathBuf::from("/c.toml")));
+    }
+
+    #[test]
+    fn subcommands_without_context_files_reject_the_flag() {
+        for argv in [
+            ["nitpicker", "reflect", "--context-file", "/a"],
+            ["nitpicker", "init", "--context-file", "/a"],
+        ] {
+            assert!(Args::try_parse_from(argv).is_err());
+        }
+    }
 }

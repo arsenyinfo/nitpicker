@@ -308,10 +308,12 @@ outside it. `--context-file` reads such a file directly into the prompt:
 nitpicker --context-file ~/notes/migration-plan.md --context-file /tmp/rfc.md
 ```
 
-Available on the default review mode, `ask`, and `pr`. Files are injected in the order given, after
-the task and any `--prompt` text. Total size is capped at 256 KiB across all files; a missing,
-binary, or non-UTF-8 file is an error, raised before any model is called. Because the contents are
-placed in the task prompt rather than the system prompt, spawned subagents do not inherit them.
+Available on the default review mode, `ask`, and `pr`; the flag may be given before or after the
+subcommand. Files are injected verbatim, in the order given, after the task and any `--prompt`
+text. Total injected size — contents plus each block's wrapper — is capped at 256 KiB; a missing,
+non-regular (FIFO, device node), binary, or non-UTF-8 file is an error, raised before any model is
+called. Because the contents are placed in the task prompt rather than the system prompt, spawned
+subagents do not inherit them.
 
 ### PR subcommand
 
@@ -379,7 +381,8 @@ println!("{}", result.text);
 ## Changelog
 
 **0.8.4** — 2026-08-10
-- New `--context-file <PATH>` flag (repeatable) injects out-of-repo files (capped at 256 KiB in total) into the task prompt for review, `ask`, and `pr`.
+- New `--context-file <PATH>` flag (repeatable) injects out-of-repo files (regular files only, capped at 256 KiB in total including block wrappers) into the task prompt for review, `ask`, and `pr`; accepted before or after the subcommand.
+- `--repo`, `--config`, and `-v`/`--verbose` are now global flags: accepted before or after a subcommand, no longer silently ignored in the root position.
 
 **0.8.3** — 2026-08-03 (`nitpicker-agent` 0.2.0)
 - **Stable Tool Definitions**: Send tool definitions in name-sorted order to preserve request prefix determinism and maximize provider prompt-cache hits across turns.

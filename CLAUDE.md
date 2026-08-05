@@ -163,12 +163,27 @@ the override is inherited by nested subagents. `None` ⇒ the built-in generic p
 
 `--context-file <PATH>` (repeatable) injects a file the agents' tools cannot reach — those are
 canonicalize-sandboxed to the repo, so a design doc living outside it is otherwise unreadable. The
-flag is a field on `CommonArgs`, which is flattened into `Args`, `Command::Ask`, and `PrArgs`, so one
-declaration covers default review, `--analyze`, `ask`, and `pr`.
+flag lives in `ContextFileArgs`, flattened into `Args` (root), `Command::Ask`, and `PrArgs`, and the
+root and subcommand vectors are concatenated root-first (= command-line order) at each use site, so
+the flag works before or after the subcommand. It is deliberately **not** a clap `global` arg:
+global propagation keeps one winning occurrence list (the subcommand's), so a repeatable flag split
+around the subcommand would silently drop the root's values. The scalar shared flags (`--repo`,
+`--config`, `-v`) *are* global — declared once on `CommonArgs` at the root, readable from
+`Args.common` regardless of position (`run_pr` receives them as a parameter). `init`/`reflect`
+don't flatten `ContextFileArgs`, so `--context-file` after them is a parse error rather than a
+silent no-op; before them it is ignored like every other root-only flag.
 
-Loading is eager and total-budgeted (256 KiB across all files, `MAX_TOTAL_BYTES`); missing, binary
-(null-byte guard, mirroring the tool sandbox's), and non-UTF-8 files are hard errors, so a bad path
-fails before any model call. `append_to_prompt` appends the blocks to the **task prompt**, not the
+Loading is eager and total-budgeted (`MAX_TOTAL_BYTES`, 256 KiB): only regular files are accepted
+(a FIFO or device node would block or stream without bound — checked by stat before open, since
+opening a FIFO read-only already blocks), each file is read through a bounded reader capped at the
+remaining budget + 1 byte so an oversized file fails fast instead of being buffered whole, and the
+budget meters the **serialized block** (escaped contents + fence + path + separator, via
+`render_block`) rather than raw file bytes — so wrapper overhead is charged and empty files are not
+free. Missing, non-regular, over-budget, binary (null-byte guard, mirroring the tool sandbox's),
+and non-UTF-8 files are hard errors, so a bad path fails before any model call. Contents are
+injected verbatim — no trimming; the only mutation is the closing-tag neutralization below.
+
+`append_to_prompt` appends the blocks to the **task prompt**, not the
 system prompt — these are per-run material with the same lifetime as `--prompt`, whereas
 `project_context` (`CLAUDE.md`/`AGENTS.md`) is a single slot that propagates to subagents. The
 consequence, deliberate: **subagents do not see context files**.
