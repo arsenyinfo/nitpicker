@@ -1738,28 +1738,22 @@ mod tests {
     /// surfaces calls under `ToolUse`, so the override losing would silently end the agent loop.
     #[test]
     fn a_structured_tool_call_overrides_any_wire_finish_reason() {
-        let choice = OneOrMany::one(tool_call_content());
-        for wire in [
-            FinishReason::Stop,
-            FinishReason::MaxTokens,
-            FinishReason::None,
-            FinishReason::Other("length_capped".to_string()),
-        ] {
-            assert_eq!(resolve_finish_reason(&choice, wire), FinishReason::ToolUse);
-        }
-    }
-
-    #[test]
-    fn a_tool_call_beside_text_still_wins() {
-        let choice = OneOrMany::many(vec![
+        let alone = OneOrMany::one(tool_call_content());
+        let beside_text = OneOrMany::many(vec![
             AssistantContent::text("narration before the call"),
             tool_call_content(),
         ])
         .expect("two items");
-        assert_eq!(
-            resolve_finish_reason(&choice, FinishReason::Stop),
-            FinishReason::ToolUse
-        );
+        for choice in [alone, beside_text] {
+            for wire in [
+                FinishReason::Stop,
+                FinishReason::MaxTokens,
+                FinishReason::None,
+                FinishReason::Other("length_capped".to_string()),
+            ] {
+                assert_eq!(resolve_finish_reason(&choice, wire), FinishReason::ToolUse);
+            }
+        }
     }
 
     #[test]

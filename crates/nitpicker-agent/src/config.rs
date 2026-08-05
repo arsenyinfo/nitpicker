@@ -656,17 +656,41 @@ mod tests {
     /// membership-only table but fails these.
     #[test]
     fn required_env_var_branch_table_and_precedence() {
-        fn check(
-            make_provider: fn() -> ProviderType,
-            auth: Option<&str>,
-            base_url: Option<&str>,
-            api_key_env: Option<&str>,
-            expected: Option<&str>,
-        ) {
+        fn provider(name: &str) -> ProviderType {
+            match name {
+                "anthropic" => ProviderType::Anthropic,
+                "gemini" => ProviderType::Gemini,
+                "openai" => ProviderType::OpenAi,
+                "openrouter" => ProviderType::OpenRouter,
+                other => panic!("unknown provider in table: {other}"),
+            }
+        }
+
+        // (provider, auth, base_url, api_key_env, expected). Rows pairing a short-circuit
+        // with an explicit api_key_env pin precedence; the last four pin the default table.
+        #[rustfmt::skip]
+        let rows = [
+            ("gemini",     Some("agy-keyring"), None,                              None,             None),
+            ("gemini",     Some("agy-keyring"), None,                              Some("EXPLICIT"), None),
+            // agy-keyring only short-circuits on gemini; elsewhere it falls through
+            ("openai",     Some("agy-keyring"), None,                              None,             Some("OPENAI_API_KEY")),
+            ("openai",     Some("azure-ad"),    Some("https://f.example/v1"),      Some("EXPLICIT"), None),
+            ("openai",     Some("codex"),       None,                              Some("EXPLICIT"), None),
+            ("openai",     None,                Some("http://localhost:1234/v1"),  Some("EXPLICIT"), None),
+            ("openai",     None,                Some("http://127.0.0.1:1234/v1"),  None,             None),
+            // a non-local base_url does not bypass the key; explicit env beats the default
+            ("anthropic",  None,                Some("https://gw.example"),        Some("EXPLICIT"), Some("EXPLICIT")),
+            ("anthropic",  None,                None,                              None,             Some("ANTHROPIC_API_KEY")),
+            ("gemini",     None,                None,                              None,             Some("GEMINI_API_KEY")),
+            ("openai",     None,                None,                              None,             Some("OPENAI_API_KEY")),
+            ("openrouter", None,                None,                              None,             Some("OPENROUTER_API_KEY")),
+        ];
+
+        for (name, auth, base_url, api_key_env, expected) in rows {
             let reviewer = ReviewerConfig {
                 name: String::new(),
                 model: String::new(),
-                provider: make_provider(),
+                provider: provider(name),
                 base_url: base_url.map(str::to_string),
                 api_key_env: api_key_env.map(str::to_string),
                 max_tokens: None,
@@ -677,7 +701,7 @@ mod tests {
             };
             let agg = AggregatorConfig {
                 model: String::new(),
-                provider: make_provider(),
+                provider: provider(name),
                 base_url: base_url.map(str::to_string),
                 api_key_env: api_key_env.map(str::to_string),
                 max_tokens: None,
@@ -685,108 +709,17 @@ mod tests {
                 azure_scope: None,
                 azure_credentials: None,
             };
-            assert_eq!(
-                required_env_var(ClientSettings::from(&reviewer)),
-                expected,
-                "reviewer: auth={auth:?} base_url={base_url:?} api_key_env={api_key_env:?}"
-            );
-            assert_eq!(
-                required_env_var(ClientSettings::from(&agg)),
-                expected,
-                "aggregator: auth={auth:?} base_url={base_url:?} api_key_env={api_key_env:?}"
-            );
+            for (role, settings) in [
+                ("reviewer", ClientSettings::from(&reviewer)),
+                ("aggregator", ClientSettings::from(&agg)),
+            ] {
+                assert_eq!(
+                    required_env_var(settings),
+                    expected,
+                    "{role}: {name} auth={auth:?} base_url={base_url:?} api_key_env={api_key_env:?}"
+                );
+            }
         }
-
-        // gemini proxy auth short-circuits, even over an explicit env
-        check(
-            || ProviderType::Gemini,
-            Some("agy-keyring"),
-            None,
-            None,
-            None,
-        );
-        check(
-            || ProviderType::Gemini,
-            Some("agy-keyring"),
-            None,
-            Some("EXPLICIT"),
-            None,
-        );
-        // ... but only on gemini: the same auth on another provider falls through
-        check(
-            || ProviderType::OpenAi,
-            Some("agy-keyring"),
-            None,
-            None,
-            Some("OPENAI_API_KEY"),
-        );
-        // azure-ad and codex auth need no key, even with an explicit env configured
-        check(
-            || ProviderType::OpenAi,
-            Some("azure-ad"),
-            Some("https://foundry.example/openai/v1"),
-            Some("EXPLICIT"),
-            None,
-        );
-        check(
-            || ProviderType::OpenAi,
-            Some("codex"),
-            None,
-            Some("EXPLICIT"),
-            None,
-        );
-        // a local server needs no key, even with an explicit env configured
-        check(
-            || ProviderType::OpenAi,
-            None,
-            Some("http://localhost:1234/v1"),
-            Some("EXPLICIT"),
-            None,
-        );
-        check(
-            || ProviderType::OpenAi,
-            None,
-            Some("http://127.0.0.1:1234/v1"),
-            None,
-            None,
-        );
-        // a non-local base_url does not bypass the key: explicit env wins over the default
-        check(
-            || ProviderType::Anthropic,
-            None,
-            Some("https://gateway.example"),
-            Some("EXPLICIT"),
-            Some("EXPLICIT"),
-        );
-        // the per-provider default table
-        check(
-            || ProviderType::Anthropic,
-            None,
-            None,
-            None,
-            Some("ANTHROPIC_API_KEY"),
-        );
-        check(
-            || ProviderType::Gemini,
-            None,
-            None,
-            None,
-            Some("GEMINI_API_KEY"),
-        );
-        check(
-            || ProviderType::OpenAi,
-            None,
-            None,
-            None,
-            Some("OPENAI_API_KEY"),
-        );
-        check(
-            || ProviderType::OpenRouter,
-            None,
-            None,
-            None,
-            Some("OPENROUTER_API_KEY"),
-        );
     }
 
     /// The two `From` impls must extract the same view from equivalent configs — a field
