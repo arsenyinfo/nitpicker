@@ -251,7 +251,7 @@ Tool outputs are intentionally a bit self-describing: `read_file` includes file/
 ### Session artifacts (`session.rs`)
 
 - When `[defaults].log_trajectories = true`, nitpicker writes session artifacts under `~/.nitpicker/sessions/session-<timestamp>-<pid>/`
-- Reviewer and debate-turn traces are stored as per-agent JSONL files; each record's `agent` field carries the file's own identity (`reviewer-<i>-<name>` / `<side>-<round>`, subagents namespaced `<parent>/subagent-<id>`), because `reflect` merges a session's files by timestamp and the label is the only thing keeping interleaved agents attributable
+- Reviewer and debate-turn traces are stored as per-agent JSONL files; each record's `agent` field names the agent that wrote it — top-level agents use their file's stem (`reviewer-<i>-<name>` / `<side>-<round>`), subagents write into the same file under `<parent>/subagent-<id>` — because `reflect` merges a session's files by timestamp and the label is the only thing keeping interleaved agents attributable
 - A failed `spawn_subagent` appends an error completion record in the parent's trace (a successful one deliberately doesn't — the subagent's own records, written under its own label to the shared session file, carry its result); `compact` records use the same 1-based turn numbering as tool records and name the turn they precede
 - Appends are flushed before returning, so write errors propagate to the caller's warn and `process::exit` paths can't drop the tail record
 - Final synthesized output is saved as `aggregation.json`
