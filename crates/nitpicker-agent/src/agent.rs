@@ -941,7 +941,8 @@ async fn execute_tool_call(
             let outcome = ToolCallOutcome {
                 output: "Error: subagent depth limit reached; cannot spawn another subagent"
                     .to_string(),
-                nested_tool_calls: 0,                status: ToolCallStatus::Error,
+                nested_tool_calls: 0,
+                status: ToolCallStatus::Error,
                 spawned_agent: None,
                 subagent_usage: TokenUsage::default(),
             };
@@ -969,7 +970,8 @@ async fn execute_tool_call(
             Err(err) => {
                 let outcome = ToolCallOutcome {
                     output: format!("Error: {err}"),
-                    nested_tool_calls: 0,                    status: ToolCallStatus::Error,
+                    nested_tool_calls: 0,
+                    status: ToolCallStatus::Error,
                     spawned_agent: None,
                     subagent_usage: TokenUsage::default(),
                 };
@@ -1012,7 +1014,8 @@ async fn execute_tool_call(
         };
         let outcome = ToolCallOutcome {
             output: sub.output,
-            nested_tool_calls: sub.tool_calls,            status,
+            nested_tool_calls: sub.tool_calls,
+            status,
             spawned_agent: sub.spawned_agent,
             subagent_usage: sub.usage,
         };
@@ -1024,7 +1027,8 @@ async fn execute_tool_call(
         Some(tool) => match tool.call(args, ctx.work_dir.to_path_buf()).await {
             Ok(output) => ToolCallOutcome {
                 output,
-                nested_tool_calls: 0,                status: ToolCallStatus::Ok,
+                nested_tool_calls: 0,
+                status: ToolCallStatus::Ok,
                 spawned_agent: None,
                 subagent_usage: TokenUsage::default(),
             },
@@ -1032,7 +1036,8 @@ async fn execute_tool_call(
                 debug!(agent = %ctx.config.name, tool = %tool_name, error = %err, "tool error");
                 ToolCallOutcome {
                     output: format!("Error: {err}"),
-                    nested_tool_calls: 0,                    status: ToolCallStatus::Error,
+                    nested_tool_calls: 0,
+                    status: ToolCallStatus::Error,
                     spawned_agent: None,
                     subagent_usage: TokenUsage::default(),
                 }
@@ -1043,7 +1048,8 @@ async fn execute_tool_call(
             debug!(agent = %ctx.config.name, tool = %tool_name, "unknown tool");
             ToolCallOutcome {
                 output: msg,
-                nested_tool_calls: 0,                status: ToolCallStatus::Error,
+                nested_tool_calls: 0,
+                status: ToolCallStatus::Error,
                 spawned_agent: None,
                 subagent_usage: TokenUsage::default(),
             }

@@ -841,7 +841,10 @@ mod tests {
 
         for (pattern, why) in [
             ("EARLY", "a duplicated sample would match this line twice"),
-            ("STRADDLE", "a lost sample would break the boundary-straddling match"),
+            (
+                "STRADDLE",
+                "a lost sample would break the boundary-straddling match",
+            ),
             ("BEYOND", "the same handle must keep reading past the probe"),
         ] {
             let regex = Regex::new(pattern).unwrap();

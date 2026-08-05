@@ -1,8 +1,7 @@
 #[cfg(feature = "antigravity")]
 use crate::config::Config;
 use crate::config::{
-    AggregatorConfig, ClientSettings, ProviderType, ReviewerConfig, is_azure_ad_auth,
-    is_codex_auth,
+    AggregatorConfig, ClientSettings, ProviderType, ReviewerConfig, is_azure_ad_auth, is_codex_auth,
 };
 use crate::llm::{LLMClient, LLMClientDyn, LLMProvider, WithRetryExt};
 use eyre::Result;

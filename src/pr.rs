@@ -817,7 +817,9 @@ async fn run_review_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::PrComment;
+    use super::{BranchRestoreGuard, HeadState, PrComment, get_head_state};
+    use std::path::Path;
+    use std::process::Command;
 
     #[test]
     fn pr_comments_tolerate_null_author() {
@@ -830,10 +832,6 @@ mod tests {
         assert!(comments[0].author.is_none());
         assert_eq!(comments[1].author.as_ref().unwrap().login, "octocat");
     }
-
-    use super::{BranchRestoreGuard, HeadState, get_head_state, restore_head};
-    use std::path::Path;
-    use std::process::Command;
 
     fn git(repo: &Path, args: &[&str]) {
         let out = Command::new("git")
@@ -891,9 +889,10 @@ mod tests {
     }
 
     /// A detached HEAD must be restored with `switch --detach` (plain `git switch` refuses a
-    /// bare commit) — the failure mode is the user silently left on the PR branch.
+    /// bare commit) — the failure mode is the user silently left on the PR branch. Exercised
+    /// through the guard's Drop, the path production actually takes.
     #[test]
-    fn restore_head_re_detaches_onto_the_original_commit() {
+    fn dropping_the_guard_re_detaches_onto_the_original_commit() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().canonicalize().unwrap();
         init_repo(&repo);
@@ -906,7 +905,10 @@ mod tests {
         };
 
         git(&repo, &["switch", "main"]);
-        restore_head(&repo, &head);
+        drop(BranchRestoreGuard {
+            repo: repo.clone(),
+            head,
+        });
 
         match get_head_state(&repo).unwrap() {
             HeadState::Detached(sha) => assert_eq!(sha, original_sha),

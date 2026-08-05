@@ -1745,10 +1745,7 @@ mod tests {
             FinishReason::None,
             FinishReason::Other("length_capped".to_string()),
         ] {
-            assert_eq!(
-                resolve_finish_reason(&choice, wire),
-                FinishReason::ToolUse
-            );
+            assert_eq!(resolve_finish_reason(&choice, wire), FinishReason::ToolUse);
         }
     }
 

@@ -484,15 +484,24 @@ mod tests {
     }
 
     /// Oversized context is cut at a char boundary near 50k: the head survives, the tail is
-    /// dropped, and a multibyte char spanning the boundary must not panic the slice.
+    /// dropped and replaced with the partial-output marker, and a multibyte char spanning the
+    /// boundary must not panic the slice.
     #[tokio::test]
     async fn oversized_project_context_is_truncated_on_a_char_boundary() {
         let dir = tempfile::tempdir().unwrap();
-        let content = "é".repeat(30_000); // 60_000 bytes, boundary splits a codepoint
+        let mut content = "é".repeat(30_000); // 60_000 bytes, the cap splits a codepoint
+        content.push_str("TAIL-SENTINEL");
         write(&dir, "CLAUDE.md", content.as_bytes());
 
         let context = build_context(dir.path()).await;
-        assert!(context.len() < content.len());
         assert!(context.contains(&"é".repeat(1_000)));
+        assert!(
+            !context.contains("TAIL-SENTINEL"),
+            "content past the cap must be dropped"
+        );
+        assert!(
+            context.contains("... truncated ("),
+            "the partial-output marker is part of the documented contract"
+        );
     }
 }

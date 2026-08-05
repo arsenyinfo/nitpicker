@@ -698,7 +698,13 @@ mod tests {
         }
 
         // gemini proxy auth short-circuits, even over an explicit env
-        check(|| ProviderType::Gemini, Some("agy-keyring"), None, None, None);
+        check(
+            || ProviderType::Gemini,
+            Some("agy-keyring"),
+            None,
+            None,
+            None,
+        );
         check(
             || ProviderType::Gemini,
             Some("agy-keyring"),
@@ -722,7 +728,13 @@ mod tests {
             Some("EXPLICIT"),
             None,
         );
-        check(|| ProviderType::OpenAi, Some("codex"), None, Some("EXPLICIT"), None);
+        check(
+            || ProviderType::OpenAi,
+            Some("codex"),
+            None,
+            Some("EXPLICIT"),
+            None,
+        );
         // a local server needs no key, even with an explicit env configured
         check(
             || ProviderType::OpenAi,
@@ -747,14 +759,40 @@ mod tests {
             Some("EXPLICIT"),
         );
         // the per-provider default table
-        check(|| ProviderType::Anthropic, None, None, None, Some("ANTHROPIC_API_KEY"));
-        check(|| ProviderType::Gemini, None, None, None, Some("GEMINI_API_KEY"));
-        check(|| ProviderType::OpenAi, None, None, None, Some("OPENAI_API_KEY"));
-        check(|| ProviderType::OpenRouter, None, None, None, Some("OPENROUTER_API_KEY"));
+        check(
+            || ProviderType::Anthropic,
+            None,
+            None,
+            None,
+            Some("ANTHROPIC_API_KEY"),
+        );
+        check(
+            || ProviderType::Gemini,
+            None,
+            None,
+            None,
+            Some("GEMINI_API_KEY"),
+        );
+        check(
+            || ProviderType::OpenAi,
+            None,
+            None,
+            None,
+            Some("OPENAI_API_KEY"),
+        );
+        check(
+            || ProviderType::OpenRouter,
+            None,
+            None,
+            None,
+            Some("OPENROUTER_API_KEY"),
+        );
     }
 
     /// The two `From` impls must extract the same view from equivalent configs — a field
-    /// added to one adapter but not the other would silently re-fork the roles.
+    /// wired from the wrong source field in either impl would silently re-fork the roles; the
+    /// exhaustive destructures below make adding a field without extending this comparison a
+    /// compile error.
     #[test]
     fn the_two_role_views_extract_identical_settings() {
         let reviewer = ReviewerConfig {
@@ -779,17 +817,31 @@ mod tests {
             azure_scope: Some("scope".to_string()),
             azure_credentials: Some("dev".to_string()),
         };
-        let rv = ClientSettings::from(&reviewer);
-        let av = ClientSettings::from(&agg);
+        let ClientSettings {
+            provider: r_provider,
+            auth: r_auth,
+            base_url: r_base_url,
+            api_key_env: r_api_key_env,
+            azure_scope: r_azure_scope,
+            azure_credentials: r_azure_credentials,
+        } = ClientSettings::from(&reviewer);
+        let ClientSettings {
+            provider: a_provider,
+            auth: a_auth,
+            base_url: a_base_url,
+            api_key_env: a_api_key_env,
+            azure_scope: a_azure_scope,
+            azure_credentials: a_azure_credentials,
+        } = ClientSettings::from(&agg);
         assert_eq!(
-            std::mem::discriminant(rv.provider),
-            std::mem::discriminant(av.provider)
+            std::mem::discriminant(r_provider),
+            std::mem::discriminant(a_provider)
         );
-        assert_eq!(rv.auth, av.auth);
-        assert_eq!(rv.base_url, av.base_url);
-        assert_eq!(rv.api_key_env, av.api_key_env);
-        assert_eq!(rv.azure_scope, av.azure_scope);
-        assert_eq!(rv.azure_credentials, av.azure_credentials);
+        assert_eq!(r_auth, a_auth);
+        assert_eq!(r_base_url, a_base_url);
+        assert_eq!(r_api_key_env, a_api_key_env);
+        assert_eq!(r_azure_scope, a_azure_scope);
+        assert_eq!(r_azure_credentials, a_azure_credentials);
     }
 
     #[test]
