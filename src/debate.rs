@@ -8,8 +8,6 @@ use nitpicker_agent::agent::{
 };
 use nitpicker_agent::config::{Config, ReviewerConfig};
 use nitpicker_agent::llm::{Completion, LLMClientDyn, TokenUsage};
-#[cfg(feature = "antigravity")]
-use nitpicker_agent::provider::config_needs_gemini_proxy;
 use nitpicker_agent::provider::{build_aggregator_client, build_reviewer_client};
 use nitpicker_agent::session::{AggregationRecord, SessionLogger, SessionWriter};
 use nitpicker_agent::tools::{Tool, all_tools};
@@ -450,20 +448,10 @@ pub async fn run_debate(
     let critic_cfg = &config.reviewer[1];
     let agg_cfg = &config.aggregator;
 
-    // proxy client stays bound for the function so its local server outlives the debate;
+    // proxy handle stays bound for the function so its local server outlives the debate;
     // only its base URL is threaded into the client builders.
-    #[cfg(feature = "antigravity")]
-    let gemini_proxy = match config_needs_gemini_proxy(config) {
-        true => {
-            info!("Starting Gemini proxy (agy-keyring)");
-            Some(crate::gemini_proxy::GeminiProxyClient::new().await?)
-        }
-        false => None,
-    };
-    #[cfg(feature = "antigravity")]
-    let proxy_url: Option<String> = gemini_proxy.as_ref().map(|p| p.base_url());
-    #[cfg(not(feature = "antigravity"))]
-    let proxy_url: Option<String> = None;
+    let gemini_proxy = crate::proxy::GeminiProxy::maybe_start(config).await?;
+    let proxy_url = gemini_proxy.url();
 
     let actor_client: Arc<dyn LLMClientDyn>;
     let critic_client: Arc<dyn LLMClientDyn>;
