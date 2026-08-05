@@ -384,7 +384,7 @@ println!("{}", result.text);
 - New `--context-file <PATH>` flag (repeatable) injects out-of-repo files (regular files only, capped at 256 KiB in total including block wrappers) into the task prompt for review, `ask`, and `pr`; accepted before or after the subcommand.
 - `--repo`, `--config`, and `-v`/`--verbose` are now global flags: accepted before or after a subcommand, no longer silently ignored in the root position. `init` honors `--repo` as the directory to write `nitpicker.toml` into, and rejects `--config`.
 
-**0.8.3** — 2026-08-03 (`nitpicker-agent` 0.2.0)
+**0.8.3** — 2026-08-05 (`nitpicker-agent` 0.2.0)
 - **Stable Tool Definitions**: Send tool definitions in name-sorted order to preserve request prefix determinism and maximize provider prompt-cache hits across turns.
 - **Cache-Aware Token Metering**: Added `cached_input_tokens` and `cache_creation_input_tokens` to `TokenUsage` and `pr --json`, normalized `input_tokens` across provider cache shapes (fixing compaction triggers on auto-caching providers), and updated progress display (e.g. `1.0M in · 90% cached`).
 - **Flexible Output Caps**: Removed hardcoded 8192-token output caps on agent turns and compaction (preventing reasoning models from exhausting token budgets on internal thinking before emitting output). Added `max_tokens` configuration per reviewer (`None` uses provider default; aggregator defaults to 16,384).
