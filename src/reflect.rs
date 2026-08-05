@@ -399,26 +399,26 @@ pub async fn run_reflect(args: ReflectArgs) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// Sessions from before the identity/turn-vocabulary changes ("root"/"subagent-N" labels,
-    /// 0-based compact turns) must keep loading next to new-format files, merged by timestamp
-    /// with labels preserved verbatim.
+    /// load_session pools every file in the session by timestamp and discards filenames — the
+    /// record's `agent` label must survive the merge verbatim, since it is the only thing left
+    /// attributing interleaved records to their agents.
     #[test]
-    fn load_session_merges_old_and_new_format_files_by_timestamp() {
+    fn load_session_merges_files_by_timestamp_preserving_agent_labels() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            dir.path().join("reviewer-old.jsonl"),
+            dir.path().join("reviewer-1-x.jsonl"),
             concat!(
-                r#"{"ts_unix_ms":2,"agent":"root","depth":0,"turn":0,"tool":"compact","args":{},"status":"ok"}"#,
+                r#"{"ts_unix_ms":2,"agent":"reviewer-1-x","depth":0,"turn":1,"tool":"spawn_subagent","args":{},"status":"started","spawned_agent":"reviewer-1-x/subagent-1"}"#,
                 "\n",
-                r#"{"ts_unix_ms":1,"agent":"subagent-1","depth":1,"turn":1,"tool":"grep","args":{},"status":"ok"}"#,
+                r#"{"ts_unix_ms":3,"agent":"reviewer-1-x/subagent-1","depth":1,"turn":1,"tool":"grep","args":{},"status":"ok"}"#,
                 "\n",
             ),
         )
         .unwrap();
         std::fs::write(
-            dir.path().join("reviewer-1-x.jsonl"),
+            dir.path().join("reviewer-2-x.jsonl"),
             concat!(
-                r#"{"ts_unix_ms":3,"agent":"reviewer-1-x","depth":0,"turn":2,"tool":"spawn_subagent","args":{},"status":"started","spawned_agent":"reviewer-1-x/subagent-1"}"#,
+                r#"{"ts_unix_ms":1,"agent":"reviewer-2-x","depth":0,"turn":1,"tool":"read_file","args":{},"status":"ok"}"#,
                 "\n",
             ),
         )
@@ -426,7 +426,10 @@ mod tests {
 
         let session = load_session(dir.path()).unwrap();
         let agents: Vec<&str> = session.records.iter().map(|r| r.agent.as_str()).collect();
-        assert_eq!(agents, ["subagent-1", "root", "reviewer-1-x"]);
+        assert_eq!(
+            agents,
+            ["reviewer-2-x", "reviewer-1-x", "reviewer-1-x/subagent-1"]
+        );
         assert!(!session.is_complete());
     }
 
