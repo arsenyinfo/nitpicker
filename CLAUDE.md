@@ -251,7 +251,9 @@ Tool outputs are intentionally a bit self-describing: `read_file` includes file/
 ### Session artifacts (`session.rs`)
 
 - When `[defaults].log_trajectories = true`, nitpicker writes session artifacts under `~/.nitpicker/sessions/session-<timestamp>-<pid>/`
-- Reviewer and debate-turn traces are stored as per-agent JSONL files
+- Reviewer and debate-turn traces are stored as per-agent JSONL files; each record's `agent` field carries the file's own identity (`reviewer-<i>-<name>` / `<side>-<round>`, subagents namespaced `<parent>/subagent-<id>`), because `reflect` merges a session's files by timestamp and the label is the only thing keeping interleaved agents attributable
+- A failed `spawn_subagent` appends an error completion record in the parent's trace (a successful one deliberately doesn't — the subagent's own file records its result); `compact` records use the same 1-based turn numbering as tool records
+- Appends are flushed before returning, so write errors propagate to the caller's warn and `process::exit` paths can't drop the tail record
 - Final synthesized output is saved as `aggregation.json`
 
 ### Gemini AG2 proxy (`gemini_proxy/`)
