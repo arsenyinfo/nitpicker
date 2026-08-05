@@ -498,7 +498,7 @@ pub async fn run_debate(
         info!(path = %logger.root().display(), "trajectory logging enabled");
     }
 
-    let project_context = crate::review::build_context(repo).await;
+    let project_context = crate::context::build_context(repo).await;
 
     let agg_client: Arc<dyn LLMClientDyn> = build_aggregator_client(agg_cfg, proxy_url.as_deref())?;
 

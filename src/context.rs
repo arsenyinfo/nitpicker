@@ -17,6 +17,85 @@ repository and cannot be opened with your tools — their full contents are alre
 const CLOSE_TAG: &str = "</context_file>";
 const ESCAPED_CLOSE_TAG: &str = "<\\/context_file>";
 
+/// Cap for auto-discovered project context, distinct from the `--context-file` budget above:
+/// discovery is best-effort and truncates, explicit files are contractual and hard-error.
+const MAX_CONTEXT_SIZE: usize = 50_000;
+
+/// Best-effort project-context discovery: the repo's `CLAUDE.md`, else `AGENTS.md`, first
+/// successful read wins. Failures degrade to a warning and an empty/partial result.
+pub(crate) async fn build_context(repo: &std::path::Path) -> String {
+    use nitpicker_agent::tools::{floor_char_boundary, is_binary_file};
+
+    let mut context = String::new();
+
+    let repo_canonical = match tokio::fs::canonicalize(repo).await {
+        Ok(p) => p,
+        Err(_) => {
+            tracing::warn!("Failed to canonicalize repo path, skipping context files");
+            return context;
+        }
+    };
+
+    for filename in ["CLAUDE.md", "AGENTS.md"] {
+        let path = repo_canonical.join(filename);
+
+        if !path.starts_with(&repo_canonical) {
+            tracing::warn!("Context file path escapes repo root: {}", filename);
+            continue;
+        }
+
+        let metadata = match tokio::fs::metadata(&path).await {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                tracing::warn!("Cannot access context file {}: {}", filename, e);
+                continue;
+            }
+        };
+
+        if !metadata.is_file() {
+            continue;
+        }
+
+        match is_binary_file(&path).await {
+            Ok(true) => {
+                tracing::warn!("Context file appears to be binary, skipping: {}", filename);
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!("Cannot check if context file is binary {}: {}", filename, e);
+                continue;
+            }
+        }
+
+        match tokio::fs::read_to_string(&path).await {
+            Ok(content) => {
+                let content = if content.len() > MAX_CONTEXT_SIZE {
+                    let boundary = floor_char_boundary(&content, MAX_CONTEXT_SIZE);
+                    format!(
+                        "{}\n... truncated ({} chars)",
+                        &content[..boundary],
+                        content.len()
+                    )
+                } else {
+                    content
+                };
+                context.push_str("## Project Context (from ");
+                context.push_str(filename);
+                context.push_str(")\n\n");
+                context.push_str(&content);
+                break;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to read context file {}: {}", filename, e);
+            }
+        }
+    }
+
+    context
+}
+
 /// A file injected verbatim into the prompt, bypassing the repo-scoped tool sandbox.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ContextFile {
@@ -372,5 +451,48 @@ mod tests {
             .expect("path attribute is present");
 
         assert_eq!(attribute, "/tmp/a&quot; onload=&quot;x.md");
+    }
+
+    #[tokio::test]
+    async fn project_context_prefers_claude_md_over_agents_md() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir, "CLAUDE.md", b"claude sentinel");
+        write(&dir, "AGENTS.md", b"agents sentinel");
+
+        let context = build_context(dir.path()).await;
+        assert!(context.contains("claude sentinel"));
+        assert!(!context.contains("agents sentinel"));
+    }
+
+    /// A binary (or unreadable) CLAUDE.md is skipped with a `continue`, not an abort: the
+    /// loader must fall through and still pick up AGENTS.md.
+    #[tokio::test]
+    async fn binary_claude_md_falls_through_to_agents_md() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir, "CLAUDE.md", b"binary\0junk");
+        write(&dir, "AGENTS.md", b"agents sentinel");
+
+        let context = build_context(dir.path()).await;
+        assert!(context.contains("agents sentinel"));
+        assert!(!context.contains("binary"));
+    }
+
+    #[tokio::test]
+    async fn missing_project_context_yields_empty_string() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(build_context(dir.path()).await, "");
+    }
+
+    /// Oversized context is cut at a char boundary near 50k: the head survives, the tail is
+    /// dropped, and a multibyte char spanning the boundary must not panic the slice.
+    #[tokio::test]
+    async fn oversized_project_context_is_truncated_on_a_char_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "é".repeat(30_000); // 60_000 bytes, boundary splits a codepoint
+        write(&dir, "CLAUDE.md", content.as_bytes());
+
+        let context = build_context(dir.path()).await;
+        assert!(context.len() < content.len());
+        assert!(context.contains(&"é".repeat(1_000)));
     }
 }
