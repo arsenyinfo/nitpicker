@@ -380,7 +380,7 @@ println!("{}", result.text);
 
 ## Changelog
 
-**0.8.4** — 2026-08-10
+**0.8.4** — 2026-08-05
 - New `--context-file <PATH>` flag (repeatable) injects out-of-repo files (regular files only, capped at 256 KiB in total including block wrappers) into the task prompt for review, `ask`, and `pr`; accepted before or after the subcommand.
 - `--repo`, `--config`, and `-v`/`--verbose` are now global flags: accepted before or after a subcommand, no longer silently ignored in the root position. `init` honors `--repo` as the directory to write `nitpicker.toml` into, and rejects `--config`.
 
