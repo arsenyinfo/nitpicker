@@ -421,6 +421,7 @@ println!("{}", result.text);
 - Parallel review's 8-reviewer concurrency cap is removed — jobs all run under the shared in-flight LLM call cap (16); the debate per-turn cap is likewise hoisted to one per run shared across lanes.
 - Preset resolution failures (unknown/empty names, more than 16 selected) abort before any model call; preset names must be free of control bytes; context-window overflows in the final synthesis now suggest selecting fewer presets.
 - Whitespace-only model responses are treated as empty (nudged, then failed) instead of passing a blank report off as review evidence.
+- Debate prompts no longer let debate history leak into results: withdrawn findings are dropped silently instead of surviving as "claim withdrawn" placeholder blocks, verdicts restate the full current position each turn, an agreeing critic restates what it confirmed, and the meta-review excludes debate chronology and inter-role uncertainty notes.
 
 **0.8.5** — 2026-08-05 (`nitpicker-agent` 0.2.1)
 - Session recorder fixes: unique per-agent record identities (no more shared `root`/`subagent-N`), failed subagent spawns logged, 1-based `compact` turn numbers, flushed appends.

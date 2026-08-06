@@ -313,7 +313,9 @@ impl DebateMode {
                 You are the recall stage. Include borderline options or considerations and mark \
                 uncertainty. When the critic refutes the recommendation or an option with code-based \
                 evidence, update — switch recommendations or acknowledge no clear winner. Do not \
-                defend bad positions out of stubbornness. When the critic is wrong, hold the line \
+                defend bad positions out of stubbornness. Each submit_verdict states your full \
+                current position on its own — do not narrate what changed between turns or keep \
+                withdrawn options around as notes. When the critic is wrong, hold the line \
                 with specific file/line evidence.\n\n\
                 Use the available tools to explore the repository to support your answer. When ready, \
                 call submit_verdict(verdict, agree=false) with your position. For uncertain claims, \
@@ -334,7 +336,10 @@ impl DebateMode {
                     false positives get filtered by the critic.\n\n\
                     In follow-up turns, treat the critic's challenges as evidence. When they refute a \
                     finding with code-based reasoning, drop it — do not defend bad findings out of \
-                    stubbornness. When they miss something or misread the code, hold the line with \
+                    stubbornness. Dropping is silent: every submit_verdict call restates your complete \
+                    current findings as if it were the first — a dropped finding is simply absent, never \
+                    a placeholder block, a \"withdrawn\" note, or commentary about the debate. When they \
+                    miss something or misread the code, hold the line with \
                     specific file/line evidence. Cite concrete paths and line numbers whenever the tools \
                     provide them.\n\n\
                     Your output is a structured list of issues, not a narrative. Strict rules:\n\
@@ -378,7 +383,9 @@ impl DebateMode {
                 Before you can agree, you must have raised at least one substantive challenge and \
                 verified that the actor addressed it with code evidence. Agreeing without your own \
                 investigation is a failure of your role. Only call submit_verdict(agree=true) when \
-                the recommendation and any alternatives still on the table are substantiated. \
+                the recommendation and any alternatives still on the table are substantiated. An \
+                agreeing verdict states the position you are endorsing — it is the last word the \
+                synthesizer reads, not a bare \"I agree\". \
                 Otherwise call submit_verdict(agree=false) with a specific, evidence-based critique.\n\n"
                     .to_string()
                     + DELEGATION_GUIDANCE
@@ -407,7 +414,9 @@ impl DebateMode {
                     the tools provide them. If you reject a claim, name one targeted next check that would have \
                     confirmed it if it were real. Classify each reviewed issue as confirmed or rejected, \
                     with evidence. Only call submit_verdict(agree=true) when no material factual disagreement \
-                    remains, every finding is confirmed, and you have checked for missed issues. Otherwise call \
+                    remains, every finding is confirmed, and you have checked for missed issues. An agreeing \
+                    verdict restates every confirmed finding in the schema — it is the last word the \
+                    synthesizer reads, not a bare \"I agree\". Otherwise call \
                     submit_verdict(agree=false) with specific corrections backed by line numbers.\n\n\
                     {DELEGATION_GUIDANCE}\n\n\
                     {VERIFY_WARNING}\n\n\
@@ -437,7 +446,9 @@ impl DebateMode {
                 answer when it does not. Drop claims the critic refuted and any inter-role uncertainty signals.\n\n\
                 Rules:\n\
                 1. Include only claims that survived the debate with code-based evidence.\n\
-                2. Drop options or claims the critic successfully refuted.\n\
+                2. Drop options or claims the critic successfully refuted. Later turns supersede \
+                earlier ones — a position the actor abandoned does not appear, and the debate's \
+                history is never narrated.\n\
                 3. Do not include an Uncertainty field in the output — it is an inter-role signal, \
                 not user-facing.\n\
                 4. Preserve concrete references (file/line) where the debate cited them.\n\
@@ -453,13 +464,18 @@ impl DebateMode {
                 format!(
                     "You synthesize code-review debates into a final summary. Output only \
                     actionable findings sorted by priority. No attribution, no praise{no_landed_fixes}, \
-                    no rejected-false-positive section.\n\n\
+                    no rejected-false-positive section, no debate chronology.\n\n\
                     Rules:\n\
-                    1. Include only issues that survived the debate and are confirmed real in the current code.\n\
+                    1. Include only issues that survived the debate and are confirmed real in the current code. \
+                    The dialogue is chronological: the reviewer's later verdicts supersede earlier ones, and \
+                    a finding absent from the final verdict was withdrawn — it must not appear in the output, \
+                    not even as a \"withdrawn during the debate\" or \"resolved\" note.\n\
                     2. Drop {drop_clause}.\n\
                     3. Drop items whose triggering scenario is implausible or needs an improbable chain of conditions.\n\
                     4. Drop items where the reviewer flagged uncertainty and the critic did not confirm them \
-                    with code evidence. The final summary only contains confirmed findings.\n\
+                    with code evidence. The final summary only contains confirmed findings, so never emit \
+                    the Uncertainty line — it is an inter-role signal, and a finding that kept an unresolved \
+                    one is dropped, not forwarded.\n\
                     5. Group duplicates and closely related points into a single finding.\n\
                     6. Preserve concrete technical detail: file/line references, trigger, fix direction.\n\
                     7. Use this schema exactly (one block per finding, blank line between blocks):\n\
