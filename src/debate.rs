@@ -441,6 +441,9 @@ pub struct DebateOutcome {
     /// Presets whose lane survived (≥1 turn ran) — the angles the meta synthesis actually
     /// covered, where the resolved list documents only the selection. `None` for Topic.
     pub covered_presets: Option<Vec<String>>,
+    /// Per-preset lane counts in resolution order (attempted is always 1 — one lane per
+    /// preset), matching the parallel path's per-job shape. `None` for Topic.
+    pub coverage: Option<Vec<crate::output::PresetCoverage>>,
 }
 
 /// One lane's full result: an independent actor/critic debate over a single preset (or the
@@ -961,6 +964,21 @@ pub async fn run_debate(
             surviving(&lanes)
                 .iter()
                 .filter_map(|lane| lane.preset_name.clone())
+                .collect()
+        }),
+        coverage: presets.map(|ps| {
+            ps.iter()
+                .map(|p| {
+                    let survived = lanes.iter().any(|lane| {
+                        lane.preset_name.as_deref() == Some(p.name.as_str())
+                            && lane.any_turn_succeeded
+                    });
+                    crate::output::PresetCoverage {
+                        preset: p.name.clone(),
+                        attempted: 1,
+                        succeeded: usize::from(survived),
+                    }
+                })
                 .collect()
         }),
     })

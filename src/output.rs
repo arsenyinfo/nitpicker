@@ -123,6 +123,12 @@ pub struct PrReviewOutput {
     /// documents its *resolution*. present iff `status: ok`. additive schema-v1 field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub covered_presets: Option<Vec<String>>,
+    /// per-preset job/lane counts in resolution order — `covered_presets` summarizes this
+    /// as "≥1 succeeded", so a preset reviewed by 1 of its N planned jobs is visible here
+    /// and only here. envelope-only by design: execution counts are never fed to the
+    /// synthesis prompt. present iff `status: ok`. additive schema-v1 field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<Vec<PresetCoverage>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report_markdown: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -146,6 +152,7 @@ impl PrReviewOutput {
             presets: None,
             degraded: None,
             covered_presets: None,
+            coverage: None,
             report_markdown: None,
             usage: None,
             comment_posted: false,
@@ -153,6 +160,14 @@ impl PrReviewOutput {
             error: Some(message),
         }
     }
+}
+
+/// One preset's planned-vs-surviving job (or lane) count for the envelope's `coverage` key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PresetCoverage {
+    pub preset: String,
+    pub attempted: usize,
+    pub succeeded: usize,
 }
 
 /// serialize `value` as one line on stdout and flush before returning.
@@ -217,6 +232,7 @@ mod tests {
             presets: None,
             degraded: None,
             covered_presets: None,
+            coverage: None,
             report_markdown: None,
             usage: Some(report),
             comment_posted: false,
@@ -256,6 +272,7 @@ mod tests {
         assert!(error_json.get("presets").is_none());
         assert!(error_json.get("degraded").is_none());
         assert!(error_json.get("covered_presets").is_none());
+        assert!(error_json.get("coverage").is_none());
 
         let mut ok = PrReviewOutput::error("unused".to_string(), 1);
         ok.status = Status::Ok;
@@ -263,10 +280,29 @@ mod tests {
         ok.presets = Some(vec!["security".to_string(), "tone".to_string()]);
         ok.degraded = Some(true);
         ok.covered_presets = Some(vec!["security".to_string()]);
+        ok.coverage = Some(vec![
+            PresetCoverage {
+                preset: "security".to_string(),
+                attempted: 2,
+                succeeded: 1,
+            },
+            PresetCoverage {
+                preset: "tone".to_string(),
+                attempted: 2,
+                succeeded: 0,
+            },
+        ]);
         let ok_json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&ok).unwrap()).unwrap();
         assert_eq!(ok_json["presets"], serde_json::json!(["security", "tone"]));
         assert_eq!(ok_json["degraded"], serde_json::json!(true));
         assert_eq!(ok_json["covered_presets"], serde_json::json!(["security"]));
+        assert_eq!(
+            ok_json["coverage"],
+            serde_json::json!([
+                {"preset": "security", "attempted": 2, "succeeded": 1},
+                {"preset": "tone", "attempted": 2, "succeeded": 0},
+            ])
+        );
     }
 }

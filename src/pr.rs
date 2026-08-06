@@ -743,7 +743,7 @@ async fn run_review_inner(
         eprintln!("warning: --alloy has no effect with --no-debate");
     }
     let debate = !args.no_debate && config.default_debate();
-    let (report, transcript_path, usage, degraded, covered_presets) = if debate {
+    let (report, transcript_path, usage, degraded, covered_presets, coverage) = if debate {
         let outcome = debate::run_debate(
             repo,
             &full_prompt,
@@ -765,6 +765,7 @@ async fn run_review_inner(
             outcome.usage,
             outcome.degraded,
             outcome.covered_presets,
+            outcome.coverage,
         )
     } else {
         let outcome = review::run_review(
@@ -783,6 +784,7 @@ async fn run_review_inner(
             outcome.usage,
             outcome.degraded,
             outcome.covered_presets,
+            outcome.coverage,
         )
     };
 
@@ -833,6 +835,7 @@ async fn run_review_inner(
                 presets: Some(presets.iter().map(|p| p.name.clone()).collect()),
                 degraded: Some(degraded),
                 covered_presets,
+                coverage,
                 report_markdown: Some(report),
                 usage: Some(usage),
                 comment_posted,

@@ -1,4 +1,4 @@
-use crate::output::UsageReport;
+use crate::output::{PresetCoverage, UsageReport};
 pub use crate::prompts::TaskMode;
 use eyre::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -35,6 +35,9 @@ pub struct ReviewOutcome {
     /// Presets with at least one surviving job — the angles the synthesis evidence actually
     /// covered, where the resolved list documents only the selection. `None` on the Ask path.
     pub covered_presets: Option<Vec<String>>,
+    /// Per-preset attempted/succeeded job counts in resolution order — the granularity
+    /// `covered_presets` summarizes away. `None` on the Ask path.
+    pub coverage: Option<Vec<PresetCoverage>>,
 }
 
 pub async fn run_review(
@@ -269,6 +272,8 @@ pub async fn run_review(
         });
     }
 
+    let coverage = presets.map(|ps| preset_coverage(ps, &job_records));
+
     // Refuse to synthesize a verdict out of nothing but failures: the aggregator would hallucinate
     // a confident review from error notes, and `pr` would post it. A total failure is an error, not
     // an "ok" report with empty findings.
@@ -382,6 +387,7 @@ pub async fn run_review(
         usage,
         degraded: success_count < job_count,
         covered_presets: surviving_presets.map(|ps| ps.into_iter().map(|p| p.name).collect()),
+        coverage,
     })
 }
 
@@ -399,6 +405,27 @@ struct ReviewJob {
 /// presets for review runs. Labels must be unique — the aggregator attributes reports by
 /// them: duplicate reviewer names get an ` #<index>` suffix, and any residual collision
 /// (a crafted name that embeds the suffix) falls back to the globally-unique job ordinal.
+/// Per-preset attempted/succeeded counts in resolution order, from the drained job list.
+fn preset_coverage(
+    presets: &[crate::presets::ReviewPreset],
+    job_records: &[JobRecord],
+) -> Vec<PresetCoverage> {
+    presets
+        .iter()
+        .map(|p| {
+            let (attempted, succeeded) = job_records
+                .iter()
+                .filter(|j| j.preset.as_deref() == Some(p.name.as_str()))
+                .fold((0, 0), |(a, s), j| (a + 1, s + usize::from(j.ok)));
+            PresetCoverage {
+                preset: p.name.clone(),
+                attempted,
+                succeeded,
+            }
+        })
+        .collect()
+}
+
 /// Bounded `{err:#}` chain for persistence — a provider error body can be huge, and the
 /// session record is not the place to store it whole.
 pub(crate) fn bounded_error_string(err: &eyre::Report) -> String {
@@ -625,6 +652,48 @@ mod tests {
         let jobs = plan_jobs(&["claude", "claude"], None);
         assert_eq!(jobs[0].label, "claude");
         assert_eq!(jobs[1].label, "claude");
+    }
+
+    /// A preset reviewed by 1 of its N planned jobs must be distinguishable from a fully
+    /// covered one — the envelope's `coverage` key carries exactly these counts, including
+    /// zero-survivor presets that `covered_presets` drops entirely.
+    #[test]
+    fn preset_coverage_counts_attempted_and_succeeded_per_preset() {
+        let presets = [
+            crate::presets::ReviewPreset {
+                name: "security".to_string(),
+                prompt: "r".to_string(),
+            },
+            crate::presets::ReviewPreset {
+                name: "tone".to_string(),
+                prompt: "r".to_string(),
+            },
+        ];
+        let job = |preset: &str, ok: bool| JobRecord {
+            label: format!("{preset} · claude"),
+            preset: Some(preset.to_string()),
+            ok,
+        };
+        let records = [
+            job("security", true),
+            job("security", false),
+            job("tone", false),
+        ];
+        assert_eq!(
+            preset_coverage(&presets, &records),
+            vec![
+                PresetCoverage {
+                    preset: "security".to_string(),
+                    attempted: 2,
+                    succeeded: 1,
+                },
+                PresetCoverage {
+                    preset: "tone".to_string(),
+                    attempted: 1,
+                    succeeded: 0,
+                },
+            ]
+        );
     }
 
     /// Failure stubs reach the synthesis input only on the Ask path; preset runs drop them
