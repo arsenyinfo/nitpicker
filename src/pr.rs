@@ -130,6 +130,9 @@ struct PrMeta {
     body: String,
     #[serde(rename = "headRefOid")]
     head_ref_oid: String,
+    /// The PR's target branch — the trust anchor `pr` mode reads `nitpicker.toml` from.
+    #[serde(rename = "baseRefName")]
+    base_ref_name: String,
 }
 
 #[derive(Deserialize)]
@@ -157,7 +160,7 @@ pub fn check_gh() -> Result<()> {
 
 fn fetch_pr_meta(url: Option<&str>, repo: &Path) -> Result<PrMeta> {
     let mut cmd = Command::new("gh");
-    cmd.args(["pr", "view", "--json", "title,body,headRefOid"])
+    cmd.args(["pr", "view", "--json", "title,body,headRefOid,baseRefName"])
         .current_dir(repo);
     if let Some(u) = url {
         cmd.arg(u);
@@ -540,15 +543,19 @@ async fn run_pr_inner(
     preset_names: Vec<String>,
     start: std::time::Instant,
 ) -> Result<bool> {
-    let mut config = crate::load_config(common.config.as_deref(), &common.repo)?;
+    check_gh()?;
+
+    let prepared = prepare_pr(&args, &common.repo)?;
+
+    // Config loads AFTER prep because its repo-level source is the PR base branch blob —
+    // the base ref comes from the PR metadata, and the checkout must already have happened
+    // for the working tree to even be the head. Guards restore state if this errors.
+    let mut config = load_pr_config(common.config.as_deref(), &prepared)?;
     // resolved before free-model resolution: a bad preset name must fail before any
     // network call, and inside run_pr_inner so it honors the --json error contract
     let presets = crate::presets::resolve(&preset_names, &config)?;
     nitpicker_agent::openrouter::resolve_free_models(&mut config).await?;
     let config = config;
-    check_gh()?;
-
-    let prepared = prepare_pr(&args, &common.repo)?;
 
     // `prepared` drops at the end of this scope, after the review completes: HEAD is restored
     // (panic- and early-error-safe), then the temp dir removed, while the lock is still held —
@@ -563,6 +570,81 @@ async fn run_pr_inner(
         start,
     )
     .await
+}
+
+/// `pr` mode never reads `nitpicker.toml` from the working tree: the tree holds the PR
+/// head — target-controlled content that could redirect `base_url` (key exfiltration) or
+/// override preset rubrics (prompt injection into the trusted rubric slot). Repo-level
+/// config comes from the PR base branch blob instead, falling back to the global config;
+/// an explicit `--config` path stays trusted and unchanged.
+fn load_pr_config(explicit: Option<&Path>, prepared: &PreparedPr) -> Result<Config> {
+    if explicit.is_some() {
+        return crate::load_config(explicit, &prepared.repo);
+    }
+    let base_blob = read_base_branch_config(&prepared.repo, &prepared.meta.base_ref_name);
+    let worktree = std::fs::read_to_string(prepared.repo.join("nitpicker.toml")).ok();
+    let (repo_config, warning) = choose_repo_config(base_blob, worktree);
+    if let Some(warning) = warning {
+        tracing::warn!("{warning}");
+    }
+    match repo_config {
+        Some(content) => {
+            let config: Config = toml::from_str(&content)
+                .map_err(|e| eyre::eyre!("invalid nitpicker.toml on the PR base branch: {e}"))?;
+            config.validate()?;
+            Ok(config)
+        }
+        None => crate::load_global_config(),
+    }
+}
+
+/// `git show origin/<base>:nitpicker.toml` from the reviewed repo. Any failure — no such
+/// blob, missing remote-tracking ref — reads as "no repo config on the base branch".
+fn read_base_branch_config(repo: &Path, base_ref: &str) -> Option<String> {
+    if base_ref.is_empty() {
+        return None;
+    }
+    let out = Command::new("git")
+        .args(["show", &format!("origin/{base_ref}:nitpicker.toml")])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    match out.status.success() {
+        true => String::from_utf8(out.stdout).ok(),
+        false => {
+            tracing::debug!(
+                base = base_ref,
+                "no nitpicker.toml readable from the PR base branch"
+            );
+            None
+        }
+    }
+}
+
+/// Which repo-level config text `pr` mode uses, and what to tell the user about the
+/// checked-out copy. Returns `(config_toml, warning)`; `None` config falls back to global.
+fn choose_repo_config(
+    base_blob: Option<String>,
+    worktree: Option<String>,
+) -> (Option<String>, Option<&'static str>) {
+    match (base_blob, worktree) {
+        (Some(blob), Some(tree)) if blob != tree => (
+            Some(blob),
+            Some(
+                "checked-out nitpicker.toml differs from the PR base branch; using the base \
+                 version — files on a PR head are target-controlled",
+            ),
+        ),
+        (Some(blob), _) => (Some(blob), None),
+        (None, Some(_)) => (
+            None,
+            Some(
+                "ignoring nitpicker.toml from the checked-out PR head (absent on the PR base \
+                 branch); using the global config",
+            ),
+        ),
+        (None, None) => (None, None),
+    }
 }
 
 /// Everything the prep phase (flow resolution → lock → checkout/clone → metadata) hands to the
@@ -851,9 +933,77 @@ async fn run_review_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::{BranchRestoreGuard, HeadState, PrComment, get_head_state};
+    use super::{
+        BranchRestoreGuard, HeadState, PrComment, choose_repo_config, get_head_state,
+        read_base_branch_config,
+    };
     use std::path::Path;
     use std::process::Command;
+
+    /// The working tree is the PR head, so its nitpicker.toml never wins: the base blob is
+    /// used when present (warning iff the tree copy diverges), and a tree-only copy is
+    /// ignored with a warning rather than trusted.
+    #[test]
+    fn repo_config_source_prefers_base_blob_and_never_the_worktree() {
+        let s = |v: &str| Some(v.to_string());
+
+        let (cfg, warn) = choose_repo_config(s("base"), s("base"));
+        assert_eq!(cfg.as_deref(), Some("base"));
+        assert!(warn.is_none());
+
+        let (cfg, warn) = choose_repo_config(s("base"), s("tampered"));
+        assert_eq!(cfg.as_deref(), Some("base"));
+        assert!(warn.is_some());
+
+        let (cfg, warn) = choose_repo_config(s("base"), None);
+        assert_eq!(cfg.as_deref(), Some("base"));
+        assert!(warn.is_none());
+
+        let (cfg, warn) = choose_repo_config(None, s("tree-only"));
+        assert!(cfg.is_none());
+        assert!(warn.is_some());
+
+        let (cfg, warn) = choose_repo_config(None, None);
+        assert!(cfg.is_none());
+        assert!(warn.is_none());
+    }
+
+    /// The blob is read from the remote-tracking base ref, not the working tree — and any
+    /// unreadable state (no such ref, no such file) degrades to None instead of erroring.
+    #[test]
+    fn base_branch_config_reads_the_ref_blob_not_the_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        init_repo(&repo);
+
+        std::fs::write(repo.join("nitpicker.toml"), "from-base").unwrap();
+        git(&repo, &["add", "nitpicker.toml"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.email=t@test",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "config",
+            ],
+        );
+        // fabricate the remote-tracking ref the PR base resolves through
+        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        // the checked-out PR head then tampers with the file
+        std::fs::write(repo.join("nitpicker.toml"), "from-head").unwrap();
+
+        assert_eq!(
+            read_base_branch_config(&repo, "main").as_deref(),
+            Some("from-base")
+        );
+        assert!(read_base_branch_config(&repo, "no-such-branch").is_none());
+        assert!(read_base_branch_config(&repo, "").is_none());
+    }
 
     #[test]
     fn pr_comments_tolerate_null_author() {

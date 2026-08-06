@@ -437,18 +437,26 @@ pub(crate) fn load_config(explicit_path: Option<&Path>, repo: &Path) -> Result<c
         let content = std::fs::read_to_string(&path)
             .map_err(|e| eyre::eyre!("failed to read config {:?}: {e}", path))?;
         toml::from_str(&content).map_err(|e| eyre::eyre!("invalid config: {e}"))?
-    } else if let Some(home) = dirs::home_dir() {
-        let path = home.join(".nitpicker").join("config.toml");
-        if path.exists() {
-            let content = std::fs::read_to_string(&path)
-                .map_err(|e| eyre::eyre!("failed to read config {:?}: {e}", path))?;
-            toml::from_str(&content).map_err(|e| eyre::eyre!("invalid config: {e}"))?
-        } else {
-            eyre::bail!("no config found — run `nitpicker init [--global]` to generate one")
-        }
     } else {
-        eyre::bail!("no config found — run `nitpicker init [--global]` to generate one")
+        return load_global_config();
     };
+    config.validate()?;
+    Ok(config)
+}
+
+/// The `~/.nitpicker/config.toml` fallback alone — `pr` mode reaches for this directly,
+/// since its repo-level config comes from the PR base branch blob, never the working tree.
+pub(crate) fn load_global_config() -> Result<config::Config> {
+    let path = dirs::home_dir()
+        .map(|home| home.join(".nitpicker").join("config.toml"))
+        .filter(|path| path.exists())
+        .ok_or_else(|| {
+            eyre::eyre!("no config found — run `nitpicker init [--global]` to generate one")
+        })?;
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| eyre::eyre!("failed to read config {:?}: {e}", path))?;
+    let config: config::Config =
+        toml::from_str(&content).map_err(|e| eyre::eyre!("invalid config: {e}"))?;
     config.validate()?;
     Ok(config)
 }
