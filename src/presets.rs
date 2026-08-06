@@ -124,6 +124,21 @@ fn lookup(name: &str, config: &Config) -> Result<ReviewPreset> {
     })
 }
 
+/// Wrap a failed global-synthesis call with the run's shape, adding the fewer-presets
+/// remediation only when the error actually is a context-window overflow — on an auth or
+/// transport failure that hint would be misdirection.
+pub fn synthesis_failure(err: eyre::Report, description: String) -> eyre::Report {
+    let hint = match nitpicker_agent::llm::is_context_length_error(&err) {
+        true => {
+            " — the assembled synthesis input likely exceeds the aggregator's context window; \
+             select fewer presets (--preset) or configure an aggregator model with a larger \
+             context window"
+        }
+        false => "",
+    };
+    err.wrap_err(format!("{description}{hint}"))
+}
+
 fn available_names(config: &Config) -> Vec<String> {
     let mut names: Vec<String> = BUILT_IN_PRESETS
         .iter()
@@ -242,8 +257,8 @@ mod tests {
     /// (`--preset "security, maintainability"` names two real presets).
     #[test]
     fn segments_are_trimmed() {
-        let resolved =
-            resolve(&cli(&[" security ", "maintainability"]), &config(None, &[])).expect("resolves");
+        let resolved = resolve(&cli(&[" security ", "maintainability"]), &config(None, &[]))
+            .expect("resolves");
         assert_eq!(names(&resolved), ["security", "maintainability"]);
     }
 
@@ -306,8 +321,10 @@ mod tests {
         for (name, _) in BUILT_IN_PRESETS {
             resolve(&cli(&[name]), &cfg).expect("built-in resolves");
         }
-        assert!(DEFAULT_PRESET_NAMES
-            .iter()
-            .all(|n| BUILT_IN_PRESETS.iter().any(|(b, _)| b == n)));
+        assert!(
+            DEFAULT_PRESET_NAMES
+                .iter()
+                .all(|n| BUILT_IN_PRESETS.iter().any(|(b, _)| b == n))
+        );
     }
 }

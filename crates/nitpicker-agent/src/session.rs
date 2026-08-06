@@ -193,4 +193,48 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].agent, "reviewer-1-x");
     }
+
+    /// `reflect` deserializes historical `aggregation.json` files into this exact type and
+    /// discards unparseable ones as incomplete sessions — a legacy record (no presets/lanes
+    /// keys) and a new-shape record must both keep parsing.
+    #[test]
+    fn aggregation_records_parse_across_schema_generations() {
+        let legacy = r#"{"kind":"aggregation","model":"m","text":"t","rounds":2,"converged":true}"#;
+        let parsed: AggregationRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.rounds, Some(2));
+        assert!(parsed.presets.is_none());
+        assert!(parsed.lanes.is_none());
+
+        let current = AggregationRecord {
+            kind: "aggregation".to_string(),
+            model: "m".to_string(),
+            text: "t".to_string(),
+            rounds: None,
+            converged: None,
+            presets: Some(vec!["security".to_string()]),
+            lanes: Some(vec![LaneRecord {
+                preset: "security".to_string(),
+                rounds: 1,
+                converged: true,
+                degraded: false,
+            }]),
+        };
+        let round_tripped: AggregationRecord =
+            serde_json::from_str(&serde_json::to_string(&current).unwrap()).unwrap();
+        assert_eq!(round_tripped.lanes.unwrap()[0].preset, "security");
+
+        // absent options serialize to absent keys, keeping old readers indifferent
+        let legacy_shaped = AggregationRecord {
+            kind: "aggregation".to_string(),
+            model: "m".to_string(),
+            text: "t".to_string(),
+            rounds: Some(1),
+            converged: Some(false),
+            presets: None,
+            lanes: None,
+        };
+        let json = serde_json::to_string(&legacy_shaped).unwrap();
+        assert!(!json.contains("presets"));
+        assert!(!json.contains("lanes"));
+    }
 }

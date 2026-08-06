@@ -55,6 +55,10 @@ See `examples/file_agent.rs` for a runnable version.
 
 ## Breaking changes
 
+**0.3.0**
+- Added `presets: Option<BTreeMap<String, PresetConfig>>` to `Config` and `presets: Option<Vec<String>>` to `DefaultsConfig` — source-breaking for code constructing these structs with literals (add `presets: None`). New `PresetConfig` type.
+- Added `presets`/`lanes` optional fields to `AggregationRecord` (same literal-construction caveat) and the new `LaneRecord` type.
+
 **0.2.0**
 - Replaced `AgentResult` token fields (`total_input_tokens`, `total_output_tokens`, `total_tokens`) and `usage()` method with `usage: TokenUsage`, which includes `cached_input_tokens` and `cache_creation_input_tokens`.
 - `TokenUsage::input_tokens` now includes provider cache reads across all providers.

@@ -106,9 +106,11 @@ pub enum TaskMode {
 
 impl TaskMode {
     /// `Review` composes the shared review protocol with exactly one preset's rubric; `Ask`
-    /// takes no preset. The rubric sits at the END of the prompt: everything before it is
-    /// byte-identical across presets, so same-model jobs share the longest possible
-    /// provider-cacheable prefix (tool schemas and protocol dominate the prompt).
+    /// takes no preset. The rubric sits at the END of this prompt so the tool schemas and
+    /// protocol stay a byte-identical prefix across same-model preset jobs. (The library
+    /// appends shared project context AFTER this string — agent.rs — so cross-preset cache
+    /// sharing covers tools+protocol only; within one job, every turn still reuses the full
+    /// prefix, which is where the bulk of the spend is.)
     pub fn system_prompt(&self, preset: Option<&crate::presets::ReviewPreset>) -> String {
         match (self, preset) {
             (TaskMode::Review(scope), Some(preset)) => {
@@ -267,8 +269,8 @@ pub(crate) fn preset_roster(presets: &[crate::presets::ReviewPreset]) -> String 
 pub fn preset_subagent_prompt(preset: &crate::presets::ReviewPreset) -> String {
     format!(
         "{base}\n\nThe agent you work for reviews code through one angle — {name}:\n{rubric}\n\
-         Investigate your assigned task through that angle; report evidence outside it only when \
-         it is severe enough that dropping it would be negligent.",
+         Investigate your assigned task through that angle only; other angles run as separate \
+         reviews.",
         base = nitpicker_agent::prompts::subagent_system_prompt(),
         name = preset.name,
         rubric = preset.prompt,
@@ -522,13 +524,23 @@ mod tests {
     /// override's evidence rules must reach the aggregator, not just the preset's name.
     #[test]
     fn reduce_prompt_carries_every_active_preset_rubric() {
-        let presets = [preset("angle-a", "RUBRIC-MARKER-A"), preset("angle-b", "RUBRIC-MARKER-B")];
+        let presets = [
+            preset("angle-a", "RUBRIC-MARKER-A"),
+            preset("angle-b", "RUBRIC-MARKER-B"),
+        ];
         let out = TaskMode::Review(ReviewScope::Diff).reduce_prompt(
             "the task",
             "the reviews",
             Some(&presets),
         );
-        for needle in ["angle-a", "RUBRIC-MARKER-A", "angle-b", "RUBRIC-MARKER-B", "the task", "the reviews"] {
+        for needle in [
+            "angle-a",
+            "RUBRIC-MARKER-A",
+            "angle-b",
+            "RUBRIC-MARKER-B",
+            "the task",
+            "the reviews",
+        ] {
             assert!(out.contains(needle), "missing {needle}");
         }
     }

@@ -309,6 +309,11 @@ fn validate_presets(presets: Option<&BTreeMap<String, PresetConfig>>) -> Result<
         if name.trim().is_empty() {
             eyre::bail!("[presets]: preset names must contain non-whitespace content");
         }
+        // selection trims before lookup, so a padded key could never be selected — and worse,
+        // would silently resolve to the same-named built-in instead of this definition
+        if name != name.trim() {
+            eyre::bail!("[presets.{name:?}]: preset names must not have surrounding whitespace");
+        }
         if preset.prompt.trim().is_empty() {
             eyre::bail!("[presets.{name}].prompt must contain non-whitespace content");
         }
@@ -849,5 +854,27 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// Selection trims names before lookup, so a padded `[presets." x "]` key could never be
+    /// selected — it must be rejected at validation instead of silently shadowed; blank
+    /// prompts and blank names are data errors the library owns.
+    #[test]
+    fn preset_tables_reject_blank_and_padded_names_and_blank_prompts() {
+        let table = |name: &str, prompt: &str| {
+            let mut presets = BTreeMap::new();
+            presets.insert(
+                name.to_string(),
+                PresetConfig {
+                    prompt: prompt.to_string(),
+                },
+            );
+            presets
+        };
+        assert!(validate_presets(None).is_ok());
+        assert!(validate_presets(Some(&table("tone", "review the docs"))).is_ok());
+        assert!(validate_presets(Some(&table(" tone", "review the docs"))).is_err());
+        assert!(validate_presets(Some(&table("  ", "review the docs"))).is_err());
+        assert!(validate_presets(Some(&table("tone", "   "))).is_err());
     }
 }

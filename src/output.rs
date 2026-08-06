@@ -109,6 +109,10 @@ pub struct PrReviewOutput {
     pub mode: Option<ReviewMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub models: Option<Models>,
+    /// resolved ordered preset names; present iff `status: ok` (every error envelope
+    /// omits it, including failures after resolution). additive schema-v1 field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presets: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report_markdown: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -129,6 +133,7 @@ impl PrReviewOutput {
             pr: None,
             mode: None,
             models: None,
+            presets: None,
             report_markdown: None,
             usage: None,
             comment_posted: false,
@@ -197,6 +202,7 @@ mod tests {
             pr: None,
             mode: None,
             models: None,
+            presets: None,
             report_markdown: None,
             usage: Some(report),
             comment_posted: false,
@@ -223,5 +229,24 @@ mod tests {
             json.get("usage").is_none(),
             "usage must be omitted on error"
         );
+    }
+
+    /// `presets` is present iff the run succeeded: every error envelope omits the key
+    /// entirely (not `null`), including failures after resolution.
+    #[test]
+    fn presets_key_is_success_only() {
+        let error_json: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&PrReviewOutput::error("boom".to_string(), 1)).unwrap(),
+        )
+        .unwrap();
+        assert!(error_json.get("presets").is_none());
+
+        let mut ok = PrReviewOutput::error("unused".to_string(), 1);
+        ok.status = Status::Ok;
+        ok.error = None;
+        ok.presets = Some(vec!["security".to_string(), "tone".to_string()]);
+        let ok_json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&ok).unwrap()).unwrap();
+        assert_eq!(ok_json["presets"], serde_json::json!(["security", "tone"]));
     }
 }

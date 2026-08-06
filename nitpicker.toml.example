@@ -49,3 +49,21 @@ provider = "openrouter"
 # name = "openrouter"
 # model = "minimax/minimax-m2.7"
 # provider = "openrouter"
+
+# --- Review presets ---------------------------------------------------------
+# A preset is one named review angle. Built-ins: correctness, security,
+# performance, maintainability, ml-rigor, tone, general. Review runs resolve
+# --preset > [defaults].presets > the built-in five (correctness, security,
+# performance, ml-rigor, maintainability). Parallel mode runs reviewers ×
+# presets jobs; debate mode runs one concurrent debate lane per preset.
+#
+# [defaults]
+# presets = ["correctness", "security", "ml-rigor"]
+#
+# Define a project preset (a table with the same name as a built-in replaces it):
+# [presets.api-security]
+# prompt = """
+# Review trust boundaries, authentication, authorization, input handling, and
+# secret exposure. Require a concrete attacker-controlled path and plausible
+# impact for every finding.
+# """

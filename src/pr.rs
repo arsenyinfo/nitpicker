@@ -815,6 +815,7 @@ async fn run_review_inner(
                     reviewers: config.reviewer.iter().map(|r| r.model.clone()).collect(),
                     aggregator: config.aggregator.model.clone(),
                 }),
+                presets: Some(presets.iter().map(|p| p.name.clone()).collect()),
                 report_markdown: Some(report),
                 usage: Some(usage),
                 comment_posted,

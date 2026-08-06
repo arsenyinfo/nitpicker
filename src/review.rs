@@ -88,10 +88,11 @@ pub async fn run_review(
         .max()
         .expect("non-empty iterator")
         .min(32);
-    let spinner_style =
-        ProgressStyle::with_template(&format!("{{spinner:.cyan}} {{prefix:<{prefix_width}}} {{msg}}"))
-            .unwrap()
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", ""]);
+    let spinner_style = ProgressStyle::with_template(&format!(
+        "{{spinner:.cyan}} {{prefix:<{prefix_width}}} {{msg}}"
+    ))
+    .unwrap()
+    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", ""]);
     let done_style =
         ProgressStyle::with_template(&format!("  {{prefix:<{prefix_width}}} {{msg}}")).unwrap();
 
@@ -111,7 +112,13 @@ pub async fn run_review(
 
     for job in &jobs {
         let reviewer = &config.reviewer[job.reviewer_index];
-        let prompt_index = job.preset_index.unwrap_or(0);
+        let prompt_index = match (presets, job.preset_index) {
+            (Some(_), Some(j)) => j,
+            (None, None) => 0,
+            (Some(_), None) | (None, Some(_)) => {
+                unreachable!("job planning matches the run's preset mode")
+            }
+        };
         let tools_map = tools.clone();
         let repo = repo.to_path_buf();
         let label = job.label.clone();
@@ -132,7 +139,9 @@ pub async fn run_review(
                 Arc::clone(&llm_semaphore),
                 session_writer,
             )),
-            Err(msg) => Err(eyre::eyre!("client setup failed: {msg}")),
+            // re-raise the message verbatim: the Ask path folds this into its aggregator
+            // input, whose bytes must not drift from the pre-fan-out rendering
+            Err(msg) => Err(eyre::eyre!("{msg}")),
         };
         info!(job = %label, "spawning agent");
 
@@ -205,27 +214,21 @@ pub async fn run_review(
     let mut rendered = Vec::new();
     let mut success_count = 0usize;
     for (label, handle) in handles {
-        let header = section_header(&label, preset_run);
         match handle.await {
             Ok(Ok(result)) => {
                 usage.add(result.usage, result.subagents_spawned);
-                rendered.push(format!("{header}\n\n{}", result.text));
+                rendered.extend(rendered_section(&label, Ok(&result.text), preset_run));
                 success_count += 1;
                 info!(job = %label, "review completed");
             }
-            // Preset runs keep failure stubs out of the synthesis input — an error note is
-            // execution noise, not review evidence; degraded accounting and the logs carry
-            // it. The Ask path predates that rule and keeps its stubs.
             Ok(Err(err)) => {
-                if !preset_run {
-                    rendered.push(format!("{header}\n\n*Failed: {err:#}*"));
-                }
+                let stub = format!("*Failed: {err:#}*");
+                rendered.extend(rendered_section(&label, Err(&stub), preset_run));
                 warn!(job = %label, error = ?err, "review failed");
             }
             Err(err) => {
-                if !preset_run {
-                    rendered.push(format!("{header}\n\n*Failed (task panicked): {err:#}*"));
-                }
+                let stub = format!("*Failed (task panicked): {err:#}*");
+                rendered.extend(rendered_section(&label, Err(&stub), preset_run));
                 error!(job = %label, error = ?err, "review task panicked");
             }
         }
@@ -259,7 +262,16 @@ pub async fn run_review(
         max_tokens: Some(config.aggregator_max_tokens()),
         additional_params: None,
     };
-    let response = client.completion(completion).await?;
+    let response = client.completion(completion).await.map_err(|err| {
+        let description = match presets {
+            Some(presets) => format!(
+                "final aggregation failed over {success_count} surviving review job(s) across {} preset(s)",
+                presets.len()
+            ),
+            None => format!("final aggregation failed over {success_count} surviving review job(s)"),
+        };
+        crate::presets::synthesis_failure(err, description)
+    })?;
     usage.add(response.usage, 0);
     pb_agg.set_style(done_style);
     if response.finish_reason == FinishReason::ToolUse {
@@ -304,7 +316,10 @@ struct ReviewJob {
 /// presets for review runs. Labels must be unique — the aggregator attributes reports by
 /// them: duplicate reviewer names get an ` #<index>` suffix, and any residual collision
 /// (a crafted name that embeds the suffix) falls back to the globally-unique job ordinal.
-fn plan_jobs(reviewer_names: &[&str], presets: Option<&[crate::presets::ReviewPreset]>) -> Vec<ReviewJob> {
+fn plan_jobs(
+    reviewer_names: &[&str],
+    presets: Option<&[crate::presets::ReviewPreset]>,
+) -> Vec<ReviewJob> {
     let duplicated: Vec<bool> = reviewer_names
         .iter()
         .map(|name| reviewer_names.iter().filter(|other| other == &name).count() > 1)
@@ -336,23 +351,38 @@ fn plan_jobs(reviewer_names: &[&str], presets: Option<&[crate::presets::ReviewPr
                     });
                 }
             }
+            // collision repair is preset-run-only: the Ask path must keep its legacy labels
+            // byte-for-byte, duplicate reviewer names included (session agents stay unique)
+            let mut seen = std::collections::HashSet::new();
+            for (ordinal, job) in jobs.iter_mut().enumerate() {
+                let mut label = job.label.clone();
+                while !seen.insert(label.clone()) {
+                    label = format!("{label} ({})", ordinal + 1);
+                }
+                job.label = label;
+            }
         }
-    }
-    let mut seen = std::collections::HashSet::new();
-    for (ordinal, job) in jobs.iter_mut().enumerate() {
-        let mut label = job.label.clone();
-        while !seen.insert(label.clone()) {
-            label = format!("{label} ({})", ordinal + 1);
-        }
-        job.label = label;
     }
     jobs
 }
 
-fn section_header(label: &str, preset_run: bool) -> String {
-    match preset_run {
+/// One finished job's contribution to the synthesis input. Successes always render;
+/// failure stubs render only outside preset runs — for Review fan-out an error note is
+/// execution noise, not review evidence (degraded accounting and the logs carry it), while
+/// the Ask path keeps its pre-fan-out stubs byte-for-byte.
+fn rendered_section(
+    label: &str,
+    outcome: std::result::Result<&str, &str>,
+    preset_run: bool,
+) -> Option<String> {
+    let header = match preset_run {
         true => format!("## {label}"),
         false => format!("## {label} review"),
+    };
+    match (outcome, preset_run) {
+        (Ok(text), _) => Some(format!("{header}\n\n{text}")),
+        (Err(stub), false) => Some(format!("{header}\n\n{stub}")),
+        (Err(_), true) => None,
     }
 }
 
@@ -492,5 +522,32 @@ mod tests {
         let ps = presets(&["a/b", "a?b"]);
         let jobs = plan_jobs(&["r!", "r?"], Some(&ps));
         assert!(all_unique(jobs.iter().map(|j| j.session_agent.clone())));
+    }
+
+    /// The Ask path is a byte-compatibility surface: duplicate reviewer names keep their
+    /// legacy identical labels there (collision repair is preset-run-only).
+    #[test]
+    fn ask_jobs_keep_legacy_labels_even_when_names_collide() {
+        let jobs = plan_jobs(&["claude", "claude"], None);
+        assert_eq!(jobs[0].label, "claude");
+        assert_eq!(jobs[1].label, "claude");
+    }
+
+    /// Failure stubs reach the synthesis input only on the Ask path; preset runs drop them
+    /// (execution noise, not review evidence) while successes always render.
+    #[test]
+    fn failure_stubs_are_review_gated_in_the_synthesis_input() {
+        assert_eq!(
+            rendered_section("security · claude", Ok("finding"), true),
+            Some("## security · claude\n\nfinding".to_string())
+        );
+        assert_eq!(
+            rendered_section("security · claude", Err("*Failed: x*"), true),
+            None
+        );
+        assert_eq!(
+            rendered_section("claude", Err("*Failed: x*"), false),
+            Some("## claude review\n\n*Failed: x*".to_string())
+        );
     }
 }
