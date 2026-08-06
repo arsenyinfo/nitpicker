@@ -73,6 +73,11 @@ pub struct ToolCallRecord {
     pub spawned_agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
+    /// Model that produced the turn issuing this call, when the client reports it — the
+    /// only durable per-turn attribution on alloy runs, where each turn may pick a
+    /// different model. Absent on compaction records and pre-0.3.0 sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl SessionLogger {
@@ -200,6 +205,7 @@ mod tests {
             status: "ok".to_string(),
             spawned_agent: None,
             result: None,
+            model: Some("kimi-k2".to_string()),
         };
         writer.append_tool_call(&record).await.unwrap();
         writer.append_tool_call(&record).await.unwrap();

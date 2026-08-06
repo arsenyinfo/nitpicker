@@ -206,6 +206,9 @@ struct ToolCallContext<'a> {
     current_turns: usize,
     total_tool_calls: usize,
     initial_subagent_count: usize,
+    /// Model that produced the turn issuing this call, when the client reports it —
+    /// load-bearing for alloy trajectories, where each turn may use a different model.
+    selected_model: Option<&'a str>,
 }
 
 /// Outcome of a single tool call. The `as_str` values are the on-disk trajectory-log
@@ -499,6 +502,7 @@ pub async fn run_agent(
                             current_turns: turn + 1,
                             total_tool_calls: totals.tool_calls,
                             initial_subagent_count,
+                            selected_model: selected_model.as_deref(),
                         },
                         call.function.name.as_str(),
                         call.function.arguments.clone(),
@@ -942,6 +946,7 @@ async fn execute_tool_call(
             outcome.status,
             outcome.spawned_agent.as_deref(),
             None,
+            ctx.selected_model,
         )
         .await;
         return Ok(outcome);
@@ -967,6 +972,7 @@ async fn execute_tool_call(
                 outcome.status,
                 outcome.spawned_agent.as_deref(),
                 None,
+                ctx.selected_model,
             )
             .await;
             return Ok(outcome);
@@ -996,6 +1002,7 @@ async fn execute_tool_call(
                     outcome.status,
                     outcome.spawned_agent.as_deref(),
                     None,
+                    ctx.selected_model,
                 )
                 .await;
                 return Ok(outcome);
@@ -1009,6 +1016,7 @@ async fn execute_tool_call(
             ToolCallStatus::Started,
             Some(&prepared.spawned_agent),
             None,
+            ctx.selected_model,
         )
         .await;
         // parent-terminal tools (e.g. submit_verdict) write into parent-owned state; a subagent
@@ -1038,6 +1046,7 @@ async fn execute_tool_call(
                 ToolCallStatus::Error,
                 sub.spawned_agent.as_deref(),
                 Some(&truncate_for_trajectory(sub.output.clone())),
+                ctx.selected_model,
             )
             .await;
         }
@@ -1093,12 +1102,14 @@ async fn execute_tool_call(
         outcome.status,
         outcome.spawned_agent.as_deref(),
         None,
+        ctx.selected_model,
     )
     .await;
 
     Ok(outcome)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn log_tool_call(
     config: &AgentConfig,
     turn: usize,
@@ -1107,6 +1118,7 @@ async fn log_tool_call(
     status: ToolCallStatus,
     spawned_agent: Option<&str>,
     result: Option<&str>,
+    model: Option<&str>,
 ) {
     let Some(session_writer) = config.session_writer.as_ref() else {
         return;
@@ -1122,6 +1134,7 @@ async fn log_tool_call(
         status: status.as_str().to_string(),
         spawned_agent: spawned_agent.map(str::to_string),
         result: result.map(str::to_string),
+        model: model.map(str::to_string),
     };
     if let Err(err) = session_writer.append_tool_call(&record).await {
         warn!(tool = %tool_name, error = %err, "failed to write trajectory log");
@@ -1143,6 +1156,7 @@ async fn log_compaction(
         status,
         None,
         result,
+        None,
     )
     .await;
 }
