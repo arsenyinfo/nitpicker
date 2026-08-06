@@ -633,8 +633,15 @@ fn origin_is_github(repo: &Path) -> bool {
 /// `git://`/`http://` reach the network unauthenticated. Only `https`, `ssh`, and git's
 /// scp-like form qualify.
 fn is_trusted_github_remote(url: &str) -> bool {
-    let host = match url.trim().contains("://") {
-        true => match url::Url::parse(url.trim()) {
+    let url = url.trim();
+    // `<transport>::<address>` is remote-helper syntax: git runs `git-remote-<transport>`
+    // and never reads it as scp-form, so `github.com::<address>` would otherwise look like
+    // the host `github.com` here while git fetches from somewhere else entirely.
+    if url.contains("::") {
+        return false;
+    }
+    let host = match url.contains("://") {
+        true => match url::Url::parse(url) {
             Ok(parsed) => match parsed.scheme() {
                 "https" | "ssh" => parsed.host_str().map(str::to_string),
                 _ => None,
@@ -1128,6 +1135,10 @@ mod tests {
             "http://github.com/owner/repo",
             "https://attacker.example/owner/repo.git",
             "git@attacker.example:owner/repo.git",
+            // remote-helper syntax: git runs `git-remote-github.com` and fetches from the
+            // address, so this is not the host github.com no matter how it reads
+            "github.com::attacker-address",
+            "github.com::https://attacker.example/owner/repo",
             "/local/path/repo",
             "",
         ] {
