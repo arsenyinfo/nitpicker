@@ -745,11 +745,20 @@ pub async fn run_debate(
     let survivors = surviving(&lanes);
     let meta_prompt = match presets {
         // Topic (`ask`): single lane, prompt shape unchanged
-        None => format!(
-            "The following is a debate about: {prompt}\n\n{dialogue}\n\n---\n{instruction}",
-            dialogue = lane_dialogue(survivors[0]),
-            instruction = mode.meta_instruction(),
-        ),
+        None => {
+            let note = match survivors[0].converged {
+                true => {
+                    "The debate converged; only the final round is shown — it supersedes the \
+                     earlier dialogue.\n\n"
+                }
+                false => "",
+            };
+            format!(
+                "The following is a debate about: {prompt}\n\n{note}{dialogue}\n\n---\n{instruction}",
+                dialogue = lane_dialogue(survivors[0]),
+                instruction = mode.meta_instruction(),
+            )
+        }
         Some(presets) => {
             // roster covers surviving lanes only — a dead lane's rubric with no matching
             // section would read as an angle that was reviewed and found clean
@@ -950,9 +959,15 @@ fn surviving(lanes: &[DebateLaneOutcome]) -> Vec<&DebateLaneOutcome> {
         .collect()
 }
 
+/// Dialogue as the meta-review sees it. A converged lane is pruned to its final round:
+/// verdicts are self-contained by prompt contract and the agreeing critic restates every
+/// confirmed finding, so earlier rounds are superseded chronology — exactly the material
+/// a synthesizer misreads into withdrawn-claim narration. Contested (non-converged) and
+/// degraded lanes keep their full trail, and the human transcript always does.
 fn lane_dialogue(lane: &DebateLaneOutcome) -> String {
     lane.verdicts
         .iter()
+        .filter(|(_, rnd, _)| !lane.converged || *rnd == lane.final_round)
         .map(|(label, rnd, text)| format!("### {label} (Round {rnd})\n{text}"))
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -967,7 +982,10 @@ fn lane_sections(survivors: &[&DebateLaneOutcome]) -> String {
         .map(|lane| {
             let name = lane.preset_name.as_deref().unwrap_or("(unnamed)");
             let convergence = match lane.converged {
-                true => format!("converged at round {}", lane.final_round),
+                true => format!(
+                    "converged at round {} (earlier rounds superseded and omitted)",
+                    lane.final_round
+                ),
                 false => format!("no convergence after {} round(s)", lane.final_round),
             };
             let degraded = match lane.degraded {
@@ -1101,6 +1119,33 @@ mod tests {
             lane_sections(&[&converged_lane]),
             lane_sections(&[&reopened])
         );
+    }
+
+    /// A converged lane reaches the meta pruned to its final round — the closing verdicts
+    /// are self-contained by prompt contract, so earlier rounds are superseded noise. A
+    /// contested lane and the human transcript keep the full dialogue.
+    #[test]
+    fn converged_lanes_reach_meta_pruned_to_final_round() {
+        let verdicts: &[(&str, usize, &str)] = &[
+            ("Reviewer", 1, "ROUND-ONE-CLAIM"),
+            ("Validator", 1, "ROUND-ONE-CHALLENGE"),
+            ("Reviewer", 2, "ROUND-TWO-FINDINGS"),
+            ("Validator", 2, "ROUND-TWO-CONFIRMATION"),
+        ];
+        let mut converged = lane(Some("security"), verdicts);
+        converged.converged = true;
+        converged.final_round = 2;
+        let section = lane_sections(&[&converged]);
+        assert!(section.contains("ROUND-TWO-FINDINGS"));
+        assert!(section.contains("ROUND-TWO-CONFIRMATION"));
+        assert!(!section.contains("ROUND-ONE-CLAIM"));
+
+        let mut open = lane(Some("security"), verdicts);
+        open.final_round = 2;
+        assert!(lane_sections(&[&open]).contains("ROUND-ONE-CLAIM"));
+
+        let transcript = render_lane_transcript_section(&converged, 2);
+        assert!(transcript.contains("ROUND-ONE-CLAIM"));
     }
 
     /// Dead lanes appear in the human transcript (flagged) but never in the meta input.
