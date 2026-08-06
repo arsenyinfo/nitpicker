@@ -746,7 +746,7 @@ pub async fn run_debate(
     let meta_prompt = match presets {
         // Topic (`ask`): single lane, prompt shape unchanged
         None => {
-            let note = match survivors[0].converged {
+            let note = match lane_pruned_to_final_round(survivors[0]) {
                 true => {
                     "The debate converged; only the final round is shown — it supersedes the \
                      earlier dialogue.\n\n"
@@ -959,15 +959,22 @@ fn surviving(lanes: &[DebateLaneOutcome]) -> Vec<&DebateLaneOutcome> {
         .collect()
 }
 
-/// Dialogue as the meta-review sees it. A converged lane is pruned to its final round:
-/// verdicts are self-contained by prompt contract and the agreeing critic restates every
-/// confirmed finding, so earlier rounds are superseded chronology — exactly the material
-/// a synthesizer misreads into withdrawn-claim narration. Contested (non-converged) and
-/// degraded lanes keep their full trail, and the human transcript always does.
+/// A cleanly converged lane is pruned to its final round in the meta input: verdicts are
+/// self-contained by prompt contract and the agreeing critic restates every confirmed
+/// finding, so earlier rounds are superseded chronology — exactly the material a
+/// synthesizer misreads into withdrawn-claim narration. A *degraded* lane converges too
+/// (convergence gates on `agent_failed`, not `used_fallback`), but some turn already
+/// violated the verdict protocol there, so the self-containment premise is untrusted and
+/// its full trail stays — as it does for contested lanes and the human transcript.
+fn lane_pruned_to_final_round(lane: &DebateLaneOutcome) -> bool {
+    lane.converged && !lane.degraded
+}
+
+/// Dialogue as the meta-review sees it (see `lane_pruned_to_final_round`).
 fn lane_dialogue(lane: &DebateLaneOutcome) -> String {
     lane.verdicts
         .iter()
-        .filter(|(_, rnd, _)| !lane.converged || *rnd == lane.final_round)
+        .filter(|(_, rnd, _)| !lane_pruned_to_final_round(lane) || *rnd == lane.final_round)
         .map(|(label, rnd, text)| format!("### {label} (Round {rnd})\n{text}"))
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -981,12 +988,13 @@ fn lane_sections(survivors: &[&DebateLaneOutcome]) -> String {
         .iter()
         .map(|lane| {
             let name = lane.preset_name.as_deref().unwrap_or("(unnamed)");
-            let convergence = match lane.converged {
-                true => format!(
+            let convergence = match (lane.converged, lane_pruned_to_final_round(lane)) {
+                (true, true) => format!(
                     "converged at round {} (earlier rounds superseded and omitted)",
                     lane.final_round
                 ),
-                false => format!("no convergence after {} round(s)", lane.final_round),
+                (true, false) => format!("converged at round {}", lane.final_round),
+                (false, _) => format!("no convergence after {} round(s)", lane.final_round),
             };
             let degraded = match lane.degraded {
                 true => " · degraded",
@@ -1143,6 +1151,14 @@ mod tests {
         let mut open = lane(Some("security"), verdicts);
         open.final_round = 2;
         assert!(lane_sections(&[&open]).contains("ROUND-ONE-CLAIM"));
+
+        // a lane degraded in round 1 (e.g. a no-verdict fallback) that converges in round 2
+        // broke the verdict protocol once already — its full trail must reach the meta
+        let mut converged_degraded = lane(Some("security"), verdicts);
+        converged_degraded.converged = true;
+        converged_degraded.degraded = true;
+        converged_degraded.final_round = 2;
+        assert!(lane_sections(&[&converged_degraded]).contains("ROUND-ONE-CLAIM"));
 
         let transcript = render_lane_transcript_section(&converged, 2);
         assert!(transcript.contains("ROUND-ONE-CLAIM"));
