@@ -1,6 +1,3 @@
-const VERIFY_WARNING: &str = "Your opponent may sound confident but still make factual errors or overlook edge cases. \
-Independently verify every claim against the actual code before accepting it.";
-
 const DELEGATION_GUIDANCE: &str = "Always first build a quick high-level map of the relevant code: change intent, affected files, nearby modules, and major components involved. \
 Then write a short working plan that enumerates the disjoint threads worth investigating — separate questions, distinct filesets, individual call paths, tests vs implementation, focused security or performance concerns. \
 Subagents spawned in a single turn run in parallel, so the fastest path in wall-clock is to fan out ALL the disjoint threads from your plan as one broad wave of spawn_subagent(task) calls in the same turn, rather than spawning a few and walking the rest serially. \
@@ -155,9 +152,7 @@ impl TaskMode {
                 "
                 .to_string()
                     + OPTIONS_SCHEMA
-                    + "\n\nExplore the codebase as needed to give an accurate, well-grounded answer to the \
-                user message.\n\n\
-                For direct answers, give a clear answer grounded in code, then flag any meaningful caveats."
+                    + "\n\nFor direct answers, give a clear answer grounded in code, then flag any meaningful caveats."
             }
         }
     }
@@ -322,8 +317,6 @@ impl DebateMode {
                 include an Uncertainty: line naming what you're unsure about and what would resolve it.\n\n"
                     .to_string()
                     + DELEGATION_GUIDANCE
-                    + "\n\n"
-                    + VERIFY_WARNING
             }
             (DebateMode::Review(scope), Some(preset)) => {
                 format!(
@@ -351,7 +344,6 @@ impl DebateMode {
                     {FINDING_FIELDS}\n\n\
                     If there are no valid findings, set verdict exactly to: {NO_FINDINGS}\n\n\
                     {DELEGATION_GUIDANCE}\n\n\
-                    {VERIFY_WARNING}\n\n\
                     Your assigned review angle — {name}:\n{rubric}\n\
                     Investigate the {target} through this angle only; other angles run as separate debates.",
                     target = scope.target_noun(),
@@ -389,8 +381,6 @@ impl DebateMode {
                 Otherwise call submit_verdict(agree=false) with a specific, evidence-based critique.\n\n"
                     .to_string()
                     + DELEGATION_GUIDANCE
-                    + "\n\n"
-                    + VERIFY_WARNING
             }
             (DebateMode::Review(scope), Some(preset)) => {
                 format!(
@@ -412,14 +402,12 @@ impl DebateMode {
                     material claim: confirm it with evidence, dispute it with counter-evidence, or name the \
                     exact missing evidence needed to resolve it. Cite concrete paths and line numbers whenever \
                     the tools provide them. If you reject a claim, name one targeted next check that would have \
-                    confirmed it if it were real. Classify each reviewed issue as confirmed or rejected, \
-                    with evidence. Only call submit_verdict(agree=true) when no material factual disagreement \
+                    confirmed it if it were real. Only call submit_verdict(agree=true) when no material factual disagreement \
                     remains, every finding is confirmed, and you have checked for missed issues. An agreeing \
                     verdict restates every confirmed finding in the schema — it is the last word the \
                     synthesizer reads, not a bare \"I agree\". Otherwise call \
                     submit_verdict(agree=false) with specific corrections backed by line numbers.\n\n\
                     {DELEGATION_GUIDANCE}\n\n\
-                    {VERIFY_WARNING}\n\n\
                     The findings under review come from one assigned angle — {name}:\n{rubric}\n\
                     Judge them against that rubric's evidence bar, and hunt for missed issues within \
                     this angle only; other angles run as separate debates.",

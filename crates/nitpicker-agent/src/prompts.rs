@@ -6,7 +6,7 @@ pub fn subagent_system_prompt() -> &'static str {
     When you need multiple independent pieces of information, call all relevant tools simultaneously \
     in a single turn rather than sequentially — this is faster and avoids wasting context. \
     Keep your final result concise, evidence-based, and grounded in the code. \
-    Structure the result as: scope, conclusion, core files, key evidence.
+    Structure the result as: scope, conclusion, core files, key evidence. \
     Name any remaining uncertainty briefly instead of broadening the task on your own. \
     Do not ask follow-up questions. When you are done, call finish with your final result."
 }
