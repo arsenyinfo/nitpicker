@@ -803,7 +803,7 @@ pub async fn run_debate(
     pb.set_message(crate::progress::bar_message("synthesizing…"));
     // preset runs get the count/context wrapping; Topic propagates the provider error
     // untouched, as it did before lanes existed
-    let meta_response: nitpicker_agent::llm::CompletionResponse = agg_client
+    let meta_result: eyre::Result<nitpicker_agent::llm::CompletionResponse> = agg_client
         .completion(meta_completion)
         .await
         .map_err(|err| match presets {
@@ -816,37 +816,72 @@ pub async fn run_debate(
                 ),
             ),
             None => err,
-        })?;
+        });
+    pb.set_style(done_style);
+    // Lane metadata travels on both outcomes: a meta failure still persists the per-lane
+    // record (the durable trace of what ran), flagged with `error` and an empty `text` so
+    // consumers (reflect) don't render it as a verdict.
+    // The scalar rounds/converged fields stay populated whenever there is exactly one
+    // lane (Topic always; single-preset review) — pre-lanes `reflect` rendered only the
+    // scalars, so clearing them for a one-lane run would lose metadata it had.
+    let (rounds, converged) = match lanes.len() {
+        1 => (Some(lanes[0].final_round), Some(lanes[0].converged)),
+        _ => (None, None),
+    };
+    let preset_names: Option<Vec<String>> =
+        presets.map(|ps| ps.iter().map(|p| p.name.clone()).collect());
+    let lane_records: Option<Vec<LaneRecord>> = presets.map(|_| {
+        lanes
+            .iter()
+            .map(|lane| LaneRecord {
+                preset: lane.preset_name.clone().unwrap_or_default(),
+                rounds: lane.final_round,
+                converged: lane.converged,
+                degraded: lane.degraded,
+            })
+            .collect()
+    });
+    let meta_response = match meta_result {
+        Ok(response) => {
+            pb.finish_with_message("✓ done");
+            response
+        }
+        Err(err) => {
+            pb.finish_with_message(crate::progress::bar_message("✗ synthesis failed"));
+            if let Some(logger) = &session_logger {
+                let record = AggregationRecord {
+                    kind: "aggregation".to_string(),
+                    model: agg_cfg.model.clone(),
+                    text: String::new(),
+                    error: Some(crate::review::bounded_error_string(&err)),
+                    rounds,
+                    converged,
+                    presets: preset_names,
+                    lanes: lane_records,
+                    jobs: None,
+                };
+                match logger.write_aggregation(&record).await {
+                    Ok(()) => {}
+                    Err(write_err) => {
+                        warn!(error = ?write_err, "failed to persist synthesis-failure record");
+                    }
+                }
+            }
+            return Err(err);
+        }
+    };
     usage.add(meta_response.usage, 0);
     let meta_text = meta_response.text();
-    pb.set_style(done_style);
-    pb.finish_with_message("✓ done");
     if let Some(logger) = &session_logger {
-        // the scalar rounds/converged fields stay populated whenever there is exactly one
-        // lane (Topic always; single-preset review) — `reflect` renders only the scalars,
-        // so clearing them for a one-lane run would lose metadata it has today
-        let (rounds, converged) = match lanes.len() {
-            1 => (Some(lanes[0].final_round), Some(lanes[0].converged)),
-            _ => (None, None),
-        };
         let record = AggregationRecord {
             kind: "aggregation".to_string(),
             model: agg_cfg.model.clone(),
             text: meta_text.clone(),
+            error: None,
             rounds,
             converged,
-            presets: presets.map(|ps| ps.iter().map(|p| p.name.clone()).collect()),
-            lanes: presets.map(|_| {
-                lanes
-                    .iter()
-                    .map(|lane| LaneRecord {
-                        preset: lane.preset_name.clone().unwrap_or_default(),
-                        rounds: lane.final_round,
-                        converged: lane.converged,
-                        degraded: lane.degraded,
-                    })
-                    .collect()
-            }),
+            presets: preset_names,
+            lanes: lane_records,
             jobs: None,
         };
         logger.write_aggregation(&record).await?;

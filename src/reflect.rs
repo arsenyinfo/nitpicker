@@ -37,8 +37,23 @@ struct SessionData {
 }
 
 impl SessionData {
+    /// A session is complete when synthesis produced a verdict — an error-flagged
+    /// aggregation record means the run reached synthesis and died there.
     fn is_complete(&self) -> bool {
-        self.aggregation.is_some()
+        match &self.aggregation {
+            Some(agg) => agg.error.is_none(),
+            None => false,
+        }
+    }
+
+    fn status(&self) -> &'static str {
+        match &self.aggregation {
+            Some(agg) => match agg.error {
+                Some(_) => "synthesis failed",
+                None => "complete",
+            },
+            None => "incomplete",
+        }
     }
 
     fn error_count(&self) -> usize {
@@ -80,13 +95,8 @@ fn status_icon(status: &str) -> &'static str {
 
 fn format_session(session: &SessionData) -> String {
     let mut lines = Vec::new();
-    let status = if session.is_complete() {
-        "complete"
-    } else {
-        "incomplete"
-    };
     lines.push(format!("# Session: {}", session.name));
-    lines.push(format!("- Status: {status}"));
+    lines.push(format!("- Status: {}", session.status()));
     lines.push(format!("- Agents: {}", session.agent_names().join(", ")));
     // records, not calls: a failed spawn contributes a started/error lifecycle pair
     lines.push(format!(
@@ -102,9 +112,32 @@ fn format_session(session: &SessionData) -> String {
         if let Some(converged) = agg.converged {
             lines.push(format!("- Converged early: {converged}"));
         }
+        if let Some(lanes) = &agg.lanes {
+            for lane in lanes {
+                lines.push(format!(
+                    "- Lane {}: {} round(s), converged: {}, degraded: {}",
+                    lane.preset, lane.rounds, lane.converged, lane.degraded
+                ));
+            }
+        }
+        if let Some(jobs) = &agg.jobs {
+            let ok = jobs.iter().filter(|j| j.ok).count();
+            lines.push(format!("- Jobs: {ok}/{} succeeded", jobs.len()));
+            for job in jobs.iter().filter(|j| !j.ok) {
+                lines.push(format!("  - failed: {}", job.label));
+            }
+        }
         lines.push(String::new());
-        lines.push("## Verdict summary".to_string());
-        lines.push(truncate(&agg.text, 600));
+        match &agg.error {
+            Some(error) => {
+                lines.push("## Synthesis failure".to_string());
+                lines.push(truncate(error, 600));
+            }
+            None => {
+                lines.push("## Verdict summary".to_string());
+                lines.push(truncate(&agg.text, 600));
+            }
+        }
     }
 
     lines.push(String::new());
@@ -430,6 +463,51 @@ mod tests {
             agents,
             ["reviewer-2-x", "reviewer-1-x", "reviewer-1-x/subagent-1"]
         );
+        assert!(!session.is_complete());
+    }
+
+    /// Lane/job metadata and synthesis failures must reach the analysis model — and an
+    /// error-flagged record renders its error, never its text slot as a verdict.
+    #[test]
+    fn format_session_renders_lanes_jobs_and_synthesis_failure() {
+        use nitpicker_agent::session::{JobRecord, LaneRecord};
+        let session = SessionData {
+            name: "s".to_string(),
+            records: Vec::new(),
+            aggregation: Some(AggregationRecord {
+                kind: "aggregation".to_string(),
+                model: "m".to_string(),
+                text: "SHOULD-NOT-RENDER".to_string(),
+                error: Some("PROVIDER-DIED".to_string()),
+                rounds: None,
+                converged: None,
+                presets: None,
+                lanes: Some(vec![LaneRecord {
+                    preset: "security".to_string(),
+                    rounds: 2,
+                    converged: false,
+                    degraded: true,
+                }]),
+                jobs: Some(vec![
+                    JobRecord {
+                        label: "security · a".to_string(),
+                        preset: Some("security".to_string()),
+                        ok: true,
+                    },
+                    JobRecord {
+                        label: "tone · b".to_string(),
+                        preset: Some("tone".to_string()),
+                        ok: false,
+                    },
+                ]),
+            }),
+        };
+        let md = format_session(&session);
+        assert!(md.contains("PROVIDER-DIED"));
+        assert!(!md.contains("SHOULD-NOT-RENDER"));
+        for needle in ["security", "tone · b", "1/2"] {
+            assert!(md.contains(needle), "missing {needle}");
+        }
         assert!(!session.is_complete());
     }
 

@@ -20,6 +20,11 @@ pub struct AggregationRecord {
     pub kind: String,
     pub model: String,
     pub text: String,
+    /// Present iff synthesis failed after the per-job/lane work completed (`text` is empty
+    /// then): the record still carries `jobs`/`lanes`, which would otherwise die with the
+    /// aggregator. Consumers must not render `text` as a verdict when this is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rounds: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -216,6 +221,7 @@ mod tests {
         let legacy = r#"{"kind":"aggregation","model":"m","text":"t","rounds":2,"converged":true}"#;
         let parsed: AggregationRecord = serde_json::from_str(legacy).unwrap();
         assert_eq!(parsed.rounds, Some(2));
+        assert!(parsed.error.is_none());
         assert!(parsed.presets.is_none());
         assert!(parsed.lanes.is_none());
         assert!(parsed.jobs.is_none());
@@ -223,7 +229,8 @@ mod tests {
         let current = AggregationRecord {
             kind: "aggregation".to_string(),
             model: "m".to_string(),
-            text: "t".to_string(),
+            text: String::new(),
+            error: Some("provider 500".to_string()),
             rounds: None,
             converged: None,
             presets: Some(vec!["security".to_string()]),
@@ -241,6 +248,7 @@ mod tests {
         };
         let round_tripped: AggregationRecord =
             serde_json::from_str(&serde_json::to_string(&current).unwrap()).unwrap();
+        assert_eq!(round_tripped.error.as_deref(), Some("provider 500"));
         assert_eq!(round_tripped.lanes.unwrap()[0].preset, "security");
         assert!(!round_tripped.jobs.unwrap()[0].ok);
 
@@ -249,6 +257,7 @@ mod tests {
             kind: "aggregation".to_string(),
             model: "m".to_string(),
             text: "t".to_string(),
+            error: None,
             rounds: Some(1),
             converged: Some(false),
             presets: None,
@@ -256,6 +265,7 @@ mod tests {
             jobs: None,
         };
         let json = serde_json::to_string(&legacy_shaped).unwrap();
+        assert!(!json.contains("error"));
         assert!(!json.contains("presets"));
         assert!(!json.contains("lanes"));
         assert!(!json.contains("jobs"));

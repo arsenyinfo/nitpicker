@@ -12,7 +12,7 @@ use nitpicker_agent::provider::{build_aggregator_client, build_reviewer_client};
 use nitpicker_agent::session::{
     AggregationRecord, JobRecord, SessionLogger, sanitize_path_component,
 };
-use nitpicker_agent::tools::all_tools;
+use nitpicker_agent::tools::{all_tools, floor_char_boundary};
 use rig_core::completion::Message;
 use std::path::Path;
 use std::sync::Arc;
@@ -297,45 +297,78 @@ pub async fn run_review(
     pb_agg.enable_steady_tick(Duration::from_millis(80));
 
     let agg = &config.aggregator;
-    let client = build_aggregator_client(agg, proxy_url.as_deref())?;
-    let completion = Completion {
-        model: agg.model.clone(),
-        prompt: Message::user(reduce_prompt),
-        preamble: Some(mode.aggregator_preamble().to_string()),
-        history: Vec::new(),
-        tools: Vec::new(),
-        tool_choice: None,
-        max_tokens: Some(config.aggregator_max_tokens()),
-        additional_params: None,
-    };
-    // preset runs get the count/context wrapping; the Ask path propagates the provider
-    // error untouched, as it did before the fan-out
-    let response = client.completion(completion).await.map_err(|err| match presets {
-        Some(presets) => crate::presets::synthesis_failure(
-            err,
-            format!(
-                "final aggregation failed over {success_count} surviving review job(s) across {} preset(s)",
-                presets.len()
+    let synthesis: Result<String> = async {
+        let client = build_aggregator_client(agg, proxy_url.as_deref())?;
+        let completion = Completion {
+            model: agg.model.clone(),
+            prompt: Message::user(reduce_prompt),
+            preamble: Some(mode.aggregator_preamble().to_string()),
+            history: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            max_tokens: Some(config.aggregator_max_tokens()),
+            additional_params: None,
+        };
+        // preset runs get the count/context wrapping; the Ask path propagates the provider
+        // error untouched, as it did before the fan-out
+        let response = client.completion(completion).await.map_err(|err| match presets {
+            Some(presets) => crate::presets::synthesis_failure(
+                err,
+                format!(
+                    "final aggregation failed over {success_count} surviving review job(s) across {} preset(s)",
+                    presets.len()
+                ),
             ),
-        ),
-        None => err,
-    })?;
-    usage.add(response.usage, 0);
-    pb_agg.set_style(done_style);
-    if response.finish_reason == FinishReason::ToolUse {
-        pb_agg.finish_with_message(crate::progress::bar_message(
-            "✗ failed: unexpected tool call",
-        ));
-        return Err(eyre::eyre!("aggregator returned tool calls unexpectedly"));
+            None => err,
+        })?;
+        usage.add(response.usage, 0);
+        if response.finish_reason == FinishReason::ToolUse {
+            eyre::bail!("aggregator returned tool calls unexpectedly");
+        }
+        Ok(response.text())
     }
-    pb_agg.finish_with_message("✓ done");
-    let text = response.text();
+    .await;
+    pb_agg.set_style(done_style);
+    // A post-collection synthesis failure still persists the per-job outcomes: the jobs
+    // list is the durable record of what ran, and losing it because the aggregator died
+    // is exactly when a post-mortem needs it. The record carries `error` and an empty
+    // `text` so consumers (reflect) don't render it as a verdict.
+    let text = match synthesis {
+        Ok(text) => {
+            pb_agg.finish_with_message("✓ done");
+            text
+        }
+        Err(err) => {
+            pb_agg.finish_with_message(crate::progress::bar_message("✗ synthesis failed"));
+            if let Some(logger) = &session_logger {
+                let record = AggregationRecord {
+                    kind: "aggregation".to_string(),
+                    model: agg.model.clone(),
+                    text: String::new(),
+                    error: Some(bounded_error_string(&err)),
+                    rounds: None,
+                    converged: None,
+                    presets: presets.map(|ps| ps.iter().map(|p| p.name.clone()).collect()),
+                    lanes: None,
+                    jobs: Some(job_records),
+                };
+                match logger.write_aggregation(&record).await {
+                    Ok(()) => {}
+                    Err(write_err) => {
+                        warn!(error = ?write_err, "failed to persist synthesis-failure record");
+                    }
+                }
+            }
+            return Err(err);
+        }
+    };
     if let Some(logger) = &session_logger {
         logger
             .write_aggregation(&AggregationRecord {
                 kind: "aggregation".to_string(),
                 model: agg.model.clone(),
                 text: text.clone(),
+                error: None,
                 rounds: None,
                 converged: None,
                 presets: presets.map(|ps| ps.iter().map(|p| p.name.clone()).collect()),
@@ -366,6 +399,17 @@ struct ReviewJob {
 /// presets for review runs. Labels must be unique — the aggregator attributes reports by
 /// them: duplicate reviewer names get an ` #<index>` suffix, and any residual collision
 /// (a crafted name that embeds the suffix) falls back to the globally-unique job ordinal.
+/// Bounded `{err:#}` chain for persistence — a provider error body can be huge, and the
+/// session record is not the place to store it whole.
+pub(crate) fn bounded_error_string(err: &eyre::Report) -> String {
+    const MAX: usize = 4000;
+    let full = format!("{err:#}");
+    match full.len() <= MAX {
+        true => full,
+        false => format!("{}…", &full[..floor_char_boundary(&full, MAX)]),
+    }
+}
+
 fn plan_jobs(
     reviewer_names: &[&str],
     presets: Option<&[crate::presets::ReviewPreset]>,
