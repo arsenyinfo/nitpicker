@@ -9,7 +9,9 @@ use nitpicker_agent::agent::{
 use nitpicker_agent::config::Config;
 use nitpicker_agent::llm::{Completion, LLMClientDyn, TokenUsage};
 use nitpicker_agent::provider::{build_aggregator_client, build_reviewer_client};
-use nitpicker_agent::session::{AggregationRecord, SessionLogger, SessionWriter};
+use nitpicker_agent::session::{
+    AggregationRecord, LaneRecord, SessionLogger, SessionWriter, sanitize_path_component,
+};
 use nitpicker_agent::tools::{Tool, all_tools};
 use rig_core::completion::Message;
 use serde_json::{Value, json};
@@ -71,13 +73,19 @@ struct DebateTurnRequest<'a> {
     max_tokens: Option<u64>,
     model: &'a str,
     system_prompt: &'a str,
+    /// Preset lanes hand their subagents a rubric-aware prompt; Topic leaves the generic one.
+    subagent_system_prompt: Option<String>,
     initial_message: &'a str,
     max_turns: usize,
     work_dir: &'a Path,
+    /// One per run, shared by every lane and subagent — concurrent lanes must split the
+    /// account-wide in-flight cap, not multiply it.
+    llm_semaphore: Arc<tokio::sync::Semaphore>,
     progress: Option<Arc<dyn Fn(AgentProgress) + Send + Sync>>,
     project_context: Option<String>,
-    /// Trajectory identity (`<side>-<round>`, the writer's file stem): `reflect` merges all of a
-    /// session's files by timestamp, so the record label is what keeps turns distinguishable.
+    /// Trajectory identity (`[lane-<j>-<preset>-]<side>-<round>`, the writer's file stem):
+    /// `reflect` merges all of a session's files by timestamp, so the record label is what
+    /// keeps turns distinguishable.
     session_agent: String,
     session_writer: Option<SessionWriter>,
 }
@@ -162,7 +170,7 @@ async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnRes
         max_tokens: request.max_tokens,
         compact_threshold: request.compact_threshold,
         system_prompt: request.system_prompt.to_string(),
-        subagent_system_prompt: None,
+        subagent_system_prompt: request.subagent_system_prompt,
         client: request.client,
         depth: AgentDepth::TopLevel,
         terminal_tools: vec!["submit_verdict".to_string()],
@@ -172,8 +180,7 @@ async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnRes
         ),
         max_empty_responses: 3,
         subagent_counter,
-        // debate turns never overlap, so a per-turn cap is the same as a global one
-        llm_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LLM_CALLS)),
+        llm_semaphore: request.llm_semaphore,
         progress: request.progress,
         project_context: request.project_context,
         session_writer: request.session_writer,
@@ -238,7 +245,8 @@ struct DebateSide<'a> {
     session_stem: &'a str,
 }
 
-/// Everything a turn needs that is identical for both sides.
+/// Everything a lane's turns need that is identical for both sides. One instance per lane:
+/// most fields borrow run-level state, the last three are the lane's own.
 struct RoundEnv<'a> {
     mp: &'a MultiProgress,
     done_style: &'a ProgressStyle,
@@ -250,6 +258,13 @@ struct RoundEnv<'a> {
     max_turns: usize,
     verbose: bool,
     stdout_ok: bool,
+    llm_semaphore: &'a Arc<tokio::sync::Semaphore>,
+    /// Preset name shown in progress prefixes; `None` for Topic (and its single lane).
+    lane_tag: Option<&'a str>,
+    subagent_system_prompt: Option<&'a str>,
+    /// Print verdicts as turns finish (single lane only) — concurrent lanes buffer instead,
+    /// since their interleaved output would be unattributable.
+    live_output: bool,
 }
 
 /// Run one side's turn for a round: spinner up, agent run, spinner down, optional render.
@@ -260,7 +275,11 @@ async fn run_debate_side(
     round: usize,
 ) -> Result<DebateTurnResult> {
     let (pb, _) = make_spinner(env.mp);
-    pb.set_prefix(colored_role_stderr(side.role));
+    let prefix = match env.lane_tag {
+        Some(tag) => format!("{tag} · {}", colored_role_stderr(side.role)),
+        None => colored_role_stderr(side.role),
+    };
+    pb.set_prefix(prefix);
     pb.set_message(crate::progress::bar_message(format!(
         "round {round} — debating…"
     )));
@@ -287,9 +306,11 @@ async fn run_debate_side(
         max_tokens: side.max_tokens,
         model: side.model,
         system_prompt: side.system_prompt,
+        subagent_system_prompt: env.subagent_system_prompt.map(str::to_string),
         initial_message: &msg,
         max_turns: env.max_turns,
         work_dir: env.repo,
+        llm_semaphore: Arc::clone(env.llm_semaphore),
         progress,
         project_context: Some(env.project_context.to_string()),
         session_writer: env
@@ -313,7 +334,7 @@ async fn run_debate_side(
         ),
         crate::progress::compact_tokens(result.usage.output_tokens)
     )));
-    if env.verbose && env.stdout_ok && stdout_is_terminal() {
+    if env.live_output && env.verbose && env.stdout_ok && stdout_is_terminal() {
         println!();
         env.skin.print_text(&result.verdict.text);
         println!();
@@ -419,11 +440,26 @@ pub struct DebateOutcome {
     pub degraded: bool,
 }
 
+/// One lane's full result: an independent actor/critic debate over a single preset (or the
+/// whole topic for `ask`). Convergence, degradation, and the dialogue are all lane-local;
+/// the global meta-review synthesizes across surviving lanes.
+struct DebateLaneOutcome {
+    preset_name: Option<String>,
+    /// (role_label, round_number, verdict_text)
+    verdicts: Vec<(String, usize, String)>,
+    converged: bool,
+    final_round: usize,
+    any_turn_succeeded: bool,
+    degraded: bool,
+    usage: UsageReport,
+}
+
 pub async fn run_debate(
     repo: &Path,
     prompt: &str,
     config: &Config,
     opts: DebateOptions,
+    presets: Option<&[crate::presets::ReviewPreset]>,
 ) -> Result<DebateOutcome> {
     let DebateOptions {
         max_rounds,
@@ -433,6 +469,12 @@ pub async fn run_debate(
         alloy,
         format,
     } = opts;
+    match (&mode, presets) {
+        (DebateMode::Review(_), Some(_)) | (DebateMode::Topic, None) => {}
+        (DebateMode::Review(_), None) | (DebateMode::Topic, Some(_)) => {
+            unreachable!("Review debates take the resolved presets; Topic takes none")
+        }
+    }
     // in json mode stdout is reserved for the final envelope; the cast lines and
     // rendered verdicts below would otherwise corrupt it.
     let stdout_ok = matches!(format, crate::output::OutputFormat::Text);
@@ -502,8 +544,9 @@ pub async fn run_debate(
 
     let actor_role = mode.actor_role();
     let critic_role = mode.critic_role();
-    let actor_system = mode.actor_system();
-    let critic_system = mode.critic_system();
+    // one in-flight-LLM cap for the whole run: concurrent lanes and their subagents share
+    // it, so lane count scales wall-clock breadth without multiplying provider pressure
+    let llm_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LLM_CALLS));
 
     let done_style = ProgressStyle::with_template("  {prefix:<12} {msg}").unwrap();
     let skin = MadSkin::default();
@@ -532,91 +575,191 @@ pub async fn run_debate(
             );
         }
         print_cast_line("Meta-review", &agg_cfg.model);
+        if let Some(presets) = presets {
+            let names: Vec<&str> = presets.iter().map(|p| p.name.as_str()).collect();
+            print_cast_line("Presets", &names.join(", "));
+        }
         println!();
     }
 
-    let actor = DebateSide {
-        role: actor_role,
-        client: actor_client,
-        compact_threshold: actor_compact_threshold,
-        max_tokens: actor_max_tokens,
-        model: &actor_label.alias,
-        system_prompt: &actor_system,
-        session_stem: "review",
+    // One lane per preset for Review; Topic (`ask`) is the degenerate single `None` lane and
+    // keeps its exact pre-preset behavior, live verbose output included.
+    let lane_presets: Vec<Option<&crate::presets::ReviewPreset>> = match presets {
+        Some(presets) => presets.iter().map(Some).collect(),
+        None => vec![None],
     };
-    let critic = DebateSide {
-        role: critic_role,
-        client: critic_client,
-        compact_threshold: critic_compact_threshold,
-        max_tokens: critic_max_tokens,
-        model: &critic_label.alias,
-        system_prompt: &critic_system,
-        session_stem: "validate",
-    };
-    let env = RoundEnv {
-        mp: &mp,
-        done_style: &done_style,
-        skin: &skin,
-        repo,
-        topic: prompt,
-        project_context: &project_context,
-        session_logger: session_logger.as_ref(),
-        max_turns,
-        verbose,
-        stdout_ok,
-    };
+    let live_output = lane_presets.len() == 1;
 
-    // (role_label, round_number, verdict_text)
-    let mut verdicts: Vec<(String, usize, String)> = Vec::new();
-    let mut converged = false;
-    let mut final_round = 0usize;
-    let mut any_turn_succeeded = false;
-    let mut degraded = false;
-    let mut usage = UsageReport::default();
+    let lane_futures = lane_presets.iter().enumerate().map(|(lane_index, preset)| {
+        let actor_client = Arc::clone(&actor_client);
+        let critic_client = Arc::clone(&critic_client);
+        let llm_semaphore = &llm_semaphore;
+        let mp = &mp;
+        let done_style = &done_style;
+        let skin = &skin;
+        let project_context = &project_context;
+        let session_logger = session_logger.as_ref();
+        let actor_alias = &actor_label.alias;
+        let critic_alias = &critic_label.alias;
+        let mode = &mode;
+        async move {
+            let actor_system = mode.actor_system(*preset);
+            let critic_system = mode.critic_system(*preset);
+            let subagent_prompt = preset.map(crate::prompts::preset_subagent_prompt);
+            let (actor_stem, critic_stem) = lane_session_stems(lane_index, *preset);
+            let actor = DebateSide {
+                role: actor_role,
+                client: actor_client,
+                compact_threshold: actor_compact_threshold,
+                max_tokens: actor_max_tokens,
+                model: actor_alias,
+                system_prompt: &actor_system,
+                session_stem: &actor_stem,
+            };
+            let critic = DebateSide {
+                role: critic_role,
+                client: critic_client,
+                compact_threshold: critic_compact_threshold,
+                max_tokens: critic_max_tokens,
+                model: critic_alias,
+                system_prompt: &critic_system,
+                session_stem: &critic_stem,
+            };
+            let env = RoundEnv {
+                mp,
+                done_style,
+                skin,
+                repo,
+                topic: prompt,
+                project_context,
+                session_logger,
+                max_turns,
+                verbose,
+                stdout_ok,
+                llm_semaphore,
+                lane_tag: preset.map(|p| p.name.as_str()),
+                subagent_system_prompt: subagent_prompt.as_deref(),
+                live_output,
+            };
 
-    'debate: for round in 1..=max_rounds {
-        final_round = round;
+            let mut lane = DebateLaneOutcome {
+                preset_name: preset.map(|p| p.name.clone()),
+                verdicts: Vec::new(),
+                converged: false,
+                final_round: 0,
+                any_turn_succeeded: false,
+                degraded: false,
+                usage: UsageReport::default(),
+            };
 
-        let actor_turn = run_debate_side(&actor, &env, &verdicts, round).await?;
-        usage.add(actor_turn.usage, actor_turn.subagents_spawned);
-        any_turn_succeeded |= !actor_turn.agent_failed;
-        degraded |= actor_turn.agent_failed || actor_turn.used_fallback;
-        verdicts.push((actor_role.to_string(), round, actor_turn.verdict.text));
+            'debate: for round in 1..=max_rounds {
+                lane.final_round = round;
 
-        let critic_turn = run_debate_side(&critic, &env, &verdicts, round).await?;
-        usage.add(critic_turn.usage, critic_turn.subagents_spawned);
-        any_turn_succeeded |= !critic_turn.agent_failed;
-        degraded |= critic_turn.agent_failed || critic_turn.used_fallback;
-        // Convergence requires a real agreement: a critic that agrees with a failed actor's
-        // `*Agent failed*` stub (or a failed critic, whose verdict defaults to agree=false) must
-        // not end the debate early.
-        let agreed =
-            critic_turn.verdict.agree && !actor_turn.agent_failed && !critic_turn.agent_failed;
-        verdicts.push((critic_role.to_string(), round, critic_turn.verdict.text));
+                let actor_turn = run_debate_side(&actor, &env, &lane.verdicts, round).await?;
+                lane.usage.add(actor_turn.usage, actor_turn.subagents_spawned);
+                lane.any_turn_succeeded |= !actor_turn.agent_failed;
+                lane.degraded |= actor_turn.agent_failed || actor_turn.used_fallback;
+                lane.verdicts
+                    .push((actor_role.to_string(), round, actor_turn.verdict.text));
 
-        if agreed {
-            converged = true;
-            break 'debate;
+                let critic_turn = run_debate_side(&critic, &env, &lane.verdicts, round).await?;
+                lane.usage.add(critic_turn.usage, critic_turn.subagents_spawned);
+                lane.any_turn_succeeded |= !critic_turn.agent_failed;
+                lane.degraded |= critic_turn.agent_failed || critic_turn.used_fallback;
+                // Convergence requires a real agreement: a critic that agrees with a failed
+                // actor's `*Agent failed*` stub (or a failed critic, whose verdict defaults to
+                // agree=false) must not end the debate early.
+                let agreed = critic_turn.verdict.agree
+                    && !actor_turn.agent_failed
+                    && !critic_turn.agent_failed;
+                lane.verdicts
+                    .push((critic_role.to_string(), round, critic_turn.verdict.text));
+
+                if agreed {
+                    lane.converged = true;
+                    break 'debate;
+                }
+            }
+            Ok::<DebateLaneOutcome, eyre::Report>(lane)
+        }
+    });
+    let lane_results = futures::future::join_all(lane_futures).await;
+
+    let mut lanes: Vec<DebateLaneOutcome> = Vec::new();
+    for (lane_index, result) in lane_results.into_iter().enumerate() {
+        match result {
+            Ok(lane) => lanes.push(lane),
+            // a lane-level error (nothing inside the loop should produce one — turn failures
+            // fold into stubs) counts as a dead, degraded lane rather than aborting siblings
+            Err(err) => {
+                warn!(lane = lane_index, error = ?err, "debate lane failed");
+                lanes.push(DebateLaneOutcome {
+                    preset_name: lane_presets[lane_index].map(|p| p.name.clone()),
+                    verdicts: Vec::new(),
+                    converged: false,
+                    final_round: 0,
+                    any_turn_succeeded: false,
+                    degraded: true,
+                    usage: UsageReport::default(),
+                });
+            }
         }
     }
 
-    // Every turn failed (provider down, bad config): the dialogue is nothing but failure stubs, so
-    // synthesizing a meta-verdict would fabricate a confident review from errors. Surface the
-    // failure instead — `run_pr` maps this to a `status: "error"` envelope and posts no comment.
-    if !any_turn_succeeded {
+    let mut usage = UsageReport::default();
+    let mut degraded = false;
+    for lane in &lanes {
+        usage.merge(&lane.usage);
+        degraded |= lane.degraded;
+    }
+
+    // Concurrent lanes buffered their dialogue (live printing would interleave); surface it
+    // per lane now that ordering is deterministic.
+    if !live_output && verbose && stdout_ok && stdout_is_terminal() {
+        for lane in &lanes {
+            if let Some(name) = &lane.preset_name {
+                println!("\n─── {name} ───");
+            }
+            for (label, rnd, text) in &lane.verdicts {
+                println!("\n{label} (Round {rnd}):");
+                skin.print_text(text);
+            }
+        }
+    }
+
+    // Every turn failed everywhere (provider down, bad config): the dialogue is nothing but
+    // failure stubs, so synthesizing a meta-verdict would fabricate a confident review from
+    // errors. Surface the failure instead — `run_pr` maps this to a `status: "error"`
+    // envelope and posts no comment. A lane with no successful turn is likewise omitted from
+    // synthesis below: its stubs are execution noise, not review evidence.
+    if !lanes.iter().any(|lane| lane.any_turn_succeeded) {
         eyre::bail!("all debate turns failed; refusing to synthesize a verdict");
     }
 
-    // meta-review: non-agentic single completion over the full dialogue
-    let dialogue = verdicts
-        .iter()
-        .map(|(label, rnd, text)| format!("### {label} (Round {rnd})\n{text}"))
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    let meta_prompt = format!(
-        "The following is a debate about: {prompt}\n\n{dialogue}\n\n---\n{}",
-        mode.meta_instruction()
-    );
+    // meta-review: non-agentic single completion over the surviving lanes' dialogue
+    let survivors: Vec<&DebateLaneOutcome> =
+        lanes.iter().filter(|lane| lane.any_turn_succeeded).collect();
+    let meta_prompt = match presets {
+        // Topic (`ask`): single lane, prompt shape unchanged
+        None => format!(
+            "The following is a debate about: {prompt}\n\n{dialogue}\n\n---\n{instruction}",
+            dialogue = lane_dialogue(survivors[0]),
+            instruction = mode.meta_instruction(),
+        ),
+        Some(presets) => format!(
+            "The following are independent review debates about the same target, one per review angle.\n\
+             Target: {prompt}\n\n{roster}\n\n{sections}\n\n---\n\
+             Notes:\n\
+             - \"*Agent failed: …*\" markers are execution errors kept for chronology; they are \
+             not review evidence and not agreement.\n\
+             - A lane that ended without convergence carries unresolved disagreement — weigh it \
+             by the evidence, do not read it as agreement.\n\
+             {instruction}",
+            roster = crate::prompts::preset_roster(presets),
+            sections = lane_sections(&survivors),
+            instruction = mode.meta_instruction(),
+        ),
+    };
     let meta_completion = Completion {
         model: agg_cfg.model.clone(),
         prompt: Message::user(meta_prompt),
@@ -637,48 +780,97 @@ pub async fn run_debate(
     pb.set_style(done_style);
     pb.finish_with_message("✓ done");
     if let Some(logger) = &session_logger {
-        logger
-            .write_aggregation(&AggregationRecord {
+        let record = match presets {
+            None => AggregationRecord {
                 kind: "aggregation".to_string(),
                 model: agg_cfg.model.clone(),
                 text: meta_text.clone(),
-                rounds: Some(final_round),
-                converged: Some(converged),
+                rounds: Some(lanes[0].final_round),
+                converged: Some(lanes[0].converged),
                 presets: None,
-            })
-            .await?;
+                lanes: None,
+            },
+            Some(presets) => AggregationRecord {
+                kind: "aggregation".to_string(),
+                model: agg_cfg.model.clone(),
+                text: meta_text.clone(),
+                rounds: None,
+                converged: None,
+                presets: Some(presets.iter().map(|p| p.name.clone()).collect()),
+                lanes: Some(
+                    lanes
+                        .iter()
+                        .map(|lane| LaneRecord {
+                            preset: lane.preset_name.clone().unwrap_or_default(),
+                            rounds: lane.final_round,
+                            converged: lane.converged,
+                            degraded: lane.degraded,
+                        })
+                        .collect(),
+                ),
+            },
+        };
+        logger.write_aggregation(&record).await?;
     }
     // write transcript file
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let transcript_path = std::env::temp_dir().join(format!("{}-{ts}.md", mode.label()));
+    let transcript_path =
+        std::env::temp_dir().join(transcript_filename(mode.label(), ts, presets));
     let now = chrono::Local::now();
-    let convergence_status = if converged {
-        format!("converged at round {final_round}")
-    } else {
-        format!("max rounds ({max_rounds}) reached without convergence")
-    };
 
     let label = mode.label();
-    let mut transcript = format!(
-        "# Debate Transcript ({label})\n\n\
-        **Topic:** {prompt}\n\
-        **{actor_role} model:** {}\n\
-        **{critic_role} model:** {}\n\
-        **Meta-reviewer:** {}\n\
-        **Date:** {}\n\
-        **Convergence:** {convergence_status}\n\
-        **Rounds:** {final_round}\n\n---\n\n",
-        actor_label.full,
-        critic_label.full,
-        agg_cfg.model,
-        now.format("%Y-%m-%d %H:%M:%S"),
-    );
-    for (label, rnd, text) in &verdicts {
-        transcript.push_str(&format!("## {label} — Round {rnd}\n\n{text}\n\n"));
-    }
+    let mut transcript = match presets {
+        // Topic (`ask`): single lane, transcript shape unchanged
+        None => {
+            let lane = &lanes[0];
+            let convergence_status = match lane.converged {
+                true => format!("converged at round {}", lane.final_round),
+                false => format!("max rounds ({max_rounds}) reached without convergence"),
+            };
+            let mut transcript = format!(
+                "# Debate Transcript ({label})\n\n\
+                **Topic:** {prompt}\n\
+                **{actor_role} model:** {}\n\
+                **{critic_role} model:** {}\n\
+                **Meta-reviewer:** {}\n\
+                **Date:** {}\n\
+                **Convergence:** {convergence_status}\n\
+                **Rounds:** {}\n\n---\n\n",
+                actor_label.full,
+                critic_label.full,
+                agg_cfg.model,
+                now.format("%Y-%m-%d %H:%M:%S"),
+                lane.final_round,
+            );
+            for (label, rnd, text) in &lane.verdicts {
+                transcript.push_str(&format!("## {label} — Round {rnd}\n\n{text}\n\n"));
+            }
+            transcript
+        }
+        Some(_) => {
+            let mut transcript = format!(
+                "# Debate Transcript ({label})\n\n\
+                **Topic:** {prompt}\n\
+                **{actor_role} model:** {}\n\
+                **{critic_role} model:** {}\n\
+                **Meta-reviewer:** {}\n\
+                **Date:** {}\n\
+                **Lanes:** {}\n\n---\n\n",
+                actor_label.full,
+                critic_label.full,
+                agg_cfg.model,
+                now.format("%Y-%m-%d %H:%M:%S"),
+                lanes.len(),
+            );
+            for lane in &lanes {
+                transcript.push_str(&render_lane_transcript_section(lane, max_rounds));
+            }
+            transcript
+        }
+    };
     transcript.push_str(&format!("---\n\n## Meta-review\n\n{meta_text}\n"));
 
     // only the verbose path surfaces this file; skip the write otherwise so a
@@ -693,4 +885,194 @@ pub async fn run_debate(
         usage,
         degraded,
     })
+}
+
+/// Trajectory stems for one lane's two sides. Topic keeps the pre-preset stems; preset
+/// lanes prefix the lane index AND sanitized preset name — the index is load-bearing
+/// because distinct preset names can sanitize to the same slug.
+fn lane_session_stems(
+    lane_index: usize,
+    preset: Option<&crate::presets::ReviewPreset>,
+) -> (String, String) {
+    match preset {
+        None => ("review".to_string(), "validate".to_string()),
+        Some(preset) => {
+            let prefix = format!("lane-{}-{}", lane_index + 1, sanitize_path_component(&preset.name));
+            (format!("{prefix}-review"), format!("{prefix}-validate"))
+        }
+    }
+}
+
+fn lane_dialogue(lane: &DebateLaneOutcome) -> String {
+    lane.verdicts
+        .iter()
+        .map(|(label, rnd, text)| format!("### {label} (Round {rnd})\n{text}"))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Meta-review input sections, surviving lanes only — convergence state is stated per lane
+/// so unresolved disagreement reaches the synthesizer as disagreement.
+fn lane_sections(survivors: &[&DebateLaneOutcome]) -> String {
+    survivors
+        .iter()
+        .map(|lane| {
+            let name = lane.preset_name.as_deref().unwrap_or("(unnamed)");
+            let convergence = match lane.converged {
+                true => format!("converged at round {}", lane.final_round),
+                false => format!("no convergence after {} round(s)", lane.final_round),
+            };
+            format!("## Preset: {name} — {convergence}\n\n{}", lane_dialogue(lane))
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// `debate-{ts}.md` for Topic (unchanged); review runs append bounded sanitized preset
+/// slugs so concurrent artifacts are attributable at a glance.
+fn transcript_filename(
+    label: &str,
+    ts: u64,
+    presets: Option<&[crate::presets::ReviewPreset]>,
+) -> String {
+    match presets {
+        None => format!("{label}-{ts}.md"),
+        Some(presets) => {
+            let mut slugs = presets
+                .iter()
+                .map(|p| sanitize_path_component(&p.name))
+                .collect::<Vec<_>>()
+                .join("-");
+            // sanitize output is ASCII, so a byte truncate cannot split a char
+            const MAX_SLUG_LEN: usize = 80;
+            slugs.truncate(MAX_SLUG_LEN);
+            format!("{label}-{ts}-{slugs}.md")
+        }
+    }
+}
+
+/// Human transcript section for one lane — every lane appears (dead ones flagged), unlike
+/// the meta input, because the transcript is the debugging artifact.
+fn render_lane_transcript_section(lane: &DebateLaneOutcome, max_rounds: usize) -> String {
+    let name = lane.preset_name.as_deref().unwrap_or("(unnamed)");
+    let convergence = match lane.converged {
+        true => format!("converged at round {}", lane.final_round),
+        false => format!("max rounds ({max_rounds}) reached without convergence"),
+    };
+    let degraded = match lane.degraded {
+        true => "yes",
+        false => "no",
+    };
+    let mut section =
+        format!("## Preset: {name}\n\n**Convergence:** {convergence}\n**Degraded:** {degraded}\n\n");
+    if !lane.any_turn_succeeded {
+        section.push_str("*Lane failed: no successful turns; omitted from synthesis.*\n\n");
+    }
+    for (label, rnd, text) in &lane.verdicts {
+        section.push_str(&format!("### {label} — Round {rnd}\n\n{text}\n\n"));
+    }
+    section
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::presets::ReviewPreset;
+
+    fn preset(name: &str) -> ReviewPreset {
+        ReviewPreset {
+            name: name.to_string(),
+            prompt: format!("rubric for {name}"),
+        }
+    }
+
+    fn lane(preset_name: Option<&str>, verdicts: &[(&str, usize, &str)]) -> DebateLaneOutcome {
+        DebateLaneOutcome {
+            preset_name: preset_name.map(str::to_string),
+            verdicts: verdicts
+                .iter()
+                .map(|(l, r, t)| (l.to_string(), *r, t.to_string()))
+                .collect(),
+            converged: false,
+            final_round: 1,
+            any_turn_succeeded: true,
+            degraded: false,
+            usage: UsageReport::default(),
+        }
+    }
+
+    /// Distinct presets that sanitize to the same slug must still produce distinct
+    /// trajectory stems — otherwise two lanes write the same `.jsonl` and their records
+    /// interleave unattributably.
+    #[test]
+    fn lane_stems_stay_unique_when_preset_names_sanitize_identically() {
+        let a = preset("a/b");
+        let b = preset("a?b");
+        let (a_review, a_validate) = lane_session_stems(0, Some(&a));
+        let (b_review, b_validate) = lane_session_stems(1, Some(&b));
+        assert_ne!(a_review, b_review);
+        assert_ne!(a_validate, b_validate);
+        assert_ne!(a_review, a_validate);
+    }
+
+    /// Topic (`ask`) keeps the pre-preset stems exactly — its trajectory layout is a
+    /// compatibility surface for `reflect`.
+    #[test]
+    fn topic_lane_keeps_legacy_stems() {
+        assert_eq!(
+            lane_session_stems(0, None),
+            ("review".to_string(), "validate".to_string())
+        );
+    }
+
+    /// The meta input must state each surviving lane's preset and convergence status —
+    /// unresolved disagreement has to arrive labelled as such.
+    #[test]
+    fn lane_sections_carry_preset_names_and_convergence_state() {
+        let mut converged_lane = lane(Some("security"), &[("Reviewer", 1, "finding X")]);
+        converged_lane.converged = true;
+        let open_lane = lane(Some("tone"), &[("Validator", 1, "disputed Y")]);
+        let sections = lane_sections(&[&converged_lane, &open_lane]);
+        for needle in [
+            "Preset: security — converged at round 1",
+            "Preset: tone — no convergence",
+            "finding X",
+            "disputed Y",
+        ] {
+            assert!(sections.contains(needle), "missing {needle}");
+        }
+    }
+
+    /// Dead lanes appear in the human transcript (flagged) but never in the meta input.
+    #[test]
+    fn dead_lanes_are_flagged_in_transcript_and_absent_from_meta_sections() {
+        let mut dead = lane(Some("security"), &[("Reviewer", 1, "*Agent failed: boom*")]);
+        dead.any_turn_succeeded = false;
+        let alive = lane(Some("tone"), &[("Reviewer", 1, "real finding")]);
+
+        let survivors: Vec<&DebateLaneOutcome> = [&dead, &alive]
+            .into_iter()
+            .filter(|l| l.any_turn_succeeded)
+            .collect();
+        assert!(!lane_sections(&survivors).contains("security"));
+
+        let section = render_lane_transcript_section(&dead, 5);
+        assert!(section.contains("Lane failed"));
+    }
+
+    /// Topic filenames are unchanged; preset filenames append bounded sanitized slugs.
+    #[test]
+    fn transcript_filenames_are_mode_appropriate_and_bounded() {
+        assert_eq!(transcript_filename("debate", 42, None), "debate-42.md");
+
+        let ps = vec![preset("security"), preset("ml-rigor")];
+        assert_eq!(
+            transcript_filename("review-debate", 42, Some(&ps)),
+            "review-debate-42-security-ml-rigor.md"
+        );
+
+        let long: Vec<ReviewPreset> = (0..30).map(|i| preset(&format!("angle-{i}"))).collect();
+        let name = transcript_filename("review-debate", 42, Some(&long));
+        assert!(name.len() < 120, "unbounded filename: {name}");
+    }
 }

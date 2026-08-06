@@ -65,6 +65,20 @@ pub struct UsageReport {
 }
 
 impl UsageReport {
+    /// fold another report's totals in (a debate lane's accumulated usage).
+    pub fn merge(&mut self, other: &UsageReport) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(other.cached_input_tokens);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .saturating_add(other.cache_creation_input_tokens);
+        self.subagents_spawned += other.subagents_spawned;
+    }
+
     /// fold one completion's token usage (and any subagents it spawned) into the totals.
     pub fn add(&mut self, usage: TokenUsage, subagents_spawned: usize) {
         self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);

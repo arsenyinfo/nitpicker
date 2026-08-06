@@ -28,6 +28,17 @@ pub struct AggregationRecord {
     /// runs without preset fan-out (`ask`), so old sessions keep deserializing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presets: Option<Vec<String>>,
+    /// Per-lane convergence metadata for preset debate runs; absent elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lanes: Option<Vec<LaneRecord>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LaneRecord {
+    pub preset: String,
+    pub rounds: usize,
+    pub converged: bool,
+    pub degraded: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

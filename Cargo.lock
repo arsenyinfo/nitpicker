@@ -1977,6 +1977,7 @@ dependencies = [
  "console",
  "dirs",
  "eyre",
+ "futures",
  "indicatif",
  "keyring",
  "libc",

@@ -250,7 +250,7 @@ impl TaskMode {
 }
 
 /// The roster block for synthesis prompts: every active preset's name and full rubric.
-fn preset_roster(presets: &[crate::presets::ReviewPreset]) -> String {
+pub(crate) fn preset_roster(presets: &[crate::presets::ReviewPreset]) -> String {
     let blocks: Vec<String> = presets
         .iter()
         .map(|p| format!("### {}\n{}", p.name, p.prompt))
@@ -295,9 +295,15 @@ impl DebateMode {
         }
     }
 
-    pub(crate) fn actor_system(&self) -> String {
-        match self {
-            DebateMode::Topic => {
+    /// `Review` lanes compose the debate protocol with exactly one preset's rubric (placed
+    /// last, like the parallel path, so lanes share a cacheable prompt prefix); `Topic`
+    /// takes no preset and is byte-identical to the pre-preset prompt.
+    pub(crate) fn actor_system(&self, preset: Option<&crate::presets::ReviewPreset>) -> String {
+        match (self, preset) {
+            (DebateMode::Review(_), None) | (DebateMode::Topic, Some(_)) => {
+                unreachable!("Review lanes take exactly one preset; Topic takes none")
+            }
+            (DebateMode::Topic, None) => {
                 "You are the ACTOR in a structured debate. Answer the question in the shape it deserves:\n\
                 - Genuine alternatives: enumerate 2-3 viable options, recommend one with reasoning \
                 grounded in the code. Don't invent options where none exist.\n\
@@ -315,11 +321,10 @@ impl DebateMode {
                     + "\n\n"
                     + VERIFY_WARNING
             }
-            DebateMode::Review(scope) => {
+            (DebateMode::Review(scope), Some(preset)) => {
                 format!(
-                    "You are a thorough code reviewer. Find genuine issues — bugs, security flaws, \
-                    performance problems, unclear logic — in the {target}. Use the available \
-                    tools to read the code and understand context.\n\n\
+                    "You are a thorough code reviewer. Find genuine issues in the {target}. \
+                    Use the available tools to read the code and understand context.\n\n\
                     You are the recall stage. Err toward inclusion: if you are moderately confident \
                     something is wrong but the trigger is narrow or you're unsure, include the finding \
                     and state your uncertainty. Reserve outright dropping for findings you yourself \
@@ -339,17 +344,24 @@ impl DebateMode {
                     {FINDING_FIELDS}\n\n\
                     If there are no valid findings, set verdict exactly to: {NO_FINDINGS}\n\n\
                     {DELEGATION_GUIDANCE}\n\n\
-                    {VERIFY_WARNING}",
+                    {VERIFY_WARNING}\n\n\
+                    Your assigned review angle — {name}:\n{rubric}\n\
+                    Investigate the {target} through this angle only; other angles run as separate debates.",
                     target = scope.target_noun(),
                     scope_rule = scope.finding_scope_rule(),
+                    name = preset.name,
+                    rubric = preset.prompt,
                 )
             }
         }
     }
 
-    pub(crate) fn critic_system(&self) -> String {
-        match self {
-            DebateMode::Topic => {
+    pub(crate) fn critic_system(&self, preset: Option<&crate::presets::ReviewPreset>) -> String {
+        match (self, preset) {
+            (DebateMode::Review(_), None) | (DebateMode::Topic, Some(_)) => {
+                unreachable!("Review lanes take exactly one preset; Topic takes none")
+            }
+            (DebateMode::Topic, None) => {
                 "You are the CRITIC in a structured debate. You are the precision filter — err toward \
                 challenging weak claims. The actor is biased toward recall, so expect options or claims \
                 that don't hold up under scrutiny.\n\n\
@@ -371,7 +383,7 @@ impl DebateMode {
                     + "\n\n"
                     + VERIFY_WARNING
             }
-            DebateMode::Review(scope) => {
+            (DebateMode::Review(scope), Some(preset)) => {
                 format!(
                     "You are a senior engineer stress-testing a code review. You are the precision filter — \
                     err toward rejection. A false positive reaching the final result is worse than a marginal \
@@ -396,8 +408,13 @@ impl DebateMode {
                     remains, every finding is confirmed, and you have checked for missed issues. Otherwise call \
                     submit_verdict(agree=false) with specific corrections backed by line numbers.\n\n\
                     {DELEGATION_GUIDANCE}\n\n\
-                    {VERIFY_WARNING}",
+                    {VERIFY_WARNING}\n\n\
+                    The findings under review come from one assigned angle — {name}:\n{rubric}\n\
+                    Judge them against that rubric's evidence bar, and hunt for missed issues within \
+                    this angle only; other angles run as separate debates.",
                     reality_check = scope.critic_reality_check(),
+                    name = preset.name,
+                    rubric = preset.prompt,
                 )
             }
         }

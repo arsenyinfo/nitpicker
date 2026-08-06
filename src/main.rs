@@ -262,6 +262,7 @@ async fn main() -> Result<()> {
                         alloy: use_alloy,
                         format: output::OutputFormat::Text,
                     },
+                    None,
                 )
                 .await?;
                 println!("{}", outcome.report);
@@ -370,6 +371,7 @@ async fn main() -> Result<()> {
                 alloy: use_alloy,
                 format: output::OutputFormat::Text,
             },
+            Some(&presets),
         )
         .await?;
         println!("{}", outcome.report);

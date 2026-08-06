@@ -753,6 +753,7 @@ async fn run_review_inner(
                 alloy: use_alloy,
                 format,
             },
+            Some(presets),
         )
         .await?;
         (outcome.report, outcome.transcript_path, outcome.usage)
