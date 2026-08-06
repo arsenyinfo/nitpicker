@@ -514,7 +514,7 @@ pub async fn run_debate(
         let mut slots = Vec::new();
         for r in &config.reviewer {
             slots.push(nitpicker_agent::llm::AlloySlot {
-                client: build_reviewer_client(r, proxy_url.as_deref())?,
+                client: gemini_proxy.annotate(build_reviewer_client(r, proxy_url.as_deref()))?,
                 model: r.model.clone(),
                 max_tokens: r.max_tokens,
             });
@@ -532,8 +532,10 @@ pub async fn run_debate(
         actor_compact_threshold = config.reviewer_compact_threshold(actor_cfg);
         critic_compact_threshold = config.reviewer_compact_threshold(critic_cfg);
     } else {
-        actor_client = build_reviewer_client(actor_cfg, proxy_url.as_deref())?;
-        critic_client = build_reviewer_client(critic_cfg, proxy_url.as_deref())?;
+        actor_client =
+            gemini_proxy.annotate(build_reviewer_client(actor_cfg, proxy_url.as_deref()))?;
+        critic_client =
+            gemini_proxy.annotate(build_reviewer_client(critic_cfg, proxy_url.as_deref()))?;
         actor_label = ModelLabel::plain(&actor_cfg.model);
         critic_label = ModelLabel::plain(&critic_cfg.model);
         actor_compact_threshold = config.reviewer_compact_threshold(actor_cfg);
@@ -546,7 +548,8 @@ pub async fn run_debate(
 
     let project_context = crate::context::build_context(repo).await;
 
-    let agg_client: Arc<dyn LLMClientDyn> = build_aggregator_client(agg_cfg, proxy_url.as_deref())?;
+    let agg_client: Arc<dyn LLMClientDyn> =
+        gemini_proxy.annotate(build_aggregator_client(agg_cfg, proxy_url.as_deref()))?;
 
     let actor_role = mode.actor_role();
     let critic_role = mode.critic_role();
@@ -741,7 +744,39 @@ pub async fn run_debate(
     // envelope and posts no comment. A lane with no successful turn is likewise omitted from
     // synthesis below: its stubs are execution noise, not review evidence.
     if surviving(&lanes).is_empty() {
-        eyre::bail!("all debate turns failed; refusing to synthesize a verdict");
+        let err = eyre::eyre!("all debate turns failed; refusing to synthesize a verdict");
+        // persist the lane outcomes before bailing: a run where every turn failed is the one
+        // that most needs a durable record of what was attempted
+        if let Some(logger) = &session_logger {
+            let record = AggregationRecord {
+                kind: "aggregation".to_string(),
+                model: agg_cfg.model.clone(),
+                text: String::new(),
+                error: Some(crate::review::bounded_error_string(&err)),
+                rounds: None,
+                converged: None,
+                presets: presets.map(|ps| ps.iter().map(|p| p.name.clone()).collect()),
+                lanes: presets.map(|_| {
+                    lanes
+                        .iter()
+                        .map(|lane| LaneRecord {
+                            preset: lane.preset_name.clone().unwrap_or_default(),
+                            rounds: lane.final_round,
+                            converged: lane.converged,
+                            degraded: lane.degraded,
+                        })
+                        .collect()
+                }),
+                jobs: None,
+            };
+            match logger.write_aggregation(&record).await {
+                Ok(()) => {}
+                Err(write_err) => {
+                    warn!(error = ?write_err, "failed to persist all-turns-failed record");
+                }
+            }
+        }
+        return Err(err);
     }
 
     // meta-review: non-agentic single completion over the surviving lanes' dialogue

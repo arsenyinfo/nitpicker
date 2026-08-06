@@ -1,3 +1,4 @@
+use eyre::{Result, WrapErr};
 use nitpicker_agent::config::Config;
 
 /// Owns the optional Gemini AG2 proxy for a run. The inner client's drop shuts the local
@@ -69,5 +70,15 @@ impl GeminiProxy {
 
     pub fn startup_error(&self) -> Option<&str> {
         self.startup_error.as_deref()
+    }
+
+    /// Attaches the proxy's startup failure to a client-construction error. Without it a
+    /// client that needed the dead proxy reports only "Gemini proxy required but not
+    /// available", losing the actual cause (e.g. an expired keyring token).
+    pub fn annotate<T>(&self, result: Result<T>) -> Result<T> {
+        match self.startup_error() {
+            Some(cause) => result.wrap_err_with(|| format!("gemini proxy startup failed: {cause}")),
+            None => result,
+        }
     }
 }

@@ -126,12 +126,9 @@ pub async fn run_review(
         .reviewer
         .iter()
         .map(|r| {
-            build_reviewer_client(r, proxy_url.as_deref()).map_err(|e| {
-                match gemini_proxy.startup_error() {
-                    Some(cause) => format!("{e:#}; gemini proxy startup failed: {cause}"),
-                    None => format!("{e:#}"),
-                }
-            })
+            gemini_proxy
+                .annotate(build_reviewer_client(r, proxy_url.as_deref()))
+                .map_err(|e| format!("{e:#}"))
         })
         .collect();
 
@@ -285,9 +282,32 @@ pub async fn run_review(
 
     // Refuse to synthesize a verdict out of nothing but failures: the aggregator would hallucinate
     // a confident review from error notes, and `pr` would post it. A total failure is an error, not
-    // an "ok" report with empty findings.
+    // an "ok" report with empty findings. The job outcomes are persisted first — a run where
+    // everything failed is the one that most needs a durable record, and client-build failures
+    // leave no trajectory file at all.
     if success_count == 0 {
-        eyre::bail!("all {job_count} review job(s) failed; refusing to synthesize a verdict");
+        let err =
+            eyre::eyre!("all {job_count} review job(s) failed; refusing to synthesize a verdict");
+        if let Some(logger) = &session_logger {
+            let record = AggregationRecord {
+                kind: "aggregation".to_string(),
+                model: config.aggregator.model.clone(),
+                text: String::new(),
+                error: Some(bounded_error_string(&err)),
+                rounds: None,
+                converged: None,
+                presets: presets.map(|ps| ps.iter().map(|p| p.name.clone()).collect()),
+                lanes: None,
+                jobs: Some(job_records),
+            };
+            match logger.write_aggregation(&record).await {
+                Ok(()) => {}
+                Err(write_err) => {
+                    warn!(error = ?write_err, "failed to persist all-jobs-failed record");
+                }
+            }
+        }
+        return Err(err);
     }
 
     let combined = rendered.join("\n\n---\n\n");
@@ -312,7 +332,7 @@ pub async fn run_review(
 
     let agg = &config.aggregator;
     let synthesis: Result<String> = async {
-        let client = build_aggregator_client(agg, proxy_url.as_deref())?;
+        let client = gemini_proxy.annotate(build_aggregator_client(agg, proxy_url.as_deref()))?;
         let completion = Completion {
             model: agg.model.clone(),
             prompt: Message::user(reduce_prompt),
