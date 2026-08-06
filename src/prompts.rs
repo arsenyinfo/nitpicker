@@ -14,6 +14,20 @@ const FINDING_FIELDS: &str = "<One sentence title about the issue>\n\
 - Potential solution: <a concrete direction such as \"replace X with Y\" or \"validate at boundary Z\" — actionable but not necessarily patch-level; \"consider refactoring\" is too vague>\n\
 - Uncertainty: <what specifically you are unsure about and what would confirm or disprove it — omit the line if fully confident>";
 
+/// Tail rules shared verbatim by both review synthesis prompts (parallel aggregator and
+/// debate meta): the evidence bar and the output contract are mode-independent; only what
+/// counts as surviving input differs, and those rules stay with their mode.
+fn review_synthesis_shared_rules() -> String {
+    format!(
+        "- Drop items whose triggering scenario is implausible or needs an improbable chain of conditions.\n\
+         - Group duplicates and closely related points into a single finding.\n\
+         - Preserve concrete technical detail: file/line references, trigger, fix direction.\n\
+         - Use this schema exactly (one block per finding, blank line between blocks):\n\
+         {FINDING_FIELDS}\n\n\
+         - If no findings survive, output exactly: {NO_FINDINGS}"
+    )
+}
+
 const OPTIONS_SCHEMA: &str = "Options considered\n\
 <option name>\n\
 - What it is: ...\n\
@@ -206,23 +220,18 @@ impl TaskMode {
         match self {
             TaskMode::Review(scope) => {
                 format!(
-                    "You synthesize code reviews into a final structured list of findings.\
-                    Output only actionable \
-                    findings in the schema. \
+                    "You synthesize code reviews into a final structured list of findings. \
+                    Output only actionable findings in the schema. \
                     No reviewer attribution, no praise{no_landed_fixes}, no rejected-false-positive section.\n\n\
                     Rules:\n\
-                    1. Drop {drop_clause} — \
+                    - Drop {drop_clause} — \
                     these are synthesis errors in the inputs, not findings.\n\
-                    2. Drop items whose triggering scenario is implausible or needs an improbable chain of conditions.\n\
-                    3. Drop items not substantiated by evidence in the reviews, or that reviewers disagreed on \
+                    - Drop items not substantiated by evidence in the reviews, or that reviewers disagreed on \
                     without the disagreement being resolved by evidence.\n\
-                    4. Group duplicates and closely related points into a single finding.\n\
-                    5. Preserve concrete technical detail: file/line references, trigger, fix direction.\n\
-                    6. Use this schema exactly (one block per finding, blank line between blocks):\n\
-                    {FINDING_FIELDS}\n\n\
-                    7. If no findings survive, output exactly: {NO_FINDINGS}",
+                    {shared}",
                     no_landed_fixes = scope.no_landed_fixes_clause(),
                     drop_clause = scope.synthesis_drop_clause(),
+                    shared = review_synthesis_shared_rules(),
                 )
             }
             TaskMode::Ask => {
@@ -454,23 +463,19 @@ impl DebateMode {
                     actionable findings sorted by priority. No attribution, no praise{no_landed_fixes}, \
                     no rejected-false-positive section, no debate chronology.\n\n\
                     Rules:\n\
-                    1. Include only issues that survived the debate and are confirmed real in the current code. \
+                    - Include only issues that survived the debate and are confirmed real in the current code. \
                     The dialogue is chronological: the reviewer's later verdicts supersede earlier ones, and \
                     a finding absent from the final verdict was withdrawn — it must not appear in the output, \
                     not even as a \"withdrawn during the debate\" or \"resolved\" note.\n\
-                    2. Drop {drop_clause}.\n\
-                    3. Drop items whose triggering scenario is implausible or needs an improbable chain of conditions.\n\
-                    4. Drop items where the reviewer flagged uncertainty and the critic did not confirm them \
+                    - Drop {drop_clause}.\n\
+                    - Drop items where the reviewer flagged uncertainty and the critic did not confirm them \
                     with code evidence. The final summary only contains confirmed findings, so never emit \
                     the Uncertainty line — it is an inter-role signal, and a finding that kept an unresolved \
                     one is dropped, not forwarded.\n\
-                    5. Group duplicates and closely related points into a single finding.\n\
-                    6. Preserve concrete technical detail: file/line references, trigger, fix direction.\n\
-                    7. Use this schema exactly (one block per finding, blank line between blocks):\n\
-                    {FINDING_FIELDS}\n\n\
-                    8. If no findings survive, output exactly: {NO_FINDINGS}",
+                    {shared}",
                     no_landed_fixes = scope.no_landed_fixes_clause(),
                     drop_clause = scope.synthesis_drop_clause(),
+                    shared = review_synthesis_shared_rules(),
                 )
             }
         }
