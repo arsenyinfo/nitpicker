@@ -59,6 +59,11 @@ const BUILT_IN_PRESETS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Upper bound on selected presets per run. Every selection runs as its own review job or
+/// debate lane, so an unbounded list turns a config mistake into unbounded spend — the
+/// LLM semaphore bounds provider *rate*, not run size.
+const MAX_SELECTED_PRESETS: usize = 16;
+
 /// The five angles the pre-preset review prompt hardcoded, in that prompt's order — the
 /// selection when neither `--preset` nor `[defaults].presets` chooses.
 const DEFAULT_PRESET_NAMES: &[&str] = &[
@@ -86,9 +91,19 @@ pub fn resolve(cli_names: &[String], config: &Config) -> Result<Vec<ReviewPreset
     };
 
     let mut seen = std::collections::HashSet::new();
-    selection
+    let selected: Vec<&str> = selection
         .into_iter()
         .filter(|name| seen.insert(*name))
+        .collect();
+    if selected.len() > MAX_SELECTED_PRESETS {
+        eyre::bail!(
+            "{} presets selected; the maximum is {MAX_SELECTED_PRESETS} — every selected \
+             preset runs as its own review job or debate lane",
+            selected.len()
+        );
+    }
+    selected
+        .into_iter()
         .map(|name| lookup(name, config))
         .collect()
 }
@@ -321,6 +336,36 @@ mod tests {
     fn names_are_case_sensitive() {
         let err = resolve(&cli(&["Security"]), &config(None, &[])).expect_err("case mismatch");
         assert!(format!("{err:#}").contains("unknown preset"));
+    }
+
+    /// Every selection runs as its own job/lane, so the count is capped — but only after
+    /// dedup, since duplicates collapse before any spend.
+    #[test]
+    fn selection_is_capped_after_dedup() {
+        let defs: Vec<(String, String)> = (0..MAX_SELECTED_PRESETS + 1)
+            .map(|i| (format!("p{i}"), format!("rubric {i}")))
+            .collect();
+        let refs: Vec<(&str, &str)> = defs.iter().map(|(n, p)| (n.as_str(), p.as_str())).collect();
+        let cfg = config(None, &refs);
+        let all: Vec<String> = defs.iter().map(|(n, _)| n.clone()).collect();
+
+        let err = resolve(&all, &cfg).expect_err("over cap");
+        assert!(format!("{err:#}").contains("maximum is 16"), "{err:#}");
+
+        let at_cap = all[..MAX_SELECTED_PRESETS].to_vec();
+        assert_eq!(
+            resolve(&at_cap, &cfg).expect("at cap").len(),
+            MAX_SELECTED_PRESETS
+        );
+
+        // dedup runs first: a long list of one repeated name is a 1-preset selection
+        let repeated = vec!["security".to_string(); MAX_SELECTED_PRESETS + 1];
+        assert_eq!(
+            resolve(&repeated, &config(None, &[]))
+                .expect("resolves")
+                .len(),
+            1
+        );
     }
 
     /// Every built-in and the default list itself must resolve — a registry typo would

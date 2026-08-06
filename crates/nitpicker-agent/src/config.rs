@@ -314,6 +314,11 @@ fn validate_presets(presets: Option<&BTreeMap<String, PresetConfig>>) -> Result<
         if name != name.trim() {
             eyre::bail!("[presets.{name:?}]: preset names must not have surrounding whitespace");
         }
+        // names reach terminals raw (cast lines, progress prefixes) and head report
+        // sections; control bytes would enable escape-sequence injection from a config
+        if name.chars().any(char::is_control) {
+            eyre::bail!("[presets.{name:?}]: preset names must not contain control characters");
+        }
         if preset.prompt.trim().is_empty() {
             eyre::bail!("[presets.{name}].prompt must contain non-whitespace content");
         }
@@ -876,5 +881,33 @@ mod tests {
         assert!(validate_presets(Some(&table(" tone", "review the docs"))).is_err());
         assert!(validate_presets(Some(&table("  ", "review the docs"))).is_err());
         assert!(validate_presets(Some(&table("tone", "   "))).is_err());
+    }
+
+    /// Preset names reach terminal output and report headers raw, so C0/C1 (and thereby
+    /// OSC/CSI escape openers) must be rejected at validation, not sanitized at display.
+    #[test]
+    fn preset_tables_reject_control_bytes_in_names() {
+        let table = |name: &str| {
+            let mut presets = BTreeMap::new();
+            presets.insert(
+                name.to_string(),
+                PresetConfig {
+                    prompt: "review the docs".to_string(),
+                },
+            );
+            presets
+        };
+        for name in [
+            "esc\u{1b}]0;pwn\u{7}",
+            "csi\u{9b}31m",
+            "tab\tname",
+            "nl\nname",
+        ] {
+            let err = validate_presets(Some(&table(name))).expect_err("control bytes rejected");
+            assert!(
+                format!("{err:#}").contains("control characters"),
+                "wrong error for {name:?}: {err:#}"
+            );
+        }
     }
 }

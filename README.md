@@ -145,8 +145,8 @@ preset, lanes concurrent, with a single meta-review across all lanes. **Spend an
 scale with the selection**: the untouched default now runs five lanes (or 5× the parallel
 jobs) where 0.8.x ran one combined review — narrow it with `--preset` or
 `[defaults].presets` if that is more than you want. Names are case-sensitive; unknown or
-empty names fail before any model call. `ask`, `init`, and `reflect` take no presets — the
-flag is rejected there.
+empty names — or more than 16 selected presets — fail before any model call. `ask`, `init`,
+and `reflect` take no presets — the flag is rejected there.
 
 Unknown config keys are rejected. For example, use `max_tokens` for output length; `token_limit` is not a supported field.
 
@@ -419,7 +419,8 @@ println!("{}", result.text);
 - **Review presets**: named review angles (`correctness`, `security`, `performance`, `ml-rigor`, `maintainability`, `tone`, `general`, plus project-defined `[presets.<name>]` tables) selected via repeatable comma-split `--preset` or `[defaults].presets`. Parallel mode fans out reviewers × presets; debate mode runs one concurrent Reviewer/Validator lane per preset with a single global meta-review. **Cost note: the untouched default resolves to five presets, so a default run now spends ~5× the tokens of 0.8.x's single combined review** — select fewer with `--preset` to keep old costs. `ask`/`init`/`reflect` are unaffected and reject the flag.
 - `pr --json` gains an additive `presets` field (successful envelopes only). Session artifacts label jobs/lanes with preset names; the combined debate transcript gets per-lane sections and preset slugs in its filename.
 - Parallel review's 8-reviewer concurrency cap is removed — jobs all run under the shared in-flight LLM call cap (16); the debate per-turn cap is likewise hoisted to one per run shared across lanes.
-- Preset resolution failures (unknown/empty names) abort before any model call; context-window overflows in the final synthesis now suggest selecting fewer presets.
+- Preset resolution failures (unknown/empty names, more than 16 selected) abort before any model call; preset names must be free of control bytes; context-window overflows in the final synthesis now suggest selecting fewer presets.
+- Whitespace-only model responses are treated as empty (nudged, then failed) instead of passing a blank report off as review evidence.
 
 **0.8.5** — 2026-08-05 (`nitpicker-agent` 0.2.1)
 - Session recorder fixes: unique per-agent record identities (no more shared `root`/`subagent-N`), failed subagent spawns logged, 1-based `compact` turn numbers, flushed appends.

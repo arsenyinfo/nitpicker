@@ -667,7 +667,9 @@ pub async fn run_agent(
                 initial_subagent_count,
                 last_subagent.clone(),
             );
-            if text.is_empty() {
+            // trimmed: a whitespace-only response is as empty as "" — counting it as a
+            // successful turn would pass a blank report off as review evidence
+            if text.trim().is_empty() {
                 if let Some(nudge) = &config.empty_response_nudge {
                     empty_response_count += 1;
                     if empty_response_count <= config.max_empty_responses && !is_final_turn {
