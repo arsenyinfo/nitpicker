@@ -613,8 +613,9 @@ fn load_pr_config(explicit: Option<&Path>, prepared: &PreparedPr) -> Result<Conf
     }
 }
 
-/// Whether `origin` points at github.com — the host the PR metadata and `refs/pull/*` come
-/// from. Slug matching ignores the host, so this is what makes `origin/<base>` trustworthy.
+/// Whether `origin` is the GitHub repository the PR metadata and `refs/pull/*` come from.
+/// Slug matching ignores the remote entirely, so this is what makes `origin/<base>`
+/// trustworthy as repo policy.
 fn origin_is_github(repo: &Path) -> bool {
     let out = Command::new("git")
         .args(["remote", "get-url", "origin"])
@@ -624,7 +625,25 @@ fn origin_is_github(repo: &Path) -> bool {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
         _ => return false,
     };
-    remote_host(&url).is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
+    is_trusted_github_remote(&url)
+}
+
+/// An *authenticated GitHub transport* — host alone is not enough. `file://github.com/…`
+/// parses with host `github.com` while git reads a local, attacker-writable repository, and
+/// `git://`/`http://` reach the network unauthenticated. Only `https`, `ssh`, and git's
+/// scp-like form qualify.
+fn is_trusted_github_remote(url: &str) -> bool {
+    let host = match url.trim().contains("://") {
+        true => match url::Url::parse(url.trim()) {
+            Ok(parsed) => match parsed.scheme() {
+                "https" | "ssh" => parsed.host_str().map(str::to_string),
+                _ => None,
+            },
+            Err(_) => None,
+        },
+        false => remote_host(url),
+    };
+    host.is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
 }
 
 /// Host of a git remote URL, for both URL forms git accepts (`scheme://host/path` and the
@@ -1029,7 +1048,7 @@ async fn run_review_inner(
 mod tests {
     use super::{
         BranchRestoreGuard, HeadConfig, HeadState, PrComment, choose_repo_config, get_head_state,
-        head_config_state, read_base_branch_config, remote_host,
+        head_config_state, is_trusted_github_remote, read_base_branch_config, remote_host,
     };
     use std::path::Path;
     use std::process::Command;
@@ -1079,8 +1098,40 @@ mod tests {
                 Some("attacker.example"),
             ),
             ("/local/path/repo", None),
+            // why the scheme gate below exists: a file:// URL carries a host component, so
+            // host matching alone would accept a local repository as "github.com"
+            (
+                "file://github.com/victim/repo/../../../tmp/attacker",
+                Some("github.com"),
+            ),
         ] {
             assert_eq!(remote_host(url).as_deref(), expected, "url: {url}");
+        }
+    }
+
+    /// The host is necessary but not sufficient: only an authenticated GitHub transport
+    /// makes `origin/<base>` a trust anchor. `file://github.com/…` parses with the right
+    /// host yet reads a local (attacker-writable) repository, and `git://`/`http://` are
+    /// unauthenticated.
+    #[test]
+    fn only_authenticated_github_transports_are_trusted() {
+        for url in [
+            "https://github.com/owner/repo.git",
+            "ssh://git@github.com/owner/repo",
+            "git@github.com:owner/repo.git",
+        ] {
+            assert!(is_trusted_github_remote(url), "must trust: {url}");
+        }
+        for url in [
+            "file://github.com/victim/repo/../../../tmp/attacker-repo",
+            "git://github.com/owner/repo",
+            "http://github.com/owner/repo",
+            "https://attacker.example/owner/repo.git",
+            "git@attacker.example:owner/repo.git",
+            "/local/path/repo",
+            "",
+        ] {
+            assert!(!is_trusted_github_remote(url), "must reject: {url}");
         }
     }
 

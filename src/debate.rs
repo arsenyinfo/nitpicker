@@ -746,15 +746,18 @@ pub async fn run_debate(
     if surviving(&lanes).is_empty() {
         let err = eyre::eyre!("all debate turns failed; refusing to synthesize a verdict");
         // persist the lane outcomes before bailing: a run where every turn failed is the one
-        // that most needs a durable record of what was attempted
+        // that most needs a durable record of what was attempted. The scalars follow the
+        // same single-lane derivation as the success and meta-failure paths, so a failed
+        // `ask` run's record isn't shaped differently from a successful one.
         if let Some(logger) = &session_logger {
+            let (rounds, converged) = single_lane_scalars(&lanes);
             let record = AggregationRecord {
                 kind: "aggregation".to_string(),
                 model: agg_cfg.model.clone(),
                 text: String::new(),
                 error: Some(crate::review::bounded_error_string(&err)),
-                rounds: None,
-                converged: None,
+                rounds,
+                converged,
                 presets: presets.map(|ps| ps.iter().map(|p| p.name.clone()).collect()),
                 lanes: presets.map(|_| {
                     lanes
@@ -859,13 +862,7 @@ pub async fn run_debate(
     // Lane metadata travels on both outcomes: a meta failure still persists the per-lane
     // record (the durable trace of what ran), flagged with `error` and an empty `text` so
     // consumers (reflect) don't render it as a verdict.
-    // The scalar rounds/converged fields stay populated whenever there is exactly one
-    // lane (Topic always; single-preset review) — pre-lanes `reflect` rendered only the
-    // scalars, so clearing them for a one-lane run would lose metadata it had.
-    let (rounds, converged) = match lanes.len() {
-        1 => (Some(lanes[0].final_round), Some(lanes[0].converged)),
-        _ => (None, None),
-    };
+    let (rounds, converged) = single_lane_scalars(&lanes);
     let preset_names: Option<Vec<String>> =
         presets.map(|ps| ps.iter().map(|p| p.name.clone()).collect());
     let lane_records: Option<Vec<LaneRecord>> = presets.map(|_| {
@@ -1036,6 +1033,17 @@ fn lane_session_stems(
             );
             (format!("{prefix}-review"), format!("{prefix}-validate"))
         }
+    }
+}
+
+/// The record's scalar `rounds`/`converged`, populated whenever there is exactly one lane
+/// (Topic always; single-preset review) — pre-lanes `reflect` rendered only the scalars, so
+/// clearing them for a one-lane run would lose metadata it had. Every persistence path uses
+/// this, so a failed run's record keeps the same shape as a successful one's.
+fn single_lane_scalars(lanes: &[DebateLaneOutcome]) -> (Option<usize>, Option<bool>) {
+    match lanes {
+        [lane] => (Some(lane.final_round), Some(lane.converged)),
+        _ => (None, None),
     }
 }
 
