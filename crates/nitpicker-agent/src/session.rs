@@ -24,6 +24,10 @@ pub struct AggregationRecord {
     pub rounds: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub converged: Option<bool>,
+    /// Resolved preset names for the run, in order. Absent on pre-preset records and on
+    /// runs without preset fan-out (`ask`), so old sessions keep deserializing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presets: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

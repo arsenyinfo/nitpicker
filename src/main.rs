@@ -282,6 +282,7 @@ async fn main() -> Result<()> {
                 max_turns,
                 args.common.verbose,
                 review::TaskMode::Ask,
+                None,
             )
             .await?;
             println!("{}", outcome.report);
@@ -316,7 +317,7 @@ async fn main() -> Result<()> {
     let mut config = load_config(args.common.config.as_deref(), &repo)?;
     // resolved before free-model resolution: a bad preset name must fail before any
     // network call (resolve_free_models can run live smoke completions)
-    let _presets = presets::resolve(&args.presets.preset, &config)?;
+    let presets = presets::resolve(&args.presets.preset, &config)?;
     openrouter::resolve_free_models(&mut config).await?;
     let config = config;
     let max_turns = config.max_turns(args.max_turns)?;
@@ -388,6 +389,7 @@ async fn main() -> Result<()> {
             max_turns,
             args.common.verbose,
             review::TaskMode::Review(scope),
+            Some(&presets),
         )
         .await?;
         println!("{}", outcome.report);
@@ -731,6 +733,8 @@ pub(crate) fn parse_positive_usize(value: &str) -> Result<usize, String> {
     Ok(parsed)
 }
 
+// Describes only the target and optional user instructions — the investigation angles come
+// from the resolved presets, not from a focus list baked in here.
 fn build_analysis_prompt(path: Option<&Path>, custom_prompt: Option<&str>) -> String {
     let target = match path {
         Some(p) => format!("`{}`", p.display()),
@@ -738,8 +742,7 @@ fn build_analysis_prompt(path: Option<&Path>, custom_prompt: Option<&str>) -> St
     };
     let base = format!(
         "Analyze the following code for issues and improvement opportunities:\n\
-         - Target: {}\n\
-         - Focus: correctness, security, performance, maintainability",
+         - Target: {}",
         target
     );
     match custom_prompt {

@@ -17,7 +17,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use tokio::sync::Semaphore;
 
-const MAX_CONCURRENT_REVIEWERS: usize = 8;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
@@ -25,7 +24,7 @@ use tracing::{error, info, warn};
 pub struct ReviewOutcome {
     pub report: String,
     pub usage: UsageReport,
-    /// At least one reviewer failed; the report is synthesized from the survivors.
+    /// At least one review job failed; the report is synthesized from the survivors.
     /// Surfaced as exit code 3 in the default-review/`ask` CLI arms.
     pub degraded: bool,
 }
@@ -37,7 +36,14 @@ pub async fn run_review(
     max_turns: usize,
     verbose: bool,
     mode: TaskMode,
+    presets: Option<&[crate::presets::ReviewPreset]>,
 ) -> Result<ReviewOutcome> {
+    match (&mode, presets) {
+        (TaskMode::Review(_), Some(_)) | (TaskMode::Ask, None) => {}
+        (TaskMode::Review(_), None) | (TaskMode::Ask, Some(_)) => {
+            unreachable!("Review runs take the resolved presets; Ask takes none")
+        }
+    }
     let mut tools = all_tools();
     add_spawn_subagent_tool(&mut tools);
     let session_logger = SessionLogger::maybe_new(config.log_trajectories())?;
@@ -45,11 +51,28 @@ pub async fn run_review(
         info!(path = %logger.root().display(), "trajectory logging enabled");
     }
     let context = crate::context::build_context(repo).await;
-    let system_prompt = mode.system_prompt();
     let initial_message = mode.initial_message(user_prompt);
+    let reviewer_names: Vec<&str> = config.reviewer.iter().map(|r| r.name.as_str()).collect();
+    let jobs = plan_jobs(&reviewer_names, presets);
+    // per-preset prompts are identical across reviewers — compose each once, not per job
+    let system_prompts: Vec<String> = match presets {
+        Some(presets) => presets
+            .iter()
+            .map(|p| mode.system_prompt(Some(p)))
+            .collect(),
+        None => vec![mode.system_prompt(None)],
+    };
+    let subagent_prompts: Vec<Option<String>> = match presets {
+        Some(presets) => presets
+            .iter()
+            .map(|p| Some(crate::prompts::preset_subagent_prompt(p)))
+            .collect(),
+        None => vec![None],
+    };
     let mut handles = Vec::new();
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_REVIEWERS));
-    // shared across every reviewer + their subagents to cap account-wide in-flight LLM calls
+    // Jobs all spawn eagerly: presets fan out as reviewers × presets and every job runs
+    // concurrently — the account-wide cap on in-flight LLM calls below is the only
+    // concurrency bound, shared with every subagent.
     let llm_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_LLM_CALLS));
 
     let mp = Arc::new(MultiProgress::new());
@@ -58,41 +81,64 @@ pub async fn run_review(
     }
     let _progress_guard = (!verbose && crate::progress::stderr_is_terminal())
         .then(|| crate::progress::set_active_progress(&mp));
-    let spinner_style = ProgressStyle::with_template("{spinner:.cyan} {prefix:<12} {msg}")
-        .unwrap()
-        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", ""]);
-    let done_style = ProgressStyle::with_template("  {prefix:<12} {msg}").unwrap();
+    let prefix_width = jobs
+        .iter()
+        .map(|job| job.label.chars().count())
+        .chain([12])
+        .max()
+        .expect("non-empty iterator")
+        .min(32);
+    let spinner_style =
+        ProgressStyle::with_template(&format!("{{spinner:.cyan}} {{prefix:<{prefix_width}}} {{msg}}"))
+            .unwrap()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", ""]);
+    let done_style =
+        ProgressStyle::with_template(&format!("  {{prefix:<{prefix_width}}} {{msg}}")).unwrap();
 
     // the proxy handle stays bound for the whole function so its local server outlives the
     // reviewers; only its base URL is threaded downstream (see build_reviewer_client).
     let gemini_proxy = crate::proxy::GeminiProxy::maybe_start(config).await?;
     let proxy_url = gemini_proxy.url();
 
-    for (index, reviewer) in config.reviewer.iter().enumerate() {
+    // One client per reviewer, shared by all its preset jobs. eyre::Report is not Clone, so
+    // a build failure is kept as its rendered message and re-raised per job — one broken
+    // reviewer fails its own jobs while the others proceed, exactly as before the fan-out.
+    let reviewer_clients: Vec<std::result::Result<_, String>> = config
+        .reviewer
+        .iter()
+        .map(|r| build_reviewer_client(r, proxy_url.as_deref()).map_err(|e| format!("{e:#}")))
+        .collect();
+
+    for job in &jobs {
+        let reviewer = &config.reviewer[job.reviewer_index];
+        let prompt_index = job.preset_index.unwrap_or(0);
         let tools_map = tools.clone();
         let repo = repo.to_path_buf();
-        let name = reviewer.name.clone();
+        let label = job.label.clone();
         let subagent_counter = Arc::new(AtomicUsize::new(0));
-        let session_agent = reviewer_session_agent(index, &name);
         let session_writer = session_logger
             .as_ref()
-            .map(|logger| logger.child(format!("{session_agent}.jsonl")));
-        let agent_config = build_agent_config(
-            config,
-            reviewer,
-            session_agent,
-            &system_prompt,
-            max_turns,
-            proxy_url.as_deref(),
-            Arc::clone(&subagent_counter),
-            Arc::clone(&llm_semaphore),
-            session_writer,
-        );
-        info!(reviewer = %name, "spawning agent");
+            .map(|logger| logger.child(format!("{}.jsonl", job.session_agent)));
+        let agent_config = match &reviewer_clients[job.reviewer_index] {
+            Ok(client) => Ok(build_agent_config(
+                config,
+                reviewer,
+                Arc::clone(client),
+                job.session_agent.clone(),
+                system_prompts[prompt_index].clone(),
+                subagent_prompts[prompt_index].clone(),
+                max_turns,
+                Arc::clone(&subagent_counter),
+                Arc::clone(&llm_semaphore),
+                session_writer,
+            )),
+            Err(msg) => Err(eyre::eyre!("client setup failed: {msg}")),
+        };
+        info!(job = %label, "spawning agent");
 
         let pb = mp.add(ProgressBar::new_spinner());
         pb.set_style(spinner_style.clone());
-        pb.set_prefix(name.clone());
+        pb.set_prefix(label.clone());
         pb.set_message(crate::progress::bar_message("reviewing…"));
         pb.enable_steady_tick(Duration::from_millis(80));
 
@@ -102,9 +148,7 @@ pub async fn run_review(
         let done = done_style.clone();
         let initial_message = initial_message.clone();
         let context = context.clone();
-        let sem = Arc::clone(&semaphore);
         let handle: JoinHandle<Result<AgentResult>> = tokio::spawn(async move {
-            let _permit = sem.acquire().await.expect("semaphore closed");
             let mut config = match agent_config {
                 Ok(config) => config,
                 Err(err) => {
@@ -152,30 +196,37 @@ pub async fn run_review(
             }
             result
         });
-        handles.push((name, handle));
+        handles.push((label, handle));
     }
 
-    let reviewer_count = handles.len();
+    let job_count = handles.len();
+    let preset_run = presets.is_some();
     let mut usage = UsageReport::default();
     let mut rendered = Vec::new();
     let mut success_count = 0usize;
-    for (name, handle) in handles {
+    for (label, handle) in handles {
+        let header = section_header(&label, preset_run);
         match handle.await {
             Ok(Ok(result)) => {
                 usage.add(result.usage, result.subagents_spawned);
-                rendered.push(format!("## {name} review\n\n{}", result.text));
+                rendered.push(format!("{header}\n\n{}", result.text));
                 success_count += 1;
-                info!(reviewer = %name, "review completed");
+                info!(job = %label, "review completed");
             }
+            // Preset runs keep failure stubs out of the synthesis input — an error note is
+            // execution noise, not review evidence; degraded accounting and the logs carry
+            // it. The Ask path predates that rule and keeps its stubs.
             Ok(Err(err)) => {
-                rendered.push(format!("## {name} review\n\n*Failed: {err:#}*"));
-                warn!(reviewer = %name, error = ?err, "review failed");
+                if !preset_run {
+                    rendered.push(format!("{header}\n\n*Failed: {err:#}*"));
+                }
+                warn!(job = %label, error = ?err, "review failed");
             }
             Err(err) => {
-                rendered.push(format!(
-                    "## {name} review\n\n*Failed (task panicked): {err:#}*"
-                ));
-                error!(reviewer = %name, error = ?err, "reviewer task panicked");
+                if !preset_run {
+                    rendered.push(format!("{header}\n\n*Failed (task panicked): {err:#}*"));
+                }
+                error!(job = %label, error = ?err, "review task panicked");
             }
         }
     }
@@ -184,11 +235,11 @@ pub async fn run_review(
     // a confident review from error notes, and `pr` would post it. A total failure is an error, not
     // an "ok" report with empty findings.
     if success_count == 0 {
-        eyre::bail!("all {reviewer_count} reviewer(s) failed; refusing to synthesize a verdict");
+        eyre::bail!("all {job_count} review job(s) failed; refusing to synthesize a verdict");
     }
 
     let combined = rendered.join("\n\n---\n\n");
-    let reduce_prompt = mode.reduce_prompt(user_prompt, &combined);
+    let reduce_prompt = mode.reduce_prompt(user_prompt, &combined, presets);
 
     let pb_agg = mp.add(ProgressBar::new_spinner());
     pb_agg.set_style(spinner_style);
@@ -227,14 +278,81 @@ pub async fn run_review(
                 text: text.clone(),
                 rounds: None,
                 converged: None,
+                presets: presets.map(|ps| ps.iter().map(|p| p.name.clone()).collect()),
             })
             .await?;
     }
     Ok(ReviewOutcome {
         report: text,
         usage,
-        degraded: success_count < reviewer_count,
+        degraded: success_count < job_count,
     })
+}
+
+/// One spawned review job. `reviewer_index` picks the client/config slot; `preset_index`
+/// (preset runs only) picks the rubric. `label` heads the rendered report section and the
+/// progress bar; `session_agent` names the trajectory file and every record in it.
+struct ReviewJob {
+    reviewer_index: usize,
+    preset_index: Option<usize>,
+    label: String,
+    session_agent: String,
+}
+
+/// Plan the job matrix: one job per reviewer for `ask` (`presets: None`), reviewers ×
+/// presets for review runs. Labels must be unique — the aggregator attributes reports by
+/// them: duplicate reviewer names get an ` #<index>` suffix, and any residual collision
+/// (a crafted name that embeds the suffix) falls back to the globally-unique job ordinal.
+fn plan_jobs(reviewer_names: &[&str], presets: Option<&[crate::presets::ReviewPreset]>) -> Vec<ReviewJob> {
+    let duplicated: Vec<bool> = reviewer_names
+        .iter()
+        .map(|name| reviewer_names.iter().filter(|other| other == &name).count() > 1)
+        .collect();
+    let mut jobs = Vec::new();
+    match presets {
+        None => {
+            for (i, name) in reviewer_names.iter().enumerate() {
+                jobs.push(ReviewJob {
+                    reviewer_index: i,
+                    preset_index: None,
+                    label: name.to_string(),
+                    session_agent: reviewer_session_agent(i, name),
+                });
+            }
+        }
+        Some(presets) => {
+            for (j, preset) in presets.iter().enumerate() {
+                for (i, name) in reviewer_names.iter().enumerate() {
+                    let label = match duplicated[i] {
+                        true => format!("{} · {} #{}", preset.name, name, i + 1),
+                        false => format!("{} · {}", preset.name, name),
+                    };
+                    jobs.push(ReviewJob {
+                        reviewer_index: i,
+                        preset_index: Some(j),
+                        label,
+                        session_agent: preset_session_agent(i, name, j, &preset.name),
+                    });
+                }
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (ordinal, job) in jobs.iter_mut().enumerate() {
+        let mut label = job.label.clone();
+        while !seen.insert(label.clone()) {
+            label = format!("{label} ({})", ordinal + 1);
+        }
+        job.label = label;
+    }
+    jobs
+}
+
+fn section_header(label: &str, preset_run: bool) -> String {
+    match preset_run {
+        true => format!("## {label}"),
+        false => format!("## {label} review"),
+    }
 }
 
 /// Trajectory identity for one reviewer: the file stem and every record's `agent` field. The
@@ -244,31 +362,48 @@ fn reviewer_session_agent(index: usize, name: &str) -> String {
     format!("reviewer-{}-{}", index + 1, sanitize_path_component(name))
 }
 
-// internal single-call-site builder; the args are distinct per-reviewer handles, not worth a struct
+/// Preset-run variant: both indices are load-bearing for uniqueness, since reviewer names
+/// AND preset names can each sanitize to identical stems.
+fn preset_session_agent(
+    reviewer_index: usize,
+    name: &str,
+    preset_index: usize,
+    preset_name: &str,
+) -> String {
+    format!(
+        "reviewer-{}-{}-{}-{}",
+        reviewer_index + 1,
+        sanitize_path_component(name),
+        preset_index + 1,
+        sanitize_path_component(preset_name)
+    )
+}
+
+// internal single-call-site builder; the args are distinct per-job handles, not worth a struct
 #[allow(clippy::too_many_arguments)]
 fn build_agent_config(
     config: &Config,
     reviewer: &ReviewerConfig,
+    client: Arc<dyn nitpicker_agent::llm::LLMClientDyn>,
     session_agent: String,
-    system_prompt: &str,
+    system_prompt: String,
+    subagent_system_prompt: Option<String>,
     max_turns: usize,
-    proxy_url: Option<&str>,
     subagent_counter: Arc<AtomicUsize>,
     llm_semaphore: Arc<Semaphore>,
     session_writer: Option<nitpicker_agent::session::SessionWriter>,
-) -> Result<AgentConfig> {
-    let client = build_reviewer_client(reviewer, proxy_url)?;
+) -> AgentConfig {
     let compact_threshold = config.reviewer_compact_threshold(reviewer);
 
-    Ok(AgentConfig {
+    AgentConfig {
         name: reviewer.name.clone(),
         session_agent,
         model: reviewer.model.clone(),
         max_turns,
         max_tokens: reviewer.max_tokens,
         compact_threshold,
-        system_prompt: system_prompt.to_string(),
-        subagent_system_prompt: None,
+        system_prompt,
+        subagent_system_prompt,
         client,
         depth: AgentDepth::TopLevel,
         terminal_tools: Vec::new(),
@@ -279,12 +414,13 @@ fn build_agent_config(
         progress: None,
         project_context: None,
         session_writer,
-    })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::presets::ReviewPreset;
 
     /// Two unnamed (or same-named) reviewers must still get distinct trajectory identities —
     /// before the index they shared one file stem AND one record label, interleaving
@@ -296,5 +432,64 @@ mod tests {
             reviewer_session_agent(0, "claude"),
             reviewer_session_agent(1, "claude")
         );
+    }
+
+    fn presets(names: &[&str]) -> Vec<ReviewPreset> {
+        names
+            .iter()
+            .map(|n| ReviewPreset {
+                name: n.to_string(),
+                prompt: format!("rubric for {n}"),
+            })
+            .collect()
+    }
+
+    fn all_unique(values: impl IntoIterator<Item = String>) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        values.into_iter().all(|v| seen.insert(v))
+    }
+
+    /// The preset fan-out is reviewers × presets, ordered preset-major, and the Ask path
+    /// (no presets) stays one job per reviewer.
+    #[test]
+    fn job_count_is_reviewers_times_presets() {
+        let ps = presets(&["security", "tone"]);
+        let jobs = plan_jobs(&["claude", "gpt", "gemini"], Some(&ps));
+        assert_eq!(jobs.len(), 6);
+        assert_eq!(jobs[0].label, "security · claude");
+        assert_eq!(jobs[5].label, "tone · gemini");
+
+        let ask_jobs = plan_jobs(&["claude", "gpt"], None);
+        assert_eq!(ask_jobs.len(), 2);
+        assert_eq!(ask_jobs[0].label, "claude");
+    }
+
+    /// Duplicate reviewer names must stay distinguishable in report headings and progress —
+    /// the aggregator attributes reports by label alone.
+    #[test]
+    fn duplicate_reviewer_names_get_indexed_labels() {
+        let ps = presets(&["security"]);
+        let jobs = plan_jobs(&["claude", "claude"], Some(&ps));
+        assert_eq!(jobs[0].label, "security · claude #1");
+        assert_eq!(jobs[1].label, "security · claude #2");
+        assert!(all_unique(jobs.iter().map(|j| j.label.clone())));
+    }
+
+    /// A crafted reviewer name that embeds the dedup suffix cannot force two jobs to share
+    /// a label — the job-ordinal fallback keeps the full set unique.
+    #[test]
+    fn crafted_names_cannot_collide_labels() {
+        let ps = presets(&["security"]);
+        let jobs = plan_jobs(&["claude", "claude", "claude #2"], Some(&ps));
+        assert!(all_unique(jobs.iter().map(|j| j.label.clone())));
+    }
+
+    /// Preset and reviewer names that sanitize identically must still produce distinct
+    /// trajectory identities (both indices are baked into the stem).
+    #[test]
+    fn preset_session_agents_stay_unique_under_sanitization_collisions() {
+        let ps = presets(&["a/b", "a?b"]);
+        let jobs = plan_jobs(&["r!", "r?"], Some(&ps));
+        assert!(all_unique(jobs.iter().map(|j| j.session_agent.clone())));
     }
 }

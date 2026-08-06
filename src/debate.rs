@@ -644,6 +644,7 @@ pub async fn run_debate(
                 text: meta_text.clone(),
                 rounds: Some(final_round),
                 converged: Some(converged),
+                presets: None,
             })
             .await?;
     }

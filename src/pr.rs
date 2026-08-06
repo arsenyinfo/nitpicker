@@ -540,7 +540,7 @@ async fn run_pr_inner(
     let mut config = crate::load_config(common.config.as_deref(), &common.repo)?;
     // resolved before free-model resolution: a bad preset name must fail before any
     // network call, and inside run_pr_inner so it honors the --json error contract
-    let _presets = crate::presets::resolve(&preset_names, &config)?;
+    let presets = crate::presets::resolve(&preset_names, &config)?;
     nitpicker_agent::openrouter::resolve_free_models(&mut config).await?;
     let config = config;
     check_gh()?;
@@ -554,6 +554,7 @@ async fn run_pr_inner(
         &prepared,
         &args,
         &context_files,
+        &presets,
         &config,
         common.verbose,
         start,
@@ -709,6 +710,7 @@ async fn run_review_inner(
     prepared: &PreparedPr,
     args: &PrArgs,
     context_files: &[PathBuf],
+    presets: &[crate::presets::ReviewPreset],
     config: &Config,
     verbose: bool,
     start: std::time::Instant,
@@ -762,6 +764,7 @@ async fn run_review_inner(
             max_turns,
             verbose,
             TaskMode::Review(ReviewScope::Diff),
+            Some(presets),
         )
         .await?;
         (outcome.report, std::path::PathBuf::new(), outcome.usage)

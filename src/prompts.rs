@@ -105,22 +105,16 @@ pub enum TaskMode {
 }
 
 impl TaskMode {
-    pub fn system_prompt(&self) -> String {
-        match self {
-            TaskMode::Review(scope) => {
+    /// `Review` composes the shared review protocol with exactly one preset's rubric; `Ask`
+    /// takes no preset. The rubric sits at the END of the prompt: everything before it is
+    /// byte-identical across presets, so same-model jobs share the longest possible
+    /// provider-cacheable prefix (tool schemas and protocol dominate the prompt).
+    pub fn system_prompt(&self, preset: Option<&crate::presets::ReviewPreset>) -> String {
+        match (self, preset) {
+            (TaskMode::Review(scope), Some(preset)) => {
                 format!(
                     "You are a code reviewer. Use the available tools \
                     to explore the repository and understand the {target}.\n\n\
-                    Review criteria:\n\
-                    - Correctness: logic bugs, edge cases, off-by-one errors\n\
-                    - Security: injection, auth issues, secrets in code, unsafe deserialization \
-                    (only flag a security issue if you can trace a concrete exploit path, not just recognize a pattern)\n\
-                    - Performance: unnecessary allocations, N+1 queries, blocking calls in async context\n\
-                    - ML rigor: data leakage, incorrect loss/metrics, numerical instability, non-reproducibility\n\
-                    - Maintainability: dead code, copy-paste, unused variables, missing error handling\n\n\
-                    Style: fail loudly, not silently. No swallowed exceptions, no magic fallbacks, \
-                    no unexplained constants. Anything that can go wrong at runtime must be explicitly \
-                    checked and logged.\n\n\
                     Your output is a structured issue list, not a narrative. Strict rules:\n\
                     {scope_rule}\
                     - No praise, validation, or positive notes.\n\
@@ -135,12 +129,19 @@ impl TaskMode {
                     to your first theory.\n\n\
                     For each finding, use this schema exactly (one block per finding, blank line between blocks):\n\
                     {FINDING_FIELDS}\n\n\
-                    If a finding cannot fill all fields tightly, drop it. If there are no valid findings, output exactly: {NO_FINDINGS}",
+                    If a finding cannot fill all fields tightly, drop it. If there are no valid findings, output exactly: {NO_FINDINGS}\n\n\
+                    Your assigned review angle — {name}:\n{rubric}\n\
+                    Investigate the {target} through this angle only; other angles run as separate reviews.",
                     target = scope.target_noun(),
                     scope_rule = scope.finding_scope_rule(),
+                    name = preset.name,
+                    rubric = preset.prompt,
                 )
             }
-            TaskMode::Ask => {
+            (TaskMode::Review(_), None) | (TaskMode::Ask, Some(_)) => {
+                unreachable!("Review runs take exactly one preset per worker; Ask takes none")
+            }
+            (TaskMode::Ask, None) => {
                 "You are a knowledgeable senior engineer. Use the available tools \
                 to explore the repository and gather whatever context you need to answer accurately.\n\n\
                 Answer shape depends on the question:\n\
@@ -172,15 +173,34 @@ impl TaskMode {
         msg
     }
 
-    pub fn reduce_prompt(&self, task: &str, combined: &str) -> String {
+    /// `Review` synthesis carries the full roster — every active preset's name AND rubric —
+    /// so project-overridden rubrics and their false-positive rules stay visible to the
+    /// aggregator; `Ask` has no presets and keeps its original shape.
+    pub fn reduce_prompt(
+        &self,
+        task: &str,
+        combined: &str,
+        presets: Option<&[crate::presets::ReviewPreset]>,
+    ) -> String {
         let inputs = match self {
             TaskMode::Review(_) => "Individual reviews to synthesize",
             TaskMode::Ask => "Individual answers to synthesize",
         };
+        let roster = match (self, presets) {
+            (TaskMode::Review(_), Some(presets)) => {
+                format!("{}\n\n", preset_roster(presets))
+            }
+            (TaskMode::Ask, None) => String::new(),
+            (TaskMode::Review(_), None) | (TaskMode::Ask, Some(_)) => {
+                unreachable!("Review synthesis takes the active presets; Ask takes none")
+            }
+        };
         match task.trim().is_empty() {
-            true => format!("{inputs}:\n\n{combined}"),
+            true => format!("{roster}{inputs}:\n\n{combined}"),
             false => {
-                format!("Original task given to each agent:\n{task}\n\n{inputs}:\n\n{combined}")
+                format!(
+                    "Original task given to each agent:\n{task}\n\n{roster}{inputs}:\n\n{combined}"
+                )
             }
         }
     }
@@ -227,6 +247,32 @@ impl TaskMode {
             }
         }
     }
+}
+
+/// The roster block for synthesis prompts: every active preset's name and full rubric.
+fn preset_roster(presets: &[crate::presets::ReviewPreset]) -> String {
+    let blocks: Vec<String> = presets
+        .iter()
+        .map(|p| format!("### {}\n{}", p.name, p.prompt))
+        .collect();
+    format!(
+        "Active review presets — each input below investigated exactly one of these angles:\n\n{}",
+        blocks.join("\n\n")
+    )
+}
+
+/// Preset-aware subagent system prompt: the library's generic subagent contract plus the
+/// parent's rubric, so a delegated investigation stays inside its lane's angle. Set via
+/// `AgentConfig::subagent_system_prompt`, which nested spawns inherit.
+pub fn preset_subagent_prompt(preset: &crate::presets::ReviewPreset) -> String {
+    format!(
+        "{base}\n\nThe agent you work for reviews code through one angle — {name}:\n{rubric}\n\
+         Investigate your assigned task through that angle; report evidence outside it only when \
+         it is severe enough that dropping it would be negligent.",
+        base = nitpicker_agent::prompts::subagent_system_prompt(),
+        name = preset.name,
+        rubric = preset.prompt,
+    )
 }
 
 pub enum DebateMode {
@@ -412,5 +458,77 @@ impl DebateMode {
             DebateMode::Topic => "debate",
             DebateMode::Review(_) => "review-debate",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::presets::ReviewPreset;
+
+    fn preset(name: &str, rubric: &str) -> ReviewPreset {
+        ReviewPreset {
+            name: name.to_string(),
+            prompt: rubric.to_string(),
+        }
+    }
+
+    /// A worker's system prompt carries exactly its assigned rubric — sibling presets must
+    /// not leak in, and the shared protocol prefix must be byte-identical across presets
+    /// (that identity is what keeps provider prompt caching warm across same-model jobs).
+    #[test]
+    fn review_system_prompt_carries_exactly_its_preset() {
+        let a = preset("angle-a", "RUBRIC-MARKER-A");
+        let b = preset("angle-b", "RUBRIC-MARKER-B");
+        for scope in [ReviewScope::Diff, ReviewScope::Static] {
+            let prompt_a = TaskMode::Review(scope).system_prompt(Some(&a));
+            let prompt_b = TaskMode::Review(scope).system_prompt(Some(&b));
+            assert!(prompt_a.contains("RUBRIC-MARKER-A"));
+            assert!(!prompt_a.contains("RUBRIC-MARKER-B"));
+            assert!(prompt_b.contains("RUBRIC-MARKER-B"));
+
+            let shared_prefix_len = prompt_a
+                .bytes()
+                .zip(prompt_b.bytes())
+                .take_while(|(x, y)| x == y)
+                .count();
+            let rubric_a_at = prompt_a.find("angle-a").expect("angle name present");
+            assert!(
+                shared_prefix_len >= rubric_a_at,
+                "prompts must only diverge at the rubric slot: shared {shared_prefix_len} bytes, \
+                 rubric starts at {rubric_a_at}"
+            );
+        }
+    }
+
+    /// The synthesis input names every active preset and carries its FULL rubric — a project
+    /// override's evidence rules must reach the aggregator, not just the preset's name.
+    #[test]
+    fn reduce_prompt_carries_every_active_preset_rubric() {
+        let presets = [preset("angle-a", "RUBRIC-MARKER-A"), preset("angle-b", "RUBRIC-MARKER-B")];
+        let out = TaskMode::Review(ReviewScope::Diff).reduce_prompt(
+            "the task",
+            "the reviews",
+            Some(&presets),
+        );
+        for needle in ["angle-a", "RUBRIC-MARKER-A", "angle-b", "RUBRIC-MARKER-B", "the task", "the reviews"] {
+            assert!(out.contains(needle), "missing {needle}");
+        }
+    }
+
+    /// Ask has no presets: its reduce prompt keeps the pre-preset shape (task + inputs only).
+    #[test]
+    fn ask_reduce_prompt_takes_no_roster() {
+        let out = TaskMode::Ask.reduce_prompt("the question", "the answers", None);
+        assert!(out.contains("the question"));
+        assert!(out.contains("the answers"));
+    }
+
+    /// Subagents inherit the lane's angle on top of the library's generic contract.
+    #[test]
+    fn preset_subagent_prompt_extends_the_generic_contract_with_the_rubric() {
+        let out = preset_subagent_prompt(&preset("angle-a", "RUBRIC-MARKER-A"));
+        assert!(out.starts_with(nitpicker_agent::prompts::subagent_system_prompt()));
+        assert!(out.contains("RUBRIC-MARKER-A"));
     }
 }
