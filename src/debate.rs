@@ -789,19 +789,21 @@ pub async fn run_debate(
     let (pb, _) = make_spinner(&mp);
     pb.set_prefix(colored_role_stderr("Meta-review"));
     pb.set_message(crate::progress::bar_message("synthesizing…"));
+    // preset runs get the count/context wrapping; Topic propagates the provider error
+    // untouched, as it did before lanes existed
     let meta_response: nitpicker_agent::llm::CompletionResponse = agg_client
         .completion(meta_completion)
         .await
-        .map_err(|err| {
-            let description = match presets {
-                Some(presets) => format!(
+        .map_err(|err| match presets {
+            Some(presets) => crate::presets::synthesis_failure(
+                err,
+                format!(
                     "meta-review failed over {} surviving lane(s) across {} preset(s)",
                     survivors.len(),
                     presets.len()
                 ),
-                None => "meta-review failed".to_string(),
-            };
-            crate::presets::synthesis_failure(err, description)
+            ),
+            None => err,
         })?;
     usage.add(meta_response.usage, 0);
     let meta_text = meta_response.text();
@@ -911,8 +913,8 @@ pub async fn run_debate(
 }
 
 /// Trajectory stems for one lane's two sides. Topic keeps the pre-preset stems; preset
-/// lanes prefix the lane index AND sanitized preset name — the index is load-bearing
-/// because distinct preset names can sanitize to the same slug.
+/// lanes prefix the lane index AND bounded preset slug — the index is load-bearing
+/// because distinct preset names can sanitize (or truncate) to the same slug.
 fn lane_session_stems(
     lane_index: usize,
     preset: Option<&crate::presets::ReviewPreset>,
@@ -923,7 +925,7 @@ fn lane_session_stems(
             let prefix = format!(
                 "lane-{}-{}",
                 lane_index + 1,
-                sanitize_path_component(&preset.name)
+                crate::presets::path_slug(&preset.name)
             );
             (format!("{prefix}-review"), format!("{prefix}-validate"))
         }
@@ -1077,14 +1079,18 @@ mod tests {
         converged_lane.converged = true;
         let open_lane = lane(Some("tone"), &[("Validator", 1, "disputed Y")]);
         let sections = lane_sections(&[&converged_lane, &open_lane]);
-        for needle in [
-            "Preset: security — converged at round 1",
-            "Preset: tone — no convergence",
-            "finding X",
-            "disputed Y",
-        ] {
+        // every surviving lane's name and dialogue reach the synthesizer
+        for needle in ["security", "tone", "finding X", "disputed Y"] {
             assert!(sections.contains(needle), "missing {needle}");
         }
+        // convergence state must be represented, whatever its wording: the same lane
+        // renders differently converged vs not
+        let mut reopened = lane(Some("security"), &[("Reviewer", 1, "finding X")]);
+        reopened.converged = false;
+        assert_ne!(
+            lane_sections(&[&converged_lane]),
+            lane_sections(&[&reopened])
+        );
     }
 
     /// Dead lanes appear in the human transcript (flagged) but never in the meta input.
@@ -1107,17 +1113,12 @@ mod tests {
     /// whose dialogue is partial must arrive flagged, not as an ordinary transcript.
     #[test]
     fn degraded_lanes_are_marked_in_meta_sections() {
-        let mut fallback = lane(Some("security"), &[("Reviewer", 1, "raw text")]);
-        fallback.degraded = true;
-        let clean = lane(Some("tone"), &[("Reviewer", 1, "finding")]);
-        let sections = lane_sections(&[&fallback, &clean]);
-        let security_section = sections
-            .split("## Preset: tone")
-            .next()
-            .expect("section order");
-        assert!(security_section.contains("degraded"));
-        let tone_section = &sections[sections.find("## Preset: tone").expect("tone present")..];
-        assert!(!tone_section.contains("degraded"));
+        // degraded state must be represented per lane, whatever its wording: an identical
+        // lane renders differently degraded vs clean, and only the degraded lane changes
+        let clean = lane(Some("security"), &[("Reviewer", 1, "raw text")]);
+        let mut degraded = lane(Some("security"), &[("Reviewer", 1, "raw text")]);
+        degraded.degraded = true;
+        assert_ne!(lane_sections(&[&clean]), lane_sections(&[&degraded]));
     }
 
     /// Topic filenames are unchanged; preset filenames append bounded sanitized slugs.

@@ -21,6 +21,9 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
+/// The pre-preset whole-agent concurrency bound, kept for the Ask path only.
+const LEGACY_ASK_CONCURRENT_AGENTS: usize = 8;
+
 pub struct ReviewOutcome {
     pub report: String,
     pub usage: UsageReport,
@@ -70,9 +73,14 @@ pub async fn run_review(
         None => vec![None],
     };
     let mut handles = Vec::new();
-    // Jobs all spawn eagerly: presets fan out as reviewers × presets and every job runs
-    // concurrently — the account-wide cap on in-flight LLM calls below is the only
-    // concurrency bound, shared with every subagent.
+    // Preset jobs all spawn eagerly and run concurrently — the account-wide cap on in-flight
+    // LLM calls below is their only concurrency bound, shared with every subagent. The Ask
+    // path keeps its legacy whole-agent bound: its behavior (incl. >8-reviewer concurrency
+    // semantics) is a compatibility surface.
+    let ask_agent_semaphore = match presets {
+        None => Some(Arc::new(Semaphore::new(LEGACY_ASK_CONCURRENT_AGENTS))),
+        Some(_) => None,
+    };
     let llm_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_LLM_CALLS));
 
     let mp = Arc::new(MultiProgress::new());
@@ -157,7 +165,12 @@ pub async fn run_review(
         let done = done_style.clone();
         let initial_message = initial_message.clone();
         let context = context.clone();
+        let agent_sem = ask_agent_semaphore.clone();
         let handle: JoinHandle<Result<AgentResult>> = tokio::spawn(async move {
+            let _agent_permit = match &agent_sem {
+                Some(sem) => Some(sem.acquire().await.expect("semaphore closed")),
+                None => None,
+            };
             let mut config = match agent_config {
                 Ok(config) => config,
                 Err(err) => {
@@ -205,7 +218,7 @@ pub async fn run_review(
             }
             result
         });
-        handles.push((label, handle));
+        handles.push((label, job.preset_index, handle));
     }
 
     let job_count = handles.len();
@@ -213,12 +226,16 @@ pub async fn run_review(
     let mut usage = UsageReport::default();
     let mut rendered = Vec::new();
     let mut success_count = 0usize;
-    for (label, handle) in handles {
+    let mut surviving_preset_indices = std::collections::HashSet::new();
+    for (label, preset_index, handle) in handles {
         match handle.await {
             Ok(Ok(result)) => {
                 usage.add(result.usage, result.subagents_spawned);
                 rendered.extend(rendered_section(&label, Ok(&result.text), preset_run));
                 success_count += 1;
+                if let Some(j) = preset_index {
+                    surviving_preset_indices.insert(j);
+                }
                 info!(job = %label, "review completed");
             }
             Ok(Err(err)) => {
@@ -242,7 +259,18 @@ pub async fn run_review(
     }
 
     let combined = rendered.join("\n\n---\n\n");
-    let reduce_prompt = mode.reduce_prompt(user_prompt, &combined, presets);
+    // The synthesis roster covers only presets with at least one surviving job — a rubric
+    // with no matching report would read as an angle that was reviewed and found clean.
+    // (The session record and `pr --json` keep the FULL resolved list: they document the
+    // run's resolution, not its coverage.)
+    let surviving_presets: Option<Vec<crate::presets::ReviewPreset>> = presets.map(|ps| {
+        ps.iter()
+            .enumerate()
+            .filter(|(j, _)| surviving_preset_indices.contains(j))
+            .map(|(_, p)| p.clone())
+            .collect()
+    });
+    let reduce_prompt = mode.reduce_prompt(user_prompt, &combined, surviving_presets.as_deref());
 
     let pb_agg = mp.add(ProgressBar::new_spinner());
     pb_agg.set_style(spinner_style);
@@ -262,15 +290,17 @@ pub async fn run_review(
         max_tokens: Some(config.aggregator_max_tokens()),
         additional_params: None,
     };
-    let response = client.completion(completion).await.map_err(|err| {
-        let description = match presets {
-            Some(presets) => format!(
+    // preset runs get the count/context wrapping; the Ask path propagates the provider
+    // error untouched, as it did before the fan-out
+    let response = client.completion(completion).await.map_err(|err| match presets {
+        Some(presets) => crate::presets::synthesis_failure(
+            err,
+            format!(
                 "final aggregation failed over {success_count} surviving review job(s) across {} preset(s)",
                 presets.len()
             ),
-            None => format!("final aggregation failed over {success_count} surviving review job(s)"),
-        };
-        crate::presets::synthesis_failure(err, description)
+        ),
+        None => err,
     })?;
     usage.add(response.usage, 0);
     pb_agg.set_style(done_style);
@@ -394,7 +424,7 @@ fn reviewer_session_agent(index: usize, name: &str) -> String {
 }
 
 /// Preset-run variant: both indices are load-bearing for uniqueness, since reviewer names
-/// AND preset names can each sanitize to identical stems.
+/// AND preset names can each sanitize (or truncate) to identical stems.
 fn preset_session_agent(
     reviewer_index: usize,
     name: &str,
@@ -406,7 +436,7 @@ fn preset_session_agent(
         reviewer_index + 1,
         sanitize_path_component(name),
         preset_index + 1,
-        sanitize_path_component(preset_name)
+        crate::presets::path_slug(preset_name)
     )
 }
 

@@ -132,10 +132,13 @@ composition stays in `prompts.rs`: the per-preset rubric is appended AFTER the s
 block so same-model jobs keep a byte-identical tools+protocol prefix for provider caching (the
 library appends shared project context after the system prompt, so cross-preset sharing covers
 tools+protocol only). Subagents inherit a rubric-aware prompt via `AgentConfig::subagent_system_prompt`.
-The one final synthesis (both modes) receives every active preset's name and FULL rubric in the
-user message (preambles stay protocol-only); a synthesis failure is wrapped with the run's
-preset/job counts, plus a "select fewer presets" hint only when `llm::is_context_length_error`
-classifies it as a context-window overflow.
+The one final synthesis (both modes) receives the preset roster — name and FULL rubric — in the
+user message (preambles stay protocol-only), filtered to presets with surviving evidence: a
+rubric with no matching report/lane would read as an angle reviewed clean (the session record
+and `pr --json` keep the full resolved list — they document resolution, not coverage). A preset
+run's synthesis failure is wrapped with the run's preset/job counts, plus a "select fewer
+presets" hint only when `llm::is_context_length_error` classifies it as a context-window
+overflow; Ask/Topic failures propagate untouched.
 
 ### Review flow
 

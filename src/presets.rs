@@ -124,6 +124,16 @@ fn lookup(name: &str, config: &Config) -> Result<ReviewPreset> {
     })
 }
 
+/// Sanitized, length-bounded path component for a preset name. Session stems embed it, and
+/// an unbounded name would push the trajectory filename past the filesystem limit — that
+/// write failure is only warned, silently losing the trace.
+pub fn path_slug(name: &str) -> String {
+    let mut slug = nitpicker_agent::session::sanitize_path_component(name);
+    // sanitize output is ASCII, so byte truncation cannot split a char
+    slug.truncate(40);
+    slug
+}
+
 /// Wrap a failed global-synthesis call with the run's shape, adding the fewer-presets
 /// remediation only when the error actually is a context-window overflow — on an auth or
 /// transport failure that hint would be misdirection.

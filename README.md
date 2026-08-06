@@ -141,9 +141,12 @@ nitpicker pr --preset api-security               # project-defined preset
 
 Fan-out: parallel mode runs every configured reviewer against every selected preset
 (reviewers × presets jobs); debate mode runs one independent Reviewer/Validator debate per
-preset, lanes concurrent, with a single meta-review across all lanes. Names are
-case-sensitive; unknown or empty names fail before any model call. `ask`, `init`, and
-`reflect` take no presets — the flag is rejected there.
+preset, lanes concurrent, with a single meta-review across all lanes. **Spend and wall-clock
+scale with the selection**: the untouched default now runs five lanes (or 5× the parallel
+jobs) where 0.8.x ran one combined review — narrow it with `--preset` or
+`[defaults].presets` if that is more than you want. Names are case-sensitive; unknown or
+empty names fail before any model call. `ask`, `init`, and `reflect` take no presets — the
+flag is rejected there.
 
 Unknown config keys are rejected. For example, use `max_tokens` for output length; `token_limit` is not a supported field.
 
@@ -379,7 +382,7 @@ Two LLM agents take turns exploring the codebase with file/git tools and submitt
 
 Interactive text runs show a compact cast/progress view while debating, then print the final synthesized result. In a terminal, `--verbose` also shows intermediate debate output and the saved transcript path; redirected stdout stays final-report-only.
 
-Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timestamp}.md`.
+With `--verbose`, the transcript is saved to `{tempdir}/debate-{timestamp}.md` (`ask`) or `review-debate-{timestamp}-{preset-slugs}.md` (review; one section per preset lane). Non-verbose runs skip the write.
 
 ### Exit codes (default review and `ask`)
 
@@ -413,7 +416,7 @@ println!("{}", result.text);
 ## Changelog
 
 **0.9.0** — 2026-08-06 (`nitpicker-agent` 0.3.0)
-- **Review presets**: named review angles (`correctness`, `security`, `performance`, `ml-rigor`, `maintainability`, `tone`, `general`, plus project-defined `[presets.<name>]` tables) selected via repeatable comma-split `--preset` or `[defaults].presets`. Parallel mode fans out reviewers × presets; debate mode runs one concurrent Reviewer/Validator lane per preset with a single global meta-review. `ask`/`init`/`reflect` are unaffected and reject the flag.
+- **Review presets**: named review angles (`correctness`, `security`, `performance`, `ml-rigor`, `maintainability`, `tone`, `general`, plus project-defined `[presets.<name>]` tables) selected via repeatable comma-split `--preset` or `[defaults].presets`. Parallel mode fans out reviewers × presets; debate mode runs one concurrent Reviewer/Validator lane per preset with a single global meta-review. **Cost note: the untouched default resolves to five presets, so a default run now spends ~5× the tokens of 0.8.x's single combined review** — select fewer with `--preset` to keep old costs. `ask`/`init`/`reflect` are unaffected and reject the flag.
 - `pr --json` gains an additive `presets` field (successful envelopes only). Session artifacts label jobs/lanes with preset names; the combined debate transcript gets per-lane sections and preset slugs in its filename.
 - Parallel review's 8-reviewer concurrency cap is removed — jobs all run under the shared in-flight LLM call cap (16); the debate per-turn cap is likewise hoisted to one per run shared across lanes.
 - Preset resolution failures (unknown/empty names) abort before any model call; context-window overflows in the final synthesis now suggest selecting fewer presets.

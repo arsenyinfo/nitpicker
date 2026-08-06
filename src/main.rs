@@ -1063,7 +1063,10 @@ mod tests {
         let config: config::Config = toml::from_str(toml_str).expect("parses");
         config.validate().expect("validates");
         let defaults = config.defaults.as_ref().expect("defaults present");
-        assert_eq!(defaults.presets.as_deref(), Some(&["tone".to_string(), "security".to_string()][..]));
+        assert_eq!(
+            defaults.presets.as_deref(),
+            Some(&["tone".to_string(), "security".to_string()][..])
+        );
         let presets = config.presets.as_ref().expect("presets present");
         assert_eq!(presets["tone"].prompt, "review the docs for tone");
     }
