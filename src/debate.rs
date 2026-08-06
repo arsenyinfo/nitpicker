@@ -496,7 +496,7 @@ pub async fn run_debate(
 
     // proxy handle stays bound for the function so its local server outlives the debate;
     // only its base URL is threaded into the client builders.
-    let gemini_proxy = crate::proxy::GeminiProxy::maybe_start(config).await?;
+    let gemini_proxy = crate::proxy::GeminiProxy::maybe_start(config).await;
     let proxy_url = gemini_proxy.url();
 
     let actor_client: Arc<dyn LLMClientDyn>;

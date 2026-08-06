@@ -114,16 +114,25 @@ pub async fn run_review(
 
     // the proxy handle stays bound for the whole function so its local server outlives the
     // reviewers; only its base URL is threaded downstream (see build_reviewer_client).
-    let gemini_proxy = crate::proxy::GeminiProxy::maybe_start(config).await?;
+    let gemini_proxy = crate::proxy::GeminiProxy::maybe_start(config).await;
     let proxy_url = gemini_proxy.url();
 
     // One client per reviewer, shared by all its preset jobs. eyre::Report is not Clone, so
     // a build failure is kept as its rendered message and re-raised per job — one broken
     // reviewer fails its own jobs while the others proceed, exactly as before the fan-out.
+    // A dead Gemini proxy degrades the same way: only proxy-needing reviewers fail, with
+    // the startup cause attached.
     let reviewer_clients: Vec<std::result::Result<_, String>> = config
         .reviewer
         .iter()
-        .map(|r| build_reviewer_client(r, proxy_url.as_deref()).map_err(|e| format!("{e:#}")))
+        .map(|r| {
+            build_reviewer_client(r, proxy_url.as_deref()).map_err(|e| {
+                match gemini_proxy.startup_error() {
+                    Some(cause) => format!("{e:#}; gemini proxy startup failed: {cause}"),
+                    None => format!("{e:#}"),
+                }
+            })
+        })
         .collect();
 
     for job in &jobs {
