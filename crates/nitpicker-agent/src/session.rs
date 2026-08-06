@@ -31,6 +31,11 @@ pub struct AggregationRecord {
     /// Per-lane convergence metadata for preset debate runs; absent elsewhere.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lanes: Option<Vec<LaneRecord>>,
+    /// Per-job outcomes for parallel review runs; absent elsewhere. The durable record of
+    /// what actually ran — a failed job is otherwise only a transient log line, and a
+    /// client-build failure writes no trajectory file at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jobs: Option<Vec<JobRecord>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -39,6 +44,15 @@ pub struct LaneRecord {
     pub rounds: usize,
     pub converged: bool,
     pub degraded: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct JobRecord {
+    pub label: String,
+    /// Absent on Ask-path jobs, which have no preset dimension.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    pub ok: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -204,6 +218,7 @@ mod tests {
         assert_eq!(parsed.rounds, Some(2));
         assert!(parsed.presets.is_none());
         assert!(parsed.lanes.is_none());
+        assert!(parsed.jobs.is_none());
 
         let current = AggregationRecord {
             kind: "aggregation".to_string(),
@@ -218,10 +233,16 @@ mod tests {
                 converged: true,
                 degraded: false,
             }]),
+            jobs: Some(vec![JobRecord {
+                label: "security · r".to_string(),
+                preset: Some("security".to_string()),
+                ok: false,
+            }]),
         };
         let round_tripped: AggregationRecord =
             serde_json::from_str(&serde_json::to_string(&current).unwrap()).unwrap();
         assert_eq!(round_tripped.lanes.unwrap()[0].preset, "security");
+        assert!(!round_tripped.jobs.unwrap()[0].ok);
 
         // absent options serialize to absent keys, keeping old readers indifferent
         let legacy_shaped = AggregationRecord {
@@ -232,9 +253,11 @@ mod tests {
             converged: Some(false),
             presets: None,
             lanes: None,
+            jobs: None,
         };
         let json = serde_json::to_string(&legacy_shaped).unwrap();
         assert!(!json.contains("presets"));
         assert!(!json.contains("lanes"));
+        assert!(!json.contains("jobs"));
     }
 }

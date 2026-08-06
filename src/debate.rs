@@ -436,8 +436,11 @@ pub struct DebateOutcome {
     pub transcript_path: std::path::PathBuf,
     pub usage: UsageReport,
     /// At least one turn failed or fell back to raw text; the report is synthesized from a
-    /// partial dialogue. Surfaced as exit code 3 in the default-review/`ask` CLI arms.
+    /// partial dialogue. Surfaced as exit code 3 in the default-review/`ask`/`pr` CLI arms.
     pub degraded: bool,
+    /// Presets whose lane survived (≥1 turn ran) — the angles the meta synthesis actually
+    /// covered, where the resolved list documents only the selection. `None` for Topic.
+    pub covered_presets: Option<Vec<String>>,
 }
 
 /// One lane's full result: an independent actor/critic debate over a single preset (or the
@@ -835,6 +838,7 @@ pub async fn run_debate(
                     })
                     .collect()
             }),
+            jobs: None,
         };
         logger.write_aggregation(&record).await?;
     }
@@ -909,6 +913,12 @@ pub async fn run_debate(
         transcript_path,
         usage,
         degraded,
+        covered_presets: presets.map(|_| {
+            surviving(&lanes)
+                .iter()
+                .filter_map(|lane| lane.preset_name.clone())
+                .collect()
+        }),
     })
 }
 

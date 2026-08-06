@@ -503,19 +503,22 @@ enum PrFlow {
     },
 }
 
+/// Returns the run's degraded flag; the caller maps it to exit code 3 — after this
+/// function returns, so the checkout-restore/lock guards inside have already dropped
+/// (`process::exit` skips destructors).
 pub async fn run_pr(
     args: PrArgs,
     common: crate::CommonArgs,
     context_files: Vec<PathBuf>,
     preset_names: Vec<String>,
-) -> Result<()> {
+) -> Result<bool> {
     let start = std::time::Instant::now();
     let format = args.output_format();
     // in json mode every failure (incl. config loading) must still leave a
     // parseable object on stdout and exit non-zero; text mode keeps the
     // eyre-to-stderr behavior.
     match run_pr_inner(args, common, context_files, preset_names, start).await {
-        Ok(()) => Ok(()),
+        Ok(degraded) => Ok(degraded),
         Err(e) => match format {
             crate::output::OutputFormat::Text => Err(e),
             crate::output::OutputFormat::Json => {
@@ -536,7 +539,7 @@ async fn run_pr_inner(
     context_files: Vec<PathBuf>,
     preset_names: Vec<String>,
     start: std::time::Instant,
-) -> Result<()> {
+) -> Result<bool> {
     let mut config = crate::load_config(common.config.as_deref(), &common.repo)?;
     // resolved before free-model resolution: a bad preset name must fail before any
     // network call, and inside run_pr_inner so it honors the --json error contract
@@ -714,7 +717,7 @@ async fn run_review_inner(
     config: &Config,
     verbose: bool,
     start: std::time::Instant,
-) -> Result<()> {
+) -> Result<bool> {
     use crate::output::{OutputFormat, PrInfo, PrReviewOutput, ReviewMode, Status};
 
     let repo = prepared.repo.as_path();
@@ -740,7 +743,7 @@ async fn run_review_inner(
         eprintln!("warning: --alloy has no effect with --no-debate");
     }
     let debate = !args.no_debate && config.default_debate();
-    let (report, transcript_path, usage) = if debate {
+    let (report, transcript_path, usage, degraded, covered_presets) = if debate {
         let outcome = debate::run_debate(
             repo,
             &full_prompt,
@@ -756,7 +759,13 @@ async fn run_review_inner(
             Some(presets),
         )
         .await?;
-        (outcome.report, outcome.transcript_path, outcome.usage)
+        (
+            outcome.report,
+            outcome.transcript_path,
+            outcome.usage,
+            outcome.degraded,
+            outcome.covered_presets,
+        )
     } else {
         let outcome = review::run_review(
             repo,
@@ -768,7 +777,13 @@ async fn run_review_inner(
             Some(presets),
         )
         .await?;
-        (outcome.report, std::path::PathBuf::new(), outcome.usage)
+        (
+            outcome.report,
+            std::path::PathBuf::new(),
+            outcome.usage,
+            outcome.degraded,
+            outcome.covered_presets,
+        )
     };
 
     match format {
@@ -816,6 +831,8 @@ async fn run_review_inner(
                     aggregator: config.aggregator.model.clone(),
                 }),
                 presets: Some(presets.iter().map(|p| p.name.clone()).collect()),
+                degraded: Some(degraded),
+                covered_presets,
                 report_markdown: Some(report),
                 usage: Some(usage),
                 comment_posted,
@@ -826,7 +843,7 @@ async fn run_review_inner(
         }
     }
 
-    Ok(())
+    Ok(degraded)
 }
 
 #[cfg(test)]

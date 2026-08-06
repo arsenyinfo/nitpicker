@@ -9,7 +9,9 @@ use nitpicker_agent::agent::{
 use nitpicker_agent::config::{Config, ReviewerConfig};
 use nitpicker_agent::llm::{Completion, FinishReason};
 use nitpicker_agent::provider::{build_aggregator_client, build_reviewer_client};
-use nitpicker_agent::session::{AggregationRecord, SessionLogger, sanitize_path_component};
+use nitpicker_agent::session::{
+    AggregationRecord, JobRecord, SessionLogger, sanitize_path_component,
+};
 use nitpicker_agent::tools::all_tools;
 use rig_core::completion::Message;
 use std::path::Path;
@@ -28,8 +30,11 @@ pub struct ReviewOutcome {
     pub report: String,
     pub usage: UsageReport,
     /// At least one review job failed; the report is synthesized from the survivors.
-    /// Surfaced as exit code 3 in the default-review/`ask` CLI arms.
+    /// Surfaced as exit code 3 in the default-review/`ask`/`pr` CLI arms.
     pub degraded: bool,
+    /// Presets with at least one surviving job — the angles the synthesis evidence actually
+    /// covered, where the resolved list documents only the selection. `None` on the Ask path.
+    pub covered_presets: Option<Vec<String>>,
 }
 
 pub async fn run_review(
@@ -227,8 +232,13 @@ pub async fn run_review(
     let mut rendered = Vec::new();
     let mut success_count = 0usize;
     let mut surviving_preset_indices = std::collections::HashSet::new();
+    let mut job_records: Vec<JobRecord> = Vec::new();
     for (label, preset_index, handle) in handles {
-        match handle.await {
+        let preset_name = match (presets, preset_index) {
+            (Some(ps), Some(j)) => Some(ps[j].name.clone()),
+            _ => None,
+        };
+        let ok = match handle.await {
             Ok(Ok(result)) => {
                 usage.add(result.usage, result.subagents_spawned);
                 rendered.extend(rendered_section(&label, Ok(&result.text), preset_run));
@@ -237,18 +247,26 @@ pub async fn run_review(
                     surviving_preset_indices.insert(j);
                 }
                 info!(job = %label, "review completed");
+                true
             }
             Ok(Err(err)) => {
                 let stub = format!("*Failed: {err:#}*");
                 rendered.extend(rendered_section(&label, Err(&stub), preset_run));
                 warn!(job = %label, error = ?err, "review failed");
+                false
             }
             Err(err) => {
                 let stub = format!("*Failed (task panicked): {err:#}*");
                 rendered.extend(rendered_section(&label, Err(&stub), preset_run));
                 error!(job = %label, error = ?err, "review task panicked");
+                false
             }
-        }
+        };
+        job_records.push(JobRecord {
+            label,
+            preset: preset_name,
+            ok,
+        });
     }
 
     // Refuse to synthesize a verdict out of nothing but failures: the aggregator would hallucinate
@@ -322,6 +340,7 @@ pub async fn run_review(
                 converged: None,
                 presets: presets.map(|ps| ps.iter().map(|p| p.name.clone()).collect()),
                 lanes: None,
+                jobs: Some(job_records),
             })
             .await?;
     }
@@ -329,6 +348,7 @@ pub async fn run_review(
         report: text,
         usage,
         degraded: success_count < job_count,
+        covered_presets: surviving_presets.map(|ps| ps.into_iter().map(|p| p.name).collect()),
     })
 }
 

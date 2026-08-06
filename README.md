@@ -362,7 +362,7 @@ Reviews a GitHub PR using its title, description, and diff. Requires the `gh` CL
 - With `URL` (`https://github.com/owner/repo/pull/N`): clones the repo into a temp dir, checks out the PR branch, reviews it, then cleans up
 - By default, posts the review as a PR comment. Pass `--no-comment` to skip posting.
 - `--no-debate`, `--rounds`, and `--max-turns` work the same as in the default review mode
-- `--json` emits a single machine-readable JSON object on stdout (status, PR metadata, models, resolved `presets`, `report_markdown`, `usage`, …) instead of the human report, with all logs/progress on stderr — handy for calling nitpicker as a subprocess. Exits non-zero on failure, with a `status: "error"` object on stdout. The `usage` block reports aggregate `input_tokens`/`output_tokens`/`total_tokens`, `cached_input_tokens`/`cache_creation_input_tokens`, and `subagents_spawned` for the run (best-effort: successful completions only). The cache fields are a breakdown of `input_tokens`, not an extra charge — a healthy multi-turn run shows most of its input served from cache. Cost formulas must discount them: `input_tokens` now counts cache reads on every provider (before 0.8.3 the Anthropic path omitted them), so a naive `input_tokens * input_price` over-states a cache-heavy run.
+- `--json` emits a single machine-readable JSON object on stdout (status, PR metadata, models, resolved `presets`, `report_markdown`, `usage`, …) instead of the human report, with all logs/progress on stderr — handy for calling nitpicker as a subprocess. Exits non-zero on failure, with a `status: "error"` object on stdout; a degraded run (some job or debate turn failed — `degraded: true`, and `covered_presets` lists the angles that actually produced evidence) exits 3 after emitting the envelope. The `usage` block reports aggregate `input_tokens`/`output_tokens`/`total_tokens`, `cached_input_tokens`/`cache_creation_input_tokens`, and `subagents_spawned` for the run (best-effort: successful completions only). The cache fields are a breakdown of `input_tokens`, not an extra charge — a healthy multi-turn run shows most of its input served from cache. Cost formulas must discount them: `input_tokens` now counts cache reads on every provider (before 0.8.3 the Anthropic path omitted them), so a naive `input_tokens * input_price` over-states a cache-heavy run.
 
 ### Ask subcommand
 
@@ -384,7 +384,7 @@ Interactive text runs show a compact cast/progress view while debating, then pri
 
 With `--verbose`, the transcript is saved to `{tempdir}/debate-{timestamp}.md` (`ask`) or `review-debate-{timestamp}-{preset-slugs}.md` (review; one section per preset lane). Non-verbose runs skip the write.
 
-### Exit codes (default review and `ask`)
+### Exit codes (default review, `ask`, and `pr`)
 
 | code | meaning |
 |------|---------|
@@ -393,7 +393,7 @@ With `--verbose`, the transcript is saved to `{tempdir}/debate-{timestamp}.md` (
 | 2 | CLI usage error (clap's exit code for bad arguments) |
 | 3 | degraded verdict — report printed, but a reviewer failed, or a debate turn failed or ended without calling `submit_verdict` |
 
-Non-interactive, non-verbose stdout carries exactly the final report, so the binary can be driven as a subprocess: read stdout for the verdict, branch on the exit code. `pr` keeps its own contract (`--json` emits `status: ok|error` and exits 0/1).
+Non-interactive, non-verbose stdout carries exactly the final report, so the binary can be driven as a subprocess: read stdout for the verdict, branch on the exit code. `pr` follows the same codes; in `--json` mode the envelope (`status: ok|error`, with `degraded: true` on an exit-3 run) is emitted and flushed before the exit.
 
 ## Using the agent as a library
 
@@ -417,7 +417,7 @@ println!("{}", result.text);
 
 **0.9.0** — 2026-08-06 (`nitpicker-agent` 0.3.0)
 - **Review presets**: named review angles (`correctness`, `security`, `performance`, `ml-rigor`, `maintainability`, `tone`, `general`, plus project-defined `[presets.<name>]` tables) selected via repeatable comma-split `--preset` or `[defaults].presets`. Parallel mode fans out reviewers × presets; debate mode runs one concurrent Reviewer/Validator lane per preset with a single global meta-review. **Cost note: the untouched default resolves to five presets, so a default run now spends ~5× the tokens of 0.8.x's single combined review** — select fewer with `--preset` to keep old costs. `ask`/`init`/`reflect` are unaffected and reject the flag.
-- `pr --json` gains an additive `presets` field (successful envelopes only). Session artifacts label jobs/lanes with preset names; the combined debate transcript gets per-lane sections and preset slugs in its filename.
+- `pr --json` gains additive `presets`, `degraded`, and `covered_presets` fields (successful envelopes only) — `covered_presets` reports coverage where `presets` reports resolution — and degraded `pr` runs now exit 3 like the other review arms. Session artifacts label jobs/lanes with preset names, and `aggregation.json` records a per-job outcome list on parallel runs; the combined debate transcript gets per-lane sections and preset slugs in its filename.
 - Parallel review's 8-reviewer concurrency cap is removed — jobs all run under the shared in-flight LLM call cap (16); the debate per-turn cap is likewise hoisted to one per run shared across lanes.
 - Preset resolution failures (unknown/empty names, more than 16 selected) abort before any model call; preset names must be free of control bytes; context-window overflows in the final synthesis now suggest selecting fewer presets.
 - Whitespace-only model responses are treated as empty (nudged, then failed) instead of passing a blank report off as review evidence.

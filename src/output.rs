@@ -97,8 +97,9 @@ impl UsageReport {
 /// the single JSON object written to stdout in `--format json` mode.
 ///
 /// `status: ok` means the review process ran to completion and produced a report;
-/// the report body may still contain per-reviewer failure notes (partial failures
-/// are folded into the markdown, not surfaced as a separate field in v1).
+/// partial failures surface as `degraded: true` plus a `covered_presets` list smaller
+/// than `presets` (and as exit code 3 — preset-run failure stubs are excluded from the
+/// synthesis input, so the report body alone cannot show them).
 #[derive(Debug, Serialize)]
 pub struct PrReviewOutput {
     pub schema_version: u32,
@@ -113,6 +114,15 @@ pub struct PrReviewOutput {
     /// omits it, including failures after resolution). additive schema-v1 field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presets: Option<Vec<String>>,
+    /// `true` when at least one review job / debate turn failed or fell back — the report
+    /// was synthesized from partial evidence. present iff `status: ok`; mirrored as exit
+    /// code 3. additive schema-v1 field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<bool>,
+    /// presets with at least one surviving job/lane — the run's *coverage*, where `presets`
+    /// documents its *resolution*. present iff `status: ok`. additive schema-v1 field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub covered_presets: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report_markdown: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -134,6 +144,8 @@ impl PrReviewOutput {
             mode: None,
             models: None,
             presets: None,
+            degraded: None,
+            covered_presets: None,
             report_markdown: None,
             usage: None,
             comment_posted: false,
@@ -203,6 +215,8 @@ mod tests {
             mode: None,
             models: None,
             presets: None,
+            degraded: None,
+            covered_presets: None,
             report_markdown: None,
             usage: Some(report),
             comment_posted: false,
@@ -240,13 +254,19 @@ mod tests {
         )
         .unwrap();
         assert!(error_json.get("presets").is_none());
+        assert!(error_json.get("degraded").is_none());
+        assert!(error_json.get("covered_presets").is_none());
 
         let mut ok = PrReviewOutput::error("unused".to_string(), 1);
         ok.status = Status::Ok;
         ok.error = None;
         ok.presets = Some(vec!["security".to_string(), "tone".to_string()]);
+        ok.degraded = Some(true);
+        ok.covered_presets = Some(vec!["security".to_string()]);
         let ok_json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&ok).unwrap()).unwrap();
         assert_eq!(ok_json["presets"], serde_json::json!(["security", "tone"]));
+        assert_eq!(ok_json["degraded"], serde_json::json!(true));
+        assert_eq!(ok_json["covered_presets"], serde_json::json!(["security"]));
     }
 }

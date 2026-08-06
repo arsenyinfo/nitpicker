@@ -294,7 +294,9 @@ async fn main() -> Result<()> {
             let context_files = merged_context_files(&args.context, &pr_args.context);
             let preset_names = merged_presets(&args.presets, &pr_args.presets);
             // config loading happens inside run_pr so its failures honor --format json too
-            return pr::run_pr(pr_args, args.common, context_files, preset_names).await;
+            let degraded = pr::run_pr(pr_args, args.common, context_files, preset_names).await?;
+            exit_if_degraded(degraded);
+            return Ok(());
         }
         Some(Command::Reflect { sessions_dir, n }) => {
             let repo = args.common.repo.canonicalize()?;
@@ -400,11 +402,12 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Exit-code contract for the default-review and `ask` arms: 0 = clean verdict,
+/// Exit-code contract for the default-review, `ask`, and `pr` arms: 0 = clean verdict,
 /// 1 = hard failure (no verdict), 3 = degraded verdict (report printed, but at least one
 /// reviewer or debate turn failed or fell back). 2 is deliberately unused — clap exits 2
 /// on usage errors, and the whole point is an unambiguous subprocess signal.
-/// `pr` keeps its own JSON/text contract.
+/// In `pr --json` the envelope (carrying `degraded: true`) is emitted and flushed first,
+/// and `run_pr` returns before this runs, so its checkout-restore guards have dropped.
 fn exit_if_degraded(degraded: bool) {
     if !degraded {
         return;
