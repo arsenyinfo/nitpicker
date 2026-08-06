@@ -57,7 +57,7 @@ See `examples/file_agent.rs` for a runnable version.
 
 **0.3.0**
 - Added `presets: Option<BTreeMap<String, PresetConfig>>` to `Config` and `presets: Option<Vec<String>>` to `DefaultsConfig` — source-breaking for code constructing these structs with literals (add `presets: None`). New `PresetConfig` type.
-- Added `presets`/`lanes`/`jobs` optional fields to `AggregationRecord` (same literal-construction caveat) and the new `LaneRecord`/`JobRecord` types.
+- Added `presets`/`lanes`/`jobs`/`error` optional fields to `AggregationRecord` and `model` to `ToolCallRecord` (same literal-construction caveat), plus the new `LaneRecord`/`JobRecord` types. An `error`-flagged aggregation record means synthesis failed post-collection — consumers must not render its `text` as a verdict.
 
 **0.2.0**
 - Replaced `AgentResult` token fields (`total_input_tokens`, `total_output_tokens`, `total_tokens`) and `usage()` method with `usage: TokenUsage`, which includes `cached_input_tokens` and `cache_creation_input_tokens`.
