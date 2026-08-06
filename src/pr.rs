@@ -92,6 +92,8 @@ pub struct PrArgs {
     pub url: Option<String>,
     #[command(flatten)]
     pub context: crate::ContextFileArgs,
+    #[command(flatten)]
+    pub presets: crate::PresetArgs,
     #[arg(long)]
     pub prompt: Option<String>,
     #[arg(long)]
@@ -505,13 +507,14 @@ pub async fn run_pr(
     args: PrArgs,
     common: crate::CommonArgs,
     context_files: Vec<PathBuf>,
+    preset_names: Vec<String>,
 ) -> Result<()> {
     let start = std::time::Instant::now();
     let format = args.output_format();
     // in json mode every failure (incl. config loading) must still leave a
     // parseable object on stdout and exit non-zero; text mode keeps the
     // eyre-to-stderr behavior.
-    match run_pr_inner(args, common, context_files, start).await {
+    match run_pr_inner(args, common, context_files, preset_names, start).await {
         Ok(()) => Ok(()),
         Err(e) => match format {
             crate::output::OutputFormat::Text => Err(e),
@@ -531,9 +534,15 @@ async fn run_pr_inner(
     args: PrArgs,
     common: crate::CommonArgs,
     context_files: Vec<PathBuf>,
+    preset_names: Vec<String>,
     start: std::time::Instant,
 ) -> Result<()> {
-    let config = crate::load_resolved_config(common.config.as_deref(), &common.repo).await?;
+    let mut config = crate::load_config(common.config.as_deref(), &common.repo)?;
+    // resolved before free-model resolution: a bad preset name must fail before any
+    // network call, and inside run_pr_inner so it honors the --json error contract
+    let _presets = crate::presets::resolve(&preset_names, &config)?;
+    nitpicker_agent::openrouter::resolve_free_models(&mut config).await?;
+    let config = config;
     check_gh()?;
 
     let prepared = prepare_pr(&args, &common.repo)?;

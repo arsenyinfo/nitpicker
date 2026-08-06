@@ -12,6 +12,7 @@ mod detect;
 mod gemini_proxy;
 mod output;
 mod pr;
+mod presets;
 mod progress;
 mod prompts;
 mod proxy;
@@ -55,6 +56,31 @@ fn merged_context_files(root: &ContextFileArgs, sub: &ContextFileArgs) -> Vec<Pa
         .collect()
 }
 
+/// `--preset`, shaped exactly like `ContextFileArgs` and for the same reason: a repeatable
+/// flag must not be `global` (clap would keep only the subcommand's occurrence list), so it
+/// is flattened at the root and into `pr`, and merged root-first at each use site.
+#[derive(Debug, ClapArgs)]
+struct PresetArgs {
+    /// Review preset(s) to run — repeatable and comma-separated (e.g. --preset security,ml-rigor).
+    /// Replaces the configured `[defaults].presets` list for this run.
+    #[arg(long = "preset", value_name = "NAME", value_delimiter = ',')]
+    preset: Vec<String>,
+}
+
+fn merged_presets(root: &PresetArgs, sub: &PresetArgs) -> Vec<String> {
+    root.preset.iter().chain(&sub.preset).cloned().collect()
+}
+
+/// Presets pick review rubrics; `ask`/`init`/`reflect` have none. Root-position `--preset`
+/// parses fine before any subcommand, so without an explicit rejection it would be silently
+/// discarded there (`pr` and the default review arms consume it).
+fn presets_allowed(command: &Option<Command>) -> bool {
+    match command {
+        None | Some(Command::Pr(_)) => true,
+        Some(Command::Ask { .. } | Command::Init { .. } | Command::Reflect { .. }) => false,
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "nitpicker")]
 struct Args {
@@ -66,6 +92,9 @@ struct Args {
 
     #[command(flatten)]
     context: ContextFileArgs,
+
+    #[command(flatten)]
+    presets: PresetArgs,
 
     #[arg(
         long,
@@ -166,6 +195,10 @@ async fn main() -> Result<()> {
         .compact()
         .init();
 
+    if !presets_allowed(&args.command) && !args.presets.preset.is_empty() {
+        eyre::bail!("--preset applies to review modes only (default review, --analyze, pr)");
+    }
+
     // note: no json panic hook. reviewer work runs in tokio::spawn tasks whose
     // panics are caught as JoinError and folded into a degraded report (exit 3
     // for review/ask, status ok for pr); a process-wide hook would double-emit
@@ -257,8 +290,9 @@ async fn main() -> Result<()> {
         }
         Some(Command::Pr(pr_args)) => {
             let context_files = merged_context_files(&args.context, &pr_args.context);
+            let preset_names = merged_presets(&args.presets, &pr_args.presets);
             // config loading happens inside run_pr so its failures honor --format json too
-            return pr::run_pr(pr_args, args.common, context_files).await;
+            return pr::run_pr(pr_args, args.common, context_files, preset_names).await;
         }
         Some(Command::Reflect { sessions_dir, n }) => {
             let repo = args.common.repo.canonicalize()?;
@@ -279,7 +313,12 @@ async fn main() -> Result<()> {
         eyre::bail!("--repo must point to a git repository (missing .git)");
     }
 
-    let config = load_resolved_config(args.common.config.as_deref(), &repo).await?;
+    let mut config = load_config(args.common.config.as_deref(), &repo)?;
+    // resolved before free-model resolution: a bad preset name must fail before any
+    // network call (resolve_free_models can run live smoke completions)
+    let _presets = presets::resolve(&args.presets.preset, &config)?;
+    openrouter::resolve_free_models(&mut config).await?;
+    let config = config;
     let max_turns = config.max_turns(args.max_turns)?;
 
     let scope = match args.analyze {
@@ -381,7 +420,7 @@ fn exit_if_degraded(degraded: bool) {
     std::process::exit(3);
 }
 
-fn load_config(explicit_path: Option<&Path>, repo: &Path) -> Result<config::Config> {
+pub(crate) fn load_config(explicit_path: Option<&Path>, repo: &Path) -> Result<config::Config> {
     let config: config::Config = if let Some(path) = explicit_path {
         let content = std::fs::read_to_string(path)
             .map_err(|e| eyre::eyre!("failed to read config {:?}: {e}", path))?;
@@ -534,9 +573,11 @@ fn build_init_config(
             max_turns: Some(config::DEFAULT_MAX_TURNS),
             compact_threshold: Some(100_000),
             log_trajectories: Some(false),
+            presets: None,
         }),
         aggregator,
         reviewer: reviewers,
+        presets: None,
     }
 }
 
@@ -919,5 +960,147 @@ mod tests {
         ] {
             assert!(Args::try_parse_from(argv).is_err());
         }
+    }
+
+    fn pr_presets(args: &Args) -> Vec<String> {
+        match &args.command {
+            Some(Command::Pr(pr_args)) => merged_presets(&args.presets, &pr_args.presets),
+            _ => panic!("expected pr subcommand"),
+        }
+    }
+
+    #[test]
+    fn preset_reaches_pr_from_either_side_of_the_subcommand() {
+        let args = parse(&["nitpicker", "--preset", "security", "pr"]);
+        assert_eq!(pr_presets(&args), ["security"]);
+
+        let args = parse(&["nitpicker", "pr", "--preset", "security"]);
+        assert_eq!(pr_presets(&args), ["security"]);
+    }
+
+    /// Repeated flags append, commas split within one occurrence, and values split around
+    /// the subcommand merge root-first (= command-line order) — same contract as
+    /// `--context-file`, and the reason `--preset` is not a clap `global`.
+    #[test]
+    fn presets_split_around_the_subcommand_merge_in_cli_order_with_commas_expanded() {
+        let args = parse(&[
+            "nitpicker",
+            "--preset",
+            "security,ml-rigor",
+            "pr",
+            "--preset",
+            "tone",
+        ]);
+        assert_eq!(pr_presets(&args), ["security", "ml-rigor", "tone"]);
+    }
+
+    #[test]
+    fn repeated_preset_flags_append_on_the_root_review_path() {
+        let args = parse(&["nitpicker", "--preset", "security", "--preset", "tone"]);
+        assert!(args.command.is_none());
+        assert_eq!(args.presets.preset, ["security", "tone"]);
+    }
+
+    #[test]
+    fn subcommands_without_presets_reject_the_flag() {
+        let cases: [&[&str]; 3] = [
+            &["nitpicker", "ask", "topic", "--preset", "security"],
+            &["nitpicker", "reflect", "--preset", "security"],
+            &["nitpicker", "init", "--preset", "security"],
+        ];
+        for argv in cases {
+            assert!(Args::try_parse_from(argv).is_err(), "argv: {argv:?}");
+        }
+    }
+
+    /// Root-position `--preset` parses before any subcommand, so the non-review arms must
+    /// reject it explicitly instead of silently discarding it.
+    #[test]
+    fn root_position_presets_are_rejected_for_non_review_subcommands() {
+        let cases: [&[&str]; 3] = [
+            &["nitpicker", "--preset", "security", "ask", "topic"],
+            &["nitpicker", "--preset", "security", "init"],
+            &["nitpicker", "--preset", "security", "reflect"],
+        ];
+        for argv in cases {
+            let args = parse(argv);
+            assert!(!presets_allowed(&args.command), "argv: {argv:?}");
+        }
+
+        let args = parse(&["nitpicker", "--preset", "security", "pr"]);
+        assert!(presets_allowed(&args.command));
+        let args = parse(&["nitpicker", "--preset", "security"]);
+        assert!(presets_allowed(&args.command));
+    }
+
+    /// The config file shape for presets: `[presets.<name>]` tables and the
+    /// `[defaults].presets` selection list round-trip through the library's Config.
+    #[test]
+    fn preset_config_tables_parse_and_validate() {
+        let toml_str = r#"
+            [defaults]
+            presets = ["tone", "security"]
+
+            [aggregator]
+            model = "m"
+            provider = "openai"
+            auth = "codex"
+
+            [[reviewer]]
+            name = "r"
+            model = "m"
+            provider = "openai"
+            auth = "codex"
+
+            [presets.tone]
+            prompt = "review the docs for tone"
+        "#;
+        let config: config::Config = toml::from_str(toml_str).expect("parses");
+        config.validate().expect("validates");
+        let defaults = config.defaults.as_ref().expect("defaults present");
+        assert_eq!(defaults.presets.as_deref(), Some(&["tone".to_string(), "security".to_string()][..]));
+        let presets = config.presets.as_ref().expect("presets present");
+        assert_eq!(presets["tone"].prompt, "review the docs for tone");
+    }
+
+    #[test]
+    fn unknown_fields_inside_a_preset_table_are_rejected() {
+        let toml_str = r#"
+            [aggregator]
+            model = "m"
+            provider = "openai"
+            auth = "codex"
+
+            [[reviewer]]
+            model = "m"
+            provider = "openai"
+            auth = "codex"
+
+            [presets.tone]
+            prompt = "p"
+            model = "sneaky-per-preset-model"
+        "#;
+        assert!(toml::from_str::<config::Config>(toml_str).is_err());
+    }
+
+    #[test]
+    fn blank_preset_prompts_fail_validation() {
+        let toml_str = r#"
+            [aggregator]
+            model = "m"
+            provider = "openai"
+            auth = "codex"
+
+            [[reviewer]]
+            model = "m"
+            provider = "openai"
+            auth = "codex"
+
+            [presets.tone]
+            prompt = "   "
+        "#;
+        let config: config::Config = toml::from_str(toml_str).expect("parses");
+        let err = config.validate().expect_err("blank prompt");
+        assert!(format!("{err:#}").contains("[presets.tone].prompt"));
     }
 }

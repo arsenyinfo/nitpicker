@@ -1,5 +1,6 @@
 use eyre::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub const DEFAULT_MAX_TURNS: usize = 100;
 
@@ -14,6 +15,17 @@ pub struct Config {
     pub defaults: Option<DefaultsConfig>,
     pub aggregator: AggregatorConfig,
     pub reviewer: Vec<ReviewerConfig>,
+    /// Project-defined review presets: `[presets.<name>] prompt = "..."`. Data only — the
+    /// built-in registry and all name resolution live in the binary (`src/presets.rs`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presets: Option<BTreeMap<String, PresetConfig>>,
+}
+
+/// One `[presets.<name>]` table: the rubric prompt for a single named review angle.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PresetConfig {
+    pub prompt: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -29,6 +41,10 @@ pub struct DefaultsConfig {
     pub compact_threshold: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_trajectories: Option<bool>,
+    /// Ordered preset selection for review runs; overridden by CLI `--preset`. Name
+    /// resolution (against built-ins and `[presets]`) happens in the binary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presets: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -210,6 +226,8 @@ impl Config {
             eyre::bail!("[defaults].compact_threshold must be greater than 0");
         }
 
+        validate_presets(self.presets.as_ref())?;
+
         Ok(())
     }
 
@@ -280,6 +298,22 @@ impl Config {
             .compact_threshold
             .or(self.default_compact_threshold())
     }
+}
+
+fn validate_presets(presets: Option<&BTreeMap<String, PresetConfig>>) -> Result<()> {
+    let presets = match presets {
+        Some(presets) => presets,
+        None => return Ok(()),
+    };
+    for (name, preset) in presets {
+        if name.trim().is_empty() {
+            eyre::bail!("[presets]: preset names must contain non-whitespace content");
+        }
+        if preset.prompt.trim().is_empty() {
+            eyre::bail!("[presets.{name}].prompt must contain non-whitespace content");
+        }
+    }
+    Ok(())
 }
 
 fn validate_free_model(label: &str, provider: &ProviderType, model: &str) -> Result<()> {
@@ -611,6 +645,7 @@ mod tests {
                 azure_scope: None,
                 azure_credentials: None,
             }],
+            presets: None,
         }
     }
 
