@@ -92,7 +92,7 @@ Example `nitpicker.toml`:
 debate = true          # optional, default: true
 max_turns = 100        # optional, default: 100
 log_trajectories = false # optional, default: false
-# presets = ["correctness", "security"]  # optional, default: the five built-in angles
+# presets = ["correctness", "security"]  # optional; default also includes performance, simplicity
 
 [aggregator]
 model = "claude-sonnet-5"
@@ -127,26 +127,30 @@ Require a concrete attacker-controlled path and plausible impact for every findi
 A preset is one named review angle — a rubric that tells a reviewer *what* to investigate;
 the execution mode (parallel, debate, alloy) decides *how*. Every review run resolves an
 ordered preset list: `--preset` on the command line beats `[defaults].presets`, which beats
-the built-in default (`correctness`, `security`, `performance`, `ml-rigor`,
-`maintainability` — the same five angles older versions hardcoded in the prompt). Built-ins
-also include `tone` and `general`; a `[presets.<name>]` table with a built-in's name
-replaces it.
+the four-angle built-in default (`correctness`, `security`, `performance`, `simplicity`).
+Domain-specific built-ins `ai-systems`, `ml-rigor`, and `tone` are opt-in. `general` is a
+standalone broad review for unusual targets or user-defined concerns and cannot be combined
+with another preset. A `[presets.<name>]` table with a built-in's name replaces it.
 
 ```bash
 nitpicker --preset security                      # one focused angle
 nitpicker --preset security,ml-rigor             # commas split
-nitpicker --preset security --preset tone        # repeats append
+nitpicker --preset ai-systems                    # agent/prompt/tool/context audit
+nitpicker --preset general --prompt "review the plugin contract"
 nitpicker pr --preset api-security               # project-defined preset
 ```
 
 Fan-out: parallel mode runs every configured reviewer against every selected preset
 (reviewers × presets jobs); debate mode runs one independent Reviewer/Validator debate per
-preset, lanes concurrent, with a single meta-review across all lanes. **Spend and wall-clock
-scale with the selection**: the untouched default now runs five lanes (or 5× the parallel
-jobs) where 0.8.x ran one combined review — narrow it with `--preset` or
-`[defaults].presets` if that is more than you want. Names are case-sensitive; unknown or
-empty names — or more than 16 selected presets — fail before any model call. `ask`, `init`,
-and `reflect` take no presets — the flag is rejected there.
+preset, lanes concurrent, with a single meta-review across all lanes. Spend and wall-clock
+scale with the selection: the untouched default runs four lanes (or 4× the parallel jobs)
+where 0.8.x ran one combined review. Names are case-sensitive; unknown or empty names,
+mixing `general` with another preset, or selecting more than 16 presets fails before any
+model call. `ask`, `init`, and `reflect` take no presets — the flag is rejected there.
+
+Built-in rubrics, review/debate protocols, and runtime prompts live as auditable Markdown under
+[`prompts/`](prompts/) and are compiled into the binary. Rust owns selection and interpolation,
+not the prompt prose.
 
 Unknown config keys are rejected. For example, use `max_tokens` for output length; `token_limit` is not a supported field.
 
@@ -416,14 +420,14 @@ println!("{}", result.text);
 ## Changelog
 
 **0.9.0** — 2026-08-06 (`nitpicker-agent` 0.3.0)
-- **Review presets**: named review angles (`correctness`, `security`, `performance`, `ml-rigor`, `maintainability`, `tone`, `general`, plus project-defined `[presets.<name>]` tables) selected via repeatable comma-split `--preset` or `[defaults].presets`. Parallel mode fans out reviewers × presets; debate mode runs one concurrent Reviewer/Validator lane per preset with a single global meta-review. **Cost note: the untouched default resolves to five presets, so a default run now spends ~5× the tokens of 0.8.x's single combined review** — select fewer with `--preset` to keep old costs. `ask`/`init`/`reflect` are unaffected and reject the flag.
+- **Review presets**: four universal defaults (`correctness`, `security`, `performance`, `simplicity`), opt-in domain angles (`ai-systems`, `ml-rigor`, `tone`), standalone `general`, and project-defined `[presets.<name>]` tables selected via repeatable comma-split `--preset` or `[defaults].presets`. Parallel mode fans out reviewers × presets; debate mode runs one concurrent Reviewer/Validator lane per preset with a single global meta-review. Built-in rubrics and protocol prompts are auditable Markdown under `prompts/` and compile into the binary. `ask`/`init`/`reflect` are unaffected and reject the flag.
 - `pr --json` gains additive `presets`, `degraded`, `covered_presets`, and per-preset `coverage` fields (successful envelopes only) — `covered_presets` reports coverage where `presets` reports resolution — and degraded `pr` runs now exit 3 like the other review arms. Session artifacts label jobs/lanes with preset names, and `aggregation.json` records a per-job outcome list on parallel runs; the combined debate transcript gets per-lane sections and preset slugs in its filename.
 - **`pr` mode config trust**: repo-level `nitpicker.toml` is read from the PR *base branch* blob (falling back to the global config) — never from the working tree, which holds target-controlled PR-head content that could redirect `base_url` or override preset rubrics. The base branch is only trusted when `origin` is a github.com remote, and the head-vs-base comparison runs on git object ids rather than reading the checked-out file. A warning names the checked-out copy when it diverges; explicit `--config` stays trusted.
 - Synthesis failures now persist: when the aggregator/meta-review dies after the review work completed, `aggregation.json` is still written with an `error` field and the per-job/lane outcome lists intact, and `reflect` renders lanes, jobs, and failed synthesis instead of dropping them.
 - Trajectory tool-call records carry the turn's `model` when the client reports it — alloy runs become attributable per turn.
 - A Gemini AG2 proxy startup failure (missing/expired keyring token) no longer aborts the whole run: only proxy-needing reviewers fail, with the startup cause attached.
 - Parallel review's 8-reviewer concurrency cap is removed — jobs all run under the shared in-flight LLM call cap (16); the debate per-turn cap is likewise hoisted to one per run shared across lanes.
-- Preset resolution failures (unknown/empty names, more than 16 selected) abort before any model call; preset names must be free of control bytes; context-window overflows in the final synthesis now suggest selecting fewer presets.
+- Preset resolution failures (unknown/empty names, `general` combined with another angle, more than 16 selected) abort before any model call; preset names must be free of control bytes; context-window overflows in the final synthesis now suggest selecting fewer presets.
 - Whitespace-only model responses are treated as empty (nudged, then failed) instead of passing a blank report off as review evidence.
 - Debate prompts no longer let debate history leak into results: withdrawn findings are dropped silently instead of surviving as "claim withdrawn" placeholder blocks, verdicts restate the full current position each turn, an agreeing critic restates what it confirmed, and the meta-review excludes debate chronology and inter-role uncertainty notes. Converged lanes reach the meta-review pruned to their final round (contested and degraded lanes keep the full dialogue; the on-disk transcript always does).
 

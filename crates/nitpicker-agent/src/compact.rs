@@ -8,32 +8,15 @@ use tracing::{info, warn};
 
 const COMPACTION_MAX_CORRECTIONS: usize = 2;
 const CONTINUE_MESSAGE: &str = "Continue from where you left off.";
-const COMPACTION_SYSTEM_PROMPT: &str = "You are summarizing an in-progress agent session so the same agent can resume it after a context reset. \
-Tools are unavailable during summarization: ignore any tool-calling or output-format instructions from the agent's role prompt (included in the request for reference only). \
-Your only output is the tagged summary.";
+const COMPACTION_SYSTEM_PROMPT: &str =
+    include_str!("../../../prompts/runtime/compaction-system.md");
 const SUMMARY_TAG: &str = "summary";
-const COMPACTION_SUMMARY_INSTRUCTIONS: &str = "Focus strictly on information vital for code analysis. Omit conversational filler, raw search/tool outputs, and large blocks of code.\n\
-When constructing the summary, you MUST use the following exact markdown structure inside the tags:\n\
-<summary>\n\
-## Review Goal\n\
-[1-2 sentences on the core objective of this code exploration/review. What are we looking for?]\n\
-## Key Findings & Discoveries\n\
-- [List major architectural insights, design patterns discovered, or critical issues/bugs identified so far.]\n\
-- [Keep these concise but highly technical.]\n\
-## Codebase Map (Relevant Files)\n\
-- [List the critical files and directories that have been identified as relevant to the goal.]\n\
-- [Briefly note why they are relevant (e.g., `src/auth/token.rs`: handles JWT validation and is where the bug likely resides).]\n\
-## Explored Territory\n\
-- [Briefly list what areas, files, or concepts have already been thoroughly investigated so we do not repeat work.]\n\
-## Last Action & Immediate Context\n\
-- [Describe the most recent tool calls and their results. What was the agent trying to find or verify? What did it just learn?]\n\
-## Open Questions & Next Steps\n\
-- [List any unresolved anomalies, pending review items, constraints to remember, or specific files that still need to be examined.]\n\
-</summary>\n\
-Return EXACTLY ONE tagged block starting with <summary> and ending with </summary>. Do not include any text, pleasantries, or explanations outside of these tags.";
-const MISSING_SUMMARY_CORRECTION: &str = "Your response is missing the required <summary>...</summary> block. Reply with ONLY the tagged summary block and nothing else outside the tags.";
+const COMPACTION_SUMMARY_INSTRUCTIONS: &str =
+    include_str!("../../../prompts/runtime/compaction-summary.md");
+const MISSING_SUMMARY_CORRECTION: &str =
+    include_str!("../../../prompts/runtime/compaction-missing-summary.md");
 const WRAP_SUMMARY_CORRECTION: &str =
-    "Wrap your entire response in <summary>...</summary> tags and output nothing outside them.";
+    include_str!("../../../prompts/runtime/compaction-wrap-summary.md");
 
 pub struct CompactionOutcome {
     pub usage: TokenUsage,

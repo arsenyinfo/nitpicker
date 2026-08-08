@@ -15,48 +15,24 @@ pub struct ReviewPreset {
 const BUILT_IN_PRESETS: &[(&str, &str)] = &[
     (
         "correctness",
-        "Find logic bugs, invalid assumptions, edge cases, off-by-one errors, incorrect state \
-         transitions, and behavior that disagrees with the surrounding contract. Require a \
-         plausible triggering scenario and evidence from the current code.",
+        include_str!("../prompts/presets/correctness.md"),
     ),
-    (
-        "security",
-        "Find concrete injection, authentication, authorization, secret exposure, unsafe \
-         deserialization, and trust-boundary failures. Only report an issue when an \
-         attacker-controlled path and plausible impact can be traced; recognizing a risky \
-         pattern by itself is insufficient.",
-    ),
+    ("security", include_str!("../prompts/presets/security.md")),
     (
         "performance",
-        "Find material unnecessary allocations, avoidable repeated work, N+1 access patterns, \
-         blocking calls in asynchronous paths, unbounded resource growth, and algorithmic \
-         regressions. Do not report micro-optimizations without a plausible workload impact.",
+        include_str!("../prompts/presets/performance.md"),
     ),
     (
-        "maintainability",
-        "Find dead or duplicated behavior, unclear ownership, fragile coupling, missing error \
-         handling, swallowed failures, magic fallbacks, and unexplained constants that make \
-         future changes materially unsafe. Reject cosmetic style preferences and speculative \
-         refactors.",
+        "simplicity",
+        include_str!("../prompts/presets/simplicity.md"),
     ),
+    ("ml-rigor", include_str!("../prompts/presets/ml-rigor.md")),
     (
-        "ml-rigor",
-        "Find data leakage, invalid train/evaluation splits, incorrect losses or metrics, \
-         numerical instability, non-reproducibility, statistically unsupported conclusions, \
-         and train/serve skew. Trace the issue through the actual data or evaluation flow.",
+        "ai-systems",
+        include_str!("../prompts/presets/ai-systems.md"),
     ),
-    (
-        "tone",
-        "Find material problems in clarity, audience fit, terminology, consistency, ambiguity, \
-         and stated tone of voice. Avoid subjective preferences; quote or locate the affected \
-         text and give a concrete rewrite direction.",
-    ),
-    (
-        "general",
-        "Investigate the target for material problems relevant to the user's task. Ground every \
-         finding in repository evidence, omit subjective nitpicks, and give a concrete \
-         correction direction.",
-    ),
+    ("tone", include_str!("../prompts/presets/tone.md")),
+    ("general", include_str!("../prompts/presets/general.md")),
 ];
 
 /// Upper bound on selected presets per run. Every selection runs as its own review job or
@@ -64,15 +40,9 @@ const BUILT_IN_PRESETS: &[(&str, &str)] = &[
 /// LLM semaphore bounds provider *rate*, not run size.
 const MAX_SELECTED_PRESETS: usize = 16;
 
-/// The five angles the pre-preset review prompt hardcoded, in that prompt's order — the
-/// selection when neither `--preset` nor `[defaults].presets` chooses.
-const DEFAULT_PRESET_NAMES: &[&str] = &[
-    "correctness",
-    "security",
-    "performance",
-    "ml-rigor",
-    "maintainability",
-];
+/// Universal default coverage. Domain-specific rubrics (`ml-rigor`, `ai-systems`, `tone`)
+/// stay opt-in, while `general` is the standalone unscoped alternative.
+const DEFAULT_PRESET_NAMES: &[&str] = &["correctness", "security", "performance", "simplicity"];
 
 /// Resolve the run's ordered preset list: CLI `--preset` values replace `[defaults].presets`,
 /// which replaces the built-in default. Names are trimmed, deduplicated first-seen, and
@@ -102,10 +72,16 @@ pub fn resolve(cli_names: &[String], config: &Config) -> Result<Vec<ReviewPreset
             selected.len()
         );
     }
-    selected
+    let resolved = selected
         .into_iter()
         .map(|name| lookup(name, config))
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    if resolved.len() > 1 && resolved.iter().any(|preset| preset.name == "general") {
+        eyre::bail!(
+            "preset \"general\" is a standalone broad review and cannot be combined with other presets"
+        );
+    }
+    Ok(resolved)
 }
 
 fn normalized<'a>(names: &'a [String], source: &str) -> Result<Vec<&'a str>> {
@@ -126,7 +102,7 @@ fn lookup(name: &str, config: &Config) -> Result<ReviewPreset> {
     let prompt = match project {
         Some(preset) => preset.prompt.clone(),
         None => match BUILT_IN_PRESETS.iter().find(|(n, _)| *n == name) {
-            Some((_, prompt)) => prompt.to_string(),
+            Some((_, prompt)) => prompt.trim().to_string(),
             None => eyre::bail!(
                 "unknown preset {name:?} — available presets: {}",
                 available_names(config).join(", ")
@@ -246,20 +222,13 @@ mod tests {
         values.iter().map(|v| v.to_string()).collect()
     }
 
-    /// With no CLI and no config selection, the run resolves to the five angles the
-    /// pre-preset prompt hardcoded, in that prompt's order.
+    /// With no CLI and no config selection, the run resolves to the four universal angles.
     #[test]
     fn absent_selection_resolves_to_builtin_default() {
         let resolved = resolve(&[], &config(None, &[])).expect("resolves");
         assert_eq!(
             names(&resolved),
-            [
-                "correctness",
-                "security",
-                "performance",
-                "ml-rigor",
-                "maintainability"
-            ]
+            ["correctness", "security", "performance", "simplicity"]
         );
     }
 
@@ -273,18 +242,18 @@ mod tests {
 
     #[test]
     fn configured_defaults_used_without_cli() {
-        let cfg = config(Some(vec!["tone", "general"]), &[]);
+        let cfg = config(Some(vec!["tone", "ai-systems"]), &[]);
         let resolved = resolve(&[], &cfg).expect("resolves");
-        assert_eq!(names(&resolved), ["tone", "general"]);
+        assert_eq!(names(&resolved), ["tone", "ai-systems"]);
     }
 
     /// Segments arrive comma-split from clap; surrounding whitespace must not change identity
-    /// (`--preset "security, maintainability"` names two real presets).
+    /// (`--preset "security, simplicity"` names two real presets).
     #[test]
     fn segments_are_trimmed() {
-        let resolved = resolve(&cli(&[" security ", "maintainability"]), &config(None, &[]))
-            .expect("resolves");
-        assert_eq!(names(&resolved), ["security", "maintainability"]);
+        let resolved =
+            resolve(&cli(&[" security ", "simplicity"]), &config(None, &[])).expect("resolves");
+        assert_eq!(names(&resolved), ["security", "simplicity"]);
     }
 
     #[test]
@@ -321,6 +290,22 @@ mod tests {
     fn empty_configured_default_list_is_rejected() {
         let err = resolve(&[], &config(Some(vec![]), &[])).expect_err("empty defaults");
         assert!(format!("{err:#}").contains("[defaults].presets must not be empty"));
+    }
+
+    #[test]
+    fn general_is_standalone_after_deduplication() {
+        assert_eq!(
+            names(&resolve(&cli(&["general", "general"]), &config(None, &[])).expect("resolves")),
+            ["general"]
+        );
+
+        for selection in [cli(&["general", "security"]), cli(&["security", "general"])] {
+            let err = resolve(&selection, &config(None, &[])).expect_err("mixed general");
+            assert!(format!("{err:#}").contains("standalone broad review"));
+        }
+
+        let cfg = config(Some(vec!["general", "tone"]), &[]);
+        assert!(resolve(&[], &cfg).is_err());
     }
 
     /// A same-named `[presets.<name>]` table replaces the built-in, so projects can
@@ -381,5 +366,8 @@ mod tests {
                 .iter()
                 .all(|n| BUILT_IN_PRESETS.iter().any(|(b, _)| b == n))
         );
+        for name in ["ml-rigor", "ai-systems", "tone", "general"] {
+            assert!(!DEFAULT_PRESET_NAMES.contains(&name), "{name} stays opt-in");
+        }
     }
 }

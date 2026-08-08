@@ -4,7 +4,7 @@ max_turns = 200
 log_trajectories = true
 compact_threshold = 120000
 # Ordered review-angle selection; CLI --preset overrides it per run.
-# presets = ["correctness", "security", "ml-rigor"]
+# presets = ["correctness", "security", "performance", "simplicity"]
 
 [aggregator]
 model = "claude-sonnet-4-6"
@@ -53,12 +53,14 @@ provider = "openrouter"
 # provider = "openrouter"
 
 # --- Review presets ---------------------------------------------------------
-# A preset is one named review angle. Built-ins: correctness, security,
-# performance, maintainability, ml-rigor, tone, general. Review runs resolve
+# A preset is one named review angle. Universal defaults: correctness, security,
+# performance, simplicity. Opt-in built-ins: ai-systems, ml-rigor, tone, and the
+# standalone broad-review preset general. Review runs resolve
 # --preset > [defaults].presets (see the [defaults] block at the top) > the
-# built-in five (correctness, security, performance, ml-rigor, maintainability).
+# built-in four (correctness, security, performance, simplicity).
 # Parallel mode runs reviewers × presets jobs; debate mode runs one concurrent
 # debate lane per preset — spend and wall-clock scale with the selection size.
+# `general` cannot be combined with another preset.
 #
 # Define a project preset (a table with the same name as a built-in replaces it):
 # [presets.api-security]
