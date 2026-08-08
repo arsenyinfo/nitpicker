@@ -101,17 +101,132 @@ impl ReviewScope {
     }
 }
 
-pub enum TaskMode {
-    Review(ReviewScope),
+#[derive(Clone, Copy)]
+pub enum RunTask<'a> {
     Ask,
+    Review {
+        scope: ReviewScope,
+        presets: &'a [crate::presets::ReviewPreset],
+    },
 }
 
-impl TaskMode {
-    /// Review workers receive exactly one rubric. Its slots are last in the template, keeping
-    /// the protocol prefix identical across same-model preset jobs for provider prompt caching.
-    pub fn system_prompt(&self, preset: Option<&crate::presets::ReviewPreset>) -> String {
-        match (self, preset) {
-            (TaskMode::Review(scope), Some(preset)) => render(
+/// One semantically complete worker/lane input derived from [`RunTask`].
+#[derive(Clone, Copy)]
+pub(crate) enum LaneTask<'a> {
+    Ask,
+    Review {
+        scope: ReviewScope,
+        preset: &'a crate::presets::ReviewPreset,
+    },
+}
+
+impl RunTask<'_> {
+    pub fn presets(&self) -> Option<&[crate::presets::ReviewPreset]> {
+        match self {
+            RunTask::Ask => None,
+            RunTask::Review { presets, .. } => Some(presets),
+        }
+    }
+
+    pub(crate) fn lanes(&self) -> Vec<LaneTask<'_>> {
+        match self {
+            RunTask::Ask => vec![LaneTask::Ask],
+            RunTask::Review { scope, presets } => presets
+                .iter()
+                .map(|preset| LaneTask::Review {
+                    scope: *scope,
+                    preset,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn initial_message(&self, user_prompt: &str) -> String {
+        if user_prompt.trim().is_empty() {
+            return String::new();
+        }
+        match self {
+            RunTask::Review { .. } => format!("Focus your review on: {user_prompt}\n\n"),
+            RunTask::Ask => format!("Question to answer: {user_prompt}\n\n"),
+        }
+    }
+
+    pub fn aggregator_preamble(&self) -> String {
+        match self {
+            RunTask::Review { scope, .. } => render(
+                REVIEW_AGGREGATOR_TEMPLATE,
+                &[
+                    ("NO_LANDED_FIXES", scope.no_landed_fixes_clause()),
+                    ("DROP_CLAUSE", scope.synthesis_drop_clause()),
+                    ("FINDING_SCHEMA", FINDING_FIELDS.trim()),
+                    ("NO_FINDINGS", NO_FINDINGS),
+                ],
+            ),
+            RunTask::Ask => render(
+                ASK_AGGREGATOR_TEMPLATE,
+                &[("OPTIONS_SCHEMA", OPTIONS_SCHEMA_WITH_NO_CONSENSUS.trim())],
+            ),
+        }
+    }
+
+    pub fn actor_role(&self) -> &'static str {
+        match self {
+            RunTask::Ask => "Actor",
+            RunTask::Review { .. } => "Reviewer",
+        }
+    }
+
+    pub fn critic_role(&self) -> &'static str {
+        match self {
+            RunTask::Ask => "Critic",
+            RunTask::Review { .. } => "Validator",
+        }
+    }
+
+    pub(crate) fn meta_instruction(&self) -> &'static str {
+        match self {
+            RunTask::Ask => "Debate transcript to synthesize into the final answer.",
+            RunTask::Review { .. } => "Debate transcript to synthesize into the final summary.",
+        }
+    }
+
+    pub(crate) fn meta_preamble(&self) -> String {
+        match self {
+            RunTask::Ask => render(
+                DEBATE_META_TOPIC_TEMPLATE,
+                &[("OPTIONS_SCHEMA", OPTIONS_SCHEMA_WITH_NO_CONSENSUS.trim())],
+            ),
+            RunTask::Review { scope, .. } => render(
+                DEBATE_META_REVIEW_TEMPLATE,
+                &[
+                    ("NO_LANDED_FIXES", scope.no_landed_fixes_clause()),
+                    ("DROP_CLAUSE", scope.synthesis_drop_clause()),
+                    ("FINDING_SCHEMA", FINDING_FIELDS.trim()),
+                    ("NO_FINDINGS", NO_FINDINGS),
+                ],
+            ),
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            RunTask::Ask => "debate",
+            RunTask::Review { .. } => "review-debate",
+        }
+    }
+}
+
+impl LaneTask<'_> {
+    pub(crate) fn preset(&self) -> Option<&crate::presets::ReviewPreset> {
+        match self {
+            LaneTask::Ask => None,
+            LaneTask::Review { preset, .. } => Some(preset),
+        }
+    }
+
+    pub(crate) fn reviewer_system(&self) -> String {
+        match self {
+            LaneTask::Review { scope, preset } => render(
                 REVIEWER_TEMPLATE,
                 &[
                     ("TARGET", scope.target_noun()),
@@ -123,69 +238,77 @@ impl TaskMode {
                     ("RUBRIC", &preset.prompt),
                 ],
             ),
-            (TaskMode::Review(_), None) | (TaskMode::Ask, Some(_)) => {
-                unreachable!("Review runs take exactly one preset per worker; Ask takes none")
-            }
-            (TaskMode::Ask, None) => {
-                render(ASK_TEMPLATE, &[("OPTIONS_SCHEMA", OPTIONS_SCHEMA.trim())])
-            }
+            LaneTask::Ask => render(ASK_TEMPLATE, &[("OPTIONS_SCHEMA", OPTIONS_SCHEMA.trim())]),
         }
     }
 
-    pub fn initial_message(&self, user_prompt: &str) -> String {
-        if user_prompt.trim().is_empty() {
-            return String::new();
-        }
+    pub(crate) fn subagent_prompt(&self) -> Option<String> {
         match self {
-            TaskMode::Review(_) => format!("Focus your review on: {user_prompt}\n\n"),
-            TaskMode::Ask => format!("Question to answer: {user_prompt}\n\n"),
+            LaneTask::Ask => None,
+            LaneTask::Review { preset, .. } => Some(preset_subagent_prompt(preset)),
         }
     }
 
-    /// Review synthesis carries every active preset's name and full rubric, including project
-    /// overrides; Ask has no preset roster.
-    pub fn reduce_prompt(
-        &self,
-        task: &str,
-        combined: &str,
-        presets: Option<&[crate::presets::ReviewPreset]>,
-    ) -> String {
-        let inputs = match self {
-            TaskMode::Review(_) => "Individual reviews to synthesize",
-            TaskMode::Ask => "Individual answers to synthesize",
-        };
-        let roster = match (self, presets) {
-            (TaskMode::Review(_), Some(presets)) => format!("{}\n\n", preset_roster(presets)),
-            (TaskMode::Ask, None) => String::new(),
-            (TaskMode::Review(_), None) | (TaskMode::Ask, Some(_)) => {
-                unreachable!("Review synthesis takes the active presets; Ask takes none")
-            }
-        };
-        match task.trim().is_empty() {
-            true => format!("{roster}{inputs}:\n\n{combined}"),
-            false => {
-                format!(
-                    "Original task given to each agent:\n{task}\n\n{roster}{inputs}:\n\n{combined}"
-                )
-            }
-        }
-    }
-
-    pub fn aggregator_preamble(&self) -> String {
+    pub(crate) fn actor_system(&self) -> String {
         match self {
-            TaskMode::Review(scope) => render(
-                REVIEW_AGGREGATOR_TEMPLATE,
+            LaneTask::Ask => render(
+                DEBATE_ACTOR_TOPIC_TEMPLATE,
+                &[("INVESTIGATION_GUIDANCE", INVESTIGATION_GUIDANCE.trim())],
+            ),
+            LaneTask::Review { scope, preset } => render(
+                DEBATE_ACTOR_REVIEW_TEMPLATE,
                 &[
-                    ("NO_LANDED_FIXES", scope.no_landed_fixes_clause()),
-                    ("DROP_CLAUSE", scope.synthesis_drop_clause()),
+                    ("TARGET", scope.target_noun()),
+                    ("SCOPE_RULE", scope.finding_scope_rule()),
                     ("FINDING_SCHEMA", FINDING_FIELDS.trim()),
                     ("NO_FINDINGS", NO_FINDINGS),
+                    ("INVESTIGATION_GUIDANCE", INVESTIGATION_GUIDANCE.trim()),
+                    ("PRESET_NAME", &preset.name),
+                    ("RUBRIC", &preset.prompt),
                 ],
             ),
-            TaskMode::Ask => render(
-                ASK_AGGREGATOR_TEMPLATE,
-                &[("OPTIONS_SCHEMA", OPTIONS_SCHEMA_WITH_NO_CONSENSUS.trim())],
+        }
+    }
+
+    pub(crate) fn critic_system(&self) -> String {
+        match self {
+            LaneTask::Ask => render(
+                DEBATE_VALIDATOR_TOPIC_TEMPLATE,
+                &[("INVESTIGATION_GUIDANCE", INVESTIGATION_GUIDANCE.trim())],
             ),
+            LaneTask::Review { scope, preset } => render(
+                DEBATE_VALIDATOR_REVIEW_TEMPLATE,
+                &[
+                    ("REALITY_CHECK", scope.critic_reality_check()),
+                    ("INVESTIGATION_GUIDANCE", INVESTIGATION_GUIDANCE.trim()),
+                    ("PRESET_NAME", &preset.name),
+                    ("RUBRIC", &preset.prompt),
+                ],
+            ),
+        }
+    }
+}
+
+/// Review synthesis carries every active preset's name and full rubric, including project
+/// overrides.
+pub(crate) fn review_reduce_prompt(
+    task: &str,
+    combined: &str,
+    presets: &[crate::presets::ReviewPreset],
+) -> String {
+    let roster = format!("{}\n\n", preset_roster(presets));
+    reduce_prompt(task, combined, "Individual reviews to synthesize", &roster)
+}
+
+pub(crate) fn ask_reduce_prompt(task: &str, combined: &str) -> String {
+    reduce_prompt(task, combined, "Individual answers to synthesize", "")
+}
+
+fn reduce_prompt(task: &str, combined: &str, inputs: &str, roster: &str) -> String {
+    match task.trim().is_empty() {
+        true => format!("{roster}{inputs}:\n\n{combined}"),
+        false => {
+            format!("Original task given to each agent:\n{task}\n\n{roster}{inputs}:\n\n{combined}")
         }
     }
 }
@@ -214,104 +337,6 @@ pub fn preset_subagent_prompt(preset: &crate::presets::ReviewPreset) -> String {
     )
 }
 
-pub enum DebateMode {
-    Topic,
-    Review(ReviewScope),
-}
-
-impl DebateMode {
-    pub fn actor_role(&self) -> &'static str {
-        match self {
-            DebateMode::Topic => "Actor",
-            DebateMode::Review(_) => "Reviewer",
-        }
-    }
-
-    pub fn critic_role(&self) -> &'static str {
-        match self {
-            DebateMode::Topic => "Critic",
-            DebateMode::Review(_) => "Validator",
-        }
-    }
-
-    pub(crate) fn actor_system(&self, preset: Option<&crate::presets::ReviewPreset>) -> String {
-        match (self, preset) {
-            (DebateMode::Review(_), None) | (DebateMode::Topic, Some(_)) => {
-                unreachable!("Review lanes take exactly one preset; Topic takes none")
-            }
-            (DebateMode::Topic, None) => render(
-                DEBATE_ACTOR_TOPIC_TEMPLATE,
-                &[("INVESTIGATION_GUIDANCE", INVESTIGATION_GUIDANCE.trim())],
-            ),
-            (DebateMode::Review(scope), Some(preset)) => render(
-                DEBATE_ACTOR_REVIEW_TEMPLATE,
-                &[
-                    ("TARGET", scope.target_noun()),
-                    ("SCOPE_RULE", scope.finding_scope_rule()),
-                    ("FINDING_SCHEMA", FINDING_FIELDS.trim()),
-                    ("NO_FINDINGS", NO_FINDINGS),
-                    ("INVESTIGATION_GUIDANCE", INVESTIGATION_GUIDANCE.trim()),
-                    ("PRESET_NAME", &preset.name),
-                    ("RUBRIC", &preset.prompt),
-                ],
-            ),
-        }
-    }
-
-    pub(crate) fn critic_system(&self, preset: Option<&crate::presets::ReviewPreset>) -> String {
-        match (self, preset) {
-            (DebateMode::Review(_), None) | (DebateMode::Topic, Some(_)) => {
-                unreachable!("Review lanes take exactly one preset; Topic takes none")
-            }
-            (DebateMode::Topic, None) => render(
-                DEBATE_VALIDATOR_TOPIC_TEMPLATE,
-                &[("INVESTIGATION_GUIDANCE", INVESTIGATION_GUIDANCE.trim())],
-            ),
-            (DebateMode::Review(scope), Some(preset)) => render(
-                DEBATE_VALIDATOR_REVIEW_TEMPLATE,
-                &[
-                    ("REALITY_CHECK", scope.critic_reality_check()),
-                    ("INVESTIGATION_GUIDANCE", INVESTIGATION_GUIDANCE.trim()),
-                    ("PRESET_NAME", &preset.name),
-                    ("RUBRIC", &preset.prompt),
-                ],
-            ),
-        }
-    }
-
-    pub(crate) fn meta_instruction(&self) -> &'static str {
-        match self {
-            DebateMode::Topic => "Debate transcript to synthesize into the final answer.",
-            DebateMode::Review(_) => "Debate transcript to synthesize into the final summary.",
-        }
-    }
-
-    pub(crate) fn meta_preamble(&self) -> String {
-        match self {
-            DebateMode::Topic => render(
-                DEBATE_META_TOPIC_TEMPLATE,
-                &[("OPTIONS_SCHEMA", OPTIONS_SCHEMA_WITH_NO_CONSENSUS.trim())],
-            ),
-            DebateMode::Review(scope) => render(
-                DEBATE_META_REVIEW_TEMPLATE,
-                &[
-                    ("NO_LANDED_FIXES", scope.no_landed_fixes_clause()),
-                    ("DROP_CLAUSE", scope.synthesis_drop_clause()),
-                    ("FINDING_SCHEMA", FINDING_FIELDS.trim()),
-                    ("NO_FINDINGS", NO_FINDINGS),
-                ],
-            ),
-        }
-    }
-
-    pub fn label(&self) -> &'static str {
-        match self {
-            DebateMode::Topic => "debate",
-            DebateMode::Review(_) => "review-debate",
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,8 +356,8 @@ mod tests {
         let a = preset("angle-a", "RUBRIC-MARKER-A");
         let b = preset("angle-b", "RUBRIC-MARKER-B");
         for scope in [ReviewScope::Diff, ReviewScope::Static] {
-            let prompt_a = TaskMode::Review(scope).system_prompt(Some(&a));
-            let prompt_b = TaskMode::Review(scope).system_prompt(Some(&b));
+            let prompt_a = LaneTask::Review { scope, preset: &a }.reviewer_system();
+            let prompt_b = LaneTask::Review { scope, preset: &b }.reviewer_system();
             assert!(prompt_a.contains("RUBRIC-MARKER-A"));
             assert!(!prompt_a.contains("RUBRIC-MARKER-B"));
             assert!(prompt_b.contains("RUBRIC-MARKER-B"));
@@ -353,11 +378,7 @@ mod tests {
             preset("angle-a", "RUBRIC-MARKER-A"),
             preset("angle-b", "RUBRIC-MARKER-B"),
         ];
-        let out = TaskMode::Review(ReviewScope::Diff).reduce_prompt(
-            "the task",
-            "the reviews",
-            Some(&presets),
-        );
+        let out = review_reduce_prompt("the task", "the reviews", &presets);
         for needle in [
             "angle-a",
             "RUBRIC-MARKER-A",
@@ -372,7 +393,7 @@ mod tests {
 
     #[test]
     fn ask_reduce_prompt_takes_no_roster() {
-        let out = TaskMode::Ask.reduce_prompt("the question", "the answers", None);
+        let out = ask_reduce_prompt("the question", "the answers");
         assert!(out.contains("the question"));
         assert!(out.contains("the answers"));
     }
@@ -387,19 +408,44 @@ mod tests {
     #[test]
     fn every_external_template_renders_all_of_its_placeholders() {
         let p = preset("angle", "rubric");
+        let presets = [p.clone()];
         let prompts = [
-            TaskMode::Review(ReviewScope::Diff).system_prompt(Some(&p)),
-            TaskMode::Review(ReviewScope::Static).system_prompt(Some(&p)),
-            TaskMode::Ask.system_prompt(None),
-            TaskMode::Review(ReviewScope::Diff).aggregator_preamble(),
-            TaskMode::Ask.aggregator_preamble(),
+            LaneTask::Review {
+                scope: ReviewScope::Diff,
+                preset: &p,
+            }
+            .reviewer_system(),
+            LaneTask::Review {
+                scope: ReviewScope::Static,
+                preset: &p,
+            }
+            .reviewer_system(),
+            LaneTask::Ask.reviewer_system(),
+            RunTask::Review {
+                scope: ReviewScope::Diff,
+                presets: &presets,
+            }
+            .aggregator_preamble(),
+            RunTask::Ask.aggregator_preamble(),
             preset_subagent_prompt(&p),
-            DebateMode::Topic.actor_system(None),
-            DebateMode::Review(ReviewScope::Diff).actor_system(Some(&p)),
-            DebateMode::Topic.critic_system(None),
-            DebateMode::Review(ReviewScope::Static).critic_system(Some(&p)),
-            DebateMode::Topic.meta_preamble(),
-            DebateMode::Review(ReviewScope::Diff).meta_preamble(),
+            LaneTask::Ask.actor_system(),
+            LaneTask::Review {
+                scope: ReviewScope::Diff,
+                preset: &p,
+            }
+            .actor_system(),
+            LaneTask::Ask.critic_system(),
+            LaneTask::Review {
+                scope: ReviewScope::Static,
+                preset: &p,
+            }
+            .critic_system(),
+            RunTask::Ask.meta_preamble(),
+            RunTask::Review {
+                scope: ReviewScope::Diff,
+                presets: &presets,
+            }
+            .meta_preamble(),
         ];
         assert!(prompts.iter().all(|prompt| !prompt.contains("{{")));
     }
@@ -407,7 +453,11 @@ mod tests {
     #[test]
     fn custom_rubric_may_contain_template_like_text() {
         let p = preset("custom", "Explain {{PROJECT_TOKEN}} exactly.");
-        let out = TaskMode::Review(ReviewScope::Diff).system_prompt(Some(&p));
+        let out = LaneTask::Review {
+            scope: ReviewScope::Diff,
+            preset: &p,
+        }
+        .reviewer_system();
         assert!(out.contains("{{PROJECT_TOKEN}}"));
     }
 }

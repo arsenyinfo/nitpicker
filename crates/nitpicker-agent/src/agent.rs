@@ -27,8 +27,7 @@ const MAX_CYCLE_REPETITIONS: usize = 2;
 const TOOL_CALL_HISTORY_WINDOW: usize = 8;
 const MAX_SUBAGENT_DEPTH: usize = 2;
 const MAX_CONSECUTIVE_BLOCKED_TOOL_CALLS: usize = 3;
-const FINAL_TURN_WRAP_UP_PROMPT: &str =
-    include_str!("../../../prompts/runtime/final-turn-wrap-up.md");
+const FINAL_TURN_WRAP_UP_PROMPT: &str = include_str!("../prompts/final-turn-wrap-up.md");
 
 pub struct AgentResult {
     pub text: String,

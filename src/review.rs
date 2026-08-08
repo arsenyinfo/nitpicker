@@ -1,5 +1,5 @@
 use crate::output::{PresetCoverage, UsageReport};
-pub use crate::prompts::TaskMode;
+use crate::prompts::RunTask;
 use eyre::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use nitpicker_agent::agent::{
@@ -32,11 +32,7 @@ pub struct ReviewOutcome {
     /// At least one review job failed; the report is synthesized from the survivors.
     /// Surfaced as exit code 3 in the default-review/`ask`/`pr` CLI arms.
     pub degraded: bool,
-    /// Presets with at least one surviving job — the angles the synthesis evidence actually
-    /// covered, where the resolved list documents only the selection. `None` on the Ask path.
-    pub covered_presets: Option<Vec<String>>,
-    /// Per-preset attempted/succeeded job counts in resolution order — the granularity
-    /// `covered_presets` summarizes away. `None` on the Ask path.
+    /// Per-preset attempted/succeeded job counts in resolution order. `None` on the Ask path.
     pub coverage: Option<Vec<PresetCoverage>>,
 }
 
@@ -46,15 +42,10 @@ pub async fn run_review(
     config: &Config,
     max_turns: usize,
     verbose: bool,
-    mode: TaskMode,
-    presets: Option<&[crate::presets::ReviewPreset]>,
+    task: RunTask<'_>,
 ) -> Result<ReviewOutcome> {
-    match (&mode, presets) {
-        (TaskMode::Review(_), Some(_)) | (TaskMode::Ask, None) => {}
-        (TaskMode::Review(_), None) | (TaskMode::Ask, Some(_)) => {
-            unreachable!("Review runs take the resolved presets; Ask takes none")
-        }
-    }
+    let presets = task.presets();
+    let lanes = task.lanes();
     let mut tools = all_tools();
     add_spawn_subagent_tool(&mut tools);
     let session_logger = SessionLogger::maybe_new(config.log_trajectories())?;
@@ -62,24 +53,13 @@ pub async fn run_review(
         info!(path = %logger.root().display(), "trajectory logging enabled");
     }
     let context = crate::context::build_context(repo).await;
-    let initial_message = mode.initial_message(user_prompt);
+    let initial_message = task.initial_message(user_prompt);
     let reviewer_names: Vec<&str> = config.reviewer.iter().map(|r| r.name.as_str()).collect();
     let jobs = plan_jobs(&reviewer_names, presets);
     // per-preset prompts are identical across reviewers — compose each once, not per job
-    let system_prompts: Vec<String> = match presets {
-        Some(presets) => presets
-            .iter()
-            .map(|p| mode.system_prompt(Some(p)))
-            .collect(),
-        None => vec![mode.system_prompt(None)],
-    };
-    let subagent_prompts: Vec<Option<String>> = match presets {
-        Some(presets) => presets
-            .iter()
-            .map(|p| Some(crate::prompts::preset_subagent_prompt(p)))
-            .collect(),
-        None => vec![None],
-    };
+    let system_prompts: Vec<String> = lanes.iter().map(|lane| lane.reviewer_system()).collect();
+    let subagent_prompts: Vec<Option<String>> =
+        lanes.iter().map(|lane| lane.subagent_prompt()).collect();
     let mut handles = Vec::new();
     // Preset jobs all spawn eagerly and run concurrently — the account-wide cap on in-flight
     // LLM calls below is their only concurrency bound, shared with every subagent. The Ask
@@ -315,14 +295,21 @@ pub async fn run_review(
     // with no matching report would read as an angle that was reviewed and found clean.
     // (The session record and `pr --json` keep the FULL resolved list: they document the
     // run's resolution, not its coverage.)
-    let surviving_presets: Option<Vec<crate::presets::ReviewPreset>> = presets.map(|ps| {
-        ps.iter()
-            .enumerate()
-            .filter(|(j, _)| surviving_preset_indices.contains(j))
-            .map(|(_, p)| p.clone())
-            .collect()
-    });
-    let reduce_prompt = mode.reduce_prompt(user_prompt, &combined, surviving_presets.as_deref());
+    let surviving_presets: Vec<crate::presets::ReviewPreset> = presets
+        .map(|ps| {
+            ps.iter()
+                .enumerate()
+                .filter(|(j, _)| surviving_preset_indices.contains(j))
+                .map(|(_, p)| p.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let reduce_prompt = match task {
+        RunTask::Ask => crate::prompts::ask_reduce_prompt(user_prompt, &combined),
+        RunTask::Review { .. } => {
+            crate::prompts::review_reduce_prompt(user_prompt, &combined, &surviving_presets)
+        }
+    };
 
     let pb_agg = mp.add(ProgressBar::new_spinner());
     pb_agg.set_style(spinner_style);
@@ -336,7 +323,7 @@ pub async fn run_review(
         let completion = Completion {
             model: agg.model.clone(),
             prompt: Message::user(reduce_prompt),
-            preamble: Some(mode.aggregator_preamble().to_string()),
+            preamble: Some(task.aggregator_preamble()),
             history: Vec::new(),
             tools: Vec::new(),
             tool_choice: None,
@@ -415,7 +402,6 @@ pub async fn run_review(
         report: text,
         usage,
         degraded: success_count < job_count,
-        covered_presets: surviving_presets.map(|ps| ps.into_iter().map(|p| p.name).collect()),
         coverage,
     })
 }
@@ -685,7 +671,7 @@ mod tests {
 
     /// A preset reviewed by 1 of its N planned jobs must be distinguishable from a fully
     /// covered one — the envelope's `coverage` key carries exactly these counts, including
-    /// zero-survivor presets that `covered_presets` drops entirely.
+    /// zero-survivor presets that a names-only summary would drop entirely.
     #[test]
     fn preset_coverage_counts_attempted_and_succeeded_per_preset() {
         let presets = [

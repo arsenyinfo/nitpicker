@@ -1,6 +1,6 @@
-use crate::debate::{self, DebateMode};
-use crate::prompts::ReviewScope;
-use crate::review::{self, TaskMode};
+use crate::debate;
+use crate::prompts::{ReviewScope, RunTask};
+use crate::review;
 use eyre::{Result, WrapErr};
 use nitpicker_agent::config::Config;
 use serde::Deserialize;
@@ -945,7 +945,7 @@ async fn run_review_inner(
         eprintln!("warning: --alloy has no effect with --no-debate");
     }
     let debate = !args.no_debate && config.default_debate();
-    let (report, transcript_path, usage, degraded, covered_presets, coverage) = if debate {
+    let (report, transcript_path, usage, degraded, coverage) = if debate {
         let outcome = debate::run_debate(
             repo,
             &full_prompt,
@@ -954,11 +954,13 @@ async fn run_review_inner(
                 max_rounds: args.rounds,
                 max_turns,
                 verbose,
-                mode: DebateMode::Review(ReviewScope::Diff),
+                task: RunTask::Review {
+                    scope: ReviewScope::Diff,
+                    presets,
+                },
                 alloy: use_alloy,
                 format,
             },
-            Some(presets),
         )
         .await?;
         (
@@ -966,7 +968,6 @@ async fn run_review_inner(
             outcome.transcript_path,
             outcome.usage,
             outcome.degraded,
-            outcome.covered_presets,
             outcome.coverage,
         )
     } else {
@@ -976,8 +977,10 @@ async fn run_review_inner(
             config,
             max_turns,
             verbose,
-            TaskMode::Review(ReviewScope::Diff),
-            Some(presets),
+            RunTask::Review {
+                scope: ReviewScope::Diff,
+                presets,
+            },
         )
         .await?;
         (
@@ -985,7 +988,6 @@ async fn run_review_inner(
             std::path::PathBuf::new(),
             outcome.usage,
             outcome.degraded,
-            outcome.covered_presets,
             outcome.coverage,
         )
     };
@@ -1036,7 +1038,6 @@ async fn run_review_inner(
                 }),
                 presets: Some(presets.iter().map(|p| p.name.clone()).collect()),
                 degraded: Some(degraded),
-                covered_presets,
                 coverage,
                 report_markdown: Some(report),
                 usage: Some(usage),
@@ -1146,37 +1147,10 @@ mod tests {
         }
     }
 
-    /// The base config is read from the remote-tracking ref, never the working tree; the
-    /// head comparison goes through git object ids, so a PR-supplied symlink at
-    /// nitpicker.toml is never followed. Unreadable state degrades instead of erroring.
+    /// The base config is read from the remote-tracking ref, never the working tree.
     #[test]
-    fn base_config_reads_the_ref_blob_and_head_state_never_reads_the_worktree() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().canonicalize().unwrap();
-        init_repo(&repo);
-
-        std::fs::write(repo.join("nitpicker.toml"), "from-base").unwrap();
-        git(&repo, &["add", "nitpicker.toml"]);
-        let commit = |repo: &Path, msg: &str| {
-            git(
-                repo,
-                &[
-                    "-c",
-                    "user.email=t@test",
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "commit.gpgsign=false",
-                    "commit",
-                    "-m",
-                    msg,
-                ],
-            )
-        };
-        commit(&repo, "config");
-        // fabricate the remote-tracking ref the PR base resolves through
-        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
-
+    fn base_config_reads_the_ref_blob() {
+        let (_dir, repo) = repo_with_base_config();
         assert_eq!(
             read_base_branch_config(&repo, "main").as_deref(),
             Some("from-base")
@@ -1184,7 +1158,14 @@ mod tests {
         assert!(read_base_branch_config(&repo, "no-such-branch").is_none());
         assert!(read_base_branch_config(&repo, "").is_none());
         assert_eq!(head_config_state(&repo, "main"), HeadConfig::SameAsBase);
+    }
 
+    /// The head comparison goes through git object ids, so a PR-supplied symlink at
+    /// nitpicker.toml is never followed. `/dev/zero` makes this regression Unix-specific.
+    #[cfg(unix)]
+    #[test]
+    fn head_config_state_never_reads_a_worktree_symlink() {
+        let (_dir, repo) = repo_with_base_config();
         // the PR head commits a hostile replacement: a symlink to a device that would hang
         // an unbounded read. Detection must stay at object-id level and still say "diverges".
         std::fs::remove_file(repo.join("nitpicker.toml")).unwrap();
@@ -1196,6 +1177,35 @@ mod tests {
         assert_eq!(
             read_base_branch_config(&repo, "main").as_deref(),
             Some("from-base")
+        );
+    }
+
+    fn repo_with_base_config() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        init_repo(&repo);
+        std::fs::write(repo.join("nitpicker.toml"), "from-base").unwrap();
+        git(&repo, &["add", "nitpicker.toml"]);
+        commit(&repo, "config");
+        // fabricate the remote-tracking ref the PR base resolves through
+        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        (dir, repo)
+    }
+
+    fn commit(repo: &Path, msg: &str) {
+        git(
+            repo,
+            &[
+                "-c",
+                "user.email=t@test",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                msg,
+            ],
         );
     }
 

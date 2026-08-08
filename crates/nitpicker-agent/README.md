@@ -7,6 +7,10 @@ parallel subagents, with provider-agnostic LLM clients and optional config-file-
 It carries none of nitpicker's CLI, review/debate, or PR machinery — just the loop, the tools,
 and the providers.
 
+The caller owns task semantics through its system prompt, initial message, and optional subagent
+prompt. The crate owns only the generic loop contracts it interprets itself—compaction, final-turn
+handling, and the fallback subagent protocol—which remain auditable Markdown under `prompts/`.
+
 ## Quick start
 
 ```rust

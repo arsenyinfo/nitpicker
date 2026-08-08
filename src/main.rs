@@ -258,11 +258,10 @@ async fn main() -> Result<()> {
                         max_rounds: rounds,
                         max_turns,
                         verbose: args.common.verbose,
-                        mode: debate::DebateMode::Topic,
+                        task: prompts::RunTask::Ask,
                         alloy: use_alloy,
                         format: output::OutputFormat::Text,
                     },
-                    None,
                 )
                 .await?;
                 println!("{}", outcome.report);
@@ -282,8 +281,7 @@ async fn main() -> Result<()> {
                 &config,
                 max_turns,
                 args.common.verbose,
-                review::TaskMode::Ask,
-                None,
+                prompts::RunTask::Ask,
             )
             .await?;
             println!("{}", outcome.report);
@@ -369,11 +367,13 @@ async fn main() -> Result<()> {
                 max_rounds: args.rounds,
                 max_turns,
                 verbose: args.common.verbose,
-                mode: debate::DebateMode::Review(scope),
+                task: prompts::RunTask::Review {
+                    scope,
+                    presets: &presets,
+                },
                 alloy: use_alloy,
                 format: output::OutputFormat::Text,
             },
-            Some(&presets),
         )
         .await?;
         println!("{}", outcome.report);
@@ -392,8 +392,10 @@ async fn main() -> Result<()> {
             &config,
             max_turns,
             args.common.verbose,
-            review::TaskMode::Review(scope),
-            Some(&presets),
+            prompts::RunTask::Review {
+                scope,
+                presets: &presets,
+            },
         )
         .await?;
         println!("{}", outcome.report);

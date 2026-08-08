@@ -1,5 +1,5 @@
 use crate::output::UsageReport;
-pub use crate::prompts::DebateMode;
+use crate::prompts::RunTask;
 use eyre::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use nitpicker_agent::agent::{
@@ -422,11 +422,11 @@ fn make_sub_spinner(mp: &MultiProgress, pb: &ProgressBar) -> ProgressBar {
     sub
 }
 
-pub struct DebateOptions {
+pub struct DebateOptions<'a> {
     pub max_rounds: usize,
     pub max_turns: usize,
     pub verbose: bool,
-    pub mode: DebateMode,
+    pub task: RunTask<'a>,
     pub alloy: bool,
     pub format: crate::output::OutputFormat,
 }
@@ -438,11 +438,8 @@ pub struct DebateOutcome {
     /// At least one turn failed or fell back to raw text; the report is synthesized from a
     /// partial dialogue. Surfaced as exit code 3 in the default-review/`ask`/`pr` CLI arms.
     pub degraded: bool,
-    /// Presets whose lane survived (≥1 turn ran) — the angles the meta synthesis actually
-    /// covered, where the resolved list documents only the selection. `None` for Topic.
-    pub covered_presets: Option<Vec<String>>,
     /// Per-preset lane counts in resolution order (attempted is always 1 — one lane per
-    /// preset), matching the parallel path's per-job shape. `None` for Topic.
+    /// preset), matching the parallel path's per-job shape. `None` for Ask.
     pub coverage: Option<Vec<crate::output::PresetCoverage>>,
 }
 
@@ -464,23 +461,18 @@ pub async fn run_debate(
     repo: &Path,
     prompt: &str,
     config: &Config,
-    opts: DebateOptions,
-    presets: Option<&[crate::presets::ReviewPreset]>,
+    opts: DebateOptions<'_>,
 ) -> Result<DebateOutcome> {
     let DebateOptions {
         max_rounds,
         max_turns,
         verbose,
-        mode,
+        task,
         alloy,
         format,
     } = opts;
-    match (&mode, presets) {
-        (DebateMode::Review(_), Some(_)) | (DebateMode::Topic, None) => {}
-        (DebateMode::Review(_), None) | (DebateMode::Topic, Some(_)) => {
-            unreachable!("Review debates take the resolved presets; Topic takes none")
-        }
-    }
+    let presets = task.presets();
+    let lane_tasks = task.lanes();
     // in json mode stdout is reserved for the final envelope; the cast lines and
     // rendered verdicts below would otherwise corrupt it.
     let stdout_ok = matches!(format, crate::output::OutputFormat::Text);
@@ -551,8 +543,8 @@ pub async fn run_debate(
     let agg_client: Arc<dyn LLMClientDyn> =
         gemini_proxy.annotate(build_aggregator_client(agg_cfg, proxy_url.as_deref()))?;
 
-    let actor_role = mode.actor_role();
-    let critic_role = mode.critic_role();
+    let actor_role = task.actor_role();
+    let critic_role = task.critic_role();
     // one in-flight-LLM cap for the whole run: concurrent lanes and their subagents share
     // it, so lane count scales wall-clock breadth without multiplying provider pressure
     let llm_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LLM_CALLS));
@@ -591,109 +583,108 @@ pub async fn run_debate(
         println!();
     }
 
-    // One lane per preset for Review; Topic (`ask`) is the degenerate single `None` lane and
+    // One lane per preset for Review; Ask is the degenerate single unscoped lane and
     // keeps its exact pre-preset behavior, live verbose output included.
-    let lane_presets: Vec<Option<&crate::presets::ReviewPreset>> = match presets {
-        Some(presets) => presets.iter().map(Some).collect(),
-        None => vec![None],
-    };
-    let live_output = lane_presets.len() == 1;
+    let live_output = lane_tasks.len() == 1;
 
-    let lane_futures = lane_presets.iter().enumerate().map(|(lane_index, preset)| {
-        let actor_client = Arc::clone(&actor_client);
-        let critic_client = Arc::clone(&critic_client);
-        let llm_semaphore = &llm_semaphore;
-        let mp = &mp;
-        let done_style = &done_style;
-        let skin = &skin;
-        let project_context = &project_context;
-        let session_logger = session_logger.as_ref();
-        let actor_alias = &actor_label.alias;
-        let critic_alias = &critic_label.alias;
-        let mode = &mode;
-        async move {
-            let actor_system = mode.actor_system(*preset);
-            let critic_system = mode.critic_system(*preset);
-            let subagent_prompt = preset.map(crate::prompts::preset_subagent_prompt);
-            let (actor_stem, critic_stem) = lane_session_stems(lane_index, *preset);
-            let actor = DebateSide {
-                role: actor_role,
-                client: actor_client,
-                compact_threshold: actor_compact_threshold,
-                max_tokens: actor_max_tokens,
-                model: actor_alias,
-                system_prompt: &actor_system,
-                session_stem: &actor_stem,
-            };
-            let critic = DebateSide {
-                role: critic_role,
-                client: critic_client,
-                compact_threshold: critic_compact_threshold,
-                max_tokens: critic_max_tokens,
-                model: critic_alias,
-                system_prompt: &critic_system,
-                session_stem: &critic_stem,
-            };
-            let env = RoundEnv {
-                mp,
-                done_style,
-                skin,
-                repo,
-                topic: prompt,
-                project_context,
-                session_logger,
-                max_turns,
-                verbose,
-                stdout_ok,
-                llm_semaphore,
-                lane_tag: preset.map(|p| p.name.as_str()),
-                subagent_system_prompt: subagent_prompt.as_deref(),
-                live_output,
-            };
+    let lane_futures = lane_tasks
+        .iter()
+        .enumerate()
+        .map(|(lane_index, lane_task)| {
+            let actor_client = Arc::clone(&actor_client);
+            let critic_client = Arc::clone(&critic_client);
+            let llm_semaphore = &llm_semaphore;
+            let mp = &mp;
+            let done_style = &done_style;
+            let skin = &skin;
+            let project_context = &project_context;
+            let session_logger = session_logger.as_ref();
+            let actor_alias = &actor_label.alias;
+            let critic_alias = &critic_label.alias;
+            async move {
+                let preset = lane_task.preset();
+                let actor_system = lane_task.actor_system();
+                let critic_system = lane_task.critic_system();
+                let subagent_prompt = lane_task.subagent_prompt();
+                let (actor_stem, critic_stem) = lane_session_stems(lane_index, preset);
+                let actor = DebateSide {
+                    role: actor_role,
+                    client: actor_client,
+                    compact_threshold: actor_compact_threshold,
+                    max_tokens: actor_max_tokens,
+                    model: actor_alias,
+                    system_prompt: &actor_system,
+                    session_stem: &actor_stem,
+                };
+                let critic = DebateSide {
+                    role: critic_role,
+                    client: critic_client,
+                    compact_threshold: critic_compact_threshold,
+                    max_tokens: critic_max_tokens,
+                    model: critic_alias,
+                    system_prompt: &critic_system,
+                    session_stem: &critic_stem,
+                };
+                let env = RoundEnv {
+                    mp,
+                    done_style,
+                    skin,
+                    repo,
+                    topic: prompt,
+                    project_context,
+                    session_logger,
+                    max_turns,
+                    verbose,
+                    stdout_ok,
+                    llm_semaphore,
+                    lane_tag: preset.map(|p| p.name.as_str()),
+                    subagent_system_prompt: subagent_prompt.as_deref(),
+                    live_output,
+                };
 
-            let mut lane = DebateLaneOutcome {
-                preset_name: preset.map(|p| p.name.clone()),
-                verdicts: Vec::new(),
-                converged: false,
-                final_round: 0,
-                any_turn_succeeded: false,
-                degraded: false,
-                usage: UsageReport::default(),
-            };
+                let mut lane = DebateLaneOutcome {
+                    preset_name: preset.map(|p| p.name.clone()),
+                    verdicts: Vec::new(),
+                    converged: false,
+                    final_round: 0,
+                    any_turn_succeeded: false,
+                    degraded: false,
+                    usage: UsageReport::default(),
+                };
 
-            'debate: for round in 1..=max_rounds {
-                lane.final_round = round;
+                'debate: for round in 1..=max_rounds {
+                    lane.final_round = round;
 
-                let actor_turn = run_debate_side(&actor, &env, &lane.verdicts, round).await?;
-                lane.usage
-                    .add(actor_turn.usage, actor_turn.subagents_spawned);
-                lane.any_turn_succeeded |= !actor_turn.agent_failed;
-                lane.degraded |= actor_turn.agent_failed || actor_turn.used_fallback;
-                lane.verdicts
-                    .push((actor_role.to_string(), round, actor_turn.verdict.text));
+                    let actor_turn = run_debate_side(&actor, &env, &lane.verdicts, round).await?;
+                    lane.usage
+                        .add(actor_turn.usage, actor_turn.subagents_spawned);
+                    lane.any_turn_succeeded |= !actor_turn.agent_failed;
+                    lane.degraded |= actor_turn.agent_failed || actor_turn.used_fallback;
+                    lane.verdicts
+                        .push((actor_role.to_string(), round, actor_turn.verdict.text));
 
-                let critic_turn = run_debate_side(&critic, &env, &lane.verdicts, round).await?;
-                lane.usage
-                    .add(critic_turn.usage, critic_turn.subagents_spawned);
-                lane.any_turn_succeeded |= !critic_turn.agent_failed;
-                lane.degraded |= critic_turn.agent_failed || critic_turn.used_fallback;
-                // Convergence requires a real agreement: a critic that agrees with a failed
-                // actor's `*Agent failed*` stub (or a failed critic, whose verdict defaults to
-                // agree=false) must not end the debate early.
-                let agreed = critic_turn.verdict.agree
-                    && !actor_turn.agent_failed
-                    && !critic_turn.agent_failed;
-                lane.verdicts
-                    .push((critic_role.to_string(), round, critic_turn.verdict.text));
+                    let critic_turn = run_debate_side(&critic, &env, &lane.verdicts, round).await?;
+                    lane.usage
+                        .add(critic_turn.usage, critic_turn.subagents_spawned);
+                    lane.any_turn_succeeded |= !critic_turn.agent_failed;
+                    lane.degraded |= critic_turn.agent_failed || critic_turn.used_fallback;
+                    // Convergence requires a real agreement: a critic that agrees with a failed
+                    // actor's `*Agent failed*` stub (or a failed critic, whose verdict defaults to
+                    // agree=false) must not end the debate early.
+                    let agreed = critic_turn.verdict.agree
+                        && !actor_turn.agent_failed
+                        && !critic_turn.agent_failed;
+                    lane.verdicts
+                        .push((critic_role.to_string(), round, critic_turn.verdict.text));
 
-                if agreed {
-                    lane.converged = true;
-                    break 'debate;
+                    if agreed {
+                        lane.converged = true;
+                        break 'debate;
+                    }
                 }
+                Ok::<DebateLaneOutcome, eyre::Report>(lane)
             }
-            Ok::<DebateLaneOutcome, eyre::Report>(lane)
-        }
-    });
+        });
     let lane_results = futures::future::join_all(lane_futures).await;
 
     let mut lanes: Vec<DebateLaneOutcome> = Vec::new();
@@ -705,7 +696,7 @@ pub async fn run_debate(
             Err(err) => {
                 warn!(lane = lane_index, error = ?err, "debate lane failed");
                 lanes.push(DebateLaneOutcome {
-                    preset_name: lane_presets[lane_index].map(|p| p.name.clone()),
+                    preset_name: lane_tasks[lane_index].preset().map(|p| p.name.clone()),
                     verdicts: Vec::new(),
                     converged: false,
                     final_round: 0,
@@ -797,7 +788,7 @@ pub async fn run_debate(
             format!(
                 "The following is a debate about: {prompt}\n\n{note}{dialogue}\n\n---\n{instruction}",
                 dialogue = lane_dialogue(survivors[0]),
-                instruction = mode.meta_instruction(),
+                instruction = task.meta_instruction(),
             )
         }
         Some(presets) => {
@@ -825,14 +816,14 @@ pub async fn run_debate(
                  {instruction}",
                 roster = crate::prompts::preset_roster(&surviving_presets),
                 sections = lane_sections(&survivors),
-                instruction = mode.meta_instruction(),
+                instruction = task.meta_instruction(),
             )
         }
     };
     let meta_completion = Completion {
         model: agg_cfg.model.clone(),
         prompt: Message::user(meta_prompt),
-        preamble: Some(mode.meta_preamble().to_string()),
+        preamble: Some(task.meta_preamble()),
         history: Vec::new(),
         tools: Vec::new(),
         tool_choice: None,
@@ -921,83 +912,78 @@ pub async fn run_debate(
         };
         logger.write_aggregation(&record).await?;
     }
-    // write transcript file
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let transcript_path = std::env::temp_dir().join(transcript_filename(mode.label(), ts, presets));
-    let now = chrono::Local::now();
-
-    let label = mode.label();
-    let mut transcript = match presets {
-        // Topic (`ask`): single lane, transcript shape unchanged
-        None => {
-            let lane = &lanes[0];
-            let convergence_status = match lane.converged {
-                true => format!("converged at round {}", lane.final_round),
-                false => format!("max rounds ({max_rounds}) reached without convergence"),
-            };
-            let mut transcript = format!(
-                "# Debate Transcript ({label})\n\n\
-                **Topic:** {prompt}\n\
-                **{actor_role} model:** {}\n\
-                **{critic_role} model:** {}\n\
-                **Meta-reviewer:** {}\n\
-                **Date:** {}\n\
-                **Convergence:** {convergence_status}\n\
-                **Rounds:** {}\n\n---\n\n",
-                actor_label.full,
-                critic_label.full,
-                agg_cfg.model,
-                now.format("%Y-%m-%d %H:%M:%S"),
-                lane.final_round,
-            );
-            for (label, rnd, text) in &lane.verdicts {
-                transcript.push_str(&format!("## {label} — Round {rnd}\n\n{text}\n\n"));
+    // The transcript is a verbose-only debugging artifact. Keep both rendering and writing
+    // behind the flag: multi-lane verdicts can be large, and non-verbose callers ignore the path.
+    let transcript_path = if verbose {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let transcript_path =
+            std::env::temp_dir().join(transcript_filename(task.label(), ts, presets));
+        let now = chrono::Local::now();
+        let label = task.label();
+        let mut transcript = match presets {
+            // Ask: single lane, transcript shape unchanged
+            None => {
+                let lane = &lanes[0];
+                let convergence_status = match lane.converged {
+                    true => format!("converged at round {}", lane.final_round),
+                    false => format!("max rounds ({max_rounds}) reached without convergence"),
+                };
+                let mut transcript = format!(
+                    "# Debate Transcript ({label})\n\n\
+                    **Topic:** {prompt}\n\
+                    **{actor_role} model:** {}\n\
+                    **{critic_role} model:** {}\n\
+                    **Meta-reviewer:** {}\n\
+                    **Date:** {}\n\
+                    **Convergence:** {convergence_status}\n\
+                    **Rounds:** {}\n\n---\n\n",
+                    actor_label.full,
+                    critic_label.full,
+                    agg_cfg.model,
+                    now.format("%Y-%m-%d %H:%M:%S"),
+                    lane.final_round,
+                );
+                for (label, rnd, text) in &lane.verdicts {
+                    transcript.push_str(&format!("## {label} — Round {rnd}\n\n{text}\n\n"));
+                }
+                transcript
             }
-            transcript
-        }
-        Some(_) => {
-            let mut transcript = format!(
-                "# Debate Transcript ({label})\n\n\
-                **Topic:** {prompt}\n\
-                **{actor_role} model:** {}\n\
-                **{critic_role} model:** {}\n\
-                **Meta-reviewer:** {}\n\
-                **Date:** {}\n\
-                **Lanes:** {}\n\n---\n\n",
-                actor_label.full,
-                critic_label.full,
-                agg_cfg.model,
-                now.format("%Y-%m-%d %H:%M:%S"),
-                lanes.len(),
-            );
-            for lane in &lanes {
-                transcript.push_str(&render_lane_transcript_section(lane, max_rounds));
+            Some(_) => {
+                let mut transcript = format!(
+                    "# Debate Transcript ({label})\n\n\
+                    **Topic:** {prompt}\n\
+                    **{actor_role} model:** {}\n\
+                    **{critic_role} model:** {}\n\
+                    **Meta-reviewer:** {}\n\
+                    **Date:** {}\n\
+                    **Lanes:** {}\n\n---\n\n",
+                    actor_label.full,
+                    critic_label.full,
+                    agg_cfg.model,
+                    now.format("%Y-%m-%d %H:%M:%S"),
+                    lanes.len(),
+                );
+                for lane in &lanes {
+                    transcript.push_str(&render_lane_transcript_section(lane, max_rounds));
+                }
+                transcript
             }
-            transcript
-        }
-    };
-    transcript.push_str(&format!("---\n\n## Meta-review\n\n{meta_text}\n"));
-
-    // only the verbose path surfaces this file; skip the write otherwise so a
-    // long-running server doesn't litter the temp dir on every review.
-    if verbose {
+        };
+        transcript.push_str(&format!("---\n\n## Meta-review\n\n{meta_text}\n"));
         tokio::fs::write(&transcript_path, &transcript).await?;
-    }
+        transcript_path
+    } else {
+        PathBuf::new()
+    };
 
     Ok(DebateOutcome {
         report: meta_text,
         transcript_path,
         usage,
         degraded,
-        covered_presets: presets.map(|_| {
-            surviving(&lanes)
-                .iter()
-                .filter_map(|lane| lane.preset_name.clone())
-                .collect()
-        }),
         coverage: presets.map(|ps| {
             ps.iter()
                 .map(|p| {

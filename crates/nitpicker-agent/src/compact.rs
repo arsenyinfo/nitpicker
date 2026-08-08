@@ -8,15 +8,11 @@ use tracing::{info, warn};
 
 const COMPACTION_MAX_CORRECTIONS: usize = 2;
 const CONTINUE_MESSAGE: &str = "Continue from where you left off.";
-const COMPACTION_SYSTEM_PROMPT: &str =
-    include_str!("../../../prompts/runtime/compaction-system.md");
+const COMPACTION_SYSTEM_PROMPT: &str = include_str!("../prompts/compaction-system.md");
 const SUMMARY_TAG: &str = "summary";
-const COMPACTION_SUMMARY_INSTRUCTIONS: &str =
-    include_str!("../../../prompts/runtime/compaction-summary.md");
-const MISSING_SUMMARY_CORRECTION: &str =
-    include_str!("../../../prompts/runtime/compaction-missing-summary.md");
-const WRAP_SUMMARY_CORRECTION: &str =
-    include_str!("../../../prompts/runtime/compaction-wrap-summary.md");
+const COMPACTION_SUMMARY_INSTRUCTIONS: &str = include_str!("../prompts/compaction-summary.md");
+const MISSING_SUMMARY_CORRECTION: &str = include_str!("../prompts/compaction-missing-summary.md");
+const WRAP_SUMMARY_CORRECTION: &str = include_str!("../prompts/compaction-wrap-summary.md");
 
 pub struct CompactionOutcome {
     pub usage: TokenUsage,

@@ -97,9 +97,9 @@ impl UsageReport {
 /// the single JSON object written to stdout in `--format json` mode.
 ///
 /// `status: ok` means the review process ran to completion and produced a report;
-/// partial failures surface as `degraded: true` plus a `covered_presets` list smaller
-/// than `presets` (and as exit code 3 — preset-run failure stubs are excluded from the
-/// synthesis input, so the report body alone cannot show them).
+/// partial failures surface as `degraded: true` plus per-preset `coverage` counts
+/// (and as exit code 3 — preset-run failure stubs are excluded from the synthesis
+/// input, so the report body alone cannot show them).
 #[derive(Debug, Serialize)]
 pub struct PrReviewOutput {
     pub schema_version: u32,
@@ -119,13 +119,9 @@ pub struct PrReviewOutput {
     /// code 3. additive schema-v1 field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub degraded: Option<bool>,
-    /// presets with at least one surviving job/lane — the run's *coverage*, where `presets`
-    /// documents its *resolution*. present iff `status: ok`. additive schema-v1 field.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub covered_presets: Option<Vec<String>>,
-    /// per-preset job/lane counts in resolution order — `covered_presets` summarizes this
-    /// as "≥1 succeeded", so a preset reviewed by 1 of its N planned jobs is visible here
-    /// and only here. envelope-only by design: execution counts are never fed to the
+    /// per-preset job/lane counts in resolution order. Entries with `succeeded > 0`
+    /// identify the angles that produced evidence; the counts preserve partial coverage
+    /// such as 1 of N jobs. Envelope-only by design: execution counts are never fed to the
     /// synthesis prompt. present iff `status: ok`. additive schema-v1 field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coverage: Option<Vec<PresetCoverage>>,
@@ -151,7 +147,6 @@ impl PrReviewOutput {
             models: None,
             presets: None,
             degraded: None,
-            covered_presets: None,
             coverage: None,
             report_markdown: None,
             usage: None,
@@ -231,7 +226,6 @@ mod tests {
             models: None,
             presets: None,
             degraded: None,
-            covered_presets: None,
             coverage: None,
             report_markdown: None,
             usage: Some(report),
@@ -271,7 +265,6 @@ mod tests {
         .unwrap();
         assert!(error_json.get("presets").is_none());
         assert!(error_json.get("degraded").is_none());
-        assert!(error_json.get("covered_presets").is_none());
         assert!(error_json.get("coverage").is_none());
 
         let mut ok = PrReviewOutput::error("unused".to_string(), 1);
@@ -279,7 +272,6 @@ mod tests {
         ok.error = None;
         ok.presets = Some(vec!["security".to_string(), "tone".to_string()]);
         ok.degraded = Some(true);
-        ok.covered_presets = Some(vec!["security".to_string()]);
         ok.coverage = Some(vec![
             PresetCoverage {
                 preset: "security".to_string(),
@@ -296,7 +288,6 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&ok).unwrap()).unwrap();
         assert_eq!(ok_json["presets"], serde_json::json!(["security", "tone"]));
         assert_eq!(ok_json["degraded"], serde_json::json!(true));
-        assert_eq!(ok_json["covered_presets"], serde_json::json!(["security"]));
         assert_eq!(
             ok_json["coverage"],
             serde_json::json!([

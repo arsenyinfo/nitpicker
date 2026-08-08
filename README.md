@@ -148,9 +148,11 @@ where 0.8.x ran one combined review. Names are case-sensitive; unknown or empty 
 mixing `general` with another preset, or selecting more than 16 presets fails before any
 model call. `ask`, `init`, and `reflect` take no presets — the flag is rejected there.
 
-Built-in rubrics, review/debate protocols, and runtime prompts live as auditable Markdown under
-[`prompts/`](prompts/) and are compiled into the binary. Rust owns selection and interpolation,
-not the prompt prose.
+Built-in rubrics and review/debate protocols live as auditable Markdown under
+[`prompts/`](prompts/) and are compiled into the binary. Generic loop contracts such as
+compaction and final-turn handling live under
+[`crates/nitpicker-agent/prompts/`](crates/nitpicker-agent/prompts/) and are compiled into the
+library that interprets them. Rust owns selection and interpolation, not the prompt prose.
 
 Unknown config keys are rejected. For example, use `max_tokens` for output length; `token_limit` is not a supported field.
 
@@ -366,7 +368,7 @@ Reviews a GitHub PR using its title, description, and diff. Requires the `gh` CL
 - With `URL` (`https://github.com/owner/repo/pull/N`): clones the repo into a temp dir, checks out the PR branch, reviews it, then cleans up
 - By default, posts the review as a PR comment. Pass `--no-comment` to skip posting.
 - `--no-debate`, `--rounds`, and `--max-turns` work the same as in the default review mode
-- `--json` emits a single machine-readable JSON object on stdout (status, PR metadata, models, resolved `presets`, `report_markdown`, `usage`, …) instead of the human report, with all logs/progress on stderr — handy for calling nitpicker as a subprocess. Exits non-zero on failure, with a `status: "error"` object on stdout; a degraded run (some job or debate turn failed — `degraded: true`, and `covered_presets` lists the angles that actually produced evidence) exits 3 after emitting the envelope. The `coverage` key breaks that down per preset (`attempted`/`succeeded` job or lane counts), so a preset reviewed by 1 of its N planned jobs is distinguishable from a fully covered one. The `usage` block reports aggregate `input_tokens`/`output_tokens`/`total_tokens`, `cached_input_tokens`/`cache_creation_input_tokens`, and `subagents_spawned` for the run (best-effort: successful completions only). The cache fields are a breakdown of `input_tokens`, not an extra charge — a healthy multi-turn run shows most of its input served from cache. Cost formulas must discount them: `input_tokens` now counts cache reads on every provider (before 0.8.3 the Anthropic path omitted them), so a naive `input_tokens * input_price` over-states a cache-heavy run.
+- `--json` emits a single machine-readable JSON object on stdout (status, PR metadata, models, resolved `presets`, `report_markdown`, `usage`, …) instead of the human report, with all logs/progress on stderr — handy for calling nitpicker as a subprocess. Exits non-zero on failure, with a `status: "error"` object on stdout; a degraded run (some job or debate turn failed — `degraded: true`) exits 3 after emitting the envelope. The `coverage` key reports each preset's `attempted`/`succeeded` job or lane counts; entries with `succeeded > 0` identify the angles that produced evidence, while the counts distinguish partial coverage such as 1 of N jobs. The `usage` block reports aggregate `input_tokens`/`output_tokens`/`total_tokens`, `cached_input_tokens`/`cache_creation_input_tokens`, and `subagents_spawned` for the run (best-effort: successful completions only). The cache fields are a breakdown of `input_tokens`, not an extra charge — a healthy multi-turn run shows most of its input served from cache. Cost formulas must discount them: `input_tokens` now counts cache reads on every provider (before 0.8.3 the Anthropic path omitted them), so a naive `input_tokens * input_price` over-states a cache-heavy run.
 
 ### Ask subcommand
 
@@ -421,7 +423,7 @@ println!("{}", result.text);
 
 **0.9.0** — 2026-08-06 (`nitpicker-agent` 0.3.0)
 - **Review presets**: four universal defaults (`correctness`, `security`, `performance`, `simplicity`), opt-in domain angles (`ai-systems`, `ml-rigor`, `tone`), standalone `general`, and project-defined `[presets.<name>]` tables selected via repeatable comma-split `--preset` or `[defaults].presets`. Parallel mode fans out reviewers × presets; debate mode runs one concurrent Reviewer/Validator lane per preset with a single global meta-review. Built-in rubrics and protocol prompts are auditable Markdown under `prompts/` and compile into the binary. `ask`/`init`/`reflect` are unaffected and reject the flag.
-- `pr --json` gains additive `presets`, `degraded`, `covered_presets`, and per-preset `coverage` fields (successful envelopes only) — `covered_presets` reports coverage where `presets` reports resolution — and degraded `pr` runs now exit 3 like the other review arms. Session artifacts label jobs/lanes with preset names, and `aggregation.json` records a per-job outcome list on parallel runs; the combined debate transcript gets per-lane sections and preset slugs in its filename.
+- `pr --json` gains additive `presets`, `degraded`, and per-preset `coverage` fields (successful envelopes only): `presets` reports resolution while `coverage` reports attempted/succeeded execution counts, and degraded `pr` runs now exit 3 like the other review arms. Session artifacts label jobs/lanes with preset names, and `aggregation.json` records a per-job outcome list on parallel runs; the combined debate transcript gets per-lane sections and preset slugs in its filename.
 - **`pr` mode config trust**: repo-level `nitpicker.toml` is read from the PR *base branch* blob (falling back to the global config) — never from the working tree, which holds target-controlled PR-head content that could redirect `base_url` or override preset rubrics. The base branch is only trusted when `origin` is a github.com remote, and the head-vs-base comparison runs on git object ids rather than reading the checked-out file. A warning names the checked-out copy when it diverges; explicit `--config` stays trusted.
 - Synthesis failures now persist: when the aggregator/meta-review dies after the review work completed, `aggregation.json` is still written with an `error` field and the per-job/lane outcome lists intact, and `reflect` renders lanes, jobs, and failed synthesis instead of dropping them.
 - Trajectory tool-call records carry the turn's `model` when the client reports it — alloy runs become attributable per turn.
