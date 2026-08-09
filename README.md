@@ -421,7 +421,7 @@ println!("{}", result.text);
 
 ## Changelog
 
-**0.9.0** — 2026-08-06 (`nitpicker-agent` 0.3.0)
+**0.9.0** — 2026-08-09 (`nitpicker-agent` 0.3.0)
 - **Review presets**: four universal defaults (`correctness`, `security`, `performance`, `simplicity`), opt-in domain angles (`ai-systems`, `ml-rigor`, `tone`), standalone `general`, and project-defined `[presets.<name>]` tables selected via repeatable comma-split `--preset` or `[defaults].presets`. Parallel mode fans out reviewers × presets; debate mode runs one concurrent Reviewer/Validator lane per preset with a single global meta-review. Built-in rubrics and protocol prompts are auditable Markdown under `prompts/` and compile into the binary. `ask`/`init`/`reflect` are unaffected and reject the flag.
 - `pr --json` gains additive `presets`, `degraded`, and per-preset `coverage` fields (successful envelopes only): `presets` reports resolution while `coverage` reports attempted/succeeded execution counts, and degraded `pr` runs now exit 3 like the other review arms. Session artifacts label jobs/lanes with preset names, and `aggregation.json` records a per-job outcome list on parallel runs; the combined debate transcript gets per-lane sections and preset slugs in its filename.
 - **`pr` mode config trust**: repo-level `nitpicker.toml` is read from the PR *base branch* blob (falling back to the global config) — never from the working tree, which holds target-controlled PR-head content that could redirect `base_url` or override preset rubrics. The base branch is only trusted when `origin` is a github.com remote, and the head-vs-base comparison runs on git object ids rather than reading the checked-out file. A warning names the checked-out copy when it diverges; explicit `--config` stays trusted.
