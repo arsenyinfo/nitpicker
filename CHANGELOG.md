@@ -6,6 +6,8 @@ Notable user-visible changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-08-09
+
 ### Changed
 
 - Debate progress uses one live TTY row per lens, and final findings identify their lens.
