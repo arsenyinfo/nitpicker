@@ -16,7 +16,8 @@ The `simplicity` rubric distills the
 [Tokenmaxxer design-taste reference](https://github.com/arsenyinfo/skills/blob/main/skills/tokenmaxxer/references/design-taste.md).
 The `ai-systems` rubric distills the
 [Spymaster harness doctrine](https://github.com/arsenyinfo/skills/blob/main/skills/spymaster/SKILL.md)
-and its [audit playbook](https://github.com/arsenyinfo/skills/blob/main/skills/spymaster/references/audit-playbook.md).
+and its supporting
+[audit references](https://github.com/arsenyinfo/skills/tree/main/skills/spymaster/references).
 
 Run `cargo test --workspace` after changing prompts. Tests verify that all protocol template
 tokens resolve and that preset selection invariants still hold.

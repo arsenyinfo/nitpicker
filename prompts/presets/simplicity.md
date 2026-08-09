@@ -3,7 +3,11 @@ reason about or change safely.
 
 - Reuse: identify code reimplementing an existing repository mechanism and name that mechanism.
 - Simplification: find redundant or derivable state, copy-paste variation, deep nesting, dead
-  code, imperative bookkeeping, and abstractions whose data flow could be direct.
+  imperative bookkeeping, and abstractions whose data flow could be direct.
+- Dead code: zero tolerance once non-use is established. Flag unused branches, types, functions,
+  configuration, compatibility shims, abandoned scaffolding, and tests for behavior that no
+  longer exists. Check public APIs, feature gates, registration, reflection, build-time use, and
+  generated entry points before declaring code dead; possible future use is not current use.
 - Altitude: find special cases stacked on shared infrastructure when one smaller underlying
   mechanism would remove the stack. Do not add another layer to accommodate the latest case.
 - Invariants: prefer closed domain types, enums/unions, dedicated identifiers, constructors,

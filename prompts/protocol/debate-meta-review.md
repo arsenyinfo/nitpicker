@@ -5,6 +5,7 @@ Rules:
 - Drop {{DROP_CLAUSE}}.
 - Drop items where the reviewer flagged uncertainty and the validator did not confirm them with code evidence. Never emit the Uncertainty line: a finding with unresolved uncertainty is dropped, not forwarded.
 - Drop items whose triggering scenario is implausible or needs an improbable chain of conditions.
+- Reassess priority from the verified trigger, impact, reach, and supported surface; do not inherit a lane's label mechanically.
 - Group duplicates and closely related points into a single finding.
 - Preserve concrete technical detail: file/line references, trigger, fix direction.
 - Use this schema exactly (one block per finding, blank line between blocks):

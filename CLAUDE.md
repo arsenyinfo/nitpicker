@@ -120,9 +120,10 @@ the override is inherited by nested subagents. `None` ⇒ the built-in generic p
 A preset is one named review angle: `ReviewPreset { name, prompt }`. Presets decide **what** to
 investigate; parallel/debate/alloy decide **how** — no preset changes provider behavior or grants
 write capabilities. Resolution (`presets::resolve`): CLI `--preset` (repeatable, comma-split,
-trimmed, first-seen dedup, case-sensitive, capped at 16 post-dedup) > `[defaults].presets` > the built-in five in prompt
-order (correctness, security, performance, ml-rigor, maintainability; `tone` and `general` are
-also built in). A `[presets.<name>]` table overrides the same-named built-in. The library's
+trimmed, first-seen dedup, case-sensitive, capped at 16 post-dedup) > `[defaults].presets` > the
+built-in four in prompt order (correctness, security, performance, simplicity). Domain-specific
+`ai-systems`, `ml-rigor`, and `tone` are opt-in; `general` is a standalone alternative. A
+`[presets.<name>]` table overrides the same-named built-in. The library's
 `Config` holds preset **data** only (blank-prompt/padded-name/control-byte validation); the registry and all
 name resolution live in the binary. Resolution runs after `load_config`+validate but BEFORE
 `resolve_free_models` (which fires live smoke completions) at all three review entry points, so an
