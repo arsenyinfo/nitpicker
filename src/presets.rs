@@ -92,6 +92,11 @@ fn normalized<'a>(names: &'a [String], source: &str) -> Result<Vec<&'a str>> {
             if name.is_empty() {
                 eyre::bail!("{source} contains an empty preset name");
             }
+            if name.contains(',') {
+                eyre::bail!(
+                    "{source} contains preset name {name:?}; commas separate presets and cannot appear in a name"
+                );
+            }
             Ok(name)
         })
         .collect()
@@ -254,6 +259,13 @@ mod tests {
         let resolved =
             resolve(&cli(&[" security ", "simplicity"]), &config(None, &[])).expect("resolves");
         assert_eq!(names(&resolved), ["security", "simplicity"]);
+    }
+
+    #[test]
+    fn selected_names_cannot_contain_the_lens_delimiter() {
+        let cfg = config(Some(vec!["api,security"]), &[("api,security", "rubric")]);
+        let err = resolve(&[], &cfg).expect_err("comma-delimited lens is ambiguous");
+        assert!(err.to_string().contains("commas separate presets"));
     }
 
     #[test]

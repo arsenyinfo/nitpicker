@@ -103,7 +103,9 @@ impl Tool for SubmitVerdictTool {
         rig_core::completion::ToolDefinition {
             name: "submit_verdict".to_string(),
             description: "Submit your final position for this round. \
-                Set agree=true if you fully agree with the opponent's latest position (convergence)."
+                Set agree=true only when the opponent's latest position can be forwarded \
+                unchanged: no corrections, caveats, unresolved blockers, or changed finding set. \
+                An agreeing verdict is the forwardable position itself, not an audit narrative."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -114,7 +116,7 @@ impl Tool for SubmitVerdictTool {
                     },
                     "agree": {
                         "type": "boolean",
-                        "description": "Set to true if you fully agree with opponent (convergence)"
+                        "description": "True only for literal, unchanged agreement; any correction or unresolved point requires false"
                     }
                 },
                 "required": ["verdict", "agree"],
@@ -245,11 +247,9 @@ struct DebateSide<'a> {
     session_stem: &'a str,
 }
 
-/// Everything a lane's turns need that is identical for both sides. One instance per lane:
-/// most fields borrow run-level state, the last three are the lane's own.
+/// Everything a lane's turns need that is identical for both sides. One instance per lane;
+/// most fields borrow run-level state, while progress is owned by the lane.
 struct RoundEnv<'a> {
-    mp: &'a MultiProgress,
-    done_style: &'a ProgressStyle,
     skin: &'a MadSkin,
     repo: &'a Path,
     topic: &'a str,
@@ -259,44 +259,36 @@ struct RoundEnv<'a> {
     verbose: bool,
     stdout_ok: bool,
     llm_semaphore: &'a Arc<tokio::sync::Semaphore>,
-    /// Preset name shown in progress prefixes; `None` for Topic (and its single lane).
-    lane_tag: Option<&'a str>,
     subagent_system_prompt: Option<&'a str>,
     /// Print verdicts as turns finish (single lane only) — concurrent lanes buffer instead,
     /// since their interleaved output would be unattributable.
     live_output: bool,
+    /// One bar owns the lane's row for its full lifetime. It is hidden by indicatif outside
+    /// the interactive non-verbose path, so the lifecycle does not need a second code path.
+    lane_progress: ProgressBar,
 }
 
-/// Run one side's turn for a round: spinner up, agent run, spinner down, optional render.
+/// Run one side's turn, updating its lane-owned progress row before and after the agent.
 async fn run_debate_side(
     side: &DebateSide<'_>,
     env: &RoundEnv<'_>,
     verdicts: &[(String, usize, String)],
     round: usize,
 ) -> Result<DebateTurnResult> {
-    let (pb, _) = make_spinner(env.mp);
-    let prefix = match env.lane_tag {
-        Some(tag) => format!("{tag} · {}", colored_role_stderr(side.role)),
-        None => colored_role_stderr(side.role),
-    };
-    pb.set_prefix(prefix);
+    let pb = env.lane_progress.clone();
+    let role = colored_role_stderr(side.role);
     pb.set_message(crate::progress::bar_message(format!(
-        "round {round} — debating…"
+        "{role} · round {round} — debating…"
     )));
-    let sub_pb = make_sub_spinner(env.mp, &pb);
     let msg = build_turn_message(env.topic, verdicts, round, side.role);
     let start = std::time::Instant::now();
     let progress_pb = pb.clone();
-    let progress_sub_pb = sub_pb.clone();
+    let progress_role = role.clone();
     let progress = (!env.verbose).then_some(Arc::new(move |progress: AgentProgress| {
         progress_pb.set_message(crate::progress::bar_message(format!(
-            "round {round} — debating… ({} turns, {} tool calls, {} subagents)",
+            "{progress_role} · round {round} — debating… ({} turns, {} tool calls, {} subagents)",
             progress.turns, progress.tool_calls, progress.subagents_spawned
         )));
-        progress_sub_pb.set_message(crate::progress::detail_message(
-            "    ↳ ",
-            progress.last_subagent.as_deref(),
-        ));
     }) as Arc<dyn Fn(AgentProgress) + Send + Sync>);
 
     let session_agent = format!("{}-{round}", side.session_stem);
@@ -321,10 +313,8 @@ async fn run_debate_side(
     .await?;
 
     let elapsed = start.elapsed().as_secs();
-    sub_pb.finish_and_clear();
-    pb.set_style(env.done_style.clone());
-    pb.finish_with_message(crate::progress::bar_message(format!(
-        "✓ round {round} ({} turns, {} tool calls, {} subagents, {}, {} out, {elapsed}s)",
+    pb.set_message(crate::progress::bar_message(format!(
+        "{role} ✓ round {round} ({} turns, {} tool calls, {} subagents, {}, {} out, {elapsed}s)",
         result.turns,
         result.tool_calls,
         result.subagents_spawned,
@@ -414,12 +404,6 @@ fn make_spinner(mp: &MultiProgress) -> (ProgressBar, ProgressStyle) {
     pb.set_style(spinner_style.clone());
     pb.enable_steady_tick(Duration::from_millis(80));
     (pb, spinner_style)
-}
-
-fn make_sub_spinner(mp: &MultiProgress, pb: &ProgressBar) -> ProgressBar {
-    let sub = mp.insert_after(pb, ProgressBar::new_spinner());
-    sub.set_style(ProgressStyle::with_template("{msg}").unwrap());
-    sub
 }
 
 pub struct DebateOptions<'a> {
@@ -603,6 +587,9 @@ pub async fn run_debate(
             let critic_alias = &critic_label.alias;
             async move {
                 let preset = lane_task.preset();
+                let (lane_progress, _) = make_spinner(mp);
+                lane_progress.set_prefix(preset.map_or("debate", |p| p.name.as_str()).to_string());
+                lane_progress.set_message(crate::progress::bar_message("waiting…"));
                 let actor_system = lane_task.actor_system();
                 let critic_system = lane_task.critic_system();
                 let subagent_prompt = lane_task.subagent_prompt();
@@ -626,8 +613,6 @@ pub async fn run_debate(
                     session_stem: &critic_stem,
                 };
                 let env = RoundEnv {
-                    mp,
-                    done_style,
                     skin,
                     repo,
                     topic: prompt,
@@ -637,11 +622,12 @@ pub async fn run_debate(
                     verbose,
                     stdout_ok,
                     llm_semaphore,
-                    lane_tag: preset.map(|p| p.name.as_str()),
                     subagent_system_prompt: subagent_prompt.as_deref(),
                     live_output,
+                    lane_progress,
                 };
 
+                let started = std::time::Instant::now();
                 let mut lane = DebateLaneOutcome {
                     preset_name: preset.map(|p| p.name.clone()),
                     verdicts: Vec::new(),
@@ -682,6 +668,13 @@ pub async fn run_debate(
                         break 'debate;
                     }
                 }
+
+                env.lane_progress.set_style(done_style.clone());
+                env.lane_progress
+                    .finish_with_message(crate::progress::bar_message(lane_progress_summary(
+                        &lane,
+                        started.elapsed().as_secs(),
+                    )));
                 Ok::<DebateLaneOutcome, eyre::Report>(lane)
             }
         });
@@ -1041,6 +1034,29 @@ fn surviving(lanes: &[DebateLaneOutcome]) -> Vec<&DebateLaneOutcome> {
         .collect()
 }
 
+fn lane_progress_summary(lane: &DebateLaneOutcome, elapsed: u64) -> String {
+    let rounds = match lane.final_round {
+        1 => "1 round".to_string(),
+        count => format!("{count} rounds"),
+    };
+    let status = match (lane.any_turn_succeeded, lane.converged, lane.degraded) {
+        (false, _, _) => format!("✗ failed after {rounds}"),
+        (true, true, false) => format!("✓ converged at round {}", lane.final_round),
+        (true, true, true) => format!("⚠ converged at round {} · degraded", lane.final_round),
+        (true, false, false) => format!("✓ done after {rounds} · no convergence"),
+        (true, false, true) => format!("⚠ done after {rounds} · no convergence · degraded"),
+    };
+    format!(
+        "{status} ({}, {} out, {} subagents, {elapsed}s)",
+        crate::progress::input_with_cache_share(
+            lane.usage.input_tokens,
+            lane.usage.cached_input_tokens
+        ),
+        crate::progress::compact_tokens(lane.usage.output_tokens),
+        lane.usage.subagents_spawned,
+    )
+}
+
 /// A cleanly converged lane is pruned to its final round in the meta input: verdicts are
 /// self-contained by prompt contract and the agreeing critic restates every confirmed
 /// finding, so earlier rounds are superseded chronology — exactly the material a
@@ -1163,6 +1179,19 @@ mod tests {
             degraded: false,
             usage: UsageReport::default(),
         }
+    }
+
+    #[test]
+    fn verdict_tool_defines_literal_agreement() {
+        let tool = SubmitVerdictTool {
+            verdict: Arc::new(Mutex::new(None)),
+        };
+        let definition = tool.definition();
+        assert!(definition.description.contains("forwarded unchanged"));
+        assert_eq!(
+            definition.parameters["properties"]["agree"]["description"],
+            "True only for literal, unchanged agreement; any correction or unresolved point requires false"
+        );
     }
 
     /// Distinct presets that sanitize to the same slug must still produce distinct

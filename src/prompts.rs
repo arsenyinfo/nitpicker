@@ -1,5 +1,7 @@
 const INVESTIGATION_GUIDANCE: &str = include_str!("../prompts/protocol/investigation-guidance.md");
-const FINDING_FIELDS: &str = include_str!("../prompts/protocol/finding-schema.md");
+const CONFIRMED_FINDING_FIELDS: &str = include_str!("../prompts/protocol/finding-schema.md");
+const CANDIDATE_UNCERTAINTY_FIELD: &str =
+    include_str!("../prompts/protocol/candidate-uncertainty-field.md");
 const OPTIONS_SCHEMA: &str = include_str!("../prompts/protocol/options-schema.md");
 const OPTIONS_SCHEMA_WITH_NO_CONSENSUS: &str =
     include_str!("../prompts/protocol/options-schema-no-consensus.md");
@@ -19,6 +21,14 @@ const DEBATE_META_TOPIC_TEMPLATE: &str = include_str!("../prompts/protocol/debat
 const DEBATE_META_REVIEW_TEMPLATE: &str = include_str!("../prompts/protocol/debate-meta-review.md");
 
 const NO_FINDINGS: &str = "No findings. Great job! 🎉";
+
+fn candidate_finding_fields() -> String {
+    format!(
+        "{}\n{}",
+        CONFIRMED_FINDING_FIELDS.trim(),
+        CANDIDATE_UNCERTAINTY_FIELD.trim()
+    )
+}
 
 /// Render one compile-time prompt template. Template placeholders are deliberately tiny and
 /// dependency-free: prompt authors can audit the Markdown directly, while Rust owns only the
@@ -158,7 +168,7 @@ impl RunTask<'_> {
                 &[
                     ("NO_LANDED_FIXES", scope.no_landed_fixes_clause()),
                     ("DROP_CLAUSE", scope.synthesis_drop_clause()),
-                    ("FINDING_SCHEMA", FINDING_FIELDS.trim()),
+                    ("FINDING_SCHEMA", CONFIRMED_FINDING_FIELDS.trim()),
                     ("NO_FINDINGS", NO_FINDINGS),
                 ],
             ),
@@ -201,7 +211,7 @@ impl RunTask<'_> {
                 &[
                     ("NO_LANDED_FIXES", scope.no_landed_fixes_clause()),
                     ("DROP_CLAUSE", scope.synthesis_drop_clause()),
-                    ("FINDING_SCHEMA", FINDING_FIELDS.trim()),
+                    ("FINDING_SCHEMA", CONFIRMED_FINDING_FIELDS.trim()),
                     ("NO_FINDINGS", NO_FINDINGS),
                 ],
             ),
@@ -226,18 +236,21 @@ impl LaneTask<'_> {
 
     pub(crate) fn reviewer_system(&self) -> String {
         match self {
-            LaneTask::Review { scope, preset } => render(
-                REVIEWER_TEMPLATE,
-                &[
-                    ("TARGET", scope.target_noun()),
-                    ("SCOPE_RULE", scope.finding_scope_rule()),
-                    ("INVESTIGATION_GUIDANCE", INVESTIGATION_GUIDANCE.trim()),
-                    ("FINDING_SCHEMA", FINDING_FIELDS.trim()),
-                    ("NO_FINDINGS", NO_FINDINGS),
-                    ("PRESET_NAME", &preset.name),
-                    ("RUBRIC", &preset.prompt),
-                ],
-            ),
+            LaneTask::Review { scope, preset } => {
+                let fields = candidate_finding_fields();
+                render(
+                    REVIEWER_TEMPLATE,
+                    &[
+                        ("TARGET", scope.target_noun()),
+                        ("SCOPE_RULE", scope.finding_scope_rule()),
+                        ("INVESTIGATION_GUIDANCE", INVESTIGATION_GUIDANCE.trim()),
+                        ("FINDING_SCHEMA", &fields),
+                        ("NO_FINDINGS", NO_FINDINGS),
+                        ("PRESET_NAME", &preset.name),
+                        ("RUBRIC", &preset.prompt),
+                    ],
+                )
+            }
             LaneTask::Ask => render(ASK_TEMPLATE, &[("OPTIONS_SCHEMA", OPTIONS_SCHEMA.trim())]),
         }
     }
@@ -255,18 +268,21 @@ impl LaneTask<'_> {
                 DEBATE_ACTOR_TOPIC_TEMPLATE,
                 &[("INVESTIGATION_GUIDANCE", INVESTIGATION_GUIDANCE.trim())],
             ),
-            LaneTask::Review { scope, preset } => render(
-                DEBATE_ACTOR_REVIEW_TEMPLATE,
-                &[
-                    ("TARGET", scope.target_noun()),
-                    ("SCOPE_RULE", scope.finding_scope_rule()),
-                    ("FINDING_SCHEMA", FINDING_FIELDS.trim()),
-                    ("NO_FINDINGS", NO_FINDINGS),
-                    ("INVESTIGATION_GUIDANCE", INVESTIGATION_GUIDANCE.trim()),
-                    ("PRESET_NAME", &preset.name),
-                    ("RUBRIC", &preset.prompt),
-                ],
-            ),
+            LaneTask::Review { scope, preset } => {
+                let fields = candidate_finding_fields();
+                render(
+                    DEBATE_ACTOR_REVIEW_TEMPLATE,
+                    &[
+                        ("TARGET", scope.target_noun()),
+                        ("SCOPE_RULE", scope.finding_scope_rule()),
+                        ("FINDING_SCHEMA", &fields),
+                        ("NO_FINDINGS", NO_FINDINGS),
+                        ("INVESTIGATION_GUIDANCE", INVESTIGATION_GUIDANCE.trim()),
+                        ("PRESET_NAME", &preset.name),
+                        ("RUBRIC", &preset.prompt),
+                    ],
+                )
+            }
         }
     }
 
@@ -280,6 +296,8 @@ impl LaneTask<'_> {
                 DEBATE_VALIDATOR_REVIEW_TEMPLATE,
                 &[
                     ("REALITY_CHECK", scope.critic_reality_check()),
+                    ("FINDING_SCHEMA", CONFIRMED_FINDING_FIELDS.trim()),
+                    ("NO_FINDINGS", NO_FINDINGS),
                     ("INVESTIGATION_GUIDANCE", INVESTIGATION_GUIDANCE.trim()),
                     ("PRESET_NAME", &preset.name),
                     ("RUBRIC", &preset.prompt),
@@ -370,6 +388,65 @@ mod tests {
             let rubric_a_at = prompt_a.find("angle-a").expect("angle name present");
             assert!(shared_prefix_len >= rubric_a_at);
         }
+    }
+
+    #[test]
+    fn review_pipeline_requires_lens_attribution() {
+        let p = preset("angle-a", "rubric");
+        let presets = [p.clone()];
+        let worker = LaneTask::Review {
+            scope: ReviewScope::Diff,
+            preset: &p,
+        };
+        for prompt in [
+            worker.reviewer_system(),
+            worker.actor_system(),
+            worker.critic_system(),
+            RunTask::Review {
+                scope: ReviewScope::Diff,
+                presets: &presets,
+            }
+            .aggregator_preamble(),
+            RunTask::Review {
+                scope: ReviewScope::Diff,
+                presets: &presets,
+            }
+            .meta_preamble(),
+        ] {
+            assert!(prompt.contains("- Lens:"));
+        }
+    }
+
+    #[test]
+    fn only_candidate_prompts_allow_uncertainty() {
+        let p = preset("angle-a", "rubric");
+        let presets = [p.clone()];
+        let worker = LaneTask::Review {
+            scope: ReviewScope::Diff,
+            preset: &p,
+        };
+        for prompt in [worker.reviewer_system(), worker.actor_system()] {
+            assert!(prompt.contains("- Uncertainty:"));
+        }
+        for prompt in [
+            worker.critic_system(),
+            RunTask::Review {
+                scope: ReviewScope::Diff,
+                presets: &presets,
+            }
+            .aggregator_preamble(),
+            RunTask::Review {
+                scope: ReviewScope::Diff,
+                presets: &presets,
+            }
+            .meta_preamble(),
+        ] {
+            assert!(!prompt.contains("- Uncertainty:"));
+        }
+
+        let validator = worker.critic_system();
+        assert!(validator.contains(NO_FINDINGS));
+        assert!(validator.contains("forwarded unchanged"));
     }
 
     #[test]

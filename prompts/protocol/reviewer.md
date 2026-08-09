@@ -18,4 +18,4 @@ If a finding cannot fill all fields tightly, drop it. If there are no valid find
 
 Your assigned review angle — {{PRESET_NAME}}:
 {{RUBRIC}}
-Investigate the {{TARGET}} through this angle only; other angles run as separate reviews.
+Investigate the {{TARGET}} through this angle only; other angles run as separate reviews. Set every finding's Lens field to exactly `{{PRESET_NAME}}`.
