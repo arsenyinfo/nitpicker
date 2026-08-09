@@ -8,6 +8,10 @@ reason about or change safely.
   configuration, compatibility shims, abandoned scaffolding, and tests for behavior that no
   longer exists. Check public APIs, feature gates, registration, reflection, build-time use, and
   generated entry points before declaring code dead; possible future use is not current use.
+  A public or serialized field may be a live API or wire-format contract even without an in-repo
+  reader. Require evidence that the contract is private, unreleased, versioned away, or that
+  consumers have migrated before calling it dead; visibility or serialization alone is not proof
+  that it remains necessary.
 - Altitude: find special cases stacked on shared infrastructure when one smaller underlying
   mechanism would remove the stack. Do not add another layer to accommodate the latest case.
 - Invariants: prefer closed domain types, enums/unions, dedicated identifiers, constructors,

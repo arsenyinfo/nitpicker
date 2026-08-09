@@ -146,7 +146,9 @@ preset, lanes concurrent, with a single meta-review across all lanes. Spend and 
 scale with the selection: the untouched default runs four lanes (or 4× the parallel jobs)
 where 0.8.x ran one combined review. Names are case-sensitive; unknown or empty names,
 mixing `general` with another preset, or selecting more than 16 presets fails before any
-model call. `ask`, `init`, and `reflect` take no presets — the flag is rejected there.
+model call. Every final finding includes a `Lens` field naming the angle that produced it
+(or all contributing angles when synthesis merges duplicates). `ask`, `init`, and `reflect`
+take no presets — the flag is rejected there.
 
 Built-in rubrics and review/debate protocols live as auditable Markdown under
 [`prompts/`](prompts/) and are compiled into the binary. Generic loop contracts such as
@@ -421,82 +423,4 @@ println!("{}", result.text);
 
 ## Changelog
 
-**0.9.0** — 2026-08-09 (`nitpicker-agent` 0.3.0)
-- **Review presets**: four universal defaults (`correctness`, `security`, `performance`, `simplicity`), opt-in domain angles (`ai-systems`, `ml-rigor`, `tone`), standalone `general`, and project-defined `[presets.<name>]` tables selected via repeatable comma-split `--preset` or `[defaults].presets`. Parallel mode fans out reviewers × presets; debate mode runs one concurrent Reviewer/Validator lane per preset with a single global meta-review. Built-in rubrics and protocol prompts are auditable Markdown under `prompts/` and compile into the binary. `ask`/`init`/`reflect` are unaffected and reject the flag.
-- `pr --json` gains additive `presets`, `degraded`, and per-preset `coverage` fields (successful envelopes only): `presets` reports resolution while `coverage` reports attempted/succeeded execution counts, and degraded `pr` runs now exit 3 like the other review arms. Session artifacts label jobs/lanes with preset names, and `aggregation.json` records a per-job outcome list on parallel runs; the combined debate transcript gets per-lane sections and preset slugs in its filename.
-- **`pr` mode config trust**: repo-level `nitpicker.toml` is read from the PR *base branch* blob (falling back to the global config) — never from the working tree, which holds target-controlled PR-head content that could redirect `base_url` or override preset rubrics. The base branch is only trusted when `origin` is a github.com remote, and the head-vs-base comparison runs on git object ids rather than reading the checked-out file. A warning names the checked-out copy when it diverges; explicit `--config` stays trusted.
-- Synthesis failures now persist: when the aggregator/meta-review dies after the review work completed, `aggregation.json` is still written with an `error` field and the per-job/lane outcome lists intact, and `reflect` renders lanes, jobs, and failed synthesis instead of dropping them.
-- Trajectory tool-call records carry the turn's `model` when the client reports it — alloy runs become attributable per turn.
-- A Gemini AG2 proxy startup failure (missing/expired keyring token) no longer aborts the whole run: only proxy-needing reviewers fail, with the startup cause attached.
-- Parallel review's 8-reviewer concurrency cap is removed — jobs all run under the shared in-flight LLM call cap (16); the debate per-turn cap is likewise hoisted to one per run shared across lanes.
-- Preset resolution failures (unknown/empty names, `general` combined with another angle, more than 16 selected) abort before any model call; preset names must be free of control bytes; context-window overflows in the final synthesis now suggest selecting fewer presets.
-- Whitespace-only model responses are treated as empty (nudged, then failed) instead of passing a blank report off as review evidence.
-- Debate prompts no longer let debate history leak into results: withdrawn findings are dropped silently instead of surviving as "claim withdrawn" placeholder blocks, verdicts restate the full current position each turn, an agreeing critic restates what it confirmed, and the meta-review excludes debate chronology and inter-role uncertainty notes. Converged lanes reach the meta-review pruned to their final round (contested and degraded lanes keep the full dialogue; the on-disk transcript always does).
-
-**0.8.5** — 2026-08-05 (`nitpicker-agent` 0.2.1)
-- Session recorder fixes: unique per-agent record identities (no more shared `root`/`subagent-N`), failed subagent spawns logged, 1-based `compact` turn numbers, flushed appends.
-- `reflect` no longer renders successful spawns or blocked cycles as failures.
-
-**0.8.4** — 2026-08-05
-- New `--context-file <PATH>` flag (repeatable) injects out-of-repo files (regular files only, capped at 256 KiB in total including block wrappers) into the task prompt for review, `ask`, and `pr`; accepted before or after the subcommand.
-- `--repo`, `--config`, and `-v`/`--verbose` are now global flags: accepted before or after a subcommand, no longer silently ignored in the root position. `init` honors `--repo` as the directory to write `nitpicker.toml` into, and rejects `--config`.
-
-**0.8.3** — 2026-08-05 (`nitpicker-agent` 0.2.0)
-- **Stable Tool Definitions**: Send tool definitions in name-sorted order to preserve request prefix determinism and maximize provider prompt-cache hits across turns.
-- **Cache-Aware Token Metering**: Added `cached_input_tokens` and `cache_creation_input_tokens` to `TokenUsage` and `pr --json`, normalized `input_tokens` across provider cache shapes (fixing compaction triggers on auto-caching providers), and updated progress display (e.g. `1.0M in · 90% cached`).
-- **Flexible Output Caps**: Removed hardcoded 8192-token output caps on agent turns and compaction (preventing reasoning models from exhausting token budgets on internal thinking before emitting output). Added `max_tokens` configuration per reviewer (`None` uses provider default; aggregator defaults to 16,384).
-- **Improved Empty Response Diagnostics**: Surfaced `finish_reason` and token usage when retrying empty responses.
-- **Unterminated Think Block Salvage**: Improved parsing to recover verdicts buried after unclosed `<think>` tags even when preceding content is present.
-- **Resilient Compaction**: Made history compaction best-effort so a summarizer failure no longer aborts the review run.
-- **Alloy Slot Cap Isolation**: Scoped `max_tokens` per model in `AlloyClient` pools.
-- **Dependency & Cleanup**: Bumped `rig-core` to 0.41 and removed redundant `fc_` tool call ID normalization.
-- **Breaking (`nitpicker-agent`)**: Replaced `AgentResult` token fields with `usage: TokenUsage`. `AlloyClient::new` now takes `Vec<AlloySlot>`.
-
-**0.8.2** — 2026-07-14 (`nitpicker-agent` 0.1.2)
-- Prevent debate subagents from inheriting `submit_verdict` tools to avoid premature convergence.
-- Run history compaction under a dedicated summarizer system prompt.
-- Wrap project context (`CLAUDE.md`/`AGENTS.md`) in `<context-only>` tags and pass task to parallel aggregator.
-- Added `ReviewScope` (`Diff`/`Static`) and `--analyze` static-analysis mode.
-
-**0.8.1** — 2026-07-03
-- Bumped `rig-core` to 0.39; simplified Codex assistant text normalization.
-
-**0.8.0** — 2026-06-16
-- Extracted core agent logic into published [`nitpicker-agent`](crates/nitpicker-agent) crate.
-- Added `subagent_system_prompt` customization to `AgentConfig`.
-
-**0.7.1** — 2026-06-14
-- Exit 3 for degraded review/ask verdicts; refined interactive progress rendering.
-- Audit fixes: hardened git tool sandboxing, provider auth/retry error classification, and `pr` checkout safety.
-
-**0.7.0** — 2026-06-07
-- Added research `auth = "codex"` for OpenAI provider using local Codex CLI OAuth tokens.
-- Fixed Codex multi-turn reasoning and gated keyring auth under `antigravity` feature flag.
-
-**0.6.3** — 2026-06-06
-- Security audit fixes: restricted git subcommands (`for-each-ref`/`show-ref`), panic-safe detached HEAD restore, retry classifier matching.
-
-**0.6.2** — 2026-06-05
-- `nitpicker pr --json` emits machine-readable output on stdout with logs/spinners on stderr.
-- Fixed macOS symlink workspace canonicalization under `pr --clone`.
-
-**0.6.1** — 2026-06-05
-- Concurrent subagent execution: run `spawn_subagent` calls in parallel via `join_all` bounded by a global semaphore (default 16).
-
-**0.6.0** — 2026-06-02
-- Added `auth = "azure-ad"` support for OpenAI/Anthropic providers via Entra ID bearer tokens (gated under `azure` feature flag).
-
-**0.5.1** — 2026-05-25
-- PR checkout safety improvements, `--clone` flag, partial clones (`--filter=blob:none`).
-
-**0.5.0** — 2026-05-24
-- Added `auth = "agy-keyring"` for Gemini; removed legacy `auth = "oauth"`.
-
-**0.4.0** — 2026-05-17
-- Added Alloy mode (`--alloy`) to pool reviewer models into a shared random-selection pool.
-
-**0.3.0 – 0.3.3** — 2026-05-06 – 2026-05-11
-- OpenRouter free model auto-selection (`init --free`), trajectory logging, `reflect` analysis tool.
-
-**0.1.2 – 0.2.3** — 2026-03-15 – 2026-05-01
-- PR review subcommand, debate mode synthesis, proactive conversation compaction, bounded subagent runtime, atomic file locks.
+See [CHANGELOG.md](CHANGELOG.md) for release history.
