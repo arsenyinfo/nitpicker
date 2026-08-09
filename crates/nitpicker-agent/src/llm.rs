@@ -700,6 +700,17 @@ const RATE_LIMIT_ERROR_TYPES: &[&str] = &[
 /// Error types that often arrive with HTTP 429 but are not transient throttles.
 const PERMANENT_QUOTA_ERROR_TYPES: &[&str] = &["insufficient_quota"];
 
+/// Whether an error chain reports a context-window overflow — the one synthesis failure
+/// where "select fewer presets" is real remediation. Matches the OpenAI-style type token
+/// (`context_length_exceeded`) and the Anthropic shape — an `invalid_request_error` whose
+/// message says the prompt is too long; a generic `invalid_request_error` alone does NOT
+/// qualify (those are malformed-request bugs, not size problems).
+pub fn is_context_length_error(err: &eyre::Report) -> bool {
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    msg.contains("context_length_exceeded")
+        || (msg.contains("invalid_request_error") && msg.contains("prompt is too long"))
+}
+
 fn is_non_retryable_client_error(err: &eyre::Report) -> bool {
     // Walk the whole chain: provider clients map non-2xx to a `ProviderError` carrying the raw
     // response body, then `.wrap_err_with(...)` adds a top-level context. `err.to_string()` renders
@@ -1687,6 +1698,16 @@ mod tests {
 
         let ctx_len = wrapped_provider_error(r#"{"error":{"code":"context_length_exceeded"}}"#);
         assert!(is_non_retryable_client_error(&ctx_len));
+
+        // Both provider shapes of a context overflow classify as such; a generic
+        // invalid_request_error must NOT — the fewer-presets remediation would be
+        // misdirection on a malformed-request bug.
+        assert!(is_context_length_error(&ctx_len));
+        assert!(is_context_length_error(&bad_request));
+        let malformed = wrapped_provider_error(
+            r#"{"error":{"type":"invalid_request_error","message":"tools[0] is invalid"}}"#,
+        );
+        assert!(!is_context_length_error(&malformed));
 
         // insufficient_quota is permanent (out of credits) despite arriving as HTTP 429.
         let quota = wrapped_provider_error(

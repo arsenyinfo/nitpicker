@@ -20,10 +20,44 @@ pub struct AggregationRecord {
     pub kind: String,
     pub model: String,
     pub text: String,
+    /// Present iff synthesis failed after the per-job/lane work completed (`text` is empty
+    /// then): the record still carries `jobs`/`lanes`, which would otherwise die with the
+    /// aggregator. Consumers must not render `text` as a verdict when this is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rounds: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub converged: Option<bool>,
+    /// Resolved preset names for the run, in order. Absent on pre-preset records and on
+    /// runs without preset fan-out (`ask`), so old sessions keep deserializing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presets: Option<Vec<String>>,
+    /// Per-lane convergence metadata for preset debate runs; absent elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lanes: Option<Vec<LaneRecord>>,
+    /// Per-job outcomes for parallel review runs; absent elsewhere. The durable record of
+    /// what actually ran — a failed job is otherwise only a transient log line, and a
+    /// client-build failure writes no trajectory file at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jobs: Option<Vec<JobRecord>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LaneRecord {
+    pub preset: String,
+    pub rounds: usize,
+    pub converged: bool,
+    pub degraded: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct JobRecord {
+    pub label: String,
+    /// Absent on Ask-path jobs, which have no preset dimension.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    pub ok: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -39,6 +73,11 @@ pub struct ToolCallRecord {
     pub spawned_agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
+    /// Model that produced the turn issuing this call, when the client reports it — the
+    /// only durable per-turn attribution on alloy runs, where each turn may pick a
+    /// different model. Absent on compaction records and pre-0.3.0 sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl SessionLogger {
@@ -166,6 +205,7 @@ mod tests {
             status: "ok".to_string(),
             spawned_agent: None,
             result: None,
+            model: Some("kimi-k2".to_string()),
         };
         writer.append_tool_call(&record).await.unwrap();
         writer.append_tool_call(&record).await.unwrap();
@@ -177,5 +217,63 @@ mod tests {
             .collect();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].agent, "reviewer-1-x");
+    }
+
+    /// `reflect` deserializes historical `aggregation.json` files into this exact type and
+    /// discards unparseable ones as incomplete sessions — a legacy record (no presets/lanes
+    /// keys) and a new-shape record must both keep parsing.
+    #[test]
+    fn aggregation_records_parse_across_schema_generations() {
+        let legacy = r#"{"kind":"aggregation","model":"m","text":"t","rounds":2,"converged":true}"#;
+        let parsed: AggregationRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.rounds, Some(2));
+        assert!(parsed.error.is_none());
+        assert!(parsed.presets.is_none());
+        assert!(parsed.lanes.is_none());
+        assert!(parsed.jobs.is_none());
+
+        let current = AggregationRecord {
+            kind: "aggregation".to_string(),
+            model: "m".to_string(),
+            text: String::new(),
+            error: Some("provider 500".to_string()),
+            rounds: None,
+            converged: None,
+            presets: Some(vec!["security".to_string()]),
+            lanes: Some(vec![LaneRecord {
+                preset: "security".to_string(),
+                rounds: 1,
+                converged: true,
+                degraded: false,
+            }]),
+            jobs: Some(vec![JobRecord {
+                label: "security · r".to_string(),
+                preset: Some("security".to_string()),
+                ok: false,
+            }]),
+        };
+        let round_tripped: AggregationRecord =
+            serde_json::from_str(&serde_json::to_string(&current).unwrap()).unwrap();
+        assert_eq!(round_tripped.error.as_deref(), Some("provider 500"));
+        assert_eq!(round_tripped.lanes.unwrap()[0].preset, "security");
+        assert!(!round_tripped.jobs.unwrap()[0].ok);
+
+        // absent options serialize to absent keys, keeping old readers indifferent
+        let legacy_shaped = AggregationRecord {
+            kind: "aggregation".to_string(),
+            model: "m".to_string(),
+            text: "t".to_string(),
+            error: None,
+            rounds: Some(1),
+            converged: Some(false),
+            presets: None,
+            lanes: None,
+            jobs: None,
+        };
+        let json = serde_json::to_string(&legacy_shaped).unwrap();
+        assert!(!json.contains("error"));
+        assert!(!json.contains("presets"));
+        assert!(!json.contains("lanes"));
+        assert!(!json.contains("jobs"));
     }
 }

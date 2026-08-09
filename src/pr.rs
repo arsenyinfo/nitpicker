@@ -1,6 +1,6 @@
-use crate::debate::{self, DebateMode};
-use crate::prompts::ReviewScope;
-use crate::review::{self, TaskMode};
+use crate::debate;
+use crate::prompts::{ReviewScope, RunTask};
+use crate::review;
 use eyre::{Result, WrapErr};
 use nitpicker_agent::config::Config;
 use serde::Deserialize;
@@ -92,6 +92,8 @@ pub struct PrArgs {
     pub url: Option<String>,
     #[command(flatten)]
     pub context: crate::ContextFileArgs,
+    #[command(flatten)]
+    pub presets: crate::PresetArgs,
     #[arg(long)]
     pub prompt: Option<String>,
     #[arg(long)]
@@ -128,6 +130,9 @@ struct PrMeta {
     body: String,
     #[serde(rename = "headRefOid")]
     head_ref_oid: String,
+    /// The PR's target branch — the trust anchor `pr` mode reads `nitpicker.toml` from.
+    #[serde(rename = "baseRefName")]
+    base_ref_name: String,
 }
 
 #[derive(Deserialize)]
@@ -155,7 +160,7 @@ pub fn check_gh() -> Result<()> {
 
 fn fetch_pr_meta(url: Option<&str>, repo: &Path) -> Result<PrMeta> {
     let mut cmd = Command::new("gh");
-    cmd.args(["pr", "view", "--json", "title,body,headRefOid"])
+    cmd.args(["pr", "view", "--json", "title,body,headRefOid,baseRefName"])
         .current_dir(repo);
     if let Some(u) = url {
         cmd.arg(u);
@@ -501,18 +506,22 @@ enum PrFlow {
     },
 }
 
+/// Returns the run's degraded flag; the caller maps it to exit code 3 — after this
+/// function returns, so the checkout-restore/lock guards inside have already dropped
+/// (`process::exit` skips destructors).
 pub async fn run_pr(
     args: PrArgs,
     common: crate::CommonArgs,
     context_files: Vec<PathBuf>,
-) -> Result<()> {
+    preset_names: Vec<String>,
+) -> Result<bool> {
     let start = std::time::Instant::now();
     let format = args.output_format();
     // in json mode every failure (incl. config loading) must still leave a
     // parseable object on stdout and exit non-zero; text mode keeps the
     // eyre-to-stderr behavior.
-    match run_pr_inner(args, common, context_files, start).await {
-        Ok(()) => Ok(()),
+    match run_pr_inner(args, common, context_files, preset_names, start).await {
+        Ok(degraded) => Ok(degraded),
         Err(e) => match format {
             crate::output::OutputFormat::Text => Err(e),
             crate::output::OutputFormat::Json => {
@@ -531,12 +540,22 @@ async fn run_pr_inner(
     args: PrArgs,
     common: crate::CommonArgs,
     context_files: Vec<PathBuf>,
+    preset_names: Vec<String>,
     start: std::time::Instant,
-) -> Result<()> {
-    let config = crate::load_resolved_config(common.config.as_deref(), &common.repo).await?;
+) -> Result<bool> {
     check_gh()?;
 
     let prepared = prepare_pr(&args, &common.repo)?;
+
+    // Config loads AFTER prep because its repo-level source is the PR base branch blob —
+    // the base ref comes from the PR metadata, and the checkout must already have happened
+    // for the working tree to even be the head. Guards restore state if this errors.
+    let mut config = load_pr_config(common.config.as_deref(), &prepared)?;
+    // resolved before free-model resolution: a bad preset name must fail before any
+    // network call, and inside run_pr_inner so it honors the --json error contract
+    let presets = crate::presets::resolve(&preset_names, &config)?;
+    nitpicker_agent::openrouter::resolve_free_models(&mut config).await?;
+    let config = config;
 
     // `prepared` drops at the end of this scope, after the review completes: HEAD is restored
     // (panic- and early-error-safe), then the temp dir removed, while the lock is still held —
@@ -545,11 +564,207 @@ async fn run_pr_inner(
         &prepared,
         &args,
         &context_files,
+        &presets,
         &config,
         common.verbose,
         start,
     )
     .await
+}
+
+/// `pr` mode never reads `nitpicker.toml` from the working tree: the tree holds the PR
+/// head — target-controlled content that could redirect `base_url` (key exfiltration) or
+/// override preset rubrics (prompt injection into the trusted rubric slot). Repo-level
+/// config comes from the PR base branch blob instead, falling back to the global config;
+/// an explicit `--config` path stays trusted and unchanged.
+fn load_pr_config(explicit: Option<&Path>, prepared: &PreparedPr) -> Result<Config> {
+    if explicit.is_some() {
+        return crate::load_config(explicit, &prepared.repo);
+    }
+    // `origin/<base>` is only a trust anchor if `origin` is the GitHub repo the PR metadata
+    // came from. The in-place flow selects on the owner/repo slug alone, so an unrelated
+    // remote with a matching path (`https://attacker.example/owner/repo`) would otherwise
+    // supply the "base branch" policy.
+    let base_blob = match origin_is_github(&prepared.repo) {
+        true => read_base_branch_config(&prepared.repo, &prepared.meta.base_ref_name),
+        false => {
+            tracing::warn!(
+                "`origin` is not a github.com remote; ignoring its nitpicker.toml and using \
+                 the global config"
+            );
+            None
+        }
+    };
+    let (repo_config, warning) = choose_repo_config(
+        base_blob,
+        head_config_state(&prepared.repo, &prepared.meta.base_ref_name),
+    );
+    if let Some(warning) = warning {
+        tracing::warn!("{warning}");
+    }
+    match repo_config {
+        Some(content) => {
+            let config: Config = toml::from_str(&content)
+                .map_err(|e| eyre::eyre!("invalid nitpicker.toml on the PR base branch: {e}"))?;
+            config.validate()?;
+            Ok(config)
+        }
+        None => crate::load_global_config(),
+    }
+}
+
+/// Whether `origin` is the GitHub repository the PR metadata and `refs/pull/*` come from.
+/// Slug matching ignores the remote entirely, so this is what makes `origin/<base>`
+/// trustworthy as repo policy.
+fn origin_is_github(repo: &Path) -> bool {
+    let out = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(repo)
+        .output();
+    let url = match out {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => return false,
+    };
+    is_trusted_github_remote(&url)
+}
+
+/// An *authenticated GitHub transport* — host alone is not enough. `file://github.com/…`
+/// parses with host `github.com` while git reads a local, attacker-writable repository, and
+/// `git://`/`http://` reach the network unauthenticated. Only `https`, `ssh`, and git's
+/// scp-like form qualify.
+fn is_trusted_github_remote(url: &str) -> bool {
+    let url = url.trim();
+    // `<transport>::<address>` is remote-helper syntax: git runs `git-remote-<transport>`
+    // and never reads it as scp-form, so `github.com::<address>` would otherwise look like
+    // the host `github.com` here while git fetches from somewhere else entirely.
+    if url.contains("::") {
+        return false;
+    }
+    let host = match url.contains("://") {
+        true => match url::Url::parse(url) {
+            Ok(parsed) => match parsed.scheme() {
+                "https" | "ssh" => parsed.host_str().map(str::to_string),
+                _ => None,
+            },
+            Err(_) => None,
+        },
+        false => remote_host(url),
+    };
+    host.is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
+}
+
+/// Host of a git remote URL, for both URL forms git accepts (`scheme://host/path` and the
+/// scp-like `[user@]host:path`).
+fn remote_host(url: &str) -> Option<String> {
+    let url = url.trim();
+    match url.contains("://") {
+        true => url::Url::parse(url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_string)),
+        false => {
+            // git only reads `[user@]host:path` as a remote when the colon precedes any
+            // slash — otherwise it is a local path, which has no host at all.
+            let colon = url.find(':')?;
+            if url[..colon].contains('/') {
+                return None;
+            }
+            let host = url[..colon].rsplit('@').next()?;
+            match host.is_empty() {
+                true => None,
+                false => Some(host.to_string()),
+            }
+        }
+    }
+}
+
+/// `git show origin/<base>:nitpicker.toml` from the reviewed repo. A missing file is normal
+/// (silent); an *unresolvable base ref* means repo policy could not be consulted at all, so
+/// it warns rather than silently degrading to the global config.
+fn read_base_branch_config(repo: &Path, base_ref: &str) -> Option<String> {
+    if base_ref.is_empty() {
+        return None;
+    }
+    let out = Command::new("git")
+        .args(["show", &format!("origin/{base_ref}:nitpicker.toml")])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    match out.status.success() {
+        true => String::from_utf8(out.stdout).ok(),
+        false => {
+            match git_object_id(repo, &format!("origin/{base_ref}")) {
+                Some(_) => tracing::debug!(
+                    base = base_ref,
+                    "no nitpicker.toml on the PR base branch; using the global config"
+                ),
+                None => tracing::warn!(
+                    base = base_ref,
+                    "cannot resolve `origin/{base_ref}`, so the base branch's nitpicker.toml \
+                     could not be read; using the global config"
+                ),
+            }
+            None
+        }
+    }
+}
+
+/// The checked-out head's `nitpicker.toml` relative to the base branch's, compared by git
+/// object id. Deliberately never reads the file from the working tree: that path is
+/// target-controlled, and an unbounded read of a PR-supplied symlink (`/dev/zero`) would
+/// hang or exhaust memory before the review even starts.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum HeadConfig {
+    Absent,
+    SameAsBase,
+    Diverges,
+}
+
+fn head_config_state(repo: &Path, base_ref: &str) -> HeadConfig {
+    let head = git_object_id(repo, "HEAD:nitpicker.toml");
+    let base = git_object_id(repo, &format!("origin/{base_ref}:nitpicker.toml"));
+    match (head, base) {
+        (None, _) => HeadConfig::Absent,
+        (Some(head), Some(base)) if head == base => HeadConfig::SameAsBase,
+        (Some(_), _) => HeadConfig::Diverges,
+    }
+}
+
+fn git_object_id(repo: &Path, revspec: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", revspec])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    match out.status.success() {
+        true => Some(String::from_utf8_lossy(&out.stdout).trim().to_string()),
+        false => None,
+    }
+}
+
+/// Which repo-level config text `pr` mode uses, and what to tell the user about the
+/// checked-out copy. Returns `(config_toml, warning)`; `None` config falls back to global.
+fn choose_repo_config(
+    base_blob: Option<String>,
+    head: HeadConfig,
+) -> (Option<String>, Option<&'static str>) {
+    match (base_blob, head) {
+        (Some(blob), HeadConfig::Diverges) => (
+            Some(blob),
+            Some(
+                "checked-out nitpicker.toml differs from the PR base branch; using the base \
+                 version — files on a PR head are target-controlled",
+            ),
+        ),
+        (Some(blob), _) => (Some(blob), None),
+        (None, HeadConfig::Absent) => (None, None),
+        (None, _) => (
+            None,
+            Some(
+                "ignoring nitpicker.toml from the checked-out PR head (absent on the PR base \
+                 branch); using the global config",
+            ),
+        ),
+    }
 }
 
 /// Everything the prep phase (flow resolution → lock → checkout/clone → metadata) hands to the
@@ -700,10 +915,11 @@ async fn run_review_inner(
     prepared: &PreparedPr,
     args: &PrArgs,
     context_files: &[PathBuf],
+    presets: &[crate::presets::ReviewPreset],
     config: &Config,
     verbose: bool,
     start: std::time::Instant,
-) -> Result<()> {
+) -> Result<bool> {
     use crate::output::{OutputFormat, PrInfo, PrReviewOutput, ReviewMode, Status};
 
     let repo = prepared.repo.as_path();
@@ -729,7 +945,7 @@ async fn run_review_inner(
         eprintln!("warning: --alloy has no effect with --no-debate");
     }
     let debate = !args.no_debate && config.default_debate();
-    let (report, transcript_path, usage) = if debate {
+    let (report, transcript_path, usage, degraded, coverage) = if debate {
         let outcome = debate::run_debate(
             repo,
             &full_prompt,
@@ -738,13 +954,22 @@ async fn run_review_inner(
                 max_rounds: args.rounds,
                 max_turns,
                 verbose,
-                mode: DebateMode::Review(ReviewScope::Diff),
+                task: RunTask::Review {
+                    scope: ReviewScope::Diff,
+                    presets,
+                },
                 alloy: use_alloy,
                 format,
             },
         )
         .await?;
-        (outcome.report, outcome.transcript_path, outcome.usage)
+        (
+            outcome.report,
+            outcome.transcript_path,
+            outcome.usage,
+            outcome.degraded,
+            outcome.coverage,
+        )
     } else {
         let outcome = review::run_review(
             repo,
@@ -752,10 +977,19 @@ async fn run_review_inner(
             config,
             max_turns,
             verbose,
-            TaskMode::Review(ReviewScope::Diff),
+            RunTask::Review {
+                scope: ReviewScope::Diff,
+                presets,
+            },
         )
         .await?;
-        (outcome.report, std::path::PathBuf::new(), outcome.usage)
+        (
+            outcome.report,
+            std::path::PathBuf::new(),
+            outcome.usage,
+            outcome.degraded,
+            outcome.coverage,
+        )
     };
 
     match format {
@@ -802,6 +1036,9 @@ async fn run_review_inner(
                     reviewers: config.reviewer.iter().map(|r| r.model.clone()).collect(),
                     aggregator: config.aggregator.model.clone(),
                 }),
+                presets: Some(presets.iter().map(|p| p.name.clone()).collect()),
+                degraded: Some(degraded),
+                coverage,
                 report_markdown: Some(report),
                 usage: Some(usage),
                 comment_posted,
@@ -812,14 +1049,165 @@ async fn run_review_inner(
         }
     }
 
-    Ok(())
+    Ok(degraded)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BranchRestoreGuard, HeadState, PrComment, get_head_state};
+    use super::{
+        BranchRestoreGuard, HeadConfig, HeadState, PrComment, choose_repo_config, get_head_state,
+        head_config_state, is_trusted_github_remote, read_base_branch_config, remote_host,
+    };
     use std::path::Path;
     use std::process::Command;
+
+    /// The working tree is the PR head, so its nitpicker.toml never wins: the base blob is
+    /// used when present (warning iff the head copy diverges), and a head-only copy is
+    /// ignored with a warning rather than trusted.
+    #[test]
+    fn repo_config_source_prefers_base_blob_and_never_the_head() {
+        let s = |v: &str| Some(v.to_string());
+
+        let (cfg, warn) = choose_repo_config(s("base"), HeadConfig::SameAsBase);
+        assert_eq!(cfg.as_deref(), Some("base"));
+        assert!(warn.is_none());
+
+        let (cfg, warn) = choose_repo_config(s("base"), HeadConfig::Diverges);
+        assert_eq!(cfg.as_deref(), Some("base"));
+        assert!(warn.is_some());
+
+        let (cfg, warn) = choose_repo_config(s("base"), HeadConfig::Absent);
+        assert_eq!(cfg.as_deref(), Some("base"));
+        assert!(warn.is_none());
+
+        let (cfg, warn) = choose_repo_config(None, HeadConfig::Diverges);
+        assert!(cfg.is_none());
+        assert!(warn.is_some());
+
+        let (cfg, warn) = choose_repo_config(None, HeadConfig::Absent);
+        assert!(cfg.is_none());
+        assert!(warn.is_none());
+    }
+
+    /// Only github.com counts: the in-place flow matches on the owner/repo slug alone, so a
+    /// same-slug remote on another host must not be trusted as the PR's base branch.
+    #[test]
+    fn remote_host_is_extracted_from_both_url_forms() {
+        for (url, expected) in [
+            ("https://github.com/owner/repo.git", Some("github.com")),
+            ("git@github.com:owner/repo.git", Some("github.com")),
+            ("ssh://git@github.com/owner/repo", Some("github.com")),
+            (
+                "https://attacker.example/owner/repo.git",
+                Some("attacker.example"),
+            ),
+            (
+                "git@attacker.example:owner/repo.git",
+                Some("attacker.example"),
+            ),
+            ("/local/path/repo", None),
+            // why the scheme gate below exists: a file:// URL carries a host component, so
+            // host matching alone would accept a local repository as "github.com"
+            (
+                "file://github.com/victim/repo/../../../tmp/attacker",
+                Some("github.com"),
+            ),
+        ] {
+            assert_eq!(remote_host(url).as_deref(), expected, "url: {url}");
+        }
+    }
+
+    /// The host is necessary but not sufficient: only an authenticated GitHub transport
+    /// makes `origin/<base>` a trust anchor. `file://github.com/…` parses with the right
+    /// host yet reads a local (attacker-writable) repository, and `git://`/`http://` are
+    /// unauthenticated.
+    #[test]
+    fn only_authenticated_github_transports_are_trusted() {
+        for url in [
+            "https://github.com/owner/repo.git",
+            "ssh://git@github.com/owner/repo",
+            "git@github.com:owner/repo.git",
+        ] {
+            assert!(is_trusted_github_remote(url), "must trust: {url}");
+        }
+        for url in [
+            "file://github.com/victim/repo/../../../tmp/attacker-repo",
+            "git://github.com/owner/repo",
+            "http://github.com/owner/repo",
+            "https://attacker.example/owner/repo.git",
+            "git@attacker.example:owner/repo.git",
+            // remote-helper syntax: git runs `git-remote-github.com` and fetches from the
+            // address, so this is not the host github.com no matter how it reads
+            "github.com::attacker-address",
+            "github.com::https://attacker.example/owner/repo",
+            "/local/path/repo",
+            "",
+        ] {
+            assert!(!is_trusted_github_remote(url), "must reject: {url}");
+        }
+    }
+
+    /// The base config is read from the remote-tracking ref, never the working tree.
+    #[test]
+    fn base_config_reads_the_ref_blob() {
+        let (_dir, repo) = repo_with_base_config();
+        assert_eq!(
+            read_base_branch_config(&repo, "main").as_deref(),
+            Some("from-base")
+        );
+        assert!(read_base_branch_config(&repo, "no-such-branch").is_none());
+        assert!(read_base_branch_config(&repo, "").is_none());
+        assert_eq!(head_config_state(&repo, "main"), HeadConfig::SameAsBase);
+    }
+
+    /// The head comparison goes through git object ids, so a PR-supplied symlink at
+    /// nitpicker.toml is never followed. `/dev/zero` makes this regression Unix-specific.
+    #[cfg(unix)]
+    #[test]
+    fn head_config_state_never_reads_a_worktree_symlink() {
+        let (_dir, repo) = repo_with_base_config();
+        // the PR head commits a hostile replacement: a symlink to a device that would hang
+        // an unbounded read. Detection must stay at object-id level and still say "diverges".
+        std::fs::remove_file(repo.join("nitpicker.toml")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", repo.join("nitpicker.toml")).unwrap();
+        git(&repo, &["add", "nitpicker.toml"]);
+        commit(&repo, "hostile config");
+        assert_eq!(head_config_state(&repo, "main"), HeadConfig::Diverges);
+        // and the config actually used is still the base branch's
+        assert_eq!(
+            read_base_branch_config(&repo, "main").as_deref(),
+            Some("from-base")
+        );
+    }
+
+    fn repo_with_base_config() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        init_repo(&repo);
+        std::fs::write(repo.join("nitpicker.toml"), "from-base").unwrap();
+        git(&repo, &["add", "nitpicker.toml"]);
+        commit(&repo, "config");
+        // fabricate the remote-tracking ref the PR base resolves through
+        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        (dir, repo)
+    }
+
+    fn commit(repo: &Path, msg: &str) {
+        git(
+            repo,
+            &[
+                "-c",
+                "user.email=t@test",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                msg,
+            ],
+        );
+    }
 
     #[test]
     fn pr_comments_tolerate_null_author() {

@@ -1,47 +1,53 @@
-const VERIFY_WARNING: &str = "Your opponent may sound confident but still make factual errors or overlook edge cases. \
-Independently verify every claim against the actual code before accepting it.";
-
-const DELEGATION_GUIDANCE: &str = "Always first build a quick high-level map of the relevant code: change intent, affected files, nearby modules, and major components involved. \
-Then write a short working plan that enumerates the disjoint threads worth investigating — separate questions, distinct filesets, individual call paths, tests vs implementation, focused security or performance concerns. \
-Subagents spawned in a single turn run in parallel, so the fastest path in wall-clock is to fan out ALL the disjoint threads from your plan as one broad wave of spawn_subagent(task) calls in the same turn, rather than spawning a few and walking the rest serially. \
-Use local tools for quick triage and synthesis, but do not try to personally exhaust every branch of the investigation. \
-Keep each subagent task bounded and self-contained so it converges quickly, and do not spawn overlapping or near-duplicate subagents that would reread the same files for the same question. \
-After the wave returns, synthesize what is now established. Spawn another wave only when a concrete finding demands a specific follow-up — not as a routine next step. Each additional serial wave adds latency, so prefer to conclude from the evidence you already gathered.";
+const INVESTIGATION_GUIDANCE: &str = include_str!("../prompts/protocol/investigation-guidance.md");
+const FINDING_FIELDS: &str = include_str!("../prompts/protocol/finding-schema.md");
+const OPTIONS_SCHEMA: &str = include_str!("../prompts/protocol/options-schema.md");
+const OPTIONS_SCHEMA_WITH_NO_CONSENSUS: &str =
+    include_str!("../prompts/protocol/options-schema-no-consensus.md");
+const REVIEWER_TEMPLATE: &str = include_str!("../prompts/protocol/reviewer.md");
+const ASK_TEMPLATE: &str = include_str!("../prompts/protocol/ask.md");
+const REVIEW_AGGREGATOR_TEMPLATE: &str = include_str!("../prompts/protocol/review-aggregator.md");
+const ASK_AGGREGATOR_TEMPLATE: &str = include_str!("../prompts/protocol/ask-aggregator.md");
+const PRESET_SUBAGENT_TEMPLATE: &str = include_str!("../prompts/protocol/preset-subagent.md");
+const DEBATE_ACTOR_TOPIC_TEMPLATE: &str = include_str!("../prompts/protocol/debate-actor-topic.md");
+const DEBATE_ACTOR_REVIEW_TEMPLATE: &str =
+    include_str!("../prompts/protocol/debate-actor-review.md");
+const DEBATE_VALIDATOR_TOPIC_TEMPLATE: &str =
+    include_str!("../prompts/protocol/debate-validator-topic.md");
+const DEBATE_VALIDATOR_REVIEW_TEMPLATE: &str =
+    include_str!("../prompts/protocol/debate-validator-review.md");
+const DEBATE_META_TOPIC_TEMPLATE: &str = include_str!("../prompts/protocol/debate-meta-topic.md");
+const DEBATE_META_REVIEW_TEMPLATE: &str = include_str!("../prompts/protocol/debate-meta-review.md");
 
 const NO_FINDINGS: &str = "No findings. Great job! 🎉";
 
-const FINDING_FIELDS: &str = "<One sentence title about the issue>\n\
-- Priority: <P0 - P3>\n\
-- Location: <path:line or line range>\n\
-- Scenario: <concrete trigger when the scenario fires, or \"always\">\n\
-- Potential solution: <a concrete direction such as \"replace X with Y\" or \"validate at boundary Z\" — actionable but not necessarily patch-level; \"consider refactoring\" is too vague>\n\
-- Uncertainty: <what specifically you are unsure about and what would confirm or disprove it — omit the line if fully confident>";
+/// Render one compile-time prompt template. Template placeholders are deliberately tiny and
+/// dependency-free: prompt authors can audit the Markdown directly, while Rust owns only the
+/// values that vary by run. Validate the template before inserting values so a custom rubric
+/// containing `{{...}}` remains ordinary prompt text rather than looking unresolved.
+fn render(template: &str, values: &[(&str, &str)]) -> String {
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        let after_open = &rest[start + 2..];
+        let end = after_open
+            .find("}}")
+            .unwrap_or_else(|| panic!("unterminated prompt placeholder in {template:?}"));
+        let name = &after_open[..end];
+        assert!(
+            values.iter().any(|(candidate, _)| *candidate == name),
+            "prompt template uses unknown placeholder {{{{{name}}}}}"
+        );
+        rest = &after_open[end + 2..];
+    }
 
-const OPTIONS_SCHEMA: &str = "Options considered\n\
-<option name>\n\
-- What it is: ...\n\
-- Fits when: ...\n\
-- Drawbacks: ...\n\
-(repeat per option)\n\n\
-Recommendation\n\
-<which option and why>\n\n\
-Caveats (omit if none)\n\
-<context-dependent considerations>";
-
-const OPTIONS_SCHEMA_WITH_NO_CONSENSUS: &str = "Options considered\n\
-<option name>\n\
-- What it is: ...\n\
-- Fits when: ...\n\
-- Drawbacks: ...\n\
-(repeat per option)\n\n\
-Recommendation\n\
-<which option and why — or \"No consensus\" with a brief explanation>\n\n\
-Caveats (omit if none)\n\
-<context-dependent considerations>";
+    let mut rendered = template.trim().to_string();
+    for (name, value) in values {
+        rendered = rendered.replace(&format!("{{{{{name}}}}}"), value);
+    }
+    rendered
+}
 
 /// Whether the review targets a change (diff/PR) or existing code (`--analyze`).
-/// Change-attribution rules ("post-change code", "fixes the diff landed") only make
-/// sense for the former; static analysis gets impact-based framing instead.
+/// Change-attribution rules only make sense for the former.
 #[derive(Clone, Copy)]
 pub enum ReviewScope {
     Diff,
@@ -59,12 +65,10 @@ impl ReviewScope {
     fn finding_scope_rule(&self) -> &'static str {
         match self {
             ReviewScope::Diff => {
-                "- Only flag problems in the current (post-change) code. Do not narrate improvements \
-                the diff made — \"X now correctly does Y\" is not a finding.\n"
+                "- Only flag problems in the current (post-change) code. Do not narrate improvements the diff made — \"X now correctly does Y\" is not a finding.\n"
             }
             ReviewScope::Static => {
-                "- You are reviewing existing code, not a change: prioritize by impact and severity, \
-                not by how recently the code was written.\n"
+                "- You are reviewing existing code, not a change: prioritize by impact and severity, not by how recently the code was written.\n"
             }
         }
     }
@@ -88,329 +92,372 @@ impl ReviewScope {
     fn critic_reality_check(&self) -> &'static str {
         match self {
             ReviewScope::Diff => {
-                "1. Is this a real problem in the current (post-change) code, or is the reviewer narrating \
-                a fix the diff already made? Reject narration of landed improvements.\n"
+                "1. Is this a real problem in the current (post-change) code, or is the reviewer narrating a fix the diff already made? Reject narration of landed improvements.\n"
             }
             ReviewScope::Static => {
-                "1. Is this a real problem in the code as it exists, or a claim about code that is not \
-                actually there? Verify the premise.\n"
+                "1. Is this a real problem in the code as it exists, or a claim about code that is not actually there? Verify the premise.\n"
             }
         }
     }
 }
 
-pub enum TaskMode {
-    Review(ReviewScope),
+#[derive(Clone, Copy)]
+pub enum RunTask<'a> {
     Ask,
+    Review {
+        scope: ReviewScope,
+        presets: &'a [crate::presets::ReviewPreset],
+    },
 }
 
-impl TaskMode {
-    pub fn system_prompt(&self) -> String {
+/// One semantically complete worker/lane input derived from [`RunTask`].
+#[derive(Clone, Copy)]
+pub(crate) enum LaneTask<'a> {
+    Ask,
+    Review {
+        scope: ReviewScope,
+        preset: &'a crate::presets::ReviewPreset,
+    },
+}
+
+impl RunTask<'_> {
+    pub fn presets(&self) -> Option<&[crate::presets::ReviewPreset]> {
         match self {
-            TaskMode::Review(scope) => {
-                format!(
-                    "You are a code reviewer. Use the available tools \
-                    to explore the repository and understand the {target}.\n\n\
-                    Review criteria:\n\
-                    - Correctness: logic bugs, edge cases, off-by-one errors\n\
-                    - Security: injection, auth issues, secrets in code, unsafe deserialization \
-                    (only flag a security issue if you can trace a concrete exploit path, not just recognize a pattern)\n\
-                    - Performance: unnecessary allocations, N+1 queries, blocking calls in async context\n\
-                    - ML rigor: data leakage, incorrect loss/metrics, numerical instability, non-reproducibility\n\
-                    - Maintainability: dead code, copy-paste, unused variables, missing error handling\n\n\
-                    Style: fail loudly, not silently. No swallowed exceptions, no magic fallbacks, \
-                    no unexplained constants. Anything that can go wrong at runtime must be explicitly \
-                    checked and logged.\n\n\
-                    Your output is a structured issue list, not a narrative. Strict rules:\n\
-                    {scope_rule}\
-                    - No praise, validation, or positive notes.\n\
-                    - Scenario must be plausible. State the concrete trigger in one sentence. If it needs \
-                    an improbable chain of conditions, drop it.\n\
-                    - Skip nitpicks and pure style. No speculative improvements.\n\n\
-                    Start with the changes or target path specified in the user message, then explore \
-                    surrounding context as needed. First make a quick map of the relevant code, then a \
-                    short working plan: scope, knowledge gaps, local checks, and candidate delegations. \
-                    Close independent knowledge gaps early, especially with subagents when they are \
-                    bounded and disjoint. Revise the plan after the first evidence wave instead of committing \
-                    to your first theory.\n\n\
-                    For each finding, use this schema exactly (one block per finding, blank line between blocks):\n\
-                    {FINDING_FIELDS}\n\n\
-                    If a finding cannot fill all fields tightly, drop it. If there are no valid findings, output exactly: {NO_FINDINGS}",
-                    target = scope.target_noun(),
-                    scope_rule = scope.finding_scope_rule(),
-                )
-            }
-            TaskMode::Ask => {
-                "You are a knowledgeable senior engineer. Use the available tools \
-                to explore the repository and gather whatever context you need to answer accurately.\n\n\
-                Answer shape depends on the question:\n\
-                - If the question has genuine alternatives (a design choice, a \"should we X or Y\"), \
-                enumerate 2-3 viable options and recommend one, with reasoning grounded in the code.\n\
-                - If the question is boolean or factual (\"is this thread-safe?\", \"does X handle Y?\"), \
-                answer directly with evidence. Do not invent options where none exist.\n\n\
-                Options schema when applicable:\n\
-                "
-                .to_string()
-                    + OPTIONS_SCHEMA
-                    + "\n\nExplore the codebase as needed to give an accurate, well-grounded answer to the \
-                user message.\n\n\
-                For direct answers, give a clear answer grounded in code, then flag any meaningful caveats."
-            }
+            RunTask::Ask => None,
+            RunTask::Review { presets, .. } => Some(presets),
+        }
+    }
+
+    pub(crate) fn lanes(&self) -> Vec<LaneTask<'_>> {
+        match self {
+            RunTask::Ask => vec![LaneTask::Ask],
+            RunTask::Review { scope, presets } => presets
+                .iter()
+                .map(|preset| LaneTask::Review {
+                    scope: *scope,
+                    preset,
+                })
+                .collect(),
         }
     }
 
     pub fn initial_message(&self, user_prompt: &str) -> String {
-        let mut msg = String::new();
-        if !user_prompt.trim().is_empty() {
-            match self {
-                TaskMode::Review(_) => {
-                    msg.push_str(&format!("Focus your review on: {user_prompt}\n\n"))
-                }
-                TaskMode::Ask => msg.push_str(&format!("Question to answer: {user_prompt}\n\n")),
-            }
+        if user_prompt.trim().is_empty() {
+            return String::new();
         }
-        msg
-    }
-
-    pub fn reduce_prompt(&self, task: &str, combined: &str) -> String {
-        let inputs = match self {
-            TaskMode::Review(_) => "Individual reviews to synthesize",
-            TaskMode::Ask => "Individual answers to synthesize",
-        };
-        match task.trim().is_empty() {
-            true => format!("{inputs}:\n\n{combined}"),
-            false => {
-                format!("Original task given to each agent:\n{task}\n\n{inputs}:\n\n{combined}")
-            }
+        match self {
+            RunTask::Review { .. } => format!("Focus your review on: {user_prompt}\n\n"),
+            RunTask::Ask => format!("Question to answer: {user_prompt}\n\n"),
         }
     }
 
     pub fn aggregator_preamble(&self) -> String {
         match self {
-            TaskMode::Review(scope) => {
-                format!(
-                    "You synthesize code reviews into a final structured list of findings.\
-                    Output only actionable \
-                    findings in the schema. \
-                    No reviewer attribution, no praise{no_landed_fixes}, no rejected-false-positive section.\n\n\
-                    Rules:\n\
-                    1. Drop {drop_clause} — \
-                    these are synthesis errors in the inputs, not findings.\n\
-                    2. Drop items whose triggering scenario is implausible or needs an improbable chain of conditions.\n\
-                    3. Drop items not substantiated by evidence in the reviews, or that reviewers disagreed on \
-                    without the disagreement being resolved by evidence.\n\
-                    4. Group duplicates and closely related points into a single finding.\n\
-                    5. Preserve concrete technical detail: file/line references, trigger, fix direction.\n\
-                    6. Use this schema exactly (one block per finding, blank line between blocks):\n\
-                    {FINDING_FIELDS}\n\n\
-                    7. If no findings survive, output exactly: {NO_FINDINGS}",
-                    no_landed_fixes = scope.no_landed_fixes_clause(),
-                    drop_clause = scope.synthesis_drop_clause(),
-                )
-            }
-            TaskMode::Ask => {
-                "You synthesize multiple expert answers into a single response. Use Options + \
-                Recommendation + Caveats when the question has genuine alternatives; give a direct, \
-                evidence-grounded answer when it does not; write a detailed implementation plan if user asked for it.\n\n\
-                Rules:\n\
-                1. If the question had genuine alternatives, output Options + Recommendation + Caveats. \
-                Merge options across answers, deduplicate, preserve meaningful alternatives even if only \
-                one reviewer raised them. For the recommendation, pick what the best-grounded reasoning \
-                supports; if there is no convergence, say \"No consensus\" and briefly explain the split.\n\
-                2. If the question is boolean or factual, give a direct answer grounded in evidence, \
-                noting any meaningful disagreement among reviewers.\n\
-                3. Drop claims not grounded in the code or the original answers.\n\
-                4. When outputting options, use this schema exactly:\n\
-                "
-                .to_string()
-                    + OPTIONS_SCHEMA_WITH_NO_CONSENSUS
-            }
+            RunTask::Review { scope, .. } => render(
+                REVIEW_AGGREGATOR_TEMPLATE,
+                &[
+                    ("NO_LANDED_FIXES", scope.no_landed_fixes_clause()),
+                    ("DROP_CLAUSE", scope.synthesis_drop_clause()),
+                    ("FINDING_SCHEMA", FINDING_FIELDS.trim()),
+                    ("NO_FINDINGS", NO_FINDINGS),
+                ],
+            ),
+            RunTask::Ask => render(
+                ASK_AGGREGATOR_TEMPLATE,
+                &[("OPTIONS_SCHEMA", OPTIONS_SCHEMA_WITH_NO_CONSENSUS.trim())],
+            ),
         }
     }
-}
 
-pub enum DebateMode {
-    Topic,
-    Review(ReviewScope),
-}
-
-impl DebateMode {
     pub fn actor_role(&self) -> &'static str {
         match self {
-            DebateMode::Topic => "Actor",
-            DebateMode::Review(_) => "Reviewer",
+            RunTask::Ask => "Actor",
+            RunTask::Review { .. } => "Reviewer",
         }
     }
 
     pub fn critic_role(&self) -> &'static str {
         match self {
-            DebateMode::Topic => "Critic",
-            DebateMode::Review(_) => "Validator",
-        }
-    }
-
-    pub(crate) fn actor_system(&self) -> String {
-        match self {
-            DebateMode::Topic => {
-                "You are the ACTOR in a structured debate. Answer the question in the shape it deserves:\n\
-                - Genuine alternatives: enumerate 2-3 viable options, recommend one with reasoning \
-                grounded in the code. Don't invent options where none exist.\n\
-                - Boolean or factual: answer directly with evidence.\n\n\
-                You are the recall stage. Include borderline options or considerations and mark \
-                uncertainty. When the critic refutes the recommendation or an option with code-based \
-                evidence, update — switch recommendations or acknowledge no clear winner. Do not \
-                defend bad positions out of stubbornness. When the critic is wrong, hold the line \
-                with specific file/line evidence.\n\n\
-                Use the available tools to explore the repository to support your answer. When ready, \
-                call submit_verdict(verdict, agree=false) with your position. For uncertain claims, \
-                include an Uncertainty: line naming what you're unsure about and what would resolve it.\n\n"
-                    .to_string()
-                    + DELEGATION_GUIDANCE
-                    + "\n\n"
-                    + VERIFY_WARNING
-            }
-            DebateMode::Review(scope) => {
-                format!(
-                    "You are a thorough code reviewer. Find genuine issues — bugs, security flaws, \
-                    performance problems, unclear logic — in the {target}. Use the available \
-                    tools to read the code and understand context.\n\n\
-                    You are the recall stage. Err toward inclusion: if you are moderately confident \
-                    something is wrong but the trigger is narrow or you're unsure, include the finding \
-                    and state your uncertainty. Reserve outright dropping for findings you yourself \
-                    estimate below ~30% likely to be real. False negatives at this stage don't recover; \
-                    false positives get filtered by the critic.\n\n\
-                    In follow-up turns, treat the critic's challenges as evidence. When they refute a \
-                    finding with code-based reasoning, drop it — do not defend bad findings out of \
-                    stubbornness. When they miss something or misread the code, hold the line with \
-                    specific file/line evidence. Cite concrete paths and line numbers whenever the tools \
-                    provide them.\n\n\
-                    Your output is a structured list of issues, not a narrative. Strict rules:\n\
-                    {scope_rule}\
-                    - No praise, validation, or positive notes.\n\
-                    - Skip nitpicks and pure style.\n\n\
-                    Call submit_verdict with a list of findings. Use this schema exactly (one block per finding, \
-                    blank line between blocks):\n\
-                    {FINDING_FIELDS}\n\n\
-                    If there are no valid findings, set verdict exactly to: {NO_FINDINGS}\n\n\
-                    {DELEGATION_GUIDANCE}\n\n\
-                    {VERIFY_WARNING}",
-                    target = scope.target_noun(),
-                    scope_rule = scope.finding_scope_rule(),
-                )
-            }
-        }
-    }
-
-    pub(crate) fn critic_system(&self) -> String {
-        match self {
-            DebateMode::Topic => {
-                "You are the CRITIC in a structured debate. You are the precision filter — err toward \
-                challenging weak claims. The actor is biased toward recall, so expect options or claims \
-                that don't hold up under scrutiny.\n\n\
-                For each option the actor raised (the recommendation AND any non-trivial alternative), \
-                check independently:\n\
-                1. Is it grounded in the code and supported by evidence?\n\
-                2. Do the stated drawbacks or \"fits when\" conditions reflect reality?\n\
-                3. Is there a better option the actor missed?\n\
-                If the actor flagged uncertainty, investigate exactly what they flagged and resolve it.\n\n\
-                If the question is boolean or factual (no options structure), verify the direct answer \
-                against the code.\n\n\
-                Before you can agree, you must have raised at least one substantive challenge and \
-                verified that the actor addressed it with code evidence. Agreeing without your own \
-                investigation is a failure of your role. Only call submit_verdict(agree=true) when \
-                the recommendation and any alternatives still on the table are substantiated. \
-                Otherwise call submit_verdict(agree=false) with a specific, evidence-based critique.\n\n"
-                    .to_string()
-                    + DELEGATION_GUIDANCE
-                    + "\n\n"
-                    + VERIFY_WARNING
-            }
-            DebateMode::Review(scope) => {
-                format!(
-                    "You are a senior engineer stress-testing a code review. You are the precision filter — \
-                    err toward rejection. A false positive reaching the final result is worse than a marginal \
-                    finding getting rejected. The reviewer is biased toward recall, so expect weak or \
-                    uncertain findings; your job is to read the code and cut them.\n\n\
-                    For each finding, check in order:\n\
-                    {reality_check}\
-                    2. Does the file/line actually contain the described issue? Read the code and verify.\n\
-                    3. Is the triggering scenario plausible, or does it need an improbable chain of conditions? \
-                    Reject if implausible.\n\
-                    4. Is the potential solution concrete and actionable, not hand-wavy?\n\
-                    5. If the reviewer stated an uncertainty, investigate exactly what they flagged and \
-                    resolve it one way or the other — confirm or reject. Do not let findings carry lingering \
-                    uncertainty into the final output.\n\n\
-                    Also actively look for important issues the reviewer missed. Agreeing without reading the \
-                    code is a failure of your role. For each response, do one of three things for every \
-                    material claim: confirm it with evidence, dispute it with counter-evidence, or name the \
-                    exact missing evidence needed to resolve it. Cite concrete paths and line numbers whenever \
-                    the tools provide them. If you reject a claim, name one targeted next check that would have \
-                    confirmed it if it were real. Classify each reviewed issue as confirmed or rejected, \
-                    with evidence. Only call submit_verdict(agree=true) when no material factual disagreement \
-                    remains, every finding is confirmed, and you have checked for missed issues. Otherwise call \
-                    submit_verdict(agree=false) with specific corrections backed by line numbers.\n\n\
-                    {DELEGATION_GUIDANCE}\n\n\
-                    {VERIFY_WARNING}",
-                    reality_check = scope.critic_reality_check(),
-                )
-            }
+            RunTask::Ask => "Critic",
+            RunTask::Review { .. } => "Validator",
         }
     }
 
     pub(crate) fn meta_instruction(&self) -> &'static str {
         match self {
-            DebateMode::Topic => "Debate transcript to synthesize into the final answer.",
-            DebateMode::Review(_) => "Debate transcript to synthesize into the final summary.",
+            RunTask::Ask => "Debate transcript to synthesize into the final answer.",
+            RunTask::Review { .. } => "Debate transcript to synthesize into the final summary.",
         }
     }
 
     pub(crate) fn meta_preamble(&self) -> String {
         match self {
-            DebateMode::Topic => {
-                "You synthesize structured debates into a single answer. Use Options + Recommendation + \
-                Caveats when the question has genuine alternatives; give a direct, evidence-grounded \
-                answer when it does not. Drop claims the critic refuted and any inter-role uncertainty signals.\n\n\
-                Rules:\n\
-                1. Include only claims that survived the debate with code-based evidence.\n\
-                2. Drop options or claims the critic successfully refuted.\n\
-                3. Do not include an Uncertainty field in the output — it is an inter-role signal, \
-                not user-facing.\n\
-                4. Preserve concrete references (file/line) where the debate cited them.\n\
-                5. If the debate produced genuine alternatives, use the Options considered / Recommendation / \
-                Caveats schema. If the question was boolean or factual, give a direct answer grounded in evidence, \
-                noting any meaningful disagreement that survived the debate.\n\
-                6. When outputting options, use this schema exactly:\n\
-                "
-                .to_string()
-                    + OPTIONS_SCHEMA_WITH_NO_CONSENSUS
-            }
-            DebateMode::Review(scope) => {
-                format!(
-                    "You synthesize code-review debates into a final summary. Output only \
-                    actionable findings sorted by priority. No attribution, no praise{no_landed_fixes}, \
-                    no rejected-false-positive section.\n\n\
-                    Rules:\n\
-                    1. Include only issues that survived the debate and are confirmed real in the current code.\n\
-                    2. Drop {drop_clause}.\n\
-                    3. Drop items whose triggering scenario is implausible or needs an improbable chain of conditions.\n\
-                    4. Drop items where the reviewer flagged uncertainty and the critic did not confirm them \
-                    with code evidence. The final summary only contains confirmed findings.\n\
-                    5. Group duplicates and closely related points into a single finding.\n\
-                    6. Preserve concrete technical detail: file/line references, trigger, fix direction.\n\
-                    7. Use this schema exactly (one block per finding, blank line between blocks):\n\
-                    {FINDING_FIELDS}\n\n\
-                    8. If no findings survive, output exactly: {NO_FINDINGS}",
-                    no_landed_fixes = scope.no_landed_fixes_clause(),
-                    drop_clause = scope.synthesis_drop_clause(),
-                )
-            }
+            RunTask::Ask => render(
+                DEBATE_META_TOPIC_TEMPLATE,
+                &[("OPTIONS_SCHEMA", OPTIONS_SCHEMA_WITH_NO_CONSENSUS.trim())],
+            ),
+            RunTask::Review { scope, .. } => render(
+                DEBATE_META_REVIEW_TEMPLATE,
+                &[
+                    ("NO_LANDED_FIXES", scope.no_landed_fixes_clause()),
+                    ("DROP_CLAUSE", scope.synthesis_drop_clause()),
+                    ("FINDING_SCHEMA", FINDING_FIELDS.trim()),
+                    ("NO_FINDINGS", NO_FINDINGS),
+                ],
+            ),
         }
     }
 
     pub fn label(&self) -> &'static str {
         match self {
-            DebateMode::Topic => "debate",
-            DebateMode::Review(_) => "review-debate",
+            RunTask::Ask => "debate",
+            RunTask::Review { .. } => "review-debate",
         }
+    }
+}
+
+impl LaneTask<'_> {
+    pub(crate) fn preset(&self) -> Option<&crate::presets::ReviewPreset> {
+        match self {
+            LaneTask::Ask => None,
+            LaneTask::Review { preset, .. } => Some(preset),
+        }
+    }
+
+    pub(crate) fn reviewer_system(&self) -> String {
+        match self {
+            LaneTask::Review { scope, preset } => render(
+                REVIEWER_TEMPLATE,
+                &[
+                    ("TARGET", scope.target_noun()),
+                    ("SCOPE_RULE", scope.finding_scope_rule()),
+                    ("INVESTIGATION_GUIDANCE", INVESTIGATION_GUIDANCE.trim()),
+                    ("FINDING_SCHEMA", FINDING_FIELDS.trim()),
+                    ("NO_FINDINGS", NO_FINDINGS),
+                    ("PRESET_NAME", &preset.name),
+                    ("RUBRIC", &preset.prompt),
+                ],
+            ),
+            LaneTask::Ask => render(ASK_TEMPLATE, &[("OPTIONS_SCHEMA", OPTIONS_SCHEMA.trim())]),
+        }
+    }
+
+    pub(crate) fn subagent_prompt(&self) -> Option<String> {
+        match self {
+            LaneTask::Ask => None,
+            LaneTask::Review { preset, .. } => Some(preset_subagent_prompt(preset)),
+        }
+    }
+
+    pub(crate) fn actor_system(&self) -> String {
+        match self {
+            LaneTask::Ask => render(
+                DEBATE_ACTOR_TOPIC_TEMPLATE,
+                &[("INVESTIGATION_GUIDANCE", INVESTIGATION_GUIDANCE.trim())],
+            ),
+            LaneTask::Review { scope, preset } => render(
+                DEBATE_ACTOR_REVIEW_TEMPLATE,
+                &[
+                    ("TARGET", scope.target_noun()),
+                    ("SCOPE_RULE", scope.finding_scope_rule()),
+                    ("FINDING_SCHEMA", FINDING_FIELDS.trim()),
+                    ("NO_FINDINGS", NO_FINDINGS),
+                    ("INVESTIGATION_GUIDANCE", INVESTIGATION_GUIDANCE.trim()),
+                    ("PRESET_NAME", &preset.name),
+                    ("RUBRIC", &preset.prompt),
+                ],
+            ),
+        }
+    }
+
+    pub(crate) fn critic_system(&self) -> String {
+        match self {
+            LaneTask::Ask => render(
+                DEBATE_VALIDATOR_TOPIC_TEMPLATE,
+                &[("INVESTIGATION_GUIDANCE", INVESTIGATION_GUIDANCE.trim())],
+            ),
+            LaneTask::Review { scope, preset } => render(
+                DEBATE_VALIDATOR_REVIEW_TEMPLATE,
+                &[
+                    ("REALITY_CHECK", scope.critic_reality_check()),
+                    ("INVESTIGATION_GUIDANCE", INVESTIGATION_GUIDANCE.trim()),
+                    ("PRESET_NAME", &preset.name),
+                    ("RUBRIC", &preset.prompt),
+                ],
+            ),
+        }
+    }
+}
+
+/// Review synthesis carries every active preset's name and full rubric, including project
+/// overrides.
+pub(crate) fn review_reduce_prompt(
+    task: &str,
+    combined: &str,
+    presets: &[crate::presets::ReviewPreset],
+) -> String {
+    let roster = format!("{}\n\n", preset_roster(presets));
+    reduce_prompt(task, combined, "Individual reviews to synthesize", &roster)
+}
+
+pub(crate) fn ask_reduce_prompt(task: &str, combined: &str) -> String {
+    reduce_prompt(task, combined, "Individual answers to synthesize", "")
+}
+
+fn reduce_prompt(task: &str, combined: &str, inputs: &str, roster: &str) -> String {
+    match task.trim().is_empty() {
+        true => format!("{roster}{inputs}:\n\n{combined}"),
+        false => {
+            format!("Original task given to each agent:\n{task}\n\n{roster}{inputs}:\n\n{combined}")
+        }
+    }
+}
+
+/// Every active preset's name and full rubric for the final synthesizer.
+pub(crate) fn preset_roster(presets: &[crate::presets::ReviewPreset]) -> String {
+    let blocks: Vec<String> = presets
+        .iter()
+        .map(|p| format!("### {}\n{}", p.name, p.prompt))
+        .collect();
+    format!(
+        "Active review presets — each input below investigated exactly one of these angles:\n\n{}",
+        blocks.join("\n\n")
+    )
+}
+
+/// Preset-aware subagent prompt: the library's generic contract plus the parent lane's rubric.
+pub fn preset_subagent_prompt(preset: &crate::presets::ReviewPreset) -> String {
+    render(
+        PRESET_SUBAGENT_TEMPLATE,
+        &[
+            ("BASE", nitpicker_agent::prompts::subagent_system_prompt()),
+            ("PRESET_NAME", &preset.name),
+            ("RUBRIC", &preset.prompt),
+        ],
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::presets::ReviewPreset;
+
+    fn preset(name: &str, rubric: &str) -> ReviewPreset {
+        ReviewPreset {
+            name: name.to_string(),
+            prompt: rubric.to_string(),
+        }
+    }
+
+    /// A worker carries exactly its assigned rubric and same-scope prompts only diverge at
+    /// the final preset slot, preserving cross-preset provider cache sharing.
+    #[test]
+    fn review_system_prompt_carries_exactly_its_preset() {
+        let a = preset("angle-a", "RUBRIC-MARKER-A");
+        let b = preset("angle-b", "RUBRIC-MARKER-B");
+        for scope in [ReviewScope::Diff, ReviewScope::Static] {
+            let prompt_a = LaneTask::Review { scope, preset: &a }.reviewer_system();
+            let prompt_b = LaneTask::Review { scope, preset: &b }.reviewer_system();
+            assert!(prompt_a.contains("RUBRIC-MARKER-A"));
+            assert!(!prompt_a.contains("RUBRIC-MARKER-B"));
+            assert!(prompt_b.contains("RUBRIC-MARKER-B"));
+
+            let shared_prefix_len = prompt_a
+                .bytes()
+                .zip(prompt_b.bytes())
+                .take_while(|(x, y)| x == y)
+                .count();
+            let rubric_a_at = prompt_a.find("angle-a").expect("angle name present");
+            assert!(shared_prefix_len >= rubric_a_at);
+        }
+    }
+
+    #[test]
+    fn reduce_prompt_carries_every_active_preset_rubric() {
+        let presets = [
+            preset("angle-a", "RUBRIC-MARKER-A"),
+            preset("angle-b", "RUBRIC-MARKER-B"),
+        ];
+        let out = review_reduce_prompt("the task", "the reviews", &presets);
+        for needle in [
+            "angle-a",
+            "RUBRIC-MARKER-A",
+            "angle-b",
+            "RUBRIC-MARKER-B",
+            "the task",
+            "the reviews",
+        ] {
+            assert!(out.contains(needle), "missing {needle}");
+        }
+    }
+
+    #[test]
+    fn ask_reduce_prompt_takes_no_roster() {
+        let out = ask_reduce_prompt("the question", "the answers");
+        assert!(out.contains("the question"));
+        assert!(out.contains("the answers"));
+    }
+
+    #[test]
+    fn preset_subagent_prompt_extends_the_generic_contract_with_the_rubric() {
+        let out = preset_subagent_prompt(&preset("angle-a", "RUBRIC-MARKER-A"));
+        assert!(out.starts_with(nitpicker_agent::prompts::subagent_system_prompt()));
+        assert!(out.contains("RUBRIC-MARKER-A"));
+    }
+
+    #[test]
+    fn every_external_template_renders_all_of_its_placeholders() {
+        let p = preset("angle", "rubric");
+        let presets = [p.clone()];
+        let prompts = [
+            LaneTask::Review {
+                scope: ReviewScope::Diff,
+                preset: &p,
+            }
+            .reviewer_system(),
+            LaneTask::Review {
+                scope: ReviewScope::Static,
+                preset: &p,
+            }
+            .reviewer_system(),
+            LaneTask::Ask.reviewer_system(),
+            RunTask::Review {
+                scope: ReviewScope::Diff,
+                presets: &presets,
+            }
+            .aggregator_preamble(),
+            RunTask::Ask.aggregator_preamble(),
+            preset_subagent_prompt(&p),
+            LaneTask::Ask.actor_system(),
+            LaneTask::Review {
+                scope: ReviewScope::Diff,
+                preset: &p,
+            }
+            .actor_system(),
+            LaneTask::Ask.critic_system(),
+            LaneTask::Review {
+                scope: ReviewScope::Static,
+                preset: &p,
+            }
+            .critic_system(),
+            RunTask::Ask.meta_preamble(),
+            RunTask::Review {
+                scope: ReviewScope::Diff,
+                presets: &presets,
+            }
+            .meta_preamble(),
+        ];
+        assert!(prompts.iter().all(|prompt| !prompt.contains("{{")));
+    }
+
+    #[test]
+    fn custom_rubric_may_contain_template_like_text() {
+        let p = preset("custom", "Explain {{PROJECT_TOKEN}} exactly.");
+        let out = LaneTask::Review {
+            scope: ReviewScope::Diff,
+            preset: &p,
+        }
+        .reviewer_system();
+        assert!(out.contains("{{PROJECT_TOKEN}}"));
     }
 }

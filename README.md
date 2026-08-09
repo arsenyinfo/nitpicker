@@ -92,6 +92,7 @@ Example `nitpicker.toml`:
 debate = true          # optional, default: true
 max_turns = 100        # optional, default: 100
 log_trajectories = false # optional, default: false
+# presets = ["correctness", "security"]  # optional; default also includes performance, simplicity
 
 [aggregator]
 model = "claude-sonnet-5"
@@ -110,9 +111,48 @@ model = "gpt-5.6-sol"
 provider = "openai_compatible"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
+
+# optional: define a custom review angle (or override a built-in by using its name)
+[presets.api-security]
+prompt = """
+Review trust boundaries, authentication, authorization, input handling, and secret exposure.
+Require a concrete attacker-controlled path and plausible impact for every finding.
+"""
 ```
 
 > **Tip:** Use providers that were not used for the initial building of your codebase to enforce diversity of thought.
+
+### Review presets
+
+A preset is one named review angle — a rubric that tells a reviewer *what* to investigate;
+the execution mode (parallel, debate, alloy) decides *how*. Every review run resolves an
+ordered preset list: `--preset` on the command line beats `[defaults].presets`, which beats
+the four-angle built-in default (`correctness`, `security`, `performance`, `simplicity`).
+Domain-specific built-ins `ai-systems`, `ml-rigor`, and `tone` are opt-in. `general` is a
+standalone broad review for unusual targets or user-defined concerns and cannot be combined
+with another preset. A `[presets.<name>]` table with a built-in's name replaces it.
+
+```bash
+nitpicker --preset security                      # one focused angle
+nitpicker --preset security,ml-rigor             # commas split
+nitpicker --preset ai-systems                    # agent/prompt/tool/context audit
+nitpicker --preset general --prompt "review the plugin contract"
+nitpicker pr --preset api-security               # project-defined preset
+```
+
+Fan-out: parallel mode runs every configured reviewer against every selected preset
+(reviewers × presets jobs); debate mode runs one independent Reviewer/Validator debate per
+preset, lanes concurrent, with a single meta-review across all lanes. Spend and wall-clock
+scale with the selection: the untouched default runs four lanes (or 4× the parallel jobs)
+where 0.8.x ran one combined review. Names are case-sensitive; unknown or empty names,
+mixing `general` with another preset, or selecting more than 16 presets fails before any
+model call. `ask`, `init`, and `reflect` take no presets — the flag is rejected there.
+
+Built-in rubrics and review/debate protocols live as auditable Markdown under
+[`prompts/`](prompts/) and are compiled into the binary. Generic loop contracts such as
+compaction and final-turn handling live under
+[`crates/nitpicker-agent/prompts/`](crates/nitpicker-agent/prompts/) and are compiled into the
+library that interprets them. Rust owns selection and interpolation, not the prompt prose.
 
 Unknown config keys are rejected. For example, use `max_tokens` for output length; `token_limit` is not a supported field.
 
@@ -291,6 +331,7 @@ nitpicker init [--global] [--free] [--repo <DIR>]
 --repo <PATH>          git repository to review [default: .]
 --config <PATH>        config file [default: <repo>/nitpicker.toml, then ~/.nitpicker/config.toml]
 --prompt <TEXT>        review instructions (optional, has a sensible default)
+--preset <NAME>        review angle(s) to run; repeatable, comma-separated, replaces the configured default list
 --context-file <PATH>  inject a file's contents into the prompt; repeatable
 --analyze [PATH]       analyze existing code instead of reviewing changes
 --no-debate            use parallel aggregation instead of actor-critic debate
@@ -318,7 +359,7 @@ subagents do not inherit them.
 ### PR subcommand
 
 ```
-nitpicker pr [URL] [--no-comment] [--no-debate] [--rounds N] [--max-turns N] [--prompt TEXT] [--context-file PATH] [--repo .] [--config PATH] [--json] [-v]
+nitpicker pr [URL] [--no-comment] [--no-debate] [--rounds N] [--max-turns N] [--prompt TEXT] [--preset NAME] [--context-file PATH] [--repo .] [--config PATH] [--json] [-v]
 ```
 
 Reviews a GitHub PR using its title, description, and diff. Requires the `gh` CLI (`gh auth login` to authenticate).
@@ -327,7 +368,7 @@ Reviews a GitHub PR using its title, description, and diff. Requires the `gh` CL
 - With `URL` (`https://github.com/owner/repo/pull/N`): clones the repo into a temp dir, checks out the PR branch, reviews it, then cleans up
 - By default, posts the review as a PR comment. Pass `--no-comment` to skip posting.
 - `--no-debate`, `--rounds`, and `--max-turns` work the same as in the default review mode
-- `--json` emits a single machine-readable JSON object on stdout (status, PR metadata, models, `report_markdown`, `usage`, …) instead of the human report, with all logs/progress on stderr — handy for calling nitpicker as a subprocess. Exits non-zero on failure, with a `status: "error"` object on stdout. The `usage` block reports aggregate `input_tokens`/`output_tokens`/`total_tokens`, `cached_input_tokens`/`cache_creation_input_tokens`, and `subagents_spawned` for the run (best-effort: successful completions only). The cache fields are a breakdown of `input_tokens`, not an extra charge — a healthy multi-turn run shows most of its input served from cache. Cost formulas must discount them: `input_tokens` now counts cache reads on every provider (before 0.8.3 the Anthropic path omitted them), so a naive `input_tokens * input_price` over-states a cache-heavy run.
+- `--json` emits a single machine-readable JSON object on stdout (status, PR metadata, models, resolved `presets`, `report_markdown`, `usage`, …) instead of the human report, with all logs/progress on stderr — handy for calling nitpicker as a subprocess. Exits non-zero on failure, with a `status: "error"` object on stdout; a degraded run (some job or debate turn failed — `degraded: true`) exits 3 after emitting the envelope. The `coverage` key reports each preset's `attempted`/`succeeded` job or lane counts; entries with `succeeded > 0` identify the angles that produced evidence, while the counts distinguish partial coverage such as 1 of N jobs. The `usage` block reports aggregate `input_tokens`/`output_tokens`/`total_tokens`, `cached_input_tokens`/`cache_creation_input_tokens`, and `subagents_spawned` for the run (best-effort: successful completions only). The cache fields are a breakdown of `input_tokens`, not an extra charge — a healthy multi-turn run shows most of its input served from cache. Cost formulas must discount them: `input_tokens` now counts cache reads on every provider (before 0.8.3 the Anthropic path omitted them), so a naive `input_tokens * input_price` over-states a cache-heavy run.
 
 ### Ask subcommand
 
@@ -347,9 +388,9 @@ Two LLM agents take turns exploring the codebase with file/git tools and submitt
 
 Interactive text runs show a compact cast/progress view while debating, then print the final synthesized result. In a terminal, `--verbose` also shows intermediate debate output and the saved transcript path; redirected stdout stays final-report-only.
 
-Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timestamp}.md`.
+With `--verbose`, the transcript is saved to `{tempdir}/debate-{timestamp}.md` (`ask`) or `review-debate-{timestamp}-{preset-slugs}.md` (review; one section per preset lane). Non-verbose runs skip the write.
 
-### Exit codes (default review and `ask`)
+### Exit codes (default review, `ask`, and `pr`)
 
 | code | meaning |
 |------|---------|
@@ -358,7 +399,7 @@ Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timesta
 | 2 | CLI usage error (clap's exit code for bad arguments) |
 | 3 | degraded verdict — report printed, but a reviewer failed, or a debate turn failed or ended without calling `submit_verdict` |
 
-Non-interactive, non-verbose stdout carries exactly the final report, so the binary can be driven as a subprocess: read stdout for the verdict, branch on the exit code. `pr` keeps its own contract (`--json` emits `status: ok|error` and exits 0/1).
+Non-interactive, non-verbose stdout carries exactly the final report, so the binary can be driven as a subprocess: read stdout for the verdict, branch on the exit code. `pr` follows the same codes; in `--json` mode the envelope (`status: ok|error`, with `degraded: true` on an exit-3 run) is emitted and flushed before the exit.
 
 ## Using the agent as a library
 
@@ -379,6 +420,18 @@ println!("{}", result.text);
 `file_agent_tools()` is the read-only file/git toolset plus `spawn_subagent`. You control the top-level prompt, the subagent prompt, the toolset, and the client; config-file-driven client construction is available via the `config`/`provider` modules. See `crates/nitpicker-agent/examples/file_agent.rs`.
 
 ## Changelog
+
+**0.9.0** — 2026-08-09 (`nitpicker-agent` 0.3.0)
+- **Review presets**: four universal defaults (`correctness`, `security`, `performance`, `simplicity`), opt-in domain angles (`ai-systems`, `ml-rigor`, `tone`), standalone `general`, and project-defined `[presets.<name>]` tables selected via repeatable comma-split `--preset` or `[defaults].presets`. Parallel mode fans out reviewers × presets; debate mode runs one concurrent Reviewer/Validator lane per preset with a single global meta-review. Built-in rubrics and protocol prompts are auditable Markdown under `prompts/` and compile into the binary. `ask`/`init`/`reflect` are unaffected and reject the flag.
+- `pr --json` gains additive `presets`, `degraded`, and per-preset `coverage` fields (successful envelopes only): `presets` reports resolution while `coverage` reports attempted/succeeded execution counts, and degraded `pr` runs now exit 3 like the other review arms. Session artifacts label jobs/lanes with preset names, and `aggregation.json` records a per-job outcome list on parallel runs; the combined debate transcript gets per-lane sections and preset slugs in its filename.
+- **`pr` mode config trust**: repo-level `nitpicker.toml` is read from the PR *base branch* blob (falling back to the global config) — never from the working tree, which holds target-controlled PR-head content that could redirect `base_url` or override preset rubrics. The base branch is only trusted when `origin` is a github.com remote, and the head-vs-base comparison runs on git object ids rather than reading the checked-out file. A warning names the checked-out copy when it diverges; explicit `--config` stays trusted.
+- Synthesis failures now persist: when the aggregator/meta-review dies after the review work completed, `aggregation.json` is still written with an `error` field and the per-job/lane outcome lists intact, and `reflect` renders lanes, jobs, and failed synthesis instead of dropping them.
+- Trajectory tool-call records carry the turn's `model` when the client reports it — alloy runs become attributable per turn.
+- A Gemini AG2 proxy startup failure (missing/expired keyring token) no longer aborts the whole run: only proxy-needing reviewers fail, with the startup cause attached.
+- Parallel review's 8-reviewer concurrency cap is removed — jobs all run under the shared in-flight LLM call cap (16); the debate per-turn cap is likewise hoisted to one per run shared across lanes.
+- Preset resolution failures (unknown/empty names, `general` combined with another angle, more than 16 selected) abort before any model call; preset names must be free of control bytes; context-window overflows in the final synthesis now suggest selecting fewer presets.
+- Whitespace-only model responses are treated as empty (nudged, then failed) instead of passing a blank report off as review evidence.
+- Debate prompts no longer let debate history leak into results: withdrawn findings are dropped silently instead of surviving as "claim withdrawn" placeholder blocks, verdicts restate the full current position each turn, an agreeing critic restates what it confirmed, and the meta-review excludes debate chronology and inter-role uncertainty notes. Converged lanes reach the meta-review pruned to their final round (contested and degraded lanes keep the full dialogue; the on-disk transcript always does).
 
 **0.8.5** — 2026-08-05 (`nitpicker-agent` 0.2.1)
 - Session recorder fixes: unique per-agent record identities (no more shared `root`/`subagent-N`), failed subagent spawns logged, 1-based `compact` turn numbers, flushed appends.

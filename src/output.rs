@@ -65,6 +65,20 @@ pub struct UsageReport {
 }
 
 impl UsageReport {
+    /// fold another report's totals in (a debate lane's accumulated usage).
+    pub fn merge(&mut self, other: &UsageReport) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(other.cached_input_tokens);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .saturating_add(other.cache_creation_input_tokens);
+        self.subagents_spawned += other.subagents_spawned;
+    }
+
     /// fold one completion's token usage (and any subagents it spawned) into the totals.
     pub fn add(&mut self, usage: TokenUsage, subagents_spawned: usize) {
         self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
@@ -83,8 +97,9 @@ impl UsageReport {
 /// the single JSON object written to stdout in `--format json` mode.
 ///
 /// `status: ok` means the review process ran to completion and produced a report;
-/// the report body may still contain per-reviewer failure notes (partial failures
-/// are folded into the markdown, not surfaced as a separate field in v1).
+/// partial failures surface as `degraded: true` plus per-preset `coverage` counts
+/// (and as exit code 3 — preset-run failure stubs are excluded from the synthesis
+/// input, so the report body alone cannot show them).
 #[derive(Debug, Serialize)]
 pub struct PrReviewOutput {
     pub schema_version: u32,
@@ -95,6 +110,21 @@ pub struct PrReviewOutput {
     pub mode: Option<ReviewMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub models: Option<Models>,
+    /// resolved ordered preset names; present iff `status: ok` (every error envelope
+    /// omits it, including failures after resolution). additive schema-v1 field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presets: Option<Vec<String>>,
+    /// `true` when at least one review job / debate turn failed or fell back — the report
+    /// was synthesized from partial evidence. present iff `status: ok`; mirrored as exit
+    /// code 3. additive schema-v1 field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<bool>,
+    /// per-preset job/lane counts in resolution order. Entries with `succeeded > 0`
+    /// identify the angles that produced evidence; the counts preserve partial coverage
+    /// such as 1 of N jobs. Envelope-only by design: execution counts are never fed to the
+    /// synthesis prompt. present iff `status: ok`. additive schema-v1 field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<Vec<PresetCoverage>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report_markdown: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -115,6 +145,9 @@ impl PrReviewOutput {
             pr: None,
             mode: None,
             models: None,
+            presets: None,
+            degraded: None,
+            coverage: None,
             report_markdown: None,
             usage: None,
             comment_posted: false,
@@ -122,6 +155,14 @@ impl PrReviewOutput {
             error: Some(message),
         }
     }
+}
+
+/// One preset's planned-vs-surviving job (or lane) count for the envelope's `coverage` key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PresetCoverage {
+    pub preset: String,
+    pub attempted: usize,
+    pub succeeded: usize,
 }
 
 /// serialize `value` as one line on stdout and flush before returning.
@@ -183,6 +224,9 @@ mod tests {
             pr: None,
             mode: None,
             models: None,
+            presets: None,
+            degraded: None,
+            coverage: None,
             report_markdown: None,
             usage: Some(report),
             comment_posted: false,
@@ -208,6 +252,48 @@ mod tests {
         assert!(
             json.get("usage").is_none(),
             "usage must be omitted on error"
+        );
+    }
+
+    /// `presets` is present iff the run succeeded: every error envelope omits the key
+    /// entirely (not `null`), including failures after resolution.
+    #[test]
+    fn presets_key_is_success_only() {
+        let error_json: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&PrReviewOutput::error("boom".to_string(), 1)).unwrap(),
+        )
+        .unwrap();
+        assert!(error_json.get("presets").is_none());
+        assert!(error_json.get("degraded").is_none());
+        assert!(error_json.get("coverage").is_none());
+
+        let mut ok = PrReviewOutput::error("unused".to_string(), 1);
+        ok.status = Status::Ok;
+        ok.error = None;
+        ok.presets = Some(vec!["security".to_string(), "tone".to_string()]);
+        ok.degraded = Some(true);
+        ok.coverage = Some(vec![
+            PresetCoverage {
+                preset: "security".to_string(),
+                attempted: 2,
+                succeeded: 1,
+            },
+            PresetCoverage {
+                preset: "tone".to_string(),
+                attempted: 2,
+                succeeded: 0,
+            },
+        ]);
+        let ok_json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&ok).unwrap()).unwrap();
+        assert_eq!(ok_json["presets"], serde_json::json!(["security", "tone"]));
+        assert_eq!(ok_json["degraded"], serde_json::json!(true));
+        assert_eq!(
+            ok_json["coverage"],
+            serde_json::json!([
+                {"preset": "security", "attempted": 2, "succeeded": 1},
+                {"preset": "tone", "attempted": 2, "succeeded": 0},
+            ])
         );
     }
 }
