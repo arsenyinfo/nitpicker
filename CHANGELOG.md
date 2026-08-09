@@ -6,6 +6,10 @@ Notable user-visible changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Resolve `--repo` through Git so linked worktrees and paths inside a worktree are supported.
+
 ## [0.9.1] - 2026-08-09
 
 ### Changed

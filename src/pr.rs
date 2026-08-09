@@ -9,10 +9,34 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn lock_path(repo: &Path) -> PathBuf {
-    let canonical = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
-    let hash = sha2::Sha256::digest(canonical.as_os_str().as_encoded_bytes());
+    // Linked worktrees have different roots but share refs and remote-tracking state. Key the
+    // process lock by Git's common directory so every worktree of one repository serializes those
+    // mutations together.
+    let identity = git_common_dir(repo)
+        .or_else(|| repo.canonicalize().ok())
+        .unwrap_or_else(|| repo.to_path_buf());
+    let hash = sha2::Sha256::digest(identity.as_os_str().as_encoded_bytes());
     let hash_hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
     std::env::temp_dir().join(format!("nitpicker-pr-review-{hash_hex}.lock"))
+}
+
+fn git_common_dir(repo: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let path = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+    let path = if path.is_absolute() {
+        path
+    } else {
+        repo.join(path)
+    };
+    path.canonicalize().ok()
 }
 
 struct PrLock {
@@ -495,15 +519,28 @@ fn build_pr_prompt(
 
 enum PrFlow {
     /// no URL — review current branch against its PR, no checkout needed
-    CurrentBranch,
+    CurrentBranch { repo: PathBuf },
     /// URL points to a PR in the user's own repo and `--clone` was not set
-    InPlace { url: String, pr_number: u32 },
+    InPlace {
+        repo: PathBuf,
+        url: String,
+        pr_number: u32,
+    },
     /// URL points elsewhere, or `--clone` forces a fresh clone
     TempClone {
         url: String,
         slug: String,
         pr_number: u32,
     },
+}
+
+impl PrFlow {
+    fn user_repo(&self) -> Option<&Path> {
+        match self {
+            Self::CurrentBranch { repo } | Self::InPlace { repo, .. } => Some(repo),
+            Self::TempClone { .. } => None,
+        }
+    }
 }
 
 /// Returns the run's degraded flag; the caller maps it to exit code 3 — after this
@@ -785,29 +822,27 @@ struct PreparedPr {
 }
 
 fn prepare_pr(args: &PrArgs, repo_arg: &Path) -> Result<PreparedPr> {
-    let user_repo = repo_arg
+    let repo_arg = repo_arg
         .canonicalize()
         .wrap_err("failed to canonicalize --repo path")?;
-    let user_has_git = user_repo.join(".git").exists();
+    let user_repo = crate::git_worktree_root(&repo_arg);
 
     let flow = match args.url.as_deref() {
-        None => {
-            if !user_has_git {
-                eyre::bail!("--repo must point to a git repository (missing .git)");
-            }
-            PrFlow::CurrentBranch
-        }
+        None => PrFlow::CurrentBranch {
+            repo: user_repo
+                .ok_or_else(|| eyre::eyre!("--repo must point inside a Git worktree"))?,
+        },
         Some(u) => {
             let (slug, pr_number) = parse_pr_url(u)?;
-            let in_place = !args.clone
-                && user_has_git
-                && get_origin_slug(&user_repo).as_deref() == Some(&slug);
-            match in_place {
-                true => PrFlow::InPlace {
+            match user_repo.filter(|repo| {
+                !args.clone && get_origin_slug(repo).as_deref() == Some(slug.as_str())
+            }) {
+                Some(repo) => PrFlow::InPlace {
+                    repo,
                     url: u.to_string(),
                     pr_number,
                 },
-                false => PrFlow::TempClone {
+                None => PrFlow::TempClone {
                     url: u.to_string(),
                     slug,
                     pr_number,
@@ -818,10 +853,7 @@ fn prepare_pr(args: &PrArgs, repo_arg: &Path) -> Result<PreparedPr> {
 
     // Acquire the lock BEFORE any git mutation when we'll touch the user's working tree.
     // Temp clones use a fresh, unique temp dir per process, so concurrent runs don't conflict.
-    let _lock = match &flow {
-        PrFlow::InPlace { .. } | PrFlow::CurrentBranch => Some(PrLock::acquire(&user_repo)?),
-        PrFlow::TempClone { .. } => None,
-    };
+    let _lock = flow.user_repo().map(PrLock::acquire).transpose()?;
 
     let _tmpdir_guard: Option<tempfile::TempDir>;
     // set when we switch branches in the user's own repo; its Drop restores HEAD on the way out
@@ -831,7 +863,11 @@ fn prepare_pr(args: &PrArgs, repo_arg: &Path) -> Result<PreparedPr> {
     // pr number is not part of PrMeta; carry it out of the flow for the json envelope
     let (repo, url_for_gh, meta, pr_number): (PathBuf, Option<String>, PrMeta, Option<u32>) =
         match flow {
-            PrFlow::InPlace { url, pr_number } => {
+            PrFlow::InPlace {
+                repo: user_repo,
+                url,
+                pr_number,
+            } => {
                 // fetch meta first — a failure here leaves the branch untouched
                 let meta = fetch_pr_meta(Some(&url), &user_repo)?;
                 // refresh remote-tracking branches so the diff is computed against an up-to-date base
@@ -884,7 +920,7 @@ fn prepare_pr(args: &PrArgs, repo_arg: &Path) -> Result<PreparedPr> {
                 _restore_guard = None;
                 (path, Some(url), meta, Some(pr_number))
             }
-            PrFlow::CurrentBranch => {
+            PrFlow::CurrentBranch { repo: user_repo } => {
                 let meta = fetch_pr_meta(None, &user_repo)?;
                 // refresh remote-tracking branches so the diff is computed against an up-to-date base
                 refresh_remote_branches(&user_repo)?;
@@ -1056,7 +1092,8 @@ async fn run_review_inner(
 mod tests {
     use super::{
         BranchRestoreGuard, HeadConfig, HeadState, PrComment, choose_repo_config, get_head_state,
-        head_config_state, is_trusted_github_remote, read_base_branch_config, remote_host,
+        head_config_state, is_trusted_github_remote, lock_path, read_base_branch_config,
+        remote_host,
     };
     use std::path::Path;
     use std::process::Command;
@@ -1251,6 +1288,22 @@ mod tests {
                 "one",
             ],
         );
+    }
+
+    #[test]
+    fn linked_worktrees_share_one_pr_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("primary");
+        std::fs::create_dir(&primary).unwrap();
+        init_repo(&primary);
+
+        let linked = dir.path().join("linked");
+        git(
+            &primary,
+            &["worktree", "add", "-b", "feature", linked.to_str().unwrap()],
+        );
+
+        assert_eq!(lock_path(&primary), lock_path(&linked));
     }
 
     /// The guard's Drop is the only thing standing between a panic/early error and the user
