@@ -1,5 +1,5 @@
 use clap::{Args as ClapArgs, Parser, Subcommand};
-use eyre::Result;
+use eyre::{Result, WrapErr};
 use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
 
@@ -226,10 +226,7 @@ async fn main() -> Result<()> {
             rounds,
             max_turns,
         }) => {
-            let repo = args.common.repo.canonicalize()?;
-            if !repo.join(".git").is_dir() {
-                eyre::bail!("--repo must point to a git repository (missing .git)");
-            }
+            let repo = resolve_repo_root(&args.common.repo)?;
             let config = load_resolved_config(args.common.config.as_deref(), &repo).await?;
             let topic = context::append_to_prompt(
                 topic,
@@ -297,7 +294,7 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Command::Reflect { sessions_dir, n }) => {
-            let repo = args.common.repo.canonicalize()?;
+            let repo = resolve_repo_root(&args.common.repo)?;
             let config = load_resolved_config(args.common.config.as_deref(), &repo).await?;
             return reflect::run_reflect(reflect::ReflectArgs {
                 sessions_dir,
@@ -310,10 +307,7 @@ async fn main() -> Result<()> {
         None => {}
     }
 
-    let repo = args.common.repo.canonicalize()?;
-    if !repo.join(".git").is_dir() {
-        eyre::bail!("--repo must point to a git repository (missing .git)");
-    }
+    let repo = resolve_repo_root(&args.common.repo)?;
 
     let mut config = load_config(args.common.config.as_deref(), &repo)?;
     // resolved before free-model resolution: a bad preset name must fail before any
@@ -444,6 +438,30 @@ pub(crate) fn load_config(explicit_path: Option<&Path>, repo: &Path) -> Result<c
     };
     config.validate()?;
     Ok(config)
+}
+
+/// Resolve the worktree containing `path` through Git itself. Linked worktrees and checked-out
+/// submodules represent `.git` as a file, so its filesystem shape is not a repository invariant.
+pub(crate) fn git_worktree_root(path: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let root = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+    root.canonicalize().ok()
+}
+
+fn resolve_repo_root(path: &Path) -> Result<PathBuf> {
+    let canonical = path
+        .canonicalize()
+        .wrap_err("failed to canonicalize --repo path")?;
+    git_worktree_root(&canonical)
+        .ok_or_else(|| eyre::eyre!("--repo must point inside a Git worktree"))
 }
 
 /// The `~/.nitpicker/config.toml` fallback alone — `pr` mode reaches for this directly,
@@ -968,6 +986,51 @@ mod tests {
     fn init_writes_into_the_repo_named_by_the_global_repo_flag() {
         let path = init_config_path(false, Path::new("/some/repo")).unwrap();
         assert_eq!(path, PathBuf::from("/some/repo/nitpicker.toml"));
+    }
+
+    #[test]
+    fn git_discovers_primary_and_linked_worktree_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("primary");
+        std::fs::create_dir(&primary).unwrap();
+        run_git(&primary, &["init", "-b", "main"]).unwrap();
+        run_git(
+            &primary,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+
+        let linked = dir.path().join("linked");
+        run_git(
+            &primary,
+            &["worktree", "add", "-b", "feature", linked.to_str().unwrap()],
+        )
+        .unwrap();
+
+        let primary = primary.canonicalize().unwrap();
+        let linked = linked.canonicalize().unwrap();
+        assert!(primary.join(".git").is_dir());
+        assert!(linked.join(".git").is_file());
+        assert_eq!(git_worktree_root(&primary).as_deref(), Some(&*primary));
+        assert_eq!(git_worktree_root(&linked).as_deref(), Some(&*linked));
+
+        let nested = linked.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        assert_eq!(git_worktree_root(&nested).as_deref(), Some(&*linked));
+
+        let fake = dir.path().join("fake");
+        std::fs::create_dir(&fake).unwrap();
+        std::fs::write(fake.join(".git"), "not a gitdir pointer").unwrap();
+        assert!(git_worktree_root(&fake).is_none());
     }
 
     #[test]
