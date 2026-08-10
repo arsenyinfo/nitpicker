@@ -1052,6 +1052,7 @@ pub(crate) fn provider_http_status(err: &eyre::Report) -> Option<u16> {
     ProviderErrorFacts::from_report(err).and_then(|facts| facts.effective_status())
 }
 
+#[cfg(any(test, feature = "azure"))]
 pub(crate) fn provider_error_has_code(err: &eyre::Report, expected: &[&str]) -> bool {
     ProviderErrorFacts::from_report(err).is_some_and(|facts| facts.has_code(expected))
 }
