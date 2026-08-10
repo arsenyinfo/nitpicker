@@ -159,6 +159,14 @@ impl ProviderType {
 
 impl Config {
     pub fn validate(&self) -> Result<()> {
+        self.validate_structure()?;
+        self.validate_credentials()
+    }
+
+    /// Validate config shape without requiring every configured route to be usable in the current
+    /// environment. Fallback-aware callers use this before client construction, where an unusable
+    /// route can be skipped in favor of the next configured route.
+    pub fn validate_structure(&self) -> Result<()> {
         if self.reviewer.is_empty() {
             eyre::bail!("no reviewers configured");
         }
@@ -184,11 +192,6 @@ impl Config {
             self.aggregator.azure_credentials.as_deref(),
         )?;
 
-        if let Some(env) = required_env_var(ClientSettings::from(&self.aggregator)) {
-            check_env_var(env)
-                .map_err(|_| eyre::eyre!("[aggregator]: env var {env} is not set"))?;
-        }
-
         for reviewer in &self.reviewer {
             let reviewer_label = match reviewer.name.is_empty() {
                 true => "reviewer <unnamed>".to_string(),
@@ -203,11 +206,6 @@ impl Config {
                 reviewer.api_key_env.as_deref(),
                 reviewer.azure_credentials.as_deref(),
             )?;
-            if let Some(env) = required_env_var(ClientSettings::from(reviewer)) {
-                check_env_var(env).map_err(|_| {
-                    eyre::eyre!("reviewer {}: env var {env} is not set", reviewer.name)
-                })?;
-            }
             if reviewer.compact_threshold == Some(0) {
                 eyre::bail!(
                     "reviewer {}: compact_threshold must be greater than 0",
@@ -248,6 +246,23 @@ impl Config {
                 "--alloy requires at least 2 reviewers, found {}",
                 self.reviewer.len()
             );
+        }
+        Ok(())
+    }
+
+    /// Require credentials for every configured route. Non-fallback execution keeps this eager
+    /// check so a pure configuration error fails before any provider request is attempted.
+    pub fn validate_credentials(&self) -> Result<()> {
+        if let Some(env) = required_env_var(ClientSettings::from(&self.aggregator)) {
+            check_env_var(env)
+                .map_err(|_| eyre::eyre!("[aggregator]: env var {env} is not set"))?;
+        }
+        for reviewer in &self.reviewer {
+            if let Some(env) = required_env_var(ClientSettings::from(reviewer)) {
+                check_env_var(env).map_err(|_| {
+                    eyre::eyre!("reviewer {}: env var {env} is not set", reviewer.name)
+                })?;
+            }
         }
         Ok(())
     }
@@ -717,6 +732,19 @@ mod tests {
             azure_credentials: None,
         });
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn structural_validation_defers_missing_route_credentials() {
+        let mut config = config_with(None, None);
+        config.aggregator.auth = None;
+        config.aggregator.api_key_env =
+            Some("NITPICKER_TEST_MISSING_AGGREGATOR_CREDENTIAL_FOR_FALLBACK_7C51".to_string());
+
+        assert!(config.validate_structure().is_ok());
+        let err = config.validate_credentials().unwrap_err();
+        assert!(format!("{err:#}").contains("env var"));
+        assert!(config.validate().is_err());
     }
 
     #[test]

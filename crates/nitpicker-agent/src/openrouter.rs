@@ -440,6 +440,12 @@ fn needs_auto_model(provider: &ProviderType, model: &str) -> bool {
 }
 
 pub async fn resolve_free_models(config: &mut Config) -> Result<()> {
+    resolve_free_models_with_fallback(config, false).await
+}
+
+/// Resolve experimental free routes while allowing fallback execution to leave routes with
+/// missing credentials unresolved. Client construction will report and skip those routes.
+pub async fn resolve_free_models_with_fallback(config: &mut Config, fallback: bool) -> Result<()> {
     for reviewer in &config.reviewer {
         if !needs_auto_model(&reviewer.provider, &reviewer.model) {
             if reviewer.name.is_empty() {
@@ -463,51 +469,82 @@ pub async fn resolve_free_models(config: &mut Config) -> Result<()> {
         .iter()
         .enumerate()
         .filter(|(_, r)| needs_auto_model(&r.provider, &r.model))
-        .map(|(i, _)| i)
-        .collect();
-    let agg_is_free = needs_auto_model(&config.aggregator.provider, &config.aggregator.model);
-
-    let reviewer_count = reviewer_indices.len();
-    if reviewer_count == 0 && !agg_is_free {
-        return Ok(());
-    }
-
-    let slot_api_keys: Vec<String> = reviewer_indices
-        .iter()
-        .map(|&idx| {
-            let key_env = config.reviewer[idx]
+        .filter_map(|(idx, reviewer)| {
+            let key_env = reviewer
                 .api_key_env
                 .as_deref()
                 .unwrap_or(DEFAULT_API_KEY_ENV);
-            std::env::var(key_env).map_err(|_| eyre::eyre!("missing env var {key_env}"))
+            match std::env::var(key_env) {
+                Ok(_) => Some(Ok(idx)),
+                Err(_) if fallback => {
+                    tracing::warn!(
+                        reviewer_index = idx,
+                        env = key_env,
+                        "experimental OpenRouter route unavailable; leaving it for fallback to skip"
+                    );
+                    None
+                }
+                Err(_) => Some(Err(eyre::eyre!("missing env var {key_env}"))),
+            }
         })
         .collect::<Result<Vec<_>>>()?;
-
+    let agg_is_free = needs_auto_model(&config.aggregator.provider, &config.aggregator.model);
     let agg_api_key = if agg_is_free {
         let key_env = config
             .aggregator
             .api_key_env
             .as_deref()
             .unwrap_or(DEFAULT_API_KEY_ENV);
-        std::env::var(key_env).map_err(|_| {
-            eyre::eyre!("missing env var {key_env} (required for experimental openrouter free auto-selection)")
-        })?
+        match std::env::var(key_env) {
+            Ok(key) => Some(key),
+            Err(_) if fallback => {
+                tracing::warn!(
+                    env = key_env,
+                    "experimental OpenRouter aggregator unavailable; leaving it for fallback to skip"
+                );
+                None
+            }
+            Err(_) => {
+                return Err(eyre::eyre!(
+                    "missing env var {key_env} (required for experimental openrouter free auto-selection)"
+                ));
+            }
+        }
     } else {
-        String::new()
+        None
     };
+
+    let reviewer_count = reviewer_indices.len();
+    if reviewer_count == 0 && agg_api_key.is_none() {
+        return Ok(());
+    }
+
+    let slot_api_keys = reviewer_indices
+        .iter()
+        .map(|&idx| {
+            let key_env = config.reviewer[idx]
+                .api_key_env
+                .as_deref()
+                .unwrap_or(DEFAULT_API_KEY_ENV);
+            // Presence was checked while filtering the indices above.
+            std::env::var(key_env).map_err(|_| eyre::eyre!("missing env var {key_env}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let fetch_key = slot_api_keys
         .first()
         .map(String::as_str)
-        .unwrap_or(agg_api_key.as_str());
+        .or(agg_api_key.as_deref())
+        .expect("at least one resolvable free route");
 
     let models = fetch_models(fetch_key, reviewer_count.max(1)).await?;
     let (reviewer_models, remaining_models) =
         select_reviewer_models(&slot_api_keys, models, reviewer_count).await?;
-    let aggregator_model = if agg_is_free {
-        Some(select_aggregator_model(&agg_api_key, &remaining_models, &reviewer_models).await?)
-    } else {
-        None
+    let aggregator_model = match agg_api_key.as_deref() {
+        Some(api_key) => {
+            Some(select_aggregator_model(api_key, &remaining_models, &reviewer_models).await?)
+        }
+        None => None,
     };
     let mut iter = reviewer_models.into_iter();
 
@@ -539,11 +576,61 @@ pub async fn resolve_free_models(config: &mut Config) -> Result<()> {
         config.reviewer[idx].model = model;
     }
 
-    if agg_is_free {
-        let model = aggregator_model.expect("checked above");
+    if let Some(model) = aggregator_model {
         tracing::info!(%model, "resolved experimental openrouter free aggregator model");
         config.aggregator.model = model;
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AggregatorConfig, ReviewerConfig};
+
+    fn unkeyed_free_config() -> Config {
+        let missing = "NITPICKER_TEST_MISSING_OPENROUTER_FALLBACK_KEY_9E42".to_string();
+        Config {
+            defaults: None,
+            aggregator: AggregatorConfig {
+                model: "free".to_string(),
+                provider: ProviderType::OpenRouter,
+                base_url: None,
+                api_key_env: Some(missing.clone()),
+                max_tokens: None,
+                auth: None,
+                azure_scope: None,
+                azure_credentials: None,
+            },
+            reviewer: vec![ReviewerConfig {
+                name: String::new(),
+                model: "free".to_string(),
+                provider: ProviderType::OpenRouter,
+                base_url: None,
+                api_key_env: Some(missing),
+                max_tokens: None,
+                compact_threshold: None,
+                auth: None,
+                azure_scope: None,
+                azure_credentials: None,
+            }],
+            presets: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_leaves_unkeyed_free_routes_for_client_construction_to_skip() {
+        let mut fallback_config = unkeyed_free_config();
+        resolve_free_models_with_fallback(&mut fallback_config, true)
+            .await
+            .unwrap();
+        assert_eq!(fallback_config.aggregator.model, "free");
+        assert_eq!(fallback_config.reviewer[0].model, "free");
+
+        let err = resolve_free_models(&mut unkeyed_free_config())
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("missing env var"));
+    }
 }

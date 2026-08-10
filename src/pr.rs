@@ -597,7 +597,10 @@ async fn run_pr_inner(
         alloy,
         fallback,
     };
-    nitpicker_agent::openrouter::resolve_free_models(&mut config).await?;
+    if !fallback {
+        config.validate_credentials()?;
+    }
+    nitpicker_agent::openrouter::resolve_free_models_with_fallback(&mut config, fallback).await?;
     let config = config;
 
     // `prepared` drops at the end of this scope, after the review completes: HEAD is restored
@@ -656,7 +659,7 @@ fn load_pr_config(explicit: Option<&Path>, prepared: &PreparedPr) -> Result<Conf
         Some(content) => {
             let config: Config = toml::from_str(&content)
                 .map_err(|e| eyre::eyre!("invalid nitpicker.toml on the PR base branch: {e}"))?;
-            config.validate()?;
+            config.validate_structure()?;
             Ok(config)
         }
         None => crate::load_global_config(),

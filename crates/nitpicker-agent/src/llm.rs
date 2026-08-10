@@ -647,6 +647,36 @@ fn requires_tool_call(tool_choice: &Option<ToolChoice>) -> bool {
     )
 }
 
+fn tool_protocol_error(completion: &Completion, response: &CompletionResponse) -> Option<String> {
+    let calls = response.tool_calls();
+    if response.finish_reason == FinishReason::ToolUse {
+        let Some(calls) = calls.as_ref() else {
+            return Some("reported tool use without returning a tool call".to_string());
+        };
+        if let Some(call) = calls.iter().find(|call| {
+            !completion
+                .tools
+                .iter()
+                .any(|tool| tool.name == call.function.name)
+        }) {
+            return Some(format!("called undeclared tool '{}'", call.function.name));
+        }
+        if let Some(ToolChoice::Specific { function_names }) = &completion.tool_choice
+            && let Some(call) = calls
+                .iter()
+                .find(|call| !function_names.contains(&call.function.name))
+        {
+            return Some(format!(
+                "called tool '{}' instead of the specifically requested tool",
+                call.function.name
+            ));
+        }
+    } else if requires_tool_call(&completion.tool_choice) {
+        return Some("returned text instead of the required tool call".to_string());
+    }
+    None
+}
+
 async fn complete_from_slots(
     slots: &[FallbackSlot],
     start_idx: usize,
@@ -680,32 +710,25 @@ async fn complete_from_slots(
         request.max_tokens = slot.max_tokens;
         attempted_models.push(slot.model.clone());
         let err = match slot.client.completion(request).await {
-            Ok(mut response) => match &response.finish_reason {
-                FinishReason::MaxTokens => eyre::eyre!(
-                    "model route '{}' reached its output token limit after {} tokens",
-                    slot.model,
-                    response.usage.output_tokens
-                ),
-                FinishReason::ToolUse if completion.tools.is_empty() => eyre::eyre!(
-                    "model route '{}' returned an unexpected tool call for a no-tools request",
-                    slot.model
-                ),
-                _ if requires_tool_call(&completion.tool_choice)
-                    && response.tool_calls().is_none() =>
-                {
-                    eyre::eyre!(
-                        "model route '{}' returned text instead of the required tool call",
-                        slot.model
-                    )
-                }
-                _ => {
+            Ok(mut response) => {
+                let protocol_error = match &response.finish_reason {
+                    FinishReason::MaxTokens => Some(format!(
+                        "model route '{}' reached its output token limit after {} tokens",
+                        slot.model, response.usage.output_tokens
+                    )),
+                    _ => tool_protocol_error(&completion, &response)
+                        .map(|reason| format!("model route '{}': {reason}", slot.model)),
+                };
+                if let Some(message) = protocol_error {
+                    eyre::eyre!(message)
+                } else {
                     response.selected_model = Some(slot.model.clone());
                     if let Some(index) = sticky_index {
                         index.store(idx, Ordering::Release);
                     }
                     return Ok(response);
                 }
-            },
+            }
             Err(err) => {
                 if is_sticky_fallback_error(&err) {
                     slot.mark_unavailable();
@@ -1598,8 +1621,12 @@ mod tests {
 
     impl LLMClient for ToolUseClient {
         async fn completion(&self, _completion: Completion) -> Result<CompletionResponse> {
+            use rig_core::completion::message::ToolFunction;
             self.calls.fetch_add(1, Ordering::Relaxed);
-            let mut response = response_with(vec![AssistantContent::text("unexpected tool use")]);
+            let mut response = response_with(vec![AssistantContent::ToolCall(ToolCall::new(
+                "call-1".to_string(),
+                ToolFunction::new("allowed".to_string(), serde_json::json!({})),
+            ))]);
             response.finish_reason = FinishReason::ToolUse;
             Ok(response)
         }
@@ -1696,6 +1723,82 @@ mod tests {
 
         assert_eq!(response.selected_model.as_deref(), Some("required-tool"));
         assert_eq!(plain_text_calls.lock().unwrap().len(), 1);
+        assert_eq!(required_tool_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn undeclared_required_tool_call_tries_the_next_route() {
+        let wrong_tool_calls = Arc::new(AtomicUsize::new(0));
+        let wrong_tool = FallbackSlot::new(
+            ToolUseClient {
+                calls: Arc::clone(&wrong_tool_calls),
+            }
+            .into_arc(),
+            "wrong-tool",
+            None,
+        );
+        let required_tool_calls = Arc::new(AtomicUsize::new(0));
+        let required_tool = FallbackSlot::new(
+            RequiredToolClient {
+                calls: Arc::clone(&required_tool_calls),
+            }
+            .into_arc(),
+            "required-tool",
+            None,
+        );
+        let client = PriorityClient::new(vec![wrong_tool, required_tool]).unwrap();
+        let mut completion = test_completion();
+        completion.tools.push(rig_core::completion::ToolDefinition {
+            name: "submit".to_string(),
+            description: "Submit the result".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        });
+        completion.tool_choice = Some(ToolChoice::Required);
+
+        let response = client.completion(completion).await.unwrap();
+
+        assert_eq!(response.selected_model.as_deref(), Some("required-tool"));
+        assert_eq!(wrong_tool_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(required_tool_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn specifically_disallowed_tool_call_tries_the_next_route() {
+        let wrong_tool_calls = Arc::new(AtomicUsize::new(0));
+        let wrong_tool = FallbackSlot::new(
+            ToolUseClient {
+                calls: Arc::clone(&wrong_tool_calls),
+            }
+            .into_arc(),
+            "wrong-tool",
+            None,
+        );
+        let required_tool_calls = Arc::new(AtomicUsize::new(0));
+        let required_tool = FallbackSlot::new(
+            RequiredToolClient {
+                calls: Arc::clone(&required_tool_calls),
+            }
+            .into_arc(),
+            "required-tool",
+            None,
+        );
+        let client = PriorityClient::new(vec![wrong_tool, required_tool]).unwrap();
+        let mut completion = test_completion();
+        for name in ["allowed", "submit"] {
+            completion.tools.push(rig_core::completion::ToolDefinition {
+                name: name.to_string(),
+                description: "A declared tool".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            });
+        }
+        completion.tool_choice = Some(ToolChoice::Specific {
+            function_names: vec!["submit".to_string()],
+        });
+
+        let response = client.completion(completion).await.unwrap();
+
+        assert_eq!(response.selected_model.as_deref(), Some("required-tool"));
+        assert_eq!(wrong_tool_calls.load(Ordering::Relaxed), 1);
         assert_eq!(required_tool_calls.load(Ordering::Relaxed), 1);
     }
 

@@ -414,8 +414,8 @@ pub struct DebateOutcome {
     pub report: String,
     pub transcript_path: std::path::PathBuf,
     pub usage: UsageReport,
-    /// At least one turn failed or fell back to raw text; the report is synthesized from a
-    /// partial dialogue. Surfaced as exit code 3 in the default-review/`ask`/`pr` CLI arms.
+    /// At least one turn failed; the report is synthesized from a partial dialogue. Surfaced as
+    /// exit code 3 in the default-review/`ask`/`pr` CLI arms.
     pub degraded: bool,
     /// Per-preset lane counts in resolution order (attempted is always 1 — one lane per
     /// preset), matching the parallel path's per-job shape. `None` for Ask.
@@ -1277,8 +1277,8 @@ mod tests {
         open.final_round = 2;
         assert!(lane_sections(&[&open]).contains("ROUND-ONE-CLAIM"));
 
-        // a lane degraded in round 1 (e.g. a no-verdict fallback) that converges in round 2
-        // broke the verdict protocol once already — its full trail must reach the meta
+        // a lane with a failed turn in round 1 that converges in round 2 still has partial
+        // evidence — its full trail must reach the meta-reviewer
         let mut converged_degraded = lane(Some("security"), verdicts);
         converged_degraded.converged = true;
         converged_degraded.degraded = true;

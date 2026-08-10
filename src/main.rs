@@ -254,7 +254,10 @@ async fn main() -> Result<()> {
             // CLI-only routing validation must precede free-model smoke completions.
             let (use_alloy, use_fallback) =
                 resolve_routing_modes(&config, alloy, args.common.fallback)?;
-            openrouter::resolve_free_models(&mut config).await?;
+            if !use_fallback {
+                config.validate_credentials()?;
+            }
+            openrouter::resolve_free_models_with_fallback(&mut config, use_fallback).await?;
             let config = config;
             let topic = context::append_to_prompt(
                 topic,
@@ -343,7 +346,10 @@ async fn main() -> Result<()> {
     let presets = presets::resolve(&args.presets.preset, &config)?;
     let (use_alloy, use_fallback) =
         resolve_routing_modes(&config, args.alloy, args.common.fallback)?;
-    openrouter::resolve_free_models(&mut config).await?;
+    if !use_fallback {
+        config.validate_credentials()?;
+    }
+    openrouter::resolve_free_models_with_fallback(&mut config, use_fallback).await?;
     let config = config;
     let max_turns = config.max_turns(args.max_turns)?;
 
@@ -430,7 +436,7 @@ async fn main() -> Result<()> {
 
 /// Exit-code contract for the default-review, `ask`, and `pr` arms: 0 = clean verdict,
 /// 1 = hard failure (no verdict), 3 = degraded verdict (report printed, but at least one
-/// reviewer or debate turn failed or fell back). 2 is deliberately unused — clap exits 2
+/// reviewer or debate turn failed). 2 is deliberately unused — clap exits 2
 /// on usage errors, and the whole point is an unambiguous subprocess signal.
 /// In `pr --json` the envelope (carrying `degraded: true`) is emitted and flushed first,
 /// and `run_pr` returns before this runs, so its checkout-restore guards have dropped.
@@ -447,9 +453,7 @@ fn exit_if_degraded(degraded: bool) {
             std::process::exit(1);
         }
     }
-    eprintln!(
-        "warning: degraded verdict — a reviewer or debate turn failed or ended without submit_verdict (exit code 3)"
-    );
+    eprintln!("warning: degraded verdict — a reviewer or debate turn failed (exit code 3)");
     std::process::exit(3);
 }
 
@@ -466,7 +470,7 @@ pub(crate) fn load_config(explicit_path: Option<&Path>, repo: &Path) -> Result<c
     } else {
         return load_global_config();
     };
-    config.validate()?;
+    config.validate_structure()?;
     Ok(config)
 }
 
@@ -507,7 +511,7 @@ pub(crate) fn load_global_config() -> Result<config::Config> {
         .map_err(|e| eyre::eyre!("failed to read config {:?}: {e}", path))?;
     let config: config::Config =
         toml::from_str(&content).map_err(|e| eyre::eyre!("invalid config: {e}"))?;
-    config.validate()?;
+    config.validate_structure()?;
     Ok(config)
 }
 
@@ -516,6 +520,7 @@ pub(crate) async fn load_resolved_config(
     repo: &Path,
 ) -> Result<config::Config> {
     let mut config = load_config(explicit_path, repo)?;
+    config.validate_credentials()?;
     openrouter::resolve_free_models(&mut config).await?;
     Ok(config)
 }

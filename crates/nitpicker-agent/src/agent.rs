@@ -726,9 +726,6 @@ pub async fn run_agent(
                 prompt = nudge;
                 continue;
             }
-            if config.depth.is_subagent() {
-                eyre::bail!("subagent returned text without calling finish")
-            }
             info!(
                 agent = %config.name,
                 turn,
