@@ -185,6 +185,13 @@ pub(crate) fn validate_synthesis_response(response: &CompletionResponse, role: &
     }
 }
 
+pub(crate) fn synthesis_model(response: &CompletionResponse, configured_model: &str) -> String {
+    response
+        .selected_model
+        .clone()
+        .unwrap_or_else(|| configured_model.to_string())
+}
+
 pub async fn run_review(
     repo: &Path,
     user_prompt: &str,
@@ -465,7 +472,7 @@ pub async fn run_review(
     pb_agg.enable_steady_tick(Duration::from_millis(80));
 
     let agg = &config.aggregator;
-    let synthesis: Result<String> = async {
+    let synthesis: Result<(String, String)> = async {
         let client = aggregator_client(
             config,
             &gemini_proxy,
@@ -503,7 +510,8 @@ pub async fn run_review(
                 None => err,
             })?;
         usage.add(response.usage, 0);
-        Ok(response.text())
+        let model = synthesis_model(&response, &agg.model);
+        Ok((response.text(), model))
     }
     .await;
     pb_agg.set_style(done_style);
@@ -511,10 +519,10 @@ pub async fn run_review(
     // list is the durable record of what ran, and losing it because the aggregator died
     // is exactly when a post-mortem needs it. The record carries `error` and an empty
     // `text` so consumers (reflect) don't render it as a verdict.
-    let text = match synthesis {
-        Ok(text) => {
+    let (text, aggregation_model) = match synthesis {
+        Ok(result) => {
             pb_agg.finish_with_message("✓ done");
-            text
+            result
         }
         Err(err) => {
             pb_agg.finish_with_message(crate::progress::bar_message("✗ synthesis failed"));
@@ -544,7 +552,7 @@ pub async fn run_review(
         logger
             .write_aggregation(&AggregationRecord {
                 kind: "aggregation".to_string(),
-                model: agg.model.clone(),
+                model: aggregation_model,
                 text: text.clone(),
                 error: None,
                 rounds: None,
@@ -854,6 +862,14 @@ mod tests {
 
         let complete = synthesis_response(FinishReason::Stop);
         assert!(validate_synthesis_response(&complete, "aggregator").is_ok());
+        assert_eq!(synthesis_model(&complete, "configured"), "fallback-model");
+
+        let mut without_selected_model = complete;
+        without_selected_model.selected_model = None;
+        assert_eq!(
+            synthesis_model(&without_selected_model, "configured"),
+            "configured"
+        );
     }
 
     /// Two unnamed (or same-named) reviewers must still get distinct trajectory identities —

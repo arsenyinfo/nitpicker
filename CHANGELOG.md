@@ -6,6 +6,18 @@ Notable user-visible changes are recorded here. The format follows
 
 ## [Unreleased]
 
+`nitpicker-agent` 0.4.0
+
+### Added
+
+- Add opt-in ordered reviewer fallback with `fallback = true` or `--fallback`, including
+  fallback-capable Alloy routing and aggregator synthesis.
+
+### Changed
+
+- **Breaking (`nitpicker-agent`)**: `DefaultsConfig` adds `fallback: Option<bool>`; downstream
+  struct literals must set `fallback: None` when fallback is not configured.
+
 ### Fixed
 
 - Resolve `--repo` through Git so linked worktrees and paths inside a worktree are supported.

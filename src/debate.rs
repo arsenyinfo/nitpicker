@@ -912,10 +912,11 @@ pub async fn run_debate(
     };
     usage.add(meta_response.usage, 0);
     let meta_text = meta_response.text();
+    let meta_model = crate::review::synthesis_model(&meta_response, &agg_cfg.model);
     if let Some(logger) = &session_logger {
         let record = AggregationRecord {
             kind: "aggregation".to_string(),
-            model: agg_cfg.model.clone(),
+            model: meta_model.clone(),
             text: meta_text.clone(),
             error: None,
             rounds,
@@ -956,7 +957,7 @@ pub async fn run_debate(
                     **Rounds:** {}\n\n---\n\n",
                     actor_label.full,
                     critic_label.full,
-                    agg_cfg.model,
+                    meta_model,
                     now.format("%Y-%m-%d %H:%M:%S"),
                     lane.final_round,
                 );
@@ -976,7 +977,7 @@ pub async fn run_debate(
                     **Lanes:** {}\n\n---\n\n",
                     actor_label.full,
                     critic_label.full,
-                    agg_cfg.model,
+                    meta_model,
                     now.format("%Y-%m-%d %H:%M:%S"),
                     lanes.len(),
                 );

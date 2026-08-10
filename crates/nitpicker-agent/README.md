@@ -59,6 +59,9 @@ See `examples/file_agent.rs` for a runnable version.
 
 ## Breaking changes
 
+**0.4.0**
+- Added `fallback: Option<bool>` to `DefaultsConfig` — source-breaking for code constructing the struct with literals (add `fallback: None`).
+
 **0.3.0**
 - Added `presets: Option<BTreeMap<String, PresetConfig>>` to `Config` and `presets: Option<Vec<String>>` to `DefaultsConfig` — source-breaking for code constructing these structs with literals (add `presets: None`). New `PresetConfig` type.
 - Added `presets`/`lanes`/`jobs`/`error` optional fields to `AggregationRecord` and `model` to `ToolCallRecord` (same literal-construction caveat), plus the new `LaneRecord`/`JobRecord` types. An `error`-flagged aggregation record means synthesis failed post-collection — consumers must not render its `text` as a verdict.

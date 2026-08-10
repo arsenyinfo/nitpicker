@@ -602,9 +602,21 @@ impl AlloyClient {
         Ok(Self { slots, fallback })
     }
 
-    fn pick_idx(&self) -> usize {
+    fn available_indices(&self) -> Vec<usize> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| slot.is_available().then_some(index))
+            .collect()
+    }
+
+    fn pick_idx(&self) -> Option<usize> {
         use rand::RngExt;
-        rand::rng().random_range(0..self.slots.len())
+        let available = self.available_indices();
+        if available.is_empty() {
+            return None;
+        }
+        Some(available[rand::rng().random_range(0..available.len())])
     }
 }
 
@@ -613,13 +625,18 @@ impl LLMClientDyn for AlloyClient {
         &self,
         completion: Completion,
     ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse>> + Send + '_>> {
-        Box::pin(complete_from_slots(
-            &self.slots,
-            self.pick_idx(),
-            self.fallback,
-            completion,
-            None,
-        ))
+        match self.pick_idx() {
+            Some(start_idx) => Box::pin(complete_from_slots(
+                &self.slots,
+                start_idx,
+                self.fallback,
+                completion,
+                None,
+            )),
+            None => Box::pin(async {
+                eyre::bail!("all configured model routes are unavailable for this run")
+            }),
+        }
     }
 }
 
@@ -656,18 +673,24 @@ async fn complete_from_slots(
         request.max_tokens = slot.max_tokens;
         attempted_models.push(slot.model.clone());
         let err = match slot.client.completion(request).await {
-            Ok(mut response) if response.finish_reason != FinishReason::MaxTokens => {
-                response.selected_model = Some(slot.model.clone());
-                if let Some(index) = sticky_index {
-                    index.store(idx, Ordering::Release);
+            Ok(mut response) => match &response.finish_reason {
+                FinishReason::MaxTokens => eyre::eyre!(
+                    "model route '{}' reached its output token limit after {} tokens",
+                    slot.model,
+                    response.usage.output_tokens
+                ),
+                FinishReason::ToolUse if completion.tools.is_empty() => eyre::eyre!(
+                    "model route '{}' returned an unexpected tool call for a no-tools request",
+                    slot.model
+                ),
+                _ => {
+                    response.selected_model = Some(slot.model.clone());
+                    if let Some(index) = sticky_index {
+                        index.store(idx, Ordering::Release);
+                    }
+                    return Ok(response);
                 }
-                return Ok(response);
-            }
-            Ok(response) => eyre::eyre!(
-                "model route '{}' reached its output token limit after {} tokens",
-                slot.model,
-                response.usage.output_tokens
-            ),
+            },
             Err(err) => {
                 if is_sticky_fallback_error(&err) {
                     slot.mark_unavailable();
@@ -932,7 +955,11 @@ fn is_rate_limit_error(err: &eyre::Report) -> bool {
     // Same reasoning as `is_non_retryable_client_error`: walk the full chain so a 429 carried in a
     // wrapped `ProviderError` body still maps to the rate-limit backoff policy. Permanent quota
     // types are excluded first because retrying them only burns the full rate-limit retry budget.
-    let msg = format!("{err:#}").to_ascii_lowercase();
+    let msg = format!("{err:#}");
+    if mentions_server_error_status(&msg) {
+        return false;
+    }
+    let msg = msg.to_ascii_lowercase();
     if PERMANENT_QUOTA_ERROR_TYPES.iter().any(|t| msg.contains(t)) {
         return false;
     }
@@ -1550,6 +1577,68 @@ mod tests {
         assert_eq!(healthy_calls.lock().unwrap().len(), 1);
     }
 
+    struct ToolUseClient {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl LLMClient for ToolUseClient {
+        async fn completion(&self, _completion: Completion) -> Result<CompletionResponse> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let mut response = response_with(vec![AssistantContent::text("unexpected tool use")]);
+            response.finish_reason = FinishReason::ToolUse;
+            Ok(response)
+        }
+    }
+
+    #[tokio::test]
+    async fn priority_client_retries_unexpected_tool_use_for_no_tools_request() {
+        let tool_use_calls = Arc::new(AtomicUsize::new(0));
+        let tool_use = FallbackSlot::new(
+            ToolUseClient {
+                calls: Arc::clone(&tool_use_calls),
+            }
+            .into_arc(),
+            "tool-use",
+            None,
+        );
+        let (healthy, healthy_calls) = recording_slot("healthy", None, false);
+        let client = PriorityClient::new(vec![tool_use, healthy]).unwrap();
+
+        let response = client.completion(test_completion()).await.unwrap();
+
+        assert_eq!(response.selected_model.as_deref(), Some("healthy"));
+        assert_eq!(tool_use_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(healthy_calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn priority_client_accepts_tool_use_when_tools_were_declared() {
+        let tool_use_calls = Arc::new(AtomicUsize::new(0));
+        let tool_use = FallbackSlot::new(
+            ToolUseClient {
+                calls: Arc::clone(&tool_use_calls),
+            }
+            .into_arc(),
+            "tool-use",
+            None,
+        );
+        let (unused, unused_calls) = recording_slot("unused", None, false);
+        let client = PriorityClient::new(vec![tool_use, unused]).unwrap();
+        let mut completion = test_completion();
+        completion.tools.push(rig_core::completion::ToolDefinition {
+            name: "allowed".to_string(),
+            description: "An allowed tool".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        });
+
+        let response = client.completion(completion).await.unwrap();
+
+        assert_eq!(response.finish_reason, FinishReason::ToolUse);
+        assert_eq!(response.selected_model.as_deref(), Some("tool-use"));
+        assert_eq!(tool_use_calls.load(Ordering::Relaxed), 1);
+        assert!(unused_calls.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn priority_client_reports_when_every_route_is_unavailable() {
         let (slot, calls) = recording_slot("unavailable", None, false);
@@ -1591,6 +1680,21 @@ mod tests {
         for _ in 0..32 {
             let response = client.completion(test_completion()).await.unwrap();
             assert_eq!(response.selected_model.as_deref(), Some("healthy"));
+        }
+    }
+
+    #[test]
+    fn alloy_random_start_excludes_unavailable_routes() {
+        let (unavailable, _) = recording_slot("unavailable", None, false);
+        unavailable.mark_unavailable();
+        let (first, _) = recording_slot("first", None, false);
+        let (second, _) = recording_slot("second", None, false);
+        let client =
+            AlloyClient::new_with_fallback_routes(vec![unavailable, first, second]).unwrap();
+
+        assert_eq!(client.available_indices(), vec![1, 2]);
+        for _ in 0..32 {
+            assert!(matches!(client.pick_idx(), Some(1 | 2)));
         }
     }
 
@@ -2002,6 +2106,12 @@ mod tests {
     }
 
     #[test]
+    fn response_text_collapses_whitespace_only_content_to_empty() {
+        let response = response_with(vec![AssistantContent::text(" \n\t ")]);
+        assert!(response.text().is_empty());
+    }
+
+    #[test]
     fn strips_nested_think_blocks() {
         // a single non-greedy regex stops at the first </think> and leaks the tail; the
         // depth-tracking scanner must drop the whole balanced span.
@@ -2085,6 +2195,11 @@ mod tests {
         ] {
             let body = format!(r#"{{"statusCode":502,"upstream":{nested}}}"#);
             let err = wrapped_provider_error(&body);
+            assert!(!is_rate_limit_error(&err), "{nested}");
+            let policy = retry_policy(&err);
+            assert!(policy.retry, "{nested}");
+            assert_eq!(policy.max_attempts, MAX_COMPLETION_ATTEMPTS, "{nested}");
+            assert_eq!(policy.base_backoff_ms, BASE_BACKOFF_MS, "{nested}");
             assert!(!is_sticky_fallback_error(&err), "{nested}");
         }
     }
