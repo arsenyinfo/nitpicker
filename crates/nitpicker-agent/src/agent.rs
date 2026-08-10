@@ -863,7 +863,13 @@ fn prepare_subagent(
             .clone()
             .unwrap_or_else(|| subagent_system_prompt().to_string()),
         subagent_system_prompt: parent_config.subagent_system_prompt.clone(),
-        client: Arc::clone(&parent_config.client),
+        // A subagent has a different prompt and conversation, so its request-specific failover
+        // must not rewrite the parent's sticky active route. Stateless clients remain shared;
+        // fallback clients fork only their active index while sharing route availability.
+        client: parent_config
+            .client
+            .fork_for_agent()
+            .unwrap_or_else(|| Arc::clone(&parent_config.client)),
         depth: AgentDepth::Subagent {
             level: subagent_level,
         },

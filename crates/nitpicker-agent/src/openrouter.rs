@@ -426,11 +426,20 @@ async fn select_aggregator_model(
     api_key: &str,
     candidates: &[(String, u64)],
     reviewer_models: &[(String, u64)],
+    proven_reviewer_model: Option<&str>,
 ) -> Result<String> {
     let passing = probe_candidates(api_key, candidates, "aggregator_probe", 1).await;
 
     if let Some(&idx) = passing.first() {
         return Ok(candidates[idx].0.clone());
+    }
+
+    if let Some(model) = proven_reviewer_model {
+        tracing::info!(
+            %model,
+            "reusing reviewer model already smoke-tested with the aggregator credential"
+        );
+        return Ok(model.to_string());
     }
 
     // Reusing a reviewer model is safe only after proving that the aggregator's own key can call
@@ -452,6 +461,23 @@ async fn select_aggregator_model(
     )
 }
 
+fn reviewer_model_proven_for_key<'a>(
+    api_key: &str,
+    reviewer_routes: &[(usize, String)],
+    reviewer_models: &'a [Option<(String, u64)>],
+) -> Option<&'a str> {
+    reviewer_routes
+        .iter()
+        .zip(reviewer_models)
+        .find_map(|((_, reviewer_key), selected)| {
+            if reviewer_key == api_key {
+                selected.as_ref().map(|(model, _)| model.as_str())
+            } else {
+                None
+            }
+        })
+}
+
 fn needs_auto_model(provider: &ProviderType, model: &str) -> bool {
     matches!(provider, ProviderType::OpenRouter) && (model.is_empty() || model == "free")
 }
@@ -470,16 +496,25 @@ pub async fn resolve_free_models(config: &mut Config) -> Result<()> {
 /// catalog failures, and failed smoke tests leave only the affected auto-routes unresolved, and
 /// client-pool construction reports and skips them. Strict execution preserves fail-fast behavior.
 pub async fn resolve_free_models_with_fallback(config: &mut Config, fallback: bool) -> Result<()> {
-    for reviewer in &config.reviewer {
-        if !needs_auto_model(&reviewer.provider, &reviewer.model) {
+    let mut auto_ordinal = 0;
+    for reviewer in &mut config.reviewer {
+        if needs_auto_model(&reviewer.provider, &reviewer.model) {
+            // Identity belongs to the configured logical reviewer, not to successful route
+            // resolution. Assign it before any best-effort filtering so a job that runs through a
+            // fallback route still has stable attribution.
             if reviewer.name.is_empty() {
-                eyre::bail!(
-                    "reviewer must specify a name (omit model or set model = \"free\" on openrouter for experimental auto-assignment)"
-                );
+                reviewer.name = format!("free_{auto_ordinal}");
             }
-            if reviewer.model.is_empty() {
-                eyre::bail!("reviewer '{}' must specify a model", reviewer.name);
-            }
+            auto_ordinal += 1;
+            continue;
+        }
+        if reviewer.name.is_empty() {
+            eyre::bail!(
+                "reviewer must specify a name (omit model or set model = \"free\" on openrouter for experimental auto-assignment)"
+            );
+        }
+        if reviewer.model.is_empty() {
+            eyre::bail!("reviewer '{}' must specify a model", reviewer.name);
         }
     }
     if !needs_auto_model(&config.aggregator.provider, &config.aggregator.model)
@@ -584,14 +619,22 @@ pub async fn resolve_free_models_with_fallback(config: &mut Config, fallback: bo
     };
     let (reviewer_models, remaining_models) =
         select_reviewer_models(&reviewer_routes, models, fallback).await?;
+    let proven_aggregator_model = agg_api_key.as_deref().and_then(|api_key| {
+        reviewer_model_proven_for_key(api_key, &reviewer_routes, &reviewer_models)
+    });
     let resolved_reviewer_models = reviewer_models
         .iter()
         .filter_map(Clone::clone)
         .collect::<Vec<_>>();
     let aggregator_model = match agg_api_key.as_deref() {
         Some(api_key) => {
-            match select_aggregator_model(api_key, &remaining_models, &resolved_reviewer_models)
-                .await
+            match select_aggregator_model(
+                api_key,
+                &remaining_models,
+                &resolved_reviewer_models,
+                proven_aggregator_model,
+            )
+            .await
             {
                 Ok(model) => Some(model),
                 Err(err) if fallback => {
@@ -607,14 +650,10 @@ pub async fn resolve_free_models_with_fallback(config: &mut Config, fallback: bo
         None => None,
     };
 
-    for (slot, ((idx, _), selected)) in reviewer_routes.into_iter().zip(reviewer_models).enumerate()
-    {
+    for ((idx, _), selected) in reviewer_routes.into_iter().zip(reviewer_models) {
         let Some((model, context_length)) = selected else {
             continue;
         };
-        if config.reviewer[idx].name.is_empty() {
-            config.reviewer[idx].name = format!("free_{slot}");
-        }
         let model_threshold = context_length.saturating_sub(COMPACT_HEADROOM);
         let configured = config.reviewer[idx]
             .compact_threshold
@@ -689,11 +728,36 @@ mod tests {
             .unwrap();
         assert_eq!(fallback_config.aggregator.model, "free");
         assert_eq!(fallback_config.reviewer[0].model, "free");
+        assert_eq!(fallback_config.reviewer[0].name, "free_0");
 
         let err = resolve_free_models(&mut unkeyed_free_config())
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("missing env var"));
+    }
+
+    #[tokio::test]
+    async fn unresolved_free_reviewers_receive_stable_config_order_names() {
+        let mut config = unkeyed_free_config();
+        config.reviewer.push(ReviewerConfig {
+            name: String::new(),
+            model: "free".to_string(),
+            provider: ProviderType::OpenRouter,
+            base_url: None,
+            api_key_env: config.reviewer[0].api_key_env.clone(),
+            max_tokens: None,
+            compact_threshold: None,
+            auth: None,
+            azure_scope: None,
+            azure_credentials: None,
+        });
+
+        resolve_free_models_with_fallback(&mut config, true)
+            .await
+            .unwrap();
+
+        assert_eq!(config.reviewer[0].name, "free_0");
+        assert_eq!(config.reviewer[1].name, "free_1");
     }
 
     #[test]
@@ -705,5 +769,27 @@ mod tests {
             "openai/gpt-oss-120b:free"
         ));
         assert!(!is_unresolved_free_route(&ProviderType::OpenAi, "free"));
+    }
+
+    #[test]
+    fn aggregator_reuses_reviewer_probe_evidence_only_for_the_same_key() {
+        let routes = vec![(0, "shared-key".to_string()), (1, "other-key".to_string())];
+        let models = vec![
+            Some(("reviewer-a".to_string(), 128_000)),
+            Some(("reviewer-b".to_string(), 128_000)),
+        ];
+
+        assert_eq!(
+            reviewer_model_proven_for_key("shared-key", &routes, &models),
+            Some("reviewer-a")
+        );
+        assert_eq!(
+            reviewer_model_proven_for_key("other-key", &routes, &models),
+            Some("reviewer-b")
+        );
+        assert_eq!(
+            reviewer_model_proven_for_key("unprobed-key", &routes, &models),
+            None
+        );
     }
 }

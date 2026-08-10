@@ -26,8 +26,11 @@ Notable user-visible changes are recorded here. The format follows
   debate-turn failures into one concise operational warning.
 - Keep fallback stickiness local to each independent debate lane while sharing run-wide route
   availability, so one lane's request-specific failover cannot reroute another lane.
+- Give spawned subagents independent sticky fallback state while preserving shared route
+  availability, so child prompts cannot reroute their parent or siblings.
 - In fallback mode, skip experimental OpenRouter free routes whose catalog lookup or smoke test
-  fails, while continuing with healthy fixed or auto-resolved routes.
+  fails, while continuing with healthy fixed or auto-resolved routes; unresolved logical reviewers
+  retain stable generated names, and same-key aggregator selection reuses reviewer smoke tests.
 - Resolve `--repo` through Git so linked worktrees and paths inside a worktree are supported.
 
 ## [0.9.1] - 2026-08-09

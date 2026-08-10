@@ -386,6 +386,13 @@ pub trait LLMClientDyn: Send + Sync {
         &self,
         completion: Completion,
     ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse>> + Send + '_>>;
+
+    /// Fork mutable routing state for an independently progressing agent while retaining shared
+    /// provider clients and run-wide route availability. Stateless clients return `None` and may
+    /// safely be shared by `Arc`.
+    fn fork_for_agent(&self) -> Option<Arc<dyn LLMClientDyn>> {
+        None
+    }
 }
 
 impl<T: LLMClient> LLMClientDyn for T {
@@ -575,6 +582,13 @@ impl LLMClientDyn for PriorityClient {
             completion,
             Some(&self.active_idx),
         ))
+    }
+
+    fn fork_for_agent(&self) -> Option<Arc<dyn LLMClientDyn>> {
+        Some(Arc::new(Self {
+            slots: self.slots.clone(),
+            active_idx: AtomicUsize::new(self.active_idx.load(Ordering::Acquire)),
+        }))
     }
 }
 
@@ -1612,6 +1626,58 @@ mod tests {
         assert_eq!(healthy_calls.lock().unwrap().len(), 3);
     }
 
+    struct FailOnCallClient {
+        calls: Arc<AtomicUsize>,
+        fail_on: usize,
+    }
+
+    impl LLMClient for FailOnCallClient {
+        async fn completion(&self, _completion: Completion) -> Result<CompletionResponse> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+            if call == self.fail_on {
+                eyre::bail!("request-specific route failure")
+            }
+            Ok(response_with(vec![AssistantContent::text("ok")]))
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_fork_inherits_but_cannot_overwrite_parent_stickiness() {
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let first = FallbackSlot::new(
+            FailOnCallClient {
+                calls: Arc::clone(&first_calls),
+                fail_on: 1,
+            }
+            .into_arc(),
+            "first",
+            None,
+        );
+        let second = FallbackSlot::new(
+            FailOnCallClient {
+                calls: Arc::clone(&second_calls),
+                fail_on: 2,
+            }
+            .into_arc(),
+            "second",
+            None,
+        );
+        let parent = PriorityClient::new(vec![first, second]).unwrap();
+
+        // The parent fails over to `second`; the fork inherits that route, then independently
+        // wraps back to `first` when its own request fails there.
+        parent.completion(test_completion()).await.unwrap();
+        let fork = parent.fork_for_agent().expect("priority clients can fork");
+        fork.completion(test_completion()).await.unwrap();
+        parent.completion(test_completion()).await.unwrap();
+
+        // The parent's final turn still starts on `second`. A shared active index would have made
+        // it start on `first`, while a fork reset to zero would have skipped `second` initially.
+        assert_eq!(first_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(second_calls.load(Ordering::Relaxed), 3);
+    }
+
     #[tokio::test]
     async fn priority_client_wraps_through_declaration_order() {
         let (first, first_calls) = recording_slot("first", None, false);
@@ -1921,7 +1987,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quota_failure_is_shared_across_priority_clients_for_the_run() {
+    async fn quota_failure_is_shared_across_agent_forks_for_the_run() {
         let quota_calls = Arc::new(AtomicUsize::new(0));
         let quota = FallbackSlot::new(
             QuotaClient {
@@ -1932,8 +1998,8 @@ mod tests {
             None,
         );
         let (healthy, _) = recording_slot("healthy", None, false);
-        let first = PriorityClient::new(vec![quota.clone(), healthy.clone()]).unwrap();
-        let second = PriorityClient::new(vec![quota, healthy]).unwrap();
+        let first = PriorityClient::new(vec![quota, healthy]).unwrap();
+        let second = first.fork_for_agent().expect("priority clients can fork");
 
         first.completion(test_completion()).await.unwrap();
         second.completion(test_completion()).await.unwrap();
