@@ -404,7 +404,7 @@ With `--verbose`, the transcript is saved to `{tempdir}/debate-{timestamp}.md` (
 | 0 | clean verdict |
 | 1 | hard failure — no verdict (bad config, missing key, every reviewer/turn failed) |
 | 2 | CLI usage error (clap's exit code for bad arguments) |
-| 3 | degraded verdict — report printed, but a reviewer failed, or a debate turn failed or ended without calling `submit_verdict` |
+| 3 | degraded verdict — report printed, but a reviewer or debate turn failed |
 
 Non-interactive, non-verbose stdout carries exactly the final report, so the binary can be driven as a subprocess: read stdout for the verdict, branch on the exit code. `pr` follows the same codes; in `--json` mode the envelope (`status: ok|error`, with `degraded: true` on an exit-3 run) is emitted and flushed before the exit.
 

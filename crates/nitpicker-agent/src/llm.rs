@@ -640,6 +640,13 @@ impl LLMClientDyn for AlloyClient {
     }
 }
 
+fn requires_tool_call(tool_choice: &Option<ToolChoice>) -> bool {
+    matches!(
+        tool_choice.as_ref(),
+        Some(ToolChoice::Required | ToolChoice::Specific { .. })
+    )
+}
+
 async fn complete_from_slots(
     slots: &[FallbackSlot],
     start_idx: usize,
@@ -683,6 +690,14 @@ async fn complete_from_slots(
                     "model route '{}' returned an unexpected tool call for a no-tools request",
                     slot.model
                 ),
+                _ if requires_tool_call(&completion.tool_choice)
+                    && response.tool_calls().is_none() =>
+                {
+                    eyre::eyre!(
+                        "model route '{}' returned text instead of the required tool call",
+                        slot.model
+                    )
+                }
                 _ => {
                     response.selected_model = Some(slot.model.clone());
                     if let Some(index) = sticky_index {
@@ -1590,6 +1605,23 @@ mod tests {
         }
     }
 
+    struct RequiredToolClient {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl LLMClient for RequiredToolClient {
+        async fn completion(&self, _completion: Completion) -> Result<CompletionResponse> {
+            use rig_core::completion::message::ToolFunction;
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let mut response = response_with(vec![AssistantContent::ToolCall(ToolCall::new(
+                "call-1".to_string(),
+                ToolFunction::new("submit".to_string(), serde_json::json!({})),
+            ))]);
+            response.finish_reason = FinishReason::ToolUse;
+            Ok(response)
+        }
+    }
+
     #[tokio::test]
     async fn priority_client_retries_unexpected_tool_use_for_no_tools_request() {
         let tool_use_calls = Arc::new(AtomicUsize::new(0));
@@ -1637,6 +1669,34 @@ mod tests {
         assert_eq!(response.selected_model.as_deref(), Some("tool-use"));
         assert_eq!(tool_use_calls.load(Ordering::Relaxed), 1);
         assert!(unused_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn required_tool_protocol_failure_tries_the_next_route() {
+        let (plain_text, plain_text_calls) = recording_slot("plain-text", None, false);
+        let required_tool_calls = Arc::new(AtomicUsize::new(0));
+        let required_tool = FallbackSlot::new(
+            RequiredToolClient {
+                calls: Arc::clone(&required_tool_calls),
+            }
+            .into_arc(),
+            "required-tool",
+            None,
+        );
+        let client = PriorityClient::new(vec![plain_text, required_tool]).unwrap();
+        let mut completion = test_completion();
+        completion.tools.push(rig_core::completion::ToolDefinition {
+            name: "submit".to_string(),
+            description: "Submit the result".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        });
+        completion.tool_choice = Some(ToolChoice::Required);
+
+        let response = client.completion(completion).await.unwrap();
+
+        assert_eq!(response.selected_model.as_deref(), Some("required-tool"));
+        assert_eq!(plain_text_calls.lock().unwrap().len(), 1);
+        assert_eq!(required_tool_calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

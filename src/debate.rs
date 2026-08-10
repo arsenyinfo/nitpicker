@@ -63,8 +63,6 @@ struct DebateTurnResult {
     usage: TokenUsage,
     /// The agent errored and `verdict` is a synthesized failure stub rather than a real verdict.
     agent_failed: bool,
-    /// The agent finished without calling `submit_verdict`; `verdict` is its raw final text.
-    used_fallback: bool,
 }
 
 struct DebateTurnRequest<'a> {
@@ -209,7 +207,6 @@ async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnRes
                 subagents_spawned: 0,
                 usage: TokenUsage::default(),
                 agent_failed: true,
-                used_fallback: false,
             });
         }
     };
@@ -218,11 +215,9 @@ async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnRes
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take();
-    let used_fallback = stored.is_none();
-    let verdict = stored.unwrap_or(DebateVerdict {
-        text: result.text,
-        agree: false,
-    });
+    let verdict = stored.ok_or_else(|| {
+        eyre::eyre!("debate agent completed without calling required submit_verdict tool")
+    })?;
     Ok(DebateTurnResult {
         verdict,
         turns: result.turns,
@@ -230,7 +225,6 @@ async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnRes
         subagents_spawned: result.subagents_spawned,
         usage,
         agent_failed: false,
-        used_fallback,
     })
 }
 
@@ -662,7 +656,7 @@ pub async fn run_debate(
                     lane.usage
                         .add(actor_turn.usage, actor_turn.subagents_spawned);
                     lane.any_turn_succeeded |= !actor_turn.agent_failed;
-                    lane.degraded |= actor_turn.agent_failed || actor_turn.used_fallback;
+                    lane.degraded |= actor_turn.agent_failed;
                     lane.verdicts
                         .push((actor_role.to_string(), round, actor_turn.verdict.text));
 
@@ -670,7 +664,7 @@ pub async fn run_debate(
                     lane.usage
                         .add(critic_turn.usage, critic_turn.subagents_spawned);
                     lane.any_turn_succeeded |= !critic_turn.agent_failed;
-                    lane.degraded |= critic_turn.agent_failed || critic_turn.used_fallback;
+                    lane.degraded |= critic_turn.agent_failed;
                     // Convergence requires a real agreement: a critic that agrees with a failed
                     // actor's `*Agent failed*` stub (or a failed critic, whose verdict defaults to
                     // agree=false) must not end the debate early.
@@ -821,8 +815,7 @@ pub async fn run_debate(
                  not review evidence and not agreement.\n\
                  - A lane that ended without convergence carries unresolved disagreement — weigh it \
                  by the evidence, do not read it as agreement.\n\
-                 - A lane marked degraded had a turn fail or end without a verdict; its dialogue \
-                 is partial.\n\
+                 - A lane marked degraded had a turn fail; its dialogue is partial.\n\
                  {instruction}",
                 roster = crate::prompts::preset_roster(&surviving_presets),
                 sections = lane_sections(&survivors),
@@ -1082,10 +1075,9 @@ fn lane_progress_summary(lane: &DebateLaneOutcome, elapsed: u64) -> String {
 /// A cleanly converged lane is pruned to its final round in the meta input: verdicts are
 /// self-contained by prompt contract and the agreeing critic restates every confirmed
 /// finding, so earlier rounds are superseded chronology — exactly the material a
-/// synthesizer misreads into withdrawn-claim narration. A *degraded* lane converges too
-/// (convergence gates on `agent_failed`, not `used_fallback`), but some turn already
-/// violated the verdict protocol there, so the self-containment premise is untrusted and
-/// its full trail stays — as it does for contested lanes and the human transcript.
+/// synthesizer misreads into withdrawn-claim narration. A *degraded* lane can converge after an
+/// earlier failed turn, but the self-containment premise is then untrusted and its full trail stays
+/// — as it does for contested lanes and the human transcript.
 fn lane_pruned_to_final_round(lane: &DebateLaneOutcome) -> bool {
     lane.converged && !lane.degraded
 }

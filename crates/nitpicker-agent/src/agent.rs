@@ -9,7 +9,7 @@ use eyre::Result;
 use futures::future::join_all;
 use rig_core::OneOrMany;
 use rig_core::completion::Message;
-use rig_core::completion::message::{ToolResult, ToolResultContent, UserContent};
+use rig_core::completion::message::{ToolChoice, ToolResult, ToolResultContent, UserContent};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -28,6 +28,15 @@ const TOOL_CALL_HISTORY_WINDOW: usize = 8;
 const MAX_SUBAGENT_DEPTH: usize = 2;
 const MAX_CONSECUTIVE_BLOCKED_TOOL_CALLS: usize = 3;
 const FINAL_TURN_WRAP_UP_PROMPT: &str = include_str!("../prompts/final-turn-wrap-up.md");
+
+fn terminal_submission_prompt(terminal_tools: &[String]) -> String {
+    format!(
+        "Your previous plain-text response was not accepted because this task requires a structured \
+         terminal result. Do not continue investigating. Submit the same conclusion now by calling \
+         one of these terminal tools: {}.",
+        terminal_tools.join(", ")
+    )
+}
 
 pub struct AgentResult {
     pub text: String,
@@ -356,6 +365,17 @@ pub async fn run_agent(
         });
         runtime_tools.insert("finish".to_string(), finish_tool as Arc<dyn Tool>);
     }
+    let mut terminal_tools = config.terminal_tools.clone();
+    if config.depth.is_subagent() {
+        terminal_tools.push("finish".to_string());
+    }
+    terminal_tools.sort();
+    terminal_tools.dedup();
+    for name in &terminal_tools {
+        if !runtime_tools.contains_key(name) {
+            eyre::bail!("required terminal tool '{name}' is not available")
+        }
+    }
 
     let mut effective_system_prompt = config.system_prompt.clone();
     match &config.project_context {
@@ -383,9 +403,12 @@ pub async fn run_agent(
     let mut totals = RunTotals::new(initial_subagent_count);
     let mut consecutive_blocked_count = 0usize;
     let mut last_subagent: Option<String> = None;
+    let mut terminal_submission_requested = false;
 
     for turn in 0..config.max_turns {
         let is_final_turn = turn + 1 == config.max_turns;
+        let force_terminal_submission =
+            terminal_submission_requested || (is_final_turn && !terminal_tools.is_empty());
         let mut available_tools = runtime_tools.clone();
         if !config.depth.can_spawn_subagent() || is_final_turn {
             available_tools.remove("spawn_subagent");
@@ -415,15 +438,20 @@ pub async fn run_agent(
             .await;
         }
 
+        if is_final_turn || terminal_submission_requested {
+            available_tools.retain(|name, _| terminal_tools.iter().any(|tool| tool == name));
+        }
+
         if is_final_turn {
-            available_tools.retain(|name, _| {
-                config
-                    .terminal_tools
-                    .iter()
-                    .any(|terminal| terminal == name)
-                    || (config.depth.is_subagent() && name == "finish")
-            });
-            let wrap_up_prompt = Message::user(FINAL_TURN_WRAP_UP_PROMPT.to_string());
+            let wrap_up = match terminal_tools.is_empty() {
+                true => FINAL_TURN_WRAP_UP_PROMPT.to_string(),
+                false => format!(
+                    "{FINAL_TURN_WRAP_UP_PROMPT}\nPlain text will not be accepted. Call one of the \
+                     available terminal tools now: {}.",
+                    terminal_tools.join(", ")
+                ),
+            };
+            let wrap_up_prompt = Message::user(wrap_up);
             history.push(wrap_up_prompt.clone());
             prompt = wrap_up_prompt;
         }
@@ -434,7 +462,7 @@ pub async fn run_agent(
             preamble: Some(effective_system_prompt.clone()),
             history: history[..history.len().saturating_sub(1)].to_vec(),
             tools: tool_definitions(&available_tools),
-            tool_choice: None,
+            tool_choice: force_terminal_submission.then_some(ToolChoice::Required),
             max_tokens: config.max_tokens,
             additional_params: None,
         };
@@ -684,6 +712,19 @@ pub async fn run_agent(
                     }
                 }
                 eyre::bail!("empty response from model (no text, no tool calls)");
+            }
+            if !terminal_tools.is_empty() {
+                if force_terminal_submission {
+                    eyre::bail!(
+                        "agent returned plain text instead of calling required terminal tool(s): {}",
+                        terminal_tools.join(", ")
+                    )
+                }
+                terminal_submission_requested = true;
+                let nudge = Message::user(terminal_submission_prompt(&terminal_tools));
+                history.push(nudge.clone());
+                prompt = nudge;
+                continue;
             }
             if config.depth.is_subagent() {
                 eyre::bail!("subagent returned text without calling finish")
@@ -1164,6 +1205,9 @@ async fn log_compaction(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::{CompletionResponse, FinishReason, LLMClient};
+    use rig_core::completion::AssistantContent;
+    use rig_core::completion::message::{ToolCall, ToolFunction};
 
     fn usage(input: u64, output: u64, cached: u64, creation: u64) -> TokenUsage {
         TokenUsage {
@@ -1241,5 +1285,141 @@ mod tests {
         let long = truncate_for_trajectory("é".repeat(MAX_TRAJECTORY_ERROR_BYTES));
         assert!(long.starts_with(&"é".repeat(MAX_TRAJECTORY_ERROR_BYTES / 2)));
         assert!(long.ends_with("bytes omitted"));
+    }
+
+    struct TerminalScriptClient {
+        calls: Arc<Mutex<Vec<Completion>>>,
+    }
+
+    impl LLMClient for TerminalScriptClient {
+        async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
+            let forced = matches!(completion.tool_choice, Some(ToolChoice::Required));
+            self.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(completion);
+            let (choice, finish_reason) = match forced {
+                true => (
+                    AssistantContent::ToolCall(ToolCall::new(
+                        "finish-call".to_string(),
+                        ToolFunction::new(
+                            "finish".to_string(),
+                            json!({"result": "structured result"}),
+                        ),
+                    )),
+                    FinishReason::ToolUse,
+                ),
+                false => (
+                    AssistantContent::text("plain-text conclusion"),
+                    FinishReason::Stop,
+                ),
+            };
+            Ok(CompletionResponse {
+                choice: OneOrMany::one(choice),
+                finish_reason,
+                usage: TokenUsage::default(),
+                selected_model: Some("scripted".to_string()),
+            })
+        }
+    }
+
+    fn terminal_test_config(
+        calls: Arc<Mutex<Vec<Completion>>>,
+        max_turns: usize,
+        terminal_tools: Vec<String>,
+    ) -> AgentConfig {
+        AgentConfig {
+            name: "terminal-test".to_string(),
+            session_agent: "terminal-test".to_string(),
+            model: "scripted".to_string(),
+            max_turns,
+            max_tokens: None,
+            compact_threshold: None,
+            system_prompt: "test".to_string(),
+            subagent_system_prompt: None,
+            client: TerminalScriptClient { calls }.into_arc(),
+            depth: AgentDepth::TopLevel,
+            terminal_tools,
+            empty_response_nudge: None,
+            max_empty_responses: 0,
+            subagent_counter: Arc::new(AtomicUsize::new(0)),
+            llm_semaphore: Arc::new(Semaphore::new(1)),
+            progress: None,
+            project_context: None,
+            session_writer: None,
+        }
+    }
+
+    fn terminal_test_tools() -> HashMap<String, Arc<dyn Tool>> {
+        let mut tools = crate::tools::all_tools();
+        let result = Arc::new(Mutex::new(None));
+        tools.insert(
+            "finish".to_string(),
+            Arc::new(FinishTool { result }) as Arc<dyn Tool>,
+        );
+        tools
+    }
+
+    #[tokio::test]
+    async fn plain_text_is_repackaged_through_a_forced_terminal_turn() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let config = terminal_test_config(Arc::clone(&calls), 3, vec!["finish".to_string()]);
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = run_agent(config, "investigate", &terminal_test_tools(), dir.path())
+            .await
+            .unwrap();
+
+        assert_eq!(result.turns, 2);
+        assert_eq!(result.tool_calls, 1);
+        let calls = calls.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].tool_choice, None);
+        assert_eq!(calls[1].tool_choice, Some(ToolChoice::Required));
+        assert_eq!(
+            calls[1]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["finish"]
+        );
+        assert!(
+            calls[1]
+                .prompt
+                .rag_text()
+                .as_deref()
+                .is_some_and(|text| text.contains("plain-text response"))
+        );
+    }
+
+    #[tokio::test]
+    async fn final_turn_forces_the_terminal_tool_immediately() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let config = terminal_test_config(Arc::clone(&calls), 1, vec!["finish".to_string()]);
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = run_agent(config, "investigate", &terminal_test_tools(), dir.path())
+            .await
+            .unwrap();
+
+        assert_eq!(result.turns, 1);
+        let calls = calls.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls[0].tool_choice, Some(ToolChoice::Required));
+    }
+
+    #[tokio::test]
+    async fn missing_terminal_tool_fails_before_the_provider_call() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let config = terminal_test_config(Arc::clone(&calls), 3, vec!["missing".to_string()]);
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = match run_agent(config, "investigate", &HashMap::new(), dir.path()).await {
+            Ok(_) => panic!("missing terminal tool should fail"),
+            Err(err) => err,
+        };
+
+        assert!(format!("{err:#}").contains("required terminal tool 'missing' is not available"));
+        assert!(calls.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
     }
 }
