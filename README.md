@@ -32,6 +32,7 @@ export ANTHROPIC_API_KEY="your-api-key-here"
 nitpicker
 nitpicker --repo /path/to/repo
 nitpicker --repo /path/to/repo --prompt "focus on src/api/"
+nitpicker --fallback  # try the next configured reviewer if a model fails
 nitpicker --analyze src/components/
 nitpicker --analyze  # entire repo
 ```
@@ -90,6 +91,7 @@ Example `nitpicker.toml`:
 ```toml
 [defaults]
 debate = true          # optional, default: true
+fallback = true        # optional, default: false; use reviewer order as a failover ring
 max_turns = 100        # optional, default: 100
 log_trajectories = false # optional, default: false
 # presets = ["correctness", "security"]  # optional; default also includes performance, simplicity
@@ -161,6 +163,8 @@ Unknown config keys are rejected. For example, use `max_tokens` for output lengt
 `max_tokens` caps a single response, and on a reasoning model it is a budget for reasoning *plus* the answer — set too low, the model spends it all thinking and returns empty content, which is indistinguishable from a model that said nothing. Reviewers therefore default to no cap (the provider applies its own per-model limit); set one only to bound spend. The aggregator writes one bounded synthesis and defaults to 16384. Two exceptions: Anthropic's API requires the field, so an unset reviewer cap becomes 8192 there — raise it explicitly if your model reasons past that; and `auth = "codex"` ignores the setting entirely, since that endpoint rejects `max_output_tokens`.
 
 Debate mode is enabled by default for `nitpicker`, `nitpicker ask`, and `nitpicker pr`. Pass `--no-debate` to use parallel aggregation for a single run. Use `[defaults].max_turns` or `--max-turns` to control the per-agent tool-use loop limit.
+
+Fallback mode is opt-in with `[defaults].fallback = true` or `--fallback` and requires at least two reviewers. Each logical reviewer keeps its normal primary, then tries subsequent `[[reviewer]]` entries in declaration order, wrapping at the end. Failover retries only the failed completion with the existing conversation history; it does not restart the agent. The successful route remains active for that agent, and a quota-limited route is skipped by the other jobs for the rest of the run. The aggregator tries its configured model first, then the reviewer list. A successful fallback is logged but does not make the verdict degraded. With Alloy, each completion still chooses its first healthy reviewer randomly; a failed choice then follows declaration order.
 
 Set `[defaults].log_trajectories = true` to save per-agent JSONL traces and a final `aggregation.json` under `~/.nitpicker/sessions/session-<timestamp>-<pid>/`.
 
@@ -337,6 +341,7 @@ nitpicker init [--global] [--free] [--repo <DIR>]
 --context-file <PATH>  inject a file's contents into the prompt; repeatable
 --analyze [PATH]       analyze existing code instead of reviewing changes
 --no-debate            use parallel aggregation instead of actor-critic debate
+--fallback             try subsequent configured reviewers when a model fails
 --rounds <N>           maximum debate rounds [default: 5]
 --max-turns <N>        maximum tool-use turns per agent or debate turn [default: 100 via config]
 -v, --verbose          show info-level logs (hidden by default)
@@ -399,7 +404,7 @@ With `--verbose`, the transcript is saved to `{tempdir}/debate-{timestamp}.md` (
 | 0 | clean verdict |
 | 1 | hard failure — no verdict (bad config, missing key, every reviewer/turn failed) |
 | 2 | CLI usage error (clap's exit code for bad arguments) |
-| 3 | degraded verdict — report printed, but a reviewer failed, or a debate turn failed or ended without calling `submit_verdict` |
+| 3 | degraded verdict — report printed, but a reviewer or debate turn failed |
 
 Non-interactive, non-verbose stdout carries exactly the final report, so the binary can be driven as a subprocess: read stdout for the verdict, branch on the exit code. `pr` follows the same codes; in `--json` mode the envelope (`status: ok|error`, with `degraded: true` on an exit-3 run) is emitted and flushed before the exit.
 

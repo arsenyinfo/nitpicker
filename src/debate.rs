@@ -7,7 +7,7 @@ use nitpicker_agent::agent::{
     run_agent,
 };
 use nitpicker_agent::config::Config;
-use nitpicker_agent::llm::{Completion, LLMClientDyn, TokenUsage};
+use nitpicker_agent::llm::{Completion, LLMClientDyn, TokenUsage, is_operational_limit_error};
 use nitpicker_agent::provider::{build_aggregator_client, build_reviewer_client};
 use nitpicker_agent::session::{
     AggregationRecord, LaneRecord, SessionLogger, SessionWriter, sanitize_path_component,
@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use termimad::MadSkin;
@@ -63,8 +63,6 @@ struct DebateTurnResult {
     usage: TokenUsage,
     /// The agent errored and `verdict` is a synthesized failure stub rather than a real verdict.
     agent_failed: bool,
-    /// The agent finished without calling `submit_verdict`; `verdict` is its raw final text.
-    used_fallback: bool,
 }
 
 struct DebateTurnRequest<'a> {
@@ -81,6 +79,8 @@ struct DebateTurnRequest<'a> {
     /// One per run, shared by every lane and subagent — concurrent lanes must split the
     /// account-wide in-flight cap, not multiply it.
     llm_semaphore: Arc<tokio::sync::Semaphore>,
+    /// One user-facing failure warning per run; full per-turn errors remain available at debug.
+    failure_warning_emitted: Arc<AtomicBool>,
     progress: Option<Arc<dyn Fn(AgentProgress) + Send + Sync>>,
     project_context: Option<String>,
     /// Trajectory identity (`[lane-<j>-<preset>-]<side>-<round>`, the writer's file stem):
@@ -198,7 +198,10 @@ async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnRes
     {
         Ok(r) => r,
         Err(err) => {
-            warn!(model = request.model, error = ?err, "debate agent failed");
+            tracing::debug!(model = request.model, error = ?err, "debate agent failed");
+            if claim_failure_warning(&request.failure_warning_emitted) {
+                warn!("{}", debate_failure_warning(&err));
+            }
             return Ok(DebateTurnResult {
                 verdict: DebateVerdict {
                     text: format!("*Agent failed: {err:#}*"),
@@ -209,7 +212,6 @@ async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnRes
                 subagents_spawned: 0,
                 usage: TokenUsage::default(),
                 agent_failed: true,
-                used_fallback: false,
             });
         }
     };
@@ -218,11 +220,9 @@ async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnRes
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take();
-    let used_fallback = stored.is_none();
-    let verdict = stored.unwrap_or(DebateVerdict {
-        text: result.text,
-        agree: false,
-    });
+    let verdict = stored.ok_or_else(|| {
+        eyre::eyre!("debate agent completed without calling required submit_verdict tool")
+    })?;
     Ok(DebateTurnResult {
         verdict,
         turns: result.turns,
@@ -230,8 +230,19 @@ async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnRes
         subagents_spawned: result.subagents_spawned,
         usage,
         agent_failed: false,
-        used_fallback,
     })
+}
+
+fn debate_failure_warning(err: &eyre::Report) -> &'static str {
+    if is_operational_limit_error(err) {
+        "A model reached its usage limit; continuing with the remaining debate where possible"
+    } else {
+        "A debate turn failed; continuing with the remaining debate where possible"
+    }
+}
+
+fn claim_failure_warning(emitted: &AtomicBool) -> bool {
+    !emitted.swap(true, Ordering::AcqRel)
 }
 
 /// One debater's fixed identity for the whole debate — the per-side inputs that would
@@ -259,6 +270,7 @@ struct RoundEnv<'a> {
     verbose: bool,
     stdout_ok: bool,
     llm_semaphore: &'a Arc<tokio::sync::Semaphore>,
+    failure_warning_emitted: &'a Arc<AtomicBool>,
     subagent_system_prompt: Option<&'a str>,
     /// Print verdicts as turns finish (single lane only) — concurrent lanes buffer instead,
     /// since their interleaved output would be unattributable.
@@ -303,6 +315,7 @@ async fn run_debate_side(
         max_turns: env.max_turns,
         work_dir: env.repo,
         llm_semaphore: Arc::clone(env.llm_semaphore),
+        failure_warning_emitted: Arc::clone(env.failure_warning_emitted),
         progress,
         project_context: Some(env.project_context.to_string()),
         session_writer: env
@@ -412,6 +425,7 @@ pub struct DebateOptions<'a> {
     pub verbose: bool,
     pub task: RunTask<'a>,
     pub alloy: bool,
+    pub fallback: bool,
     pub format: crate::output::OutputFormat,
 }
 
@@ -419,8 +433,8 @@ pub struct DebateOutcome {
     pub report: String,
     pub transcript_path: std::path::PathBuf,
     pub usage: UsageReport,
-    /// At least one turn failed or fell back to raw text; the report is synthesized from a
-    /// partial dialogue. Surfaced as exit code 3 in the default-review/`ask`/`pr` CLI arms.
+    /// At least one turn failed; the report is synthesized from a partial dialogue. Surfaced as
+    /// exit code 3 in the default-review/`ask`/`pr` CLI arms.
     pub degraded: bool,
     /// Per-preset lane counts in resolution order (attempted is always 1 — one lane per
     /// preset), matching the parallel path's per-job shape. `None` for Ask.
@@ -453,6 +467,7 @@ pub async fn run_debate(
         verbose,
         task,
         alloy,
+        fallback,
         format,
     } = opts;
     let presets = task.presets();
@@ -481,22 +496,17 @@ pub async fn run_debate(
     let critic_label: ModelLabel;
     let actor_compact_threshold: Option<u64>;
     let critic_compact_threshold: Option<u64>;
-    // In alloy mode the client pools every reviewer, so these come from the same two slots the
-    // roles are otherwise pinned to — the existing convention for per-side settings.
+    // Output caps stay bound to the two logical roles; the routing clients replace them with the
+    // selected route's cap at the completion boundary.
     let actor_max_tokens = actor_cfg.max_tokens;
     let critic_max_tokens = critic_cfg.max_tokens;
 
+    let reviewer_pool = (alloy || fallback)
+        .then(|| crate::review::build_reviewer_pool(config, &gemini_proxy, proxy_url.as_deref()));
+
     if alloy {
-        let mut slots = Vec::new();
-        for r in &config.reviewer {
-            slots.push(nitpicker_agent::llm::AlloySlot {
-                client: gemini_proxy.annotate(build_reviewer_client(r, proxy_url.as_deref()))?,
-                model: r.model.clone(),
-                max_tokens: r.max_tokens,
-            });
-        }
-        let shared: Arc<dyn LLMClientDyn> =
-            Arc::new(nitpicker_agent::llm::AlloyClient::new(slots)?);
+        let pool = reviewer_pool.as_ref().expect("alloy builds reviewer pool");
+        let shared = crate::review::alloy_client(pool, fallback)?;
         actor_client = Arc::clone(&shared);
         critic_client = shared;
         let label = ModelLabel::alloy(config.reviewer.iter().map(|r| r.model.as_str()));
@@ -505,8 +515,20 @@ pub async fn run_debate(
             full: label.full.clone(),
         };
         critic_label = label;
-        actor_compact_threshold = config.reviewer_compact_threshold(actor_cfg);
-        critic_compact_threshold = config.reviewer_compact_threshold(critic_cfg);
+        let threshold = crate::review::reviewer_pool_compact_threshold(config, pool);
+        actor_compact_threshold = threshold;
+        critic_compact_threshold = threshold;
+    } else if fallback {
+        let pool = reviewer_pool
+            .as_ref()
+            .expect("fallback builds reviewer pool");
+        actor_client = crate::review::debate_reviewer_client(pool, 0, 1)?;
+        critic_client = crate::review::debate_reviewer_client(pool, 1, 0)?;
+        actor_label = ModelLabel::plain(&actor_cfg.model);
+        critic_label = ModelLabel::plain(&critic_cfg.model);
+        let threshold = crate::review::reviewer_pool_compact_threshold(config, pool);
+        actor_compact_threshold = threshold;
+        critic_compact_threshold = threshold;
     } else {
         actor_client =
             gemini_proxy.annotate(build_reviewer_client(actor_cfg, proxy_url.as_deref()))?;
@@ -524,14 +546,39 @@ pub async fn run_debate(
 
     let project_context = crate::context::build_context(repo).await;
 
-    let agg_client: Arc<dyn LLMClientDyn> =
-        gemini_proxy.annotate(build_aggregator_client(agg_cfg, proxy_url.as_deref()))?;
+    let agg_client: Arc<dyn LLMClientDyn> = match &reviewer_pool {
+        Some(pool) if fallback => crate::review::aggregator_client(
+            config,
+            &gemini_proxy,
+            proxy_url.as_deref(),
+            pool,
+            true,
+        )?,
+        _ => gemini_proxy.annotate(build_aggregator_client(agg_cfg, proxy_url.as_deref()))?,
+    };
+
+    // Sticky failover belongs to one logical agent. Treat actor/critic clients as pristine role
+    // templates and fork each preset lane before any of them starts; forks keep independent active
+    // indices while their cloned FallbackSlots share run-wide route availability.
+    let lane_role_clients = (0..lane_tasks.len())
+        .map(|_| {
+            if fallback && !alloy {
+                (
+                    crate::review::independent_agent_client(&actor_client),
+                    crate::review::independent_agent_client(&critic_client),
+                )
+            } else {
+                (Arc::clone(&actor_client), Arc::clone(&critic_client))
+            }
+        })
+        .collect::<Vec<_>>();
 
     let actor_role = task.actor_role();
     let critic_role = task.critic_role();
     // one in-flight-LLM cap for the whole run: concurrent lanes and their subagents share
     // it, so lane count scales wall-clock breadth without multiplying provider pressure
     let llm_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LLM_CALLS));
+    let failure_warning_emitted = Arc::new(AtomicBool::new(false));
 
     let done_style = ProgressStyle::with_template("  {prefix:<12} {msg}").unwrap();
     let skin = MadSkin::default();
@@ -575,9 +622,10 @@ pub async fn run_debate(
         .iter()
         .enumerate()
         .map(|(lane_index, lane_task)| {
-            let actor_client = Arc::clone(&actor_client);
-            let critic_client = Arc::clone(&critic_client);
+            let actor_client = Arc::clone(&lane_role_clients[lane_index].0);
+            let critic_client = Arc::clone(&lane_role_clients[lane_index].1);
             let llm_semaphore = &llm_semaphore;
+            let failure_warning_emitted = &failure_warning_emitted;
             let mp = &mp;
             let done_style = &done_style;
             let skin = &skin;
@@ -622,6 +670,7 @@ pub async fn run_debate(
                     verbose,
                     stdout_ok,
                     llm_semaphore,
+                    failure_warning_emitted,
                     subagent_system_prompt: subagent_prompt.as_deref(),
                     live_output,
                     lane_progress,
@@ -645,7 +694,7 @@ pub async fn run_debate(
                     lane.usage
                         .add(actor_turn.usage, actor_turn.subagents_spawned);
                     lane.any_turn_succeeded |= !actor_turn.agent_failed;
-                    lane.degraded |= actor_turn.agent_failed || actor_turn.used_fallback;
+                    lane.degraded |= actor_turn.agent_failed;
                     lane.verdicts
                         .push((actor_role.to_string(), round, actor_turn.verdict.text));
 
@@ -653,7 +702,7 @@ pub async fn run_debate(
                     lane.usage
                         .add(critic_turn.usage, critic_turn.subagents_spawned);
                     lane.any_turn_succeeded |= !critic_turn.agent_failed;
-                    lane.degraded |= critic_turn.agent_failed || critic_turn.used_fallback;
+                    lane.degraded |= critic_turn.agent_failed;
                     // Convergence requires a real agreement: a critic that agrees with a failed
                     // actor's `*Agent failed*` stub (or a failed critic, whose verdict defaults to
                     // agree=false) must not end the debate early.
@@ -804,8 +853,7 @@ pub async fn run_debate(
                  not review evidence and not agreement.\n\
                  - A lane that ended without convergence carries unresolved disagreement — weigh it \
                  by the evidence, do not read it as agreement.\n\
-                 - A lane marked degraded had a turn fail or end without a verdict; its dialogue \
-                 is partial.\n\
+                 - A lane marked degraded had a turn fail; its dialogue is partial.\n\
                  {instruction}",
                 roster = crate::prompts::preset_roster(&surviving_presets),
                 sections = lane_sections(&survivors),
@@ -831,6 +879,10 @@ pub async fn run_debate(
     let meta_result: eyre::Result<nitpicker_agent::llm::CompletionResponse> = agg_client
         .completion(meta_completion)
         .await
+        .and_then(|response| {
+            crate::review::validate_synthesis_response(&response, "meta-review")?;
+            Ok(response)
+        })
         .map_err(|err| match presets {
             Some(presets) => crate::presets::synthesis_failure(
                 err,
@@ -891,10 +943,11 @@ pub async fn run_debate(
     };
     usage.add(meta_response.usage, 0);
     let meta_text = meta_response.text();
+    let meta_model = crate::review::synthesis_model(&meta_response, &agg_cfg.model);
     if let Some(logger) = &session_logger {
         let record = AggregationRecord {
             kind: "aggregation".to_string(),
-            model: agg_cfg.model.clone(),
+            model: meta_model.clone(),
             text: meta_text.clone(),
             error: None,
             rounds,
@@ -935,7 +988,7 @@ pub async fn run_debate(
                     **Rounds:** {}\n\n---\n\n",
                     actor_label.full,
                     critic_label.full,
-                    agg_cfg.model,
+                    meta_model,
                     now.format("%Y-%m-%d %H:%M:%S"),
                     lane.final_round,
                 );
@@ -955,7 +1008,7 @@ pub async fn run_debate(
                     **Lanes:** {}\n\n---\n\n",
                     actor_label.full,
                     critic_label.full,
-                    agg_cfg.model,
+                    meta_model,
                     now.format("%Y-%m-%d %H:%M:%S"),
                     lanes.len(),
                 );
@@ -1060,10 +1113,9 @@ fn lane_progress_summary(lane: &DebateLaneOutcome, elapsed: u64) -> String {
 /// A cleanly converged lane is pruned to its final round in the meta input: verdicts are
 /// self-contained by prompt contract and the agreeing critic restates every confirmed
 /// finding, so earlier rounds are superseded chronology — exactly the material a
-/// synthesizer misreads into withdrawn-claim narration. A *degraded* lane converges too
-/// (convergence gates on `agent_failed`, not `used_fallback`), but some turn already
-/// violated the verdict protocol there, so the self-containment premise is untrusted and
-/// its full trail stays — as it does for contested lanes and the human transcript.
+/// synthesizer misreads into withdrawn-claim narration. A *degraded* lane can converge after an
+/// earlier failed turn, but the self-containment premise is then untrusted and its full trail stays
+/// — as it does for contested lanes and the human transcript.
 fn lane_pruned_to_final_round(lane: &DebateLaneOutcome) -> bool {
     lane.converged && !lane.degraded
 }
@@ -1194,6 +1246,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn operational_failure_warning_is_concise_and_emitted_once() {
+        let err = eyre::Report::new(rig_core::completion::CompletionError::from_http_response(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"error":{"type":"access_terminated_error","message":"You've reached your usage limit for this billing cycle. Your quota will be refreshed in the next cycle"}}"#,
+        ));
+        assert_eq!(
+            debate_failure_warning(&err),
+            "A model reached its usage limit; continuing with the remaining debate where possible"
+        );
+        let emitted = AtomicBool::new(false);
+        assert!(claim_failure_warning(&emitted));
+        assert!(!claim_failure_warning(&emitted));
+    }
+
     /// Distinct presets that sanitize to the same slug must still produce distinct
     /// trajectory stems — otherwise two lanes write the same `.jsonl` and their records
     /// interleave unattributably.
@@ -1263,8 +1330,8 @@ mod tests {
         open.final_round = 2;
         assert!(lane_sections(&[&open]).contains("ROUND-ONE-CLAIM"));
 
-        // a lane degraded in round 1 (e.g. a no-verdict fallback) that converges in round 2
-        // broke the verdict protocol once already — its full trail must reach the meta
+        // a lane with a failed turn in round 1 that converges in round 2 still has partial
+        // evidence — its full trail must reach the meta-reviewer
         let mut converged_degraded = lane(Some("security"), verdicts);
         converged_degraded.converged = true;
         converged_degraded.degraded = true;

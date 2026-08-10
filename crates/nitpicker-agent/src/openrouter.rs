@@ -1,11 +1,14 @@
 use crate::config::{Config, ProviderType};
-use crate::llm::{Completion, LLMClient, openrouter_headers};
+use crate::llm::{
+    Completion, LLMClient, openrouter_headers, provider_error_has_code, provider_http_status,
+};
 use chrono::{Duration, Utc};
 use eyre::Result;
 use rig_core::completion::{Message, ToolDefinition};
 use rig_core::providers::openrouter;
 use serde::Deserialize;
 use serde_json::json;
+use std::future::Future;
 use std::time::Instant;
 
 const MODELS_URL: &str =
@@ -19,6 +22,24 @@ const SMOKE_TEST_CALLS_REQUIRED: usize = 2;
 const SMOKE_TEST_BATCH_SIZE: usize = 3;
 const FETCH_MODELS_MAX_ATTEMPTS: usize = 3;
 const FETCH_MODELS_BACKOFF_MS: u64 = 1_000;
+
+#[derive(Debug)]
+struct ModelsHttpError {
+    status: reqwest::StatusCode,
+    url: String,
+}
+
+impl std::fmt::Display for ModelsHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "OpenRouter models API returned {} for {}",
+            self.status, self.url
+        )
+    }
+}
+
+impl std::error::Error for ModelsHttpError {}
 
 static PARAMS_RE: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"(\d+(?:\.\d+)?)(b|t)").unwrap());
@@ -96,6 +117,7 @@ async fn fetch_models(api_key: &str, needed: usize) -> Result<Vec<(String, u64)>
     for attempt in 1..=FETCH_MODELS_MAX_ATTEMPTS {
         match try_fetch_models(&client, api_key, needed).await {
             Ok(models) => return Ok(models),
+            Err(err) if models_credential_rejected(&err) => return Err(err),
             Err(err) => {
                 tracing::warn!(attempt, error = %err, "failed to fetch OpenRouter models, retrying");
                 last_err = err;
@@ -112,6 +134,14 @@ async fn fetch_models(api_key: &str, needed: usize) -> Result<Vec<(String, u64)>
     Err(last_err)
 }
 
+fn models_credential_rejected(err: &eyre::Report) -> bool {
+    err.chain().any(|source| {
+        source
+            .downcast_ref::<ModelsHttpError>()
+            .is_some_and(|error| error.status == reqwest::StatusCode::UNAUTHORIZED)
+    })
+}
+
 async fn fetch_model_list(
     client: &reqwest::Client,
     api_key: &str,
@@ -124,10 +154,10 @@ async fn fetch_model_list(
         .await
         .map_err(|e| eyre::eyre!("failed to fetch OpenRouter models from {url}: {e}"))?;
     if !response.status().is_success() {
-        eyre::bail!(
-            "OpenRouter models API returned {} for {url}",
-            response.status()
-        );
+        return Err(eyre::Report::new(ModelsHttpError {
+            status: response.status(),
+            url: url.to_string(),
+        }));
     }
     response
         .json()
@@ -253,12 +283,39 @@ fn build_openrouter_client(api_key: &str) -> Result<openrouter::Client> {
         .map_err(|e| eyre::eyre!("failed to build openrouter client: {e}"))
 }
 
-async fn smoke_test_call(api_key: &str, model: &str, slot_label: &str, attempt: usize) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SmokeTestOutcome {
+    Passed,
+    CandidateFailed,
+    CredentialRejected,
+}
+
+fn failed_smoke_test_outcome(err: &eyre::Report) -> SmokeTestOutcome {
+    let status = provider_http_status(err);
+    if status == Some(401)
+        || (!status.is_some_and(|status| (500..600).contains(&status))
+            && provider_error_has_code(
+                err,
+                &["authentication", "authentication_error", "invalid_api_key"],
+            ))
+    {
+        SmokeTestOutcome::CredentialRejected
+    } else {
+        SmokeTestOutcome::CandidateFailed
+    }
+}
+
+async fn smoke_test_call(
+    api_key: &str,
+    model: &str,
+    slot_label: &str,
+    attempt: usize,
+) -> SmokeTestOutcome {
     let client = match build_openrouter_client(api_key) {
         Ok(client) => client,
         Err(err) => {
             tracing::warn!(slot = slot_label, %model, attempt, error = %err, "openrouter smoke test client init failed");
-            return false;
+            return SmokeTestOutcome::CandidateFailed;
         }
     };
     let started = Instant::now();
@@ -289,7 +346,7 @@ async fn smoke_test_call(api_key: &str, model: &str, slot_label: &str, attempt: 
     match result {
         Ok(Ok(response)) if response.tool_calls().is_some() => {
             tracing::info!(slot = slot_label, %model, attempt, latency_ms, "experimental openrouter free smoke test passed");
-            true
+            SmokeTestOutcome::Passed
         }
         Ok(Ok(response)) => {
             tracing::warn!(
@@ -301,26 +358,34 @@ async fn smoke_test_call(api_key: &str, model: &str, slot_label: &str, attempt: 
                 text = response.text(),
                 "experimental openrouter free smoke test failed: no tool call"
             );
-            false
+            SmokeTestOutcome::CandidateFailed
         }
         Ok(Err(err)) => {
+            let outcome = failed_smoke_test_outcome(&err);
             tracing::warn!(slot = slot_label, %model, attempt, latency_ms, error = %err, "experimental openrouter free smoke test failed");
-            false
+            outcome
         }
         Err(_) => {
             tracing::warn!(slot = slot_label, %model, attempt, latency_ms, timeout_secs = SMOKE_TEST_TIMEOUT_SECS, "experimental openrouter free smoke test timed out");
-            false
+            SmokeTestOutcome::CandidateFailed
         }
     }
 }
 
-async fn smoke_test_model(api_key: &str, model: &str, slot_label: &str) -> bool {
+async fn smoke_test_model(api_key: &str, model: &str, slot_label: &str) -> SmokeTestOutcome {
     for attempt in 1..=SMOKE_TEST_CALLS_REQUIRED {
-        if !smoke_test_call(api_key, model, slot_label, attempt).await {
-            return false;
+        match smoke_test_call(api_key, model, slot_label, attempt).await {
+            SmokeTestOutcome::Passed => {}
+            failed => return failed,
         }
     }
-    true
+    SmokeTestOutcome::Passed
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeCandidatesResult {
+    Passing(Vec<usize>),
+    CredentialRejected,
 }
 
 /// Probes candidates in batches of SMOKE_TEST_BATCH_SIZE, returning indices of the first
@@ -330,7 +395,28 @@ async fn probe_candidates(
     candidates: &[(String, u64)],
     slot_label: &str,
     needed: usize,
-) -> Vec<usize> {
+) -> ProbeCandidatesResult {
+    probe_candidates_with(
+        api_key,
+        candidates,
+        slot_label,
+        needed,
+        |key, model, label| async move { smoke_test_model(&key, &model, &label).await },
+    )
+    .await
+}
+
+async fn probe_candidates_with<P, F>(
+    api_key: &str,
+    candidates: &[(String, u64)],
+    slot_label: &str,
+    needed: usize,
+    probe: P,
+) -> ProbeCandidatesResult
+where
+    P: Fn(String, String, String) -> F + Clone + Send + 'static,
+    F: Future<Output = SmokeTestOutcome> + Send + 'static,
+{
     let mut found = Vec::new();
     let indexed: Vec<(usize, &(String, u64))> = candidates.iter().enumerate().collect();
     for chunk in indexed.chunks(SMOKE_TEST_BATCH_SIZE) {
@@ -340,39 +426,51 @@ async fn probe_candidates(
                 let key = api_key.to_string();
                 let model = model_id.to_string();
                 let label = slot_label.to_string();
+                let probe = probe.clone();
                 tokio::spawn(async move {
-                    let passed = smoke_test_model(&key, &model, &label).await;
-                    (idx, passed)
+                    let outcome = probe(key, model, label).await;
+                    (idx, outcome)
                 })
             })
             .collect();
+        let mut credential_rejected = false;
         for handle in handles {
             match handle.await {
-                Ok((idx, true)) => found.push(idx),
+                Ok((idx, SmokeTestOutcome::Passed)) => found.push(idx),
+                Ok((_, SmokeTestOutcome::CredentialRejected)) => {
+                    credential_rejected = true;
+                }
                 Ok(_) => {}
                 Err(e) => tracing::error!(error = %e, "smoke test task panicked"),
             }
+        }
+        if credential_rejected {
+            return ProbeCandidatesResult::CredentialRejected;
         }
         if found.len() >= needed {
             break;
         }
     }
-    found
+    ProbeCandidatesResult::Passing(found)
 }
 
 async fn select_reviewer_models(
-    slot_api_keys: &[String],
+    reviewer_routes: &[(usize, String)],
     candidates: Vec<(String, u64)>,
-    reviewer_count: usize,
-) -> Result<(Vec<(String, u64)>, Vec<(String, u64)>)> {
+    fallback: bool,
+) -> Result<(Vec<Option<(String, u64)>>, Vec<(String, u64)>)> {
+    let reviewer_count = reviewer_routes.len();
     if reviewer_count == 0 {
         return Ok((Vec::new(), candidates));
     }
 
     // probe in batches per unique key; probe enough for all reviewer slots in case of overlap
-    let unique_keys: std::collections::HashSet<&str> =
-        slot_api_keys.iter().map(String::as_str).collect();
-    let mut key_passing: std::collections::HashMap<&str, Vec<usize>> = Default::default();
+    let unique_keys: std::collections::HashSet<&str> = reviewer_routes
+        .iter()
+        .map(|(_, key)| key.as_str())
+        .collect();
+    let mut key_passing: std::collections::HashMap<&str, ProbeCandidatesResult> =
+        Default::default();
     for &key in &unique_keys {
         key_passing.insert(
             key,
@@ -384,11 +482,36 @@ async fn select_reviewer_models(
     let mut assigned = std::collections::HashSet::new();
     let mut selected = Vec::with_capacity(reviewer_count);
 
-    for (slot, slot_key) in slot_api_keys.iter().enumerate().take(reviewer_count) {
+    for (slot, (reviewer_index, slot_key)) in reviewer_routes.iter().enumerate() {
         let slot_label = format!("free_slot_{}", slot + 1);
-        let passing = key_passing.get(slot_key.as_str()).expect("key was probed");
+        let probe_result = key_passing.get(slot_key.as_str()).expect("key was probed");
+        let passing = match probe_result {
+            ProbeCandidatesResult::Passing(passing) => passing,
+            ProbeCandidatesResult::CredentialRejected if fallback => {
+                tracing::warn!(
+                    reviewer_index,
+                    "experimental OpenRouter credential was rejected; leaving its route for fallback to skip"
+                );
+                selected.push(None);
+                continue;
+            }
+            ProbeCandidatesResult::CredentialRejected => {
+                eyre::bail!(
+                    "OpenRouter credential was rejected while resolving experimental free reviewer models"
+                );
+            }
+        };
 
-        let Some(&winner_idx) = passing.iter().find(|&&idx| !assigned.contains(&idx)) else {
+        let winner_idx = passing.iter().find(|&&idx| !assigned.contains(&idx));
+        let Some(&winner_idx) = winner_idx else {
+            if fallback {
+                tracing::warn!(
+                    reviewer_index,
+                    "experimental OpenRouter route failed smoke testing; leaving it for fallback to skip"
+                );
+                selected.push(None);
+                continue;
+            }
             eyre::bail!(
                 "No usable OpenRouter experimental free model found for {} after smoke tests of {} candidates",
                 slot_label,
@@ -397,7 +520,7 @@ async fn select_reviewer_models(
         };
 
         assigned.insert(winner_idx);
-        selected.push(candidates[winner_idx].clone());
+        selected.push(Some(candidates[winner_idx].clone()));
     }
 
     let remaining = candidates
@@ -414,14 +537,44 @@ async fn select_aggregator_model(
     api_key: &str,
     candidates: &[(String, u64)],
     reviewer_models: &[(String, u64)],
+    proven_reviewer_model: Option<&str>,
 ) -> Result<String> {
-    let passing = probe_candidates(api_key, candidates, "aggregator_probe", 1).await;
+    let passing = match probe_candidates(api_key, candidates, "aggregator_probe", 1).await {
+        ProbeCandidatesResult::Passing(passing) => passing,
+        ProbeCandidatesResult::CredentialRejected => {
+            eyre::bail!(
+                "OpenRouter credential was rejected while resolving the experimental free aggregator"
+            );
+        }
+    };
 
     if let Some(&idx) = passing.first() {
         return Ok(candidates[idx].0.clone());
     }
 
-    if let Some((model, _)) = reviewer_models.first() {
+    if let Some(model) = proven_reviewer_model {
+        tracing::info!(
+            %model,
+            "reusing reviewer model already smoke-tested with the aggregator credential"
+        );
+        return Ok(model.to_string());
+    }
+
+    // Reusing a reviewer model is safe only after proving that the aggregator's own key can call
+    // it. This matters in fallback mode, where a present but revoked key must leave the route
+    // unresolved instead of borrowing another route's successful probe.
+    let reviewer_passing = match probe_candidates(api_key, reviewer_models, "aggregator_probe", 1)
+        .await
+    {
+        ProbeCandidatesResult::Passing(passing) => passing,
+        ProbeCandidatesResult::CredentialRejected => {
+            eyre::bail!(
+                "OpenRouter credential was rejected while resolving the experimental free aggregator"
+            );
+        }
+    };
+    if let Some(&idx) = reviewer_passing.first() {
+        let model = &reviewer_models[idx].0;
         tracing::info!(
             model = %model,
             "reusing first reviewer model for experimental openrouter free aggregator"
@@ -435,21 +588,60 @@ async fn select_aggregator_model(
     )
 }
 
+fn reviewer_model_proven_for_key<'a>(
+    api_key: &str,
+    reviewer_routes: &[(usize, String)],
+    reviewer_models: &'a [Option<(String, u64)>],
+) -> Option<&'a str> {
+    reviewer_routes
+        .iter()
+        .zip(reviewer_models)
+        .find_map(|((_, reviewer_key), selected)| {
+            if reviewer_key == api_key {
+                selected.as_ref().map(|(model, _)| model.as_str())
+            } else {
+                None
+            }
+        })
+}
+
 fn needs_auto_model(provider: &ProviderType, model: &str) -> bool {
     matches!(provider, ProviderType::OpenRouter) && (model.is_empty() || model == "free")
 }
 
+/// Whether experimental OpenRouter auto-selection has not produced a concrete route. Fallback
+/// client pools use this after best-effort resolution to skip routes whose key/catalog/probe failed.
+pub fn is_unresolved_free_route(provider: &ProviderType, model: &str) -> bool {
+    needs_auto_model(provider, model)
+}
+
 pub async fn resolve_free_models(config: &mut Config) -> Result<()> {
-    for reviewer in &config.reviewer {
-        if !needs_auto_model(&reviewer.provider, &reviewer.model) {
+    resolve_free_models_with_fallback(config, false).await
+}
+
+/// Resolve experimental free routes. Fallback execution is best-effort: missing credentials,
+/// catalog failures, and failed smoke tests leave only the affected auto-routes unresolved, and
+/// client-pool construction reports and skips them. Strict execution preserves fail-fast behavior.
+pub async fn resolve_free_models_with_fallback(config: &mut Config, fallback: bool) -> Result<()> {
+    let mut auto_ordinal = 0;
+    for reviewer in &mut config.reviewer {
+        if needs_auto_model(&reviewer.provider, &reviewer.model) {
+            // Identity belongs to the configured logical reviewer, not to successful route
+            // resolution. Assign it before any best-effort filtering so a job that runs through a
+            // fallback route still has stable attribution.
             if reviewer.name.is_empty() {
-                eyre::bail!(
-                    "reviewer must specify a name (omit model or set model = \"free\" on openrouter for experimental auto-assignment)"
-                );
+                reviewer.name = format!("free_{auto_ordinal}");
             }
-            if reviewer.model.is_empty() {
-                eyre::bail!("reviewer '{}' must specify a model", reviewer.name);
-            }
+            auto_ordinal += 1;
+            continue;
+        }
+        if reviewer.name.is_empty() {
+            eyre::bail!(
+                "reviewer must specify a name (omit model or set model = \"free\" on openrouter for experimental auto-assignment)"
+            );
+        }
+        if reviewer.model.is_empty() {
+            eyre::bail!("reviewer '{}' must specify a model", reviewer.name);
         }
     }
     if !needs_auto_model(&config.aggregator.provider, &config.aggregator.model)
@@ -458,64 +650,137 @@ pub async fn resolve_free_models(config: &mut Config) -> Result<()> {
         eyre::bail!("[aggregator] must specify a model");
     }
 
-    let reviewer_indices: Vec<usize> = config
+    let reviewer_routes: Vec<(usize, String)> = config
         .reviewer
         .iter()
         .enumerate()
         .filter(|(_, r)| needs_auto_model(&r.provider, &r.model))
-        .map(|(i, _)| i)
-        .collect();
-    let agg_is_free = needs_auto_model(&config.aggregator.provider, &config.aggregator.model);
-
-    let reviewer_count = reviewer_indices.len();
-    if reviewer_count == 0 && !agg_is_free {
-        return Ok(());
-    }
-
-    let slot_api_keys: Vec<String> = reviewer_indices
-        .iter()
-        .map(|&idx| {
-            let key_env = config.reviewer[idx]
+        .filter_map(|(idx, reviewer)| {
+            let key_env = reviewer
                 .api_key_env
                 .as_deref()
                 .unwrap_or(DEFAULT_API_KEY_ENV);
-            std::env::var(key_env).map_err(|_| eyre::eyre!("missing env var {key_env}"))
+            match std::env::var(key_env) {
+                Ok(key) => Some(Ok((idx, key))),
+                Err(_) if fallback => {
+                    tracing::warn!(
+                        reviewer_index = idx,
+                        env = key_env,
+                        "experimental OpenRouter route unavailable; leaving it for fallback to skip"
+                    );
+                    None
+                }
+                Err(_) => Some(Err(eyre::eyre!("missing env var {key_env}"))),
+            }
         })
         .collect::<Result<Vec<_>>>()?;
-
+    let agg_is_free = needs_auto_model(&config.aggregator.provider, &config.aggregator.model);
     let agg_api_key = if agg_is_free {
         let key_env = config
             .aggregator
             .api_key_env
             .as_deref()
             .unwrap_or(DEFAULT_API_KEY_ENV);
-        std::env::var(key_env).map_err(|_| {
-            eyre::eyre!("missing env var {key_env} (required for experimental openrouter free auto-selection)")
-        })?
-    } else {
-        String::new()
-    };
-
-    let fetch_key = slot_api_keys
-        .first()
-        .map(String::as_str)
-        .unwrap_or(agg_api_key.as_str());
-
-    let models = fetch_models(fetch_key, reviewer_count.max(1)).await?;
-    let (reviewer_models, remaining_models) =
-        select_reviewer_models(&slot_api_keys, models, reviewer_count).await?;
-    let aggregator_model = if agg_is_free {
-        Some(select_aggregator_model(&agg_api_key, &remaining_models, &reviewer_models).await?)
+        match std::env::var(key_env) {
+            Ok(key) => Some(key),
+            Err(_) if fallback => {
+                tracing::warn!(
+                    env = key_env,
+                    "experimental OpenRouter aggregator unavailable; leaving it for fallback to skip"
+                );
+                None
+            }
+            Err(_) => {
+                return Err(eyre::eyre!(
+                    "missing env var {key_env} (required for experimental openrouter free auto-selection)"
+                ));
+            }
+        }
     } else {
         None
     };
-    let mut iter = reviewer_models.into_iter();
 
-    for (slot, idx) in reviewer_indices.into_iter().enumerate() {
-        let (model, context_length) = iter.next().expect("checked above");
-        if config.reviewer[idx].name.is_empty() {
-            config.reviewer[idx].name = format!("free_{slot}");
+    let reviewer_count = reviewer_routes.len();
+    if reviewer_count == 0 && agg_api_key.is_none() {
+        return Ok(());
+    }
+
+    // A revoked route must not prevent a healthy auto-route from supplying the shared catalog.
+    // Strict mode preserves the historical first-key failure; fallback mode tries every distinct
+    // configured key and leaves all auto-routes unresolved only if none can fetch candidates.
+    let mut seen_fetch_keys = std::collections::HashSet::new();
+    let fetch_keys = reviewer_routes
+        .iter()
+        .map(|(_, key)| key.as_str())
+        .chain(agg_api_key.as_deref());
+    let needed_models = if fallback { 1 } else { reviewer_count.max(1) };
+    let mut models = None;
+    let mut last_fetch_error = None;
+    for fetch_key in fetch_keys {
+        if !seen_fetch_keys.insert(fetch_key) {
+            continue;
         }
+        match fetch_models(fetch_key, needed_models).await {
+            Ok(found) => {
+                models = Some(found);
+                break;
+            }
+            Err(err) if fallback => {
+                tracing::warn!(
+                    error = %err,
+                    "experimental OpenRouter route could not fetch the model catalog; trying another fallback route"
+                );
+                last_fetch_error = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    let Some(models) = models else {
+        if let Some(err) = last_fetch_error {
+            tracing::warn!(
+                error = %err,
+                "no experimental OpenRouter route could resolve free models; leaving them for fallback to skip"
+            );
+        }
+        return Ok(());
+    };
+    let (reviewer_models, remaining_models) =
+        select_reviewer_models(&reviewer_routes, models, fallback).await?;
+    let proven_aggregator_model = agg_api_key.as_deref().and_then(|api_key| {
+        reviewer_model_proven_for_key(api_key, &reviewer_routes, &reviewer_models)
+    });
+    let resolved_reviewer_models = reviewer_models
+        .iter()
+        .filter_map(Clone::clone)
+        .collect::<Vec<_>>();
+    let aggregator_model = match agg_api_key.as_deref() {
+        Some(api_key) => {
+            match select_aggregator_model(
+                api_key,
+                &remaining_models,
+                &resolved_reviewer_models,
+                proven_aggregator_model,
+            )
+            .await
+            {
+                Ok(model) => Some(model),
+                Err(err) if fallback => {
+                    tracing::warn!(
+                        error = %err,
+                        "experimental OpenRouter aggregator unavailable; leaving it for fallback to skip"
+                    );
+                    None
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        None => None,
+    };
+
+    for ((idx, _), selected) in reviewer_routes.into_iter().zip(reviewer_models) {
+        let Some((model, context_length)) = selected else {
+            continue;
+        };
         let model_threshold = context_length.saturating_sub(COMPACT_HEADROOM);
         let configured = config.reviewer[idx]
             .compact_threshold
@@ -539,11 +804,203 @@ pub async fn resolve_free_models(config: &mut Config) -> Result<()> {
         config.reviewer[idx].model = model;
     }
 
-    if agg_is_free {
-        let model = aggregator_model.expect("checked above");
+    if let Some(model) = aggregator_model {
         tracing::info!(%model, "resolved experimental openrouter free aggregator model");
         config.aggregator.model = model;
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AggregatorConfig, ReviewerConfig};
+    use rig_core::completion::CompletionError;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn unkeyed_free_config() -> Config {
+        let missing = "NITPICKER_TEST_MISSING_OPENROUTER_FALLBACK_KEY_9E42".to_string();
+        Config {
+            defaults: None,
+            aggregator: AggregatorConfig {
+                model: "free".to_string(),
+                provider: ProviderType::OpenRouter,
+                base_url: None,
+                api_key_env: Some(missing.clone()),
+                max_tokens: None,
+                auth: None,
+                azure_scope: None,
+                azure_credentials: None,
+            },
+            reviewer: vec![ReviewerConfig {
+                name: String::new(),
+                model: "free".to_string(),
+                provider: ProviderType::OpenRouter,
+                base_url: None,
+                api_key_env: Some(missing),
+                max_tokens: None,
+                compact_threshold: None,
+                auth: None,
+                azure_scope: None,
+                azure_credentials: None,
+            }],
+            presets: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_leaves_unkeyed_free_routes_for_client_construction_to_skip() {
+        let mut fallback_config = unkeyed_free_config();
+        resolve_free_models_with_fallback(&mut fallback_config, true)
+            .await
+            .unwrap();
+        assert_eq!(fallback_config.aggregator.model, "free");
+        assert_eq!(fallback_config.reviewer[0].model, "free");
+        assert_eq!(fallback_config.reviewer[0].name, "free_0");
+
+        let err = resolve_free_models(&mut unkeyed_free_config())
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("missing env var"));
+    }
+
+    #[tokio::test]
+    async fn unresolved_free_reviewers_receive_stable_config_order_names() {
+        let mut config = unkeyed_free_config();
+        config.reviewer.push(ReviewerConfig {
+            name: String::new(),
+            model: "free".to_string(),
+            provider: ProviderType::OpenRouter,
+            base_url: None,
+            api_key_env: config.reviewer[0].api_key_env.clone(),
+            max_tokens: None,
+            compact_threshold: None,
+            auth: None,
+            azure_scope: None,
+            azure_credentials: None,
+        });
+
+        resolve_free_models_with_fallback(&mut config, true)
+            .await
+            .unwrap();
+
+        assert_eq!(config.reviewer[0].name, "free_0");
+        assert_eq!(config.reviewer[1].name, "free_1");
+    }
+
+    #[test]
+    fn unresolved_free_route_requires_openrouter_auto_selection() {
+        assert!(is_unresolved_free_route(&ProviderType::OpenRouter, "free"));
+        assert!(is_unresolved_free_route(&ProviderType::OpenRouter, ""));
+        assert!(!is_unresolved_free_route(
+            &ProviderType::OpenRouter,
+            "openai/gpt-oss-120b:free"
+        ));
+        assert!(!is_unresolved_free_route(&ProviderType::OpenAi, "free"));
+    }
+
+    #[test]
+    fn aggregator_reuses_reviewer_probe_evidence_only_for_the_same_key() {
+        let routes = vec![(0, "shared-key".to_string()), (1, "other-key".to_string())];
+        let models = vec![
+            Some(("reviewer-a".to_string(), 128_000)),
+            Some(("reviewer-b".to_string(), 128_000)),
+        ];
+
+        assert_eq!(
+            reviewer_model_proven_for_key("shared-key", &routes, &models),
+            Some("reviewer-a")
+        );
+        assert_eq!(
+            reviewer_model_proven_for_key("other-key", &routes, &models),
+            Some("reviewer-b")
+        );
+        assert_eq!(
+            reviewer_model_proven_for_key("unprobed-key", &routes, &models),
+            None
+        );
+    }
+
+    #[test]
+    fn only_authentication_failures_reject_a_smoke_test_credential() {
+        let unauthorized = eyre::Report::new(CompletionError::from_http_response(
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"error":{"message":"invalid key"}}"#,
+        ));
+        assert_eq!(
+            failed_smoke_test_outcome(&unauthorized),
+            SmokeTestOutcome::CredentialRejected
+        );
+
+        // OpenRouter also uses 403 for model permissions and guardrails, so it cannot prove the
+        // whole credential is unusable. The resolver must keep trying other candidates.
+        let forbidden = eyre::Report::new(CompletionError::from_http_response(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"error":{"message":"model unavailable for this key"}}"#,
+        ));
+        assert_eq!(
+            failed_smoke_test_outcome(&forbidden),
+            SmokeTestOutcome::CandidateFailed
+        );
+
+        let typed_auth = eyre::Report::new(CompletionError::from_provider_body(
+            r#"{"error":{"error_type":"authentication"}}"#,
+        ));
+        assert_eq!(
+            failed_smoke_test_outcome(&typed_auth),
+            SmokeTestOutcome::CredentialRejected
+        );
+
+        let gateway = eyre::Report::new(CompletionError::from_http_response(
+            reqwest::StatusCode::BAD_GATEWAY,
+            r#"{"upstream":{"error":{"type":"invalid_api_key"}}}"#,
+        ));
+        assert_eq!(
+            failed_smoke_test_outcome(&gateway),
+            SmokeTestOutcome::CandidateFailed
+        );
+    }
+
+    #[test]
+    fn model_catalog_401_is_not_retried() {
+        let unauthorized = eyre::Report::new(ModelsHttpError {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            url: MODELS_URL.to_string(),
+        });
+        assert!(models_credential_rejected(&unauthorized));
+
+        let forbidden = eyre::Report::new(ModelsHttpError {
+            status: reqwest::StatusCode::FORBIDDEN,
+            url: MODELS_URL.to_string(),
+        });
+        assert!(!models_credential_rejected(&forbidden));
+    }
+
+    #[tokio::test]
+    async fn credential_rejection_stops_after_the_first_probe_batch() {
+        let candidates = (0..8)
+            .map(|index| (format!("model-{index}"), MIN_CONTEXT_LENGTH))
+            .collect::<Vec<_>>();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe_calls = Arc::clone(&calls);
+
+        let result =
+            probe_candidates_with("rejected-key", &candidates, "test", 1, move |_, _, _| {
+                let calls = Arc::clone(&probe_calls);
+                async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    SmokeTestOutcome::CredentialRejected
+                }
+            })
+            .await;
+
+        assert_eq!(result, ProbeCandidatesResult::CredentialRejected);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            SMOKE_TEST_BATCH_SIZE,
+            "already-started probes in the first batch may finish, but later batches must not run"
+        );
+    }
 }

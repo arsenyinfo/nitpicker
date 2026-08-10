@@ -188,6 +188,7 @@ mod tests {
             defaults: defaults_presets.map(|names| DefaultsConfig {
                 debate: None,
                 alloy: None,
+                fallback: None,
                 max_turns: None,
                 compact_threshold: None,
                 log_trajectories: None,

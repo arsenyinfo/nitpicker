@@ -114,8 +114,8 @@ pub struct PrReviewOutput {
     /// omits it, including failures after resolution). additive schema-v1 field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presets: Option<Vec<String>>,
-    /// `true` when at least one review job / debate turn failed or fell back — the report
-    /// was synthesized from partial evidence. present iff `status: ok`; mirrored as exit
+    /// `true` when at least one review job / debate turn failed — the report was synthesized
+    /// from partial evidence. present iff `status: ok`; mirrored as exit
     /// code 3. additive schema-v1 field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub degraded: Option<bool>,

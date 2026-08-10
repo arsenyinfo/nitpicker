@@ -17,7 +17,10 @@ use rig_core::providers::{anthropic, openai};
 use tokio::sync::Mutex;
 
 use crate::config::ProviderType;
-use crate::llm::{Completion, CompletionResponse, LLMClient, LLMClientDyn, mentions_http_status};
+use crate::llm::{
+    Completion, CompletionResponse, LLMClient, LLMClientDyn, provider_error_has_code,
+    provider_http_status,
+};
 
 /// Default AAD scope for Azure AI Foundry / Cognitive Services.
 pub const DEFAULT_SCOPE: &str = "https://cognitiveservices.azure.com/.default";
@@ -316,43 +319,32 @@ fn now_unix() -> i64 {
 }
 
 fn is_unauthorized(err: &eyre::Report) -> bool {
-    // The status lives in the wrapped source (rig surfaces the raw response body as `ProviderError`,
-    // and `llm.rs` wraps it with `.wrap_err_with(...)`), so we must walk the whole chain —
-    // `err.to_string()` would only render the top-level context. `{err:#}` is the alternate Display
-    // that joins the full chain.
-    //
-    // Key on the numeric 401 only, NOT the bare word "unauthorized": a 403 (e.g. an RBAC/deployment
-    // denial whose body reads "Unauthorized to use this deployment") must not trigger a refresh —
-    // re-minting the same identity's token can't fix a permissions error, it just wastes a token
-    // fetch + a retried completion. `mentions_http_status` matches the status across the JSON/HTTP
-    // shapings it can take in a raw body (`: 401`, `:401`, `401,`, `"401"`, ...), shared with the
-    // `llm.rs` retry classifiers so the two paths agree on what a 401 looks like.
-    let msg = format!("{err:#}");
-    if mentions_http_status(&msg, 401) {
-        return true;
-    }
-    // A Foundry route fronting OpenAI/Anthropic can return a provider-style auth body with no numeric
-    // status (rig drops it). Match the auth-specific error *types* only — NOT the 403 permission
-    // types, which a token refresh can't fix.
-    let lower = msg.to_ascii_lowercase();
-    lower.contains("authentication_error") || lower.contains("invalid_api_key")
+    // Key on the captured HTTP status or exact structured auth code. A 403 body which happens to
+    // say "unauthorized" must not trigger a refresh: re-minting the same identity cannot repair a
+    // deployment/RBAC denial.
+    provider_http_status(err) == Some(401)
+        || provider_error_has_code(err, &["authentication_error", "invalid_api_key"])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rig_core::completion::CompletionError;
 
-    /// Mirror how a Foundry 401 reaches `completion`: rig returns the raw body as `ProviderError`,
-    /// wrapped by `llm.rs` via `.wrap_err_with(...)`. The status text is only in the source.
-    fn wrapped_provider_error(body: &str) -> eyre::Report {
-        Err::<(), _>(eyre::eyre!("ProviderError: {body}"))
-            .wrap_err("Anthropic completion failed for model 'claude'")
-            .unwrap_err()
+    fn provider_error(status: Option<u16>, body: &str) -> eyre::Report {
+        let error = match status {
+            Some(status) => CompletionError::from_http_response(
+                reqwest::StatusCode::from_u16(status).unwrap(),
+                body,
+            ),
+            None => CompletionError::from_provider_body(body),
+        };
+        eyre::Report::new(error).wrap_err("Anthropic completion failed for model 'claude'")
     }
 
     #[test]
     fn is_unauthorized_walks_the_chain() {
-        let err = wrapped_provider_error(r#"{"statusCode": 401, "message": "Unauthorized"}"#);
+        let err = provider_error(Some(401), r#"{"message":"Unauthorized"}"#);
         // Top-level Display hides the status; the chain-walk must still catch it.
         let top_level = err.to_string().to_ascii_lowercase();
         assert!(!top_level.contains("unauthorized"));
@@ -361,16 +353,8 @@ mod tests {
 
     #[test]
     fn is_unauthorized_false_for_unrelated_error() {
-        let err = wrapped_provider_error(r#"{"statusCode": 500, "message": "boom"}"#);
+        let err = provider_error(Some(500), r#"{"message":"boom"}"#);
         assert!(!is_unauthorized(&err));
-    }
-
-    #[test]
-    fn is_unauthorized_detects_compact_json_status() {
-        // A compact 401 body (no space after the colon) must still trigger the refresh-and-retry —
-        // `:401,` slips past a plain `" 401"` substring check.
-        let err = wrapped_provider_error(r#"{"statusCode":401,"message":"token expired"}"#);
-        assert!(is_unauthorized(&err));
     }
 
     #[test]
@@ -378,8 +362,9 @@ mod tests {
         // A 403 (deployment/RBAC denial) whose body literally says "unauthorized" must not be
         // mistaken for a 401 — refreshing the token can't fix a permissions error, so triggering a
         // refresh-and-retry would just waste a token fetch before the real 403 propagates.
-        let err = wrapped_provider_error(
-            r#"{"statusCode": 403, "message": "Unauthorized to use this deployment"}"#,
+        let err = provider_error(
+            Some(403),
+            r#"{"message":"Unauthorized to use this deployment"}"#,
         );
         assert!(!is_unauthorized(&err));
     }
@@ -387,13 +372,15 @@ mod tests {
     #[test]
     fn is_unauthorized_detects_provider_auth_types_without_status() {
         // A Foundry route fronting OpenAI/Anthropic returns an auth body with no numeric status.
-        let openai = wrapped_provider_error(r#"{"error":{"code":"invalid_api_key"}}"#);
+        let openai = provider_error(None, r#"{"error":{"code":"invalid_api_key"}}"#);
         assert!(is_unauthorized(&openai));
-        let anthropic =
-            wrapped_provider_error(r#"{"type":"error","error":{"type":"authentication_error"}}"#);
+        let anthropic = provider_error(
+            None,
+            r#"{"type":"error","error":{"type":"authentication_error"}}"#,
+        );
         assert!(is_unauthorized(&anthropic));
         // A 403-class permission type is NOT an auth failure a refresh can fix.
-        let permission = wrapped_provider_error(r#"{"error":{"type":"permission_error"}}"#);
+        let permission = provider_error(None, r#"{"error":{"type":"permission_error"}}"#);
         assert!(!is_unauthorized(&permission));
     }
 

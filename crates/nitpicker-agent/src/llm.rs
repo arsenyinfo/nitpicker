@@ -1,3 +1,4 @@
+use crate::tools::floor_char_boundary;
 use eyre::{Result, WrapErr};
 use rig_core::OneOrMany;
 use rig_core::client::CompletionClient;
@@ -12,9 +13,10 @@ use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
-use tracing::warn;
+use tracing::{debug, warn};
 
 const MAX_COMPLETION_ATTEMPTS: usize = 4;
 const RATE_LIMIT_MAX_COMPLETION_ATTEMPTS: usize = 8;
@@ -385,6 +387,13 @@ pub trait LLMClientDyn: Send + Sync {
         &self,
         completion: Completion,
     ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse>> + Send + '_>>;
+
+    /// Fork mutable routing state for an independently progressing agent while retaining shared
+    /// provider clients and run-wide route availability. Stateless clients return `None` and may
+    /// safely be shared by `Arc`.
+    fn fork_for_agent(&self) -> Option<Arc<dyn LLMClientDyn>> {
+        None
+    }
 }
 
 impl<T: LLMClient> LLMClientDyn for T {
@@ -478,50 +487,314 @@ impl<C: LLMClient> LLMClient for RetryingLLM<C> {
     }
 }
 
-/// randomly alternates between models within a single agentic loop — see https://xbow.com/blog/alloy-agents
-///
-/// inner clients must already be wrapped with retry (e.g. via `.with_retry()`); AlloyClient does not add retry itself
-/// One model in the pool, carrying the settings that belong to it rather than to the role.
+/// One model route in an alloy/fallback pool, carrying the settings that belong to it rather than
+/// to the logical reviewer role. Inner clients must already be retry-wrapped.
+#[derive(Clone)]
 pub struct AlloySlot {
     pub client: Arc<dyn LLMClientDyn>,
     pub model: String,
     pub max_tokens: Option<u64>,
 }
 
+/// A fallback-capable route. Unlike the legacy public [`AlloySlot`] shape, clones share their
+/// run-local availability and warning state so independent reviewer/aggregator clients stop
+/// probing a quota-exhausted subscription and announce that one route failure only once.
+#[derive(Clone)]
+pub struct FallbackSlot {
+    client: Arc<dyn LLMClientDyn>,
+    model: String,
+    max_tokens: Option<u64>,
+    unavailable: Arc<AtomicBool>,
+    failover_warning_emitted: Arc<AtomicBool>,
+}
+
+impl FallbackSlot {
+    pub fn new(
+        client: Arc<dyn LLMClientDyn>,
+        model: impl Into<String>,
+        max_tokens: Option<u64>,
+    ) -> Self {
+        Self {
+            client,
+            model: model.into(),
+            max_tokens,
+            unavailable: Arc::new(AtomicBool::new(false)),
+            failover_warning_emitted: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn is_available(&self) -> bool {
+        !self.unavailable.load(Ordering::Acquire)
+    }
+
+    fn mark_unavailable(&self) {
+        self.unavailable.store(true, Ordering::Release);
+    }
+
+    fn claim_failover_warning(&self) -> bool {
+        !self.failover_warning_emitted.swap(true, Ordering::AcqRel)
+    }
+
+    pub fn client(&self) -> Arc<dyn LLMClientDyn> {
+        Arc::clone(&self.client)
+    }
+}
+
+impl From<AlloySlot> for FallbackSlot {
+    fn from(slot: AlloySlot) -> Self {
+        Self::new(slot.client, slot.model, slot.max_tokens)
+    }
+}
+
+impl From<&FallbackSlot> for AlloySlot {
+    fn from(slot: &FallbackSlot) -> Self {
+        Self {
+            client: Arc::clone(&slot.client),
+            model: slot.model.clone(),
+            max_tokens: slot.max_tokens,
+        }
+    }
+}
+
+/// Deterministic failover for one logical reviewer. The caller puts the configured primary first;
+/// after an exhausted client retry policy, the remaining reviewer routes are tried in declaration
+/// order, wrapping at the end. The same completion (including its full history) is replayed, so the
+/// agent does not lose completed investigation work.
+pub struct PriorityClient {
+    slots: Vec<FallbackSlot>,
+    active_idx: AtomicUsize,
+}
+
+impl PriorityClient {
+    pub fn new(slots: Vec<FallbackSlot>) -> Result<Self> {
+        if slots.is_empty() {
+            eyre::bail!("PriorityClient requires at least one slot");
+        }
+        Ok(Self {
+            slots,
+            active_idx: AtomicUsize::new(0),
+        })
+    }
+}
+
+impl LLMClientDyn for PriorityClient {
+    fn completion(
+        &self,
+        completion: Completion,
+    ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse>> + Send + '_>> {
+        Box::pin(complete_from_slots(
+            &self.slots,
+            self.active_idx.load(Ordering::Acquire),
+            true,
+            completion,
+            Some(&self.active_idx),
+        ))
+    }
+
+    fn fork_for_agent(&self) -> Option<Arc<dyn LLMClientDyn>> {
+        Some(Arc::new(Self {
+            slots: self.slots.clone(),
+            active_idx: AtomicUsize::new(self.active_idx.load(Ordering::Acquire)),
+        }))
+    }
+}
+
+/// Randomly chooses the first model for every completion — see
+/// https://xbow.com/blog/alloy-agents. With fallback enabled, a failed random pick falls through
+/// the remaining configured reviewers in declaration order.
 pub struct AlloyClient {
-    slots: Vec<AlloySlot>,
+    slots: Vec<FallbackSlot>,
+    fallback: bool,
 }
 
 impl AlloyClient {
     pub fn new(slots: Vec<AlloySlot>) -> Result<Self> {
+        Self::build(slots.into_iter().map(FallbackSlot::from).collect(), false)
+    }
+
+    pub fn new_with_fallback_routes(slots: Vec<FallbackSlot>) -> Result<Self> {
+        Self::build(slots, true)
+    }
+
+    fn build(slots: Vec<FallbackSlot>, fallback: bool) -> Result<Self> {
         if slots.is_empty() {
             eyre::bail!("AlloyClient requires at least one slot");
         }
-        Ok(Self { slots })
+        Ok(Self { slots, fallback })
     }
 
-    fn pick_idx(&self) -> usize {
+    fn available_indices(&self) -> Vec<usize> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| slot.is_available().then_some(index))
+            .collect()
+    }
+
+    fn pick_idx(&self) -> Option<usize> {
         use rand::RngExt;
-        rand::rng().random_range(0..self.slots.len())
+        let available = self.available_indices();
+        if available.is_empty() {
+            return None;
+        }
+        Some(available[rand::rng().random_range(0..available.len())])
     }
 }
 
 impl LLMClientDyn for AlloyClient {
     fn completion(
         &self,
-        mut completion: Completion,
+        completion: Completion,
     ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse>> + Send + '_>> {
-        let slot = &self.slots[self.pick_idx()];
-        completion.model = slot.model.clone();
-        // the selected model's own cap, not the role's: a cap belongs to the model it was set for
-        completion.max_tokens = slot.max_tokens;
-        let client = Arc::clone(&slot.client);
-        let model = slot.model.clone();
-        Box::pin(async move {
-            let mut response = client.completion(completion).await?;
-            response.selected_model = Some(model);
-            Ok(response)
-        })
+        match self.pick_idx() {
+            Some(start_idx) => Box::pin(complete_from_slots(
+                &self.slots,
+                start_idx,
+                self.fallback,
+                completion,
+                None,
+            )),
+            None => Box::pin(async {
+                eyre::bail!("all configured model routes are unavailable for this run")
+            }),
+        }
+    }
+}
+
+fn requires_tool_call(tool_choice: &Option<ToolChoice>) -> bool {
+    matches!(
+        tool_choice.as_ref(),
+        Some(ToolChoice::Required | ToolChoice::Specific { .. })
+    )
+}
+
+fn tool_protocol_error(completion: &Completion, response: &CompletionResponse) -> Option<String> {
+    let calls = response.tool_calls();
+    if response.finish_reason == FinishReason::ToolUse {
+        let Some(calls) = calls.as_ref() else {
+            return Some("reported tool use without returning a tool call".to_string());
+        };
+        if let Some(call) = calls.iter().find(|call| {
+            !completion
+                .tools
+                .iter()
+                .any(|tool| tool.name == call.function.name)
+        }) {
+            return Some(format!("called undeclared tool '{}'", call.function.name));
+        }
+        if let Some(ToolChoice::Specific { function_names }) = &completion.tool_choice
+            && let Some(call) = calls
+                .iter()
+                .find(|call| !function_names.contains(&call.function.name))
+        {
+            return Some(format!(
+                "called tool '{}' instead of the specifically requested tool",
+                call.function.name
+            ));
+        }
+    } else if requires_tool_call(&completion.tool_choice) {
+        return Some("returned text instead of the required tool call".to_string());
+    }
+    None
+}
+
+async fn complete_from_slots(
+    slots: &[FallbackSlot],
+    start_idx: usize,
+    fallback: bool,
+    completion: Completion,
+    sticky_index: Option<&AtomicUsize>,
+) -> Result<CompletionResponse> {
+    if !fallback {
+        let slot = &slots[start_idx];
+        let mut request = completion;
+        request.model = slot.model.clone();
+        request.max_tokens = slot.max_tokens;
+        let mut response = slot.client.completion(request).await?;
+        response.selected_model = Some(slot.model.clone());
+        return Ok(response);
+    }
+
+    let attempts = slots.len();
+    let mut last_err = None;
+    let mut attempted_models = Vec::with_capacity(attempts);
+
+    for offset in 0..attempts {
+        let idx = (start_idx + offset) % slots.len();
+        let slot = &slots[idx];
+        if !slot.is_available() {
+            continue;
+        }
+        let mut request = completion.clone();
+        request.model = slot.model.clone();
+        // A cap belongs to the selected model route, not the logical role whose turn this is.
+        request.max_tokens = slot.max_tokens;
+        attempted_models.push(slot.model.clone());
+        let (err, sticky_failure) = match slot.client.completion(request).await {
+            Ok(mut response) => {
+                let protocol_error = match &response.finish_reason {
+                    FinishReason::MaxTokens => Some(format!(
+                        "model route '{}' reached its output token limit after {} tokens",
+                        slot.model, response.usage.output_tokens
+                    )),
+                    _ => tool_protocol_error(&completion, &response)
+                        .map(|reason| format!("model route '{}': {reason}", slot.model)),
+                };
+                if let Some(message) = protocol_error {
+                    (eyre::eyre!(message), false)
+                } else {
+                    response.selected_model = Some(slot.model.clone());
+                    if let Some(index) = sticky_index {
+                        index.store(idx, Ordering::Release);
+                    }
+                    return Ok(response);
+                }
+            }
+            Err(err) => {
+                let sticky_failure = is_sticky_fallback_error(&err);
+                if sticky_failure {
+                    slot.mark_unavailable();
+                }
+                (err, sticky_failure)
+            }
+        };
+        if let Some(next_idx) = (1..attempts - offset)
+            .map(|step| (idx + step) % slots.len())
+            .find(|&candidate| slots[candidate].is_available())
+        {
+            if sticky_failure {
+                if slot.claim_failover_warning() {
+                    warn!(
+                        failed_model = %slot.model,
+                        next_model = %slots[next_idx].model,
+                        "model unavailable; trying next configured reviewer"
+                    );
+                } else {
+                    debug!(
+                        failed_model = %slot.model,
+                        next_model = %slots[next_idx].model,
+                        error = ?err,
+                        "duplicate unavailable-route failure; continuing with fallback"
+                    );
+                }
+            } else {
+                warn!(
+                    failed_model = %slot.model,
+                    next_model = %slots[next_idx].model,
+                    error = %err,
+                    "model failed; trying next configured reviewer"
+                );
+            }
+        }
+        last_err = Some(err);
+    }
+
+    match last_err {
+        Some(err) => {
+            let attempted = attempted_models.join(" -> ");
+            Err(err.wrap_err(format!("all model routes failed ({attempted})")))
+        }
+        None => eyre::bail!("all configured model routes are unavailable for this run"),
     }
 }
 
@@ -546,159 +819,270 @@ struct RetryPolicy {
 }
 
 fn retry_policy(err: &eyre::Report) -> RetryPolicy {
-    if is_rate_limit_error(err) {
-        return RetryPolicy {
-            retry: true,
-            max_attempts: RATE_LIMIT_MAX_COMPLETION_ATTEMPTS,
-            base_backoff_ms: RATE_LIMIT_BASE_BACKOFF_MS,
-            max_backoff_ms: RATE_LIMIT_MAX_BACKOFF_MS,
-        };
-    }
-
-    if is_non_retryable_client_error(err) {
-        return RetryPolicy {
+    match classify_provider_failure(err) {
+        // A rolling subscription allowance measured in hours cannot recover within this command.
+        // Surface it immediately so fallback can move on instead of entering the 429 backoff loop.
+        ProviderFailureClass::PermanentQuota => RetryPolicy {
             retry: false,
             max_attempts: 0,
             base_backoff_ms: 0,
             max_backoff_ms: 0,
-        };
-    }
-
-    RetryPolicy {
-        retry: true,
-        max_attempts: MAX_COMPLETION_ATTEMPTS,
-        base_backoff_ms: BASE_BACKOFF_MS,
-        max_backoff_ms: MAX_BACKOFF_MS,
-    }
-}
-
-/// HTTP status codes the retry/refresh classifiers key on, paired with their canonical reason
-/// phrase. The phrase lets us recognize the plain-text `"<code> <reason>"` status-line form
-/// (`401 Unauthorized`, `429 Too Many Requests`) that carries no JSON status key.
-const STATUS_REASONS: &[(u16, &str)] = &[
-    (400, "bad request"),
-    (401, "unauthorized"),
-    (402, "payment required"),
-    (403, "forbidden"),
-    (404, "not found"),
-    (429, "too many requests"),
-    (500, "internal server error"),
-    (502, "bad gateway"),
-    (503, "service unavailable"),
-    (504, "gateway timeout"),
-];
-
-/// How far back (in bytes) to scan for a status key before a candidate number. Comfortably covers
-/// `"statusCode": ` even with extra spacing, while staying local enough that an unrelated
-/// `code`/`status` field elsewhere in the body doesn't bleed in.
-const STATUS_KEY_WINDOW: usize = 24;
-
-/// True if `status` (an HTTP status code) appears in `msg` as a genuine status reference: a
-/// standalone number (not part of a longer digit run) that is *also* in an HTTP-status context —
-/// either immediately followed by its canonical reason phrase (`401 Unauthorized`) or preceded
-/// within [`STATUS_KEY_WINDOW`] by a `status`/`code` key (covering `"statusCode": 401`, `:401`,
-/// `Invalid status code 401`, ...). The context requirement keeps incidental standalone numbers in
-/// a raw provider body — `400 tokens`, `trace 404`, `req_402abc` — from being misread as the
-/// response status. Provider errors surface the status only inside the raw body, whose punctuation
-/// varies (spaced `"statusCode": 401` vs compact `"statusCode":401`), so we can't rely on fixed
-/// delimiters; the trade-off is that a status carrying neither a nearby key nor a reason phrase is
-/// not recognized (rare in practice, and recoverable — at worst a retried/failed request).
-pub(crate) fn mentions_http_status(msg: &str, status: u16) -> bool {
-    let lower = msg.to_ascii_lowercase();
-    let needle = status.to_string();
-    let reason = STATUS_REASONS
-        .iter()
-        .find(|(code, _)| *code == status)
-        .map(|(_, phrase)| *phrase);
-    let bytes = lower.as_bytes();
-    let mut from = 0;
-    while let Some(rel) = lower[from..].find(&needle) {
-        let start = from + rel;
-        let end = start + needle.len();
-        let prev_digit = start > 0 && bytes[start - 1].is_ascii_digit();
-        let next_digit = end < bytes.len() && bytes[end].is_ascii_digit();
-        if !prev_digit && !next_digit && status_in_context(&lower, start, end, reason) {
-            return true;
+        },
+        ProviderFailureClass::RateLimit => RetryPolicy {
+            retry: true,
+            max_attempts: RATE_LIMIT_MAX_COMPLETION_ATTEMPTS,
+            base_backoff_ms: RATE_LIMIT_BASE_BACKOFF_MS,
+            max_backoff_ms: RATE_LIMIT_MAX_BACKOFF_MS,
+        },
+        ProviderFailureClass::ContextLength | ProviderFailureClass::NonRetryableClient => {
+            RetryPolicy {
+                retry: false,
+                max_attempts: 0,
+                base_backoff_ms: 0,
+                max_backoff_ms: 0,
+            }
         }
-        from = start + 1;
+        ProviderFailureClass::Server | ProviderFailureClass::Unknown => RetryPolicy {
+            retry: true,
+            max_attempts: MAX_COMPLETION_ATTEMPTS,
+            base_backoff_ms: BASE_BACKOFF_MS,
+            max_backoff_ms: MAX_BACKOFF_MS,
+        },
     }
-    false
 }
 
-/// Whether the standalone number at `start..end` in `lower` (already lowercased) sits in an
-/// HTTP-status context: followed by its reason phrase, or preceded within [`STATUS_KEY_WINDOW`] by a
-/// `status`/`code` key. `start`/`end` are byte offsets on char boundaries (the needle is ASCII); the
-/// preceding-window start is floored to a boundary so a multibyte char in the body can't panic the
-/// slice.
-fn status_in_context(lower: &str, start: usize, end: usize, reason: Option<&str>) -> bool {
-    if let Some(reason) = reason {
-        if lower[end..].trim_start().starts_with(reason) {
-            return true;
-        }
-    }
-    let mut window_start = start.saturating_sub(STATUS_KEY_WINDOW);
-    while !lower.is_char_boundary(window_start) {
-        window_start += 1;
-    }
-    // `statuscode` is the lowercased compact `statusCode` (no separator), where neither `status`
-    // nor `code` is a whole word on its own, so it needs its own key.
-    key_word_present(lower, window_start, start, "status")
-        || key_word_present(lower, window_start, start, "code")
-        || key_word_present(lower, window_start, start, "statuscode")
-}
-
-/// Whether `key` appears as a whole word within `lower[lo..hi]`. The left edge must be the string
-/// start or a non-`[a-z0-9_]` byte; the right edge must be the string end or a non-`[a-z0-9]` byte
-/// (`_` is allowed on the right so `status_code` still matches via the `status` key, while
-/// `decode`/`encode`/`unicode`/`error_code`/`codec`/`statuslike` do NOT count as keys). Boundary
-/// checks read `lower`'s absolute bytes, so a word split by the `[lo..hi]` window edge is judged
-/// against its real neighbours. `key` is ASCII; `lo`/`hi` are on char boundaries.
-fn key_word_present(lower: &str, lo: usize, hi: usize, key: &str) -> bool {
-    let bytes = lower.as_bytes();
-    let region = &lower[lo..hi];
-    let mut from = 0;
-    while let Some(rel) = region[from..].find(key) {
-        let abs = lo + from + rel;
-        let left_ok = abs == 0 || {
-            let b = bytes[abs - 1];
-            !b.is_ascii_alphanumeric() && b != b'_'
-        };
-        let after = abs + key.len();
-        let right_ok = after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
-        if left_ok && right_ok {
-            return true;
-        }
-        from += rel + 1;
-    }
-    false
-}
-
-/// Permanent error *types* that direct Anthropic/OpenAI bodies carry instead of a numeric status.
-/// rig flattens a non-2xx response to `ProviderError(<raw body>)` with the HTTP status dropped, so
-/// for those providers the numeric-status matchers never fire — these strings are the only signal.
-/// `insufficient_quota` (out of credits) is permanent despite arriving as HTTP 429: retrying never
-/// helps. Auth/permission `403`-class types are deliberately included here, *not* in the rate-limit
-/// set. All lowercase; matched as substrings on the lowercased chain.
-const NON_RETRYABLE_ERROR_TYPES: &[&str] = &[
+/// Exact provider error codes which describe a request that cannot succeed unchanged. These are
+/// read from structured `error.code` / `error.type` / `error.status` / `error_type` fields, never
+/// searched for in a rendered error string.
+const NON_RETRYABLE_ERROR_CODES: &[&str] = &[
     "authentication_error",
     "invalid_api_key",
     "permission_error",
     "permission_denied",
     "invalid_request_error",
     "not_found_error",
-    "context_length_exceeded",
-    "insufficient_quota",
 ];
 
-/// Transient error *types* (overload / throttling) that warrant the rate-limit backoff policy.
-const RATE_LIMIT_ERROR_TYPES: &[&str] = &[
+/// Exact transient overload/throttling codes which warrant the longer rate-limit backoff policy.
+const RATE_LIMIT_ERROR_CODES: &[&str] = &[
     "rate_limit_error",
     "rate_limit_exceeded",
     "overloaded_error",
 ];
 
-/// Error types that often arrive with HTTP 429 but are not transient throttles.
-const PERMANENT_QUOTA_ERROR_TYPES: &[&str] = &["insufficient_quota"];
+/// Exact provider codes for allowance exhaustion which cannot recover during this command.
+const PERMANENT_QUOTA_ERROR_CODES: &[&str] = &["insufficient_quota", "usage_limit_reached"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderFailureClass {
+    Server,
+    PermanentQuota,
+    RateLimit,
+    ContextLength,
+    NonRetryableClient,
+    Unknown,
+}
+
+#[derive(Debug, Default)]
+struct ProviderErrorFacts {
+    status: Option<u16>,
+    body_status: Option<u16>,
+    body_code_status: Option<u16>,
+    codes: Vec<String>,
+    messages: Vec<String>,
+}
+
+impl ProviderErrorFacts {
+    fn from_report(err: &eyre::Report) -> Option<Self> {
+        let completion_error = err
+            .chain()
+            .find_map(|source| source.downcast_ref::<CompletionError>())?;
+        let mut facts = Self {
+            status: completion_error
+                .provider_response_status()
+                .map(|status| status.as_u16()),
+            ..Self::default()
+        };
+        match completion_error.provider_response_json() {
+            Ok(Some(body)) => {
+                collect_provider_status_hints(&body, &mut facts);
+                collect_provider_error_fields(&body, &mut facts);
+            }
+            Err(_) => {
+                if let Some(body) = completion_error.provider_response_body() {
+                    // Some compatible gateways return text/plain. This is the sole unstructured
+                    // compatibility input: it is still the provider body, never the rendered
+                    // eyre chain or surrounding diagnostic text.
+                    facts.messages.push(body.to_string());
+                }
+            }
+            Ok(None) => {}
+        }
+        Some(facts)
+    }
+
+    fn effective_status(&self) -> Option<u16> {
+        match self.status {
+            Some(status) if !(200..300).contains(&status) => Some(status),
+            _ => self.body_status.or(self.body_code_status).or(self.status),
+        }
+    }
+
+    fn has_code(&self, expected: &[&str]) -> bool {
+        self.codes
+            .iter()
+            .any(|code| expected.contains(&code.as_str()))
+    }
+}
+
+fn numeric_field(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<u16> {
+    keys.iter().find_map(|key| {
+        object
+            .get(*key)
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+    })
+}
+
+/// Rank body-carried status hints by their semantic position instead of whichever numeric field a
+/// recursive traversal happens to encounter first. Top-level status fields describe an envelope;
+/// a numeric provider `code` is only a fallback for 2xx/statusless error envelopes.
+fn collect_provider_status_hints(value: &Value, facts: &mut ProviderErrorFacts) {
+    let Some(root) = value.as_object() else {
+        return;
+    };
+    facts.body_status = numeric_field(root, &["status", "statusCode", "status_code"]);
+    facts.body_code_status = numeric_field(root, &["code"]);
+
+    if let Some(error) = root.get("error").and_then(Value::as_object) {
+        facts.body_status = facts
+            .body_status
+            .or_else(|| numeric_field(error, &["status", "statusCode", "status_code"]));
+        facts.body_code_status = facts
+            .body_code_status
+            .or_else(|| numeric_field(error, &["code"]));
+    }
+}
+
+/// Collect only semantically named scalar fields from a provider JSON error envelope. Recursing
+/// covers gateway shapes such as `{ "upstream": { "error": ... } }`; the real outer HTTP status
+/// is stored separately and always wins over nested provider facts.
+fn collect_provider_error_fields(value: &Value, facts: &mut ProviderErrorFacts) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                match (key.as_str(), value) {
+                    ("code" | "type" | "status" | "error_type", Value::String(value)) => {
+                        facts.codes.push(value.to_ascii_lowercase());
+                    }
+                    ("message", Value::String(value)) => facts.messages.push(value.clone()),
+                    _ => collect_provider_error_fields(value, facts),
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_provider_error_fields(value, facts);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Keep Codex's stored provider error bounded without turning valid JSON into an unparseable
+/// prefix. Large structured bodies are projected to the exact facts used by the classifier;
+/// malformed/text bodies retain the old bounded-prefix behavior.
+pub(crate) fn compact_provider_error_body(body: &str, compact_above_bytes: usize) -> String {
+    if body.len() <= compact_above_bytes {
+        return body.to_string();
+    }
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return truncate_utf8(body, compact_above_bytes);
+    };
+    let mut facts = ProviderErrorFacts::default();
+    collect_provider_status_hints(&value, &mut facts);
+    collect_provider_error_fields(&value, &mut facts);
+    let codes = facts
+        .codes
+        .into_iter()
+        .take(16)
+        .map(|code| serde_json::json!({ "code": truncate_utf8(&code, 128) }))
+        .collect::<Vec<_>>();
+    let messages = facts
+        .messages
+        .into_iter()
+        .take(4)
+        .map(|message| serde_json::json!({ "message": truncate_utf8(&message, 512) }))
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "status": facts.body_status,
+        "code": facts.body_code_status,
+        "details": codes,
+        "messages": messages,
+    })
+    .to_string()
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let end = floor_char_boundary(value, max_bytes);
+    format!("{}…", &value[..end])
+}
+
+fn classify_provider_failure(err: &eyre::Report) -> ProviderFailureClass {
+    let Some(facts) = ProviderErrorFacts::from_report(err) else {
+        return ProviderFailureClass::Unknown;
+    };
+    let status = facts.effective_status();
+
+    // Anthropic defines a captured HTTP 529 carrying `overloaded_error` as provider overload. It
+    // follows the longer overload/throttling policy; an arbitrary gateway 5xx with a nested
+    // overload payload must still retain normal server-error precedence.
+    if facts.status == Some(529) && facts.has_code(&["overloaded_error"]) {
+        return ProviderFailureClass::RateLimit;
+    }
+    // The captured HTTP status is otherwise the outer response. A gateway 5xx therefore remains
+    // transient even when its JSON body embeds an upstream quota or client-error payload.
+    if status.is_some_and(|status| (500..600).contains(&status)) {
+        return ProviderFailureClass::Server;
+    }
+    if facts.has_code(PERMANENT_QUOTA_ERROR_CODES)
+        || facts
+            .messages
+            .iter()
+            .any(|message| is_long_window_quota_message(message))
+    {
+        return ProviderFailureClass::PermanentQuota;
+    }
+    if facts.has_code(RATE_LIMIT_ERROR_CODES) || status == Some(429) {
+        return ProviderFailureClass::RateLimit;
+    }
+    if facts.has_code(&["context_length_exceeded"])
+        || (facts.has_code(&["invalid_request_error"])
+            && facts
+                .messages
+                .iter()
+                .any(|message| message.to_ascii_lowercase().contains("prompt is too long")))
+    {
+        return ProviderFailureClass::ContextLength;
+    }
+    if facts.has_code(NON_RETRYABLE_ERROR_CODES)
+        || status.is_some_and(|status| (400..=404).contains(&status))
+    {
+        return ProviderFailureClass::NonRetryableClient;
+    }
+    ProviderFailureClass::Unknown
+}
+
+pub(crate) fn provider_http_status(err: &eyre::Report) -> Option<u16> {
+    ProviderErrorFacts::from_report(err).and_then(|facts| facts.effective_status())
+}
+
+pub(crate) fn provider_error_has_code(err: &eyre::Report, expected: &[&str]) -> bool {
+    ProviderErrorFacts::from_report(err).is_some_and(|facts| facts.has_code(expected))
+}
 
 /// Whether an error chain reports a context-window overflow — the one synthesis failure
 /// where "select fewer presets" is real remediation. Matches the OpenAI-style type token
@@ -706,50 +1090,54 @@ const PERMANENT_QUOTA_ERROR_TYPES: &[&str] = &["insufficient_quota"];
 /// message says the prompt is too long; a generic `invalid_request_error` alone does NOT
 /// qualify (those are malformed-request bugs, not size problems).
 pub fn is_context_length_error(err: &eyre::Report) -> bool {
-    let msg = format!("{err:#}").to_ascii_lowercase();
-    msg.contains("context_length_exceeded")
-        || (msg.contains("invalid_request_error") && msg.contains("prompt is too long"))
+    classify_provider_failure(err) == ProviderFailureClass::ContextLength
 }
 
+#[cfg(test)]
 fn is_non_retryable_client_error(err: &eyre::Report) -> bool {
-    // Walk the whole chain: provider clients map non-2xx to a `ProviderError` carrying the raw
-    // response body, then `.wrap_err_with(...)` adds a top-level context. `err.to_string()` renders
-    // only that context, so the status code would be invisible; `{err:#}` joins the full chain.
-    let msg = format!("{err:#}");
-    // a 5xx response takes precedence: even when a 4xx is nested in the body (e.g. an upstream
-    // `"code": 403` inside a 502 envelope), the response itself is a retryable server error, so we
-    // must not classify it as a permanent client error. Cover the full registered 5xx range; the
-    // JSON `status`/`code`-key form is matched even for codes without a reason phrase here.
-    if [500, 501, 502, 503, 504, 505, 506, 507, 508, 510, 511]
-        .iter()
-        .any(|&status| mentions_http_status(&msg, status))
-    {
-        return false;
-    }
-    if [400, 401, 402, 403, 404]
-        .iter()
-        .any(|&status| mentions_http_status(&msg, status))
-    {
-        return true;
-    }
-    let lower = msg.to_ascii_lowercase();
-    NON_RETRYABLE_ERROR_TYPES.iter().any(|t| lower.contains(t))
+    matches!(
+        classify_provider_failure(err),
+        ProviderFailureClass::ContextLength | ProviderFailureClass::NonRetryableClient
+    )
 }
 
+#[cfg(test)]
 fn is_rate_limit_error(err: &eyre::Report) -> bool {
-    // Same reasoning as `is_non_retryable_client_error`: walk the full chain so a 429 carried in a
-    // wrapped `ProviderError` body still maps to the rate-limit backoff policy. Permanent quota
-    // types are excluded first because retrying them only burns the full rate-limit retry budget.
-    let msg = format!("{err:#}").to_ascii_lowercase();
-    if PERMANENT_QUOTA_ERROR_TYPES.iter().any(|t| msg.contains(t)) {
-        return false;
-    }
-    mentions_http_status(&msg, 429)
-        || msg.contains("rate limit")
-        || msg.contains("too many requests")
-        || msg.contains("tokens per minute")
-        || msg.contains("requests per minute")
-        || RATE_LIMIT_ERROR_TYPES.iter().any(|t| msg.contains(t))
+    classify_provider_failure(err) == ProviderFailureClass::RateLimit
+}
+
+#[cfg(test)]
+fn is_long_window_quota_error(err: &eyre::Report) -> bool {
+    classify_provider_failure(err) == ProviderFailureClass::PermanentQuota
+}
+
+fn is_long_window_quota_message(msg: &str) -> bool {
+    let msg = msg.to_ascii_lowercase();
+    msg.contains("out of tokens")
+        || msg.contains("hit your usage limit")
+        || msg.contains("usage limit has been reached")
+        || ((msg.contains("usage limit") || msg.contains("token limit"))
+            && (msg.contains("window")
+                || msg.contains("reset")
+                || msg.contains("refresh")
+                || msg.contains("billing cycle")
+                || msg.contains("next cycle")
+                || msg.contains("5h")
+                || msg.contains("5 h")
+                || msg.contains("5 hour")))
+}
+
+/// Whether an error represents an operational provider limit that cannot recover during this run.
+/// CLI layers use this to present a concise message while retaining the full report at debug level.
+pub fn is_operational_limit_error(err: &eyre::Report) -> bool {
+    is_sticky_fallback_error(err)
+}
+
+fn is_sticky_fallback_error(err: &eyre::Report) -> bool {
+    matches!(
+        classify_provider_failure(err),
+        ProviderFailureClass::PermanentQuota | ProviderFailureClass::RateLimit
+    )
 }
 
 fn jittered_backoff(attempt: usize, base_backoff_ms: u64, max_backoff_ms: u64) -> Duration {
@@ -769,48 +1157,18 @@ fn jitter_factor() -> f64 {
     0.5 + scaled
 }
 
-#[derive(Debug, Deserialize)]
-struct OpenRouterErrorEnvelope {
-    error: OpenRouterErrorBody,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenRouterErrorBody {
-    message: String,
-    code: Option<u16>,
-}
-
-fn normalize_openrouter_completion_error(err: &CompletionError) -> eyre::Report {
-    match err {
-        CompletionError::ResponseError(msg) => normalize_openrouter_response_error(msg),
-        CompletionError::ProviderError(msg) => eyre::eyre!("ProviderError: {msg}"),
-        _ => eyre::eyre!("{err}"),
+fn normalize_openrouter_completion_error(err: CompletionError) -> eyre::Report {
+    let empty_response = matches!(
+        &err,
+        CompletionError::ResponseError(msg)
+            if msg.contains("no message or tool call") || msg.contains("no choices")
+    );
+    let report = eyre::Report::new(err);
+    if empty_response {
+        report.wrap_err("empty response from model (no message or tool call)")
+    } else {
+        report
     }
-}
-
-fn normalize_openrouter_response_error(msg: &str) -> eyre::Report {
-    if msg.contains("no message or tool call") || msg.contains("no choices") {
-        return eyre::eyre!("empty response from model (no message or tool call)");
-    }
-
-    if let Some(err) = parse_openrouter_error_envelope(msg) {
-        return match err.code {
-            Some(code) => eyre::eyre!(
-                "HttpError: Invalid status code {code} OpenRouter provider error: {}",
-                err.message
-            ),
-            None => eyre::eyre!("ProviderError: {}", err.message),
-        };
-    }
-
-    eyre::eyre!("ResponseError: {msg}")
-}
-
-fn parse_openrouter_error_envelope(msg: &str) -> Option<OpenRouterErrorBody> {
-    let body = msg.split_once("response body:")?.1.trim();
-    serde_json::from_str::<OpenRouterErrorEnvelope>(body)
-        .ok()
-        .map(|envelope| envelope.error)
 }
 
 fn is_local_base_url(base_url: Option<&str>) -> bool {
@@ -939,7 +1297,8 @@ impl LLMClient for openrouter::Client {
         let response = model
             .completion(request)
             .await
-            .map_err(|e| normalize_openrouter_completion_error(&e))?;
+            .map_err(normalize_openrouter_completion_error)
+            .wrap_err_with(|| format!("OpenRouter completion failed for model '{model_name}'"))?;
         let finish_reason = response
             .raw_response
             .choices
@@ -1185,6 +1544,7 @@ fn map_gemini_finish_reason(
 mod tests {
     use super::*;
     use rig_core::completion::Usage;
+    use std::sync::Mutex as StdMutex;
 
     fn strip_think_blocks(text: &str) -> String {
         scan_think_blocks(text).0
@@ -1198,6 +1558,492 @@ mod tests {
             usage: TokenUsage::default(),
             selected_model: None,
         }
+    }
+
+    struct RecordingClient {
+        fail: bool,
+        calls: Arc<StdMutex<Vec<Completion>>>,
+    }
+
+    impl LLMClient for RecordingClient {
+        async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
+            self.calls.lock().unwrap().push(completion);
+            if self.fail {
+                eyre::bail!("route failed");
+            }
+            Ok(response_with(vec![AssistantContent::text("ok")]))
+        }
+    }
+
+    fn recording_slot(
+        model: &str,
+        max_tokens: Option<u64>,
+        fail: bool,
+    ) -> (FallbackSlot, Arc<StdMutex<Vec<Completion>>>) {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let client = RecordingClient {
+            fail,
+            calls: Arc::clone(&calls),
+        }
+        .into_arc();
+        (FallbackSlot::new(client, model, max_tokens), calls)
+    }
+
+    fn test_completion() -> Completion {
+        Completion {
+            model: "logical-primary".to_string(),
+            prompt: Message::user("continue"),
+            preamble: Some("system".to_string()),
+            history: vec![Message::user("prior work")],
+            tools: Vec::new(),
+            tool_choice: None,
+            max_tokens: Some(999),
+            additional_params: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn priority_client_uses_next_route_without_losing_the_completion() {
+        let (first, first_calls) = recording_slot("first", Some(10), true);
+        let (second, second_calls) = recording_slot("second", Some(20), false);
+        let client = PriorityClient::new(vec![first, second]).unwrap();
+
+        let response = client.completion(test_completion()).await.unwrap();
+
+        assert_eq!(response.selected_model.as_deref(), Some("second"));
+        {
+            let first_guard = first_calls.lock().unwrap();
+            let second_guard = second_calls.lock().unwrap();
+            assert_eq!(first_guard.len(), 1);
+            assert_eq!(second_guard.len(), 1);
+            assert_eq!(first_guard[0].model, "first");
+            assert_eq!(first_guard[0].max_tokens, Some(10));
+            assert_eq!(second_guard[0].model, "second");
+            assert_eq!(second_guard[0].max_tokens, Some(20));
+            assert_eq!(second_guard[0].history.len(), 1);
+            assert_eq!(second_guard[0].preamble.as_deref(), Some("system"));
+        }
+
+        // A successful failover becomes this logical agent's active route, so the next turn does
+        // not probe the failed primary again.
+        client.completion(test_completion()).await.unwrap();
+        assert_eq!(first_calls.lock().unwrap().len(), 1);
+        assert_eq!(second_calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn priority_clients_share_slots_without_sharing_stickiness() {
+        let (failed, failed_calls) = recording_slot("failed", None, true);
+        let (healthy, healthy_calls) = recording_slot("healthy", None, false);
+        let first = PriorityClient::new(vec![failed.clone(), healthy.clone()]).unwrap();
+        let independent = PriorityClient::new(vec![failed, healthy]).unwrap();
+
+        first.completion(test_completion()).await.unwrap();
+        first.completion(test_completion()).await.unwrap();
+        independent.completion(test_completion()).await.unwrap();
+
+        // The first logical agent sticks to its successful fallback, while the independent agent
+        // still starts from its own primary. Shared slot state is tested separately for quota.
+        assert_eq!(failed_calls.lock().unwrap().len(), 2);
+        assert_eq!(healthy_calls.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn fallback_slot_clones_share_one_failover_warning_claim() {
+        let (slot, _) = recording_slot("shared-route", None, false);
+        let clone = slot.clone();
+
+        assert!(slot.claim_failover_warning());
+        assert!(!clone.claim_failover_warning());
+
+        // Dedupe follows a concrete route, not its model string: distinct credentials using the
+        // same model must each retain their own warning claim.
+        let (same_model_distinct_route, _) = recording_slot("shared-route", None, false);
+        assert!(same_model_distinct_route.claim_failover_warning());
+    }
+
+    struct FailOnCallClient {
+        calls: Arc<AtomicUsize>,
+        fail_on: usize,
+    }
+
+    impl LLMClient for FailOnCallClient {
+        async fn completion(&self, _completion: Completion) -> Result<CompletionResponse> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+            if call == self.fail_on {
+                eyre::bail!("request-specific route failure")
+            }
+            Ok(response_with(vec![AssistantContent::text("ok")]))
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_fork_inherits_but_cannot_overwrite_parent_stickiness() {
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let first = FallbackSlot::new(
+            FailOnCallClient {
+                calls: Arc::clone(&first_calls),
+                fail_on: 1,
+            }
+            .into_arc(),
+            "first",
+            None,
+        );
+        let second = FallbackSlot::new(
+            FailOnCallClient {
+                calls: Arc::clone(&second_calls),
+                fail_on: 2,
+            }
+            .into_arc(),
+            "second",
+            None,
+        );
+        let parent = PriorityClient::new(vec![first, second]).unwrap();
+
+        // The parent fails over to `second`; the fork inherits that route, then independently
+        // wraps back to `first` when its own request fails there.
+        parent.completion(test_completion()).await.unwrap();
+        let fork = parent.fork_for_agent().expect("priority clients can fork");
+        fork.completion(test_completion()).await.unwrap();
+        parent.completion(test_completion()).await.unwrap();
+
+        // The parent's final turn still starts on `second`. A shared active index would have made
+        // it start on `first`, while a fork reset to zero would have skipped `second` initially.
+        assert_eq!(first_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(second_calls.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn priority_client_wraps_through_declaration_order() {
+        let (first, first_calls) = recording_slot("first", None, false);
+        let (second, second_calls) = recording_slot("second", None, true);
+        let (third, third_calls) = recording_slot("third", None, true);
+        // Production callers rotate the configured ring so the logical primary is first.
+        let client = PriorityClient::new(vec![second, third, first]).unwrap();
+
+        let response = client.completion(test_completion()).await.unwrap();
+
+        assert_eq!(response.selected_model.as_deref(), Some("first"));
+        assert_eq!(second_calls.lock().unwrap().len(), 1);
+        assert_eq!(third_calls.lock().unwrap().len(), 1);
+        assert_eq!(first_calls.lock().unwrap().len(), 1);
+    }
+
+    struct MaxTokensClient {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl LLMClient for MaxTokensClient {
+        async fn completion(&self, _completion: Completion) -> Result<CompletionResponse> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let mut response = response_with(vec![AssistantContent::text("partial")]);
+            response.finish_reason = FinishReason::MaxTokens;
+            response.usage.output_tokens = 10;
+            Ok(response)
+        }
+    }
+
+    #[tokio::test]
+    async fn priority_client_retries_truncated_response_on_the_next_route() {
+        let truncated_calls = Arc::new(AtomicUsize::new(0));
+        let truncated = FallbackSlot::new(
+            MaxTokensClient {
+                calls: Arc::clone(&truncated_calls),
+            }
+            .into_arc(),
+            "truncated",
+            Some(10),
+        );
+        let (healthy, healthy_calls) = recording_slot("healthy", Some(20), false);
+        let client = PriorityClient::new(vec![truncated, healthy]).unwrap();
+
+        let response = client.completion(test_completion()).await.unwrap();
+
+        assert_eq!(response.selected_model.as_deref(), Some("healthy"));
+        assert_eq!(truncated_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(healthy_calls.lock().unwrap().len(), 1);
+    }
+
+    struct ToolUseClient {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl LLMClient for ToolUseClient {
+        async fn completion(&self, _completion: Completion) -> Result<CompletionResponse> {
+            use rig_core::completion::message::ToolFunction;
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let mut response = response_with(vec![AssistantContent::ToolCall(ToolCall::new(
+                "call-1".to_string(),
+                ToolFunction::new("allowed".to_string(), serde_json::json!({})),
+            ))]);
+            response.finish_reason = FinishReason::ToolUse;
+            Ok(response)
+        }
+    }
+
+    struct RequiredToolClient {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl LLMClient for RequiredToolClient {
+        async fn completion(&self, _completion: Completion) -> Result<CompletionResponse> {
+            use rig_core::completion::message::ToolFunction;
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let mut response = response_with(vec![AssistantContent::ToolCall(ToolCall::new(
+                "call-1".to_string(),
+                ToolFunction::new("submit".to_string(), serde_json::json!({})),
+            ))]);
+            response.finish_reason = FinishReason::ToolUse;
+            Ok(response)
+        }
+    }
+
+    #[tokio::test]
+    async fn priority_client_retries_unexpected_tool_use_for_no_tools_request() {
+        let tool_use_calls = Arc::new(AtomicUsize::new(0));
+        let tool_use = FallbackSlot::new(
+            ToolUseClient {
+                calls: Arc::clone(&tool_use_calls),
+            }
+            .into_arc(),
+            "tool-use",
+            None,
+        );
+        let (healthy, healthy_calls) = recording_slot("healthy", None, false);
+        let client = PriorityClient::new(vec![tool_use, healthy]).unwrap();
+
+        let response = client.completion(test_completion()).await.unwrap();
+
+        assert_eq!(response.selected_model.as_deref(), Some("healthy"));
+        assert_eq!(tool_use_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(healthy_calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn priority_client_accepts_tool_use_when_tools_were_declared() {
+        let tool_use_calls = Arc::new(AtomicUsize::new(0));
+        let tool_use = FallbackSlot::new(
+            ToolUseClient {
+                calls: Arc::clone(&tool_use_calls),
+            }
+            .into_arc(),
+            "tool-use",
+            None,
+        );
+        let (unused, unused_calls) = recording_slot("unused", None, false);
+        let client = PriorityClient::new(vec![tool_use, unused]).unwrap();
+        let mut completion = test_completion();
+        completion.tools.push(rig_core::completion::ToolDefinition {
+            name: "allowed".to_string(),
+            description: "An allowed tool".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        });
+
+        let response = client.completion(completion).await.unwrap();
+
+        assert_eq!(response.finish_reason, FinishReason::ToolUse);
+        assert_eq!(response.selected_model.as_deref(), Some("tool-use"));
+        assert_eq!(tool_use_calls.load(Ordering::Relaxed), 1);
+        assert!(unused_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn required_tool_protocol_failure_tries_the_next_route() {
+        let (plain_text, plain_text_calls) = recording_slot("plain-text", None, false);
+        let required_tool_calls = Arc::new(AtomicUsize::new(0));
+        let required_tool = FallbackSlot::new(
+            RequiredToolClient {
+                calls: Arc::clone(&required_tool_calls),
+            }
+            .into_arc(),
+            "required-tool",
+            None,
+        );
+        let client = PriorityClient::new(vec![plain_text, required_tool]).unwrap();
+        let mut completion = test_completion();
+        completion.tools.push(rig_core::completion::ToolDefinition {
+            name: "submit".to_string(),
+            description: "Submit the result".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        });
+        completion.tool_choice = Some(ToolChoice::Required);
+
+        let response = client.completion(completion).await.unwrap();
+
+        assert_eq!(response.selected_model.as_deref(), Some("required-tool"));
+        assert_eq!(plain_text_calls.lock().unwrap().len(), 1);
+        assert_eq!(required_tool_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn undeclared_required_tool_call_tries_the_next_route() {
+        let wrong_tool_calls = Arc::new(AtomicUsize::new(0));
+        let wrong_tool = FallbackSlot::new(
+            ToolUseClient {
+                calls: Arc::clone(&wrong_tool_calls),
+            }
+            .into_arc(),
+            "wrong-tool",
+            None,
+        );
+        let required_tool_calls = Arc::new(AtomicUsize::new(0));
+        let required_tool = FallbackSlot::new(
+            RequiredToolClient {
+                calls: Arc::clone(&required_tool_calls),
+            }
+            .into_arc(),
+            "required-tool",
+            None,
+        );
+        let client = PriorityClient::new(vec![wrong_tool, required_tool]).unwrap();
+        let mut completion = test_completion();
+        completion.tools.push(rig_core::completion::ToolDefinition {
+            name: "submit".to_string(),
+            description: "Submit the result".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        });
+        completion.tool_choice = Some(ToolChoice::Required);
+
+        let response = client.completion(completion).await.unwrap();
+
+        assert_eq!(response.selected_model.as_deref(), Some("required-tool"));
+        assert_eq!(wrong_tool_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(required_tool_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn specifically_disallowed_tool_call_tries_the_next_route() {
+        let wrong_tool_calls = Arc::new(AtomicUsize::new(0));
+        let wrong_tool = FallbackSlot::new(
+            ToolUseClient {
+                calls: Arc::clone(&wrong_tool_calls),
+            }
+            .into_arc(),
+            "wrong-tool",
+            None,
+        );
+        let required_tool_calls = Arc::new(AtomicUsize::new(0));
+        let required_tool = FallbackSlot::new(
+            RequiredToolClient {
+                calls: Arc::clone(&required_tool_calls),
+            }
+            .into_arc(),
+            "required-tool",
+            None,
+        );
+        let client = PriorityClient::new(vec![wrong_tool, required_tool]).unwrap();
+        let mut completion = test_completion();
+        for name in ["allowed", "submit"] {
+            completion.tools.push(rig_core::completion::ToolDefinition {
+                name: name.to_string(),
+                description: "A declared tool".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            });
+        }
+        completion.tool_choice = Some(ToolChoice::Specific {
+            function_names: vec!["submit".to_string()],
+        });
+
+        let response = client.completion(completion).await.unwrap();
+
+        assert_eq!(response.selected_model.as_deref(), Some("required-tool"));
+        assert_eq!(wrong_tool_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(required_tool_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn priority_client_reports_when_every_route_is_unavailable() {
+        let (slot, calls) = recording_slot("unavailable", None, false);
+        slot.mark_unavailable();
+        let client = PriorityClient::new(vec![slot]).unwrap();
+
+        let err = client.completion(test_completion()).await.unwrap_err();
+
+        assert_eq!(
+            format!("{err:#}"),
+            "all configured model routes are unavailable for this run"
+        );
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn alloy_without_fallback_attempts_only_the_selected_route() {
+        let (first, first_calls) = recording_slot("first", None, true);
+        let (second, second_calls) = recording_slot("second", None, true);
+        let client =
+            AlloyClient::new(vec![AlloySlot::from(&first), AlloySlot::from(&second)]).unwrap();
+
+        assert!(client.completion(test_completion()).await.is_err());
+        assert_eq!(
+            first_calls.lock().unwrap().len() + second_calls.lock().unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn alloy_fallback_succeeds_from_every_random_start() {
+        let (failed_a, _) = recording_slot("failed-a", None, true);
+        let (healthy, _) = recording_slot("healthy", None, false);
+        let (failed_b, _) = recording_slot("failed-b", None, true);
+        let client =
+            AlloyClient::new_with_fallback_routes(vec![failed_a, healthy, failed_b]).unwrap();
+
+        // Whichever slot randomness selects first, walking the ring once must reach `healthy`.
+        for _ in 0..32 {
+            let response = client.completion(test_completion()).await.unwrap();
+            assert_eq!(response.selected_model.as_deref(), Some("healthy"));
+        }
+    }
+
+    #[test]
+    fn alloy_random_start_excludes_unavailable_routes() {
+        let (unavailable, _) = recording_slot("unavailable", None, false);
+        unavailable.mark_unavailable();
+        let (first, _) = recording_slot("first", None, false);
+        let (second, _) = recording_slot("second", None, false);
+        let client =
+            AlloyClient::new_with_fallback_routes(vec![unavailable, first, second]).unwrap();
+
+        assert_eq!(client.available_indices(), vec![1, 2]);
+        for _ in 0..32 {
+            assert!(matches!(client.pick_idx(), Some(1 | 2)));
+        }
+    }
+
+    struct QuotaClient {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl LLMClient for QuotaClient {
+        async fn completion(&self, _completion: Completion) -> Result<CompletionResponse> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Err(eyre::Report::new(CompletionError::from_http_response(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":{"code":"usage_limit_reached"}}"#,
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_failure_is_shared_across_agent_forks_for_the_run() {
+        let quota_calls = Arc::new(AtomicUsize::new(0));
+        let quota = FallbackSlot::new(
+            QuotaClient {
+                calls: Arc::clone(&quota_calls),
+            }
+            .into_arc(),
+            "quota",
+            None,
+        );
+        let (healthy, _) = recording_slot("healthy", None, false);
+        let first = PriorityClient::new(vec![quota, healthy]).unwrap();
+        let second = first.fork_for_agent().expect("priority clients can fork");
+
+        first.completion(test_completion()).await.unwrap();
+        second.completion(test_completion()).await.unwrap();
+
+        assert_eq!(quota_calls.load(Ordering::Relaxed), 1);
     }
 
     fn reasoning_item(text: &str) -> AssistantContent {
@@ -1469,15 +2315,15 @@ mod tests {
         assert_eq!(usage.cached_input_tokens, 0);
     }
 
-    /// Reproduce how a provider 401 actually reaches the retry layer: rig surfaces the raw
-    /// response body as `ProviderError`, and the per-provider `completion` impls wrap it with
-    /// `.wrap_err_with(...)`. The status only lives in the source, so the classifier must walk
-    /// the chain rather than read `err.to_string()`.
-    fn wrapped_provider_error(body: &str) -> eyre::Report {
-        let inner = eyre::eyre!("ProviderError: {body}");
-        Err::<(), _>(inner)
-            .wrap_err("Anthropic completion failed for model 'claude'")
-            .unwrap_err()
+    fn provider_error(status: Option<u16>, body: &str) -> eyre::Report {
+        let error = match status {
+            Some(status) => CompletionError::from_http_response(
+                reqwest::StatusCode::from_u16(status).unwrap(),
+                body,
+            ),
+            None => CompletionError::from_provider_body(body),
+        };
+        eyre::Report::new(error).wrap_err("completion failed for model 'test'")
     }
 
     fn gemini_completion(max_tokens: Option<u64>, additional_params: Option<Value>) -> Completion {
@@ -1576,6 +2422,12 @@ mod tests {
     }
 
     #[test]
+    fn response_text_collapses_whitespace_only_content_to_empty() {
+        let response = response_with(vec![AssistantContent::text(" \n\t ")]);
+        assert!(response.text().is_empty());
+    }
+
+    #[test]
     fn strips_nested_think_blocks() {
         // a single non-greedy regex stops at the first </think> and leaks the tail; the
         // depth-tracking scanner must drop the whole balanced span.
@@ -1601,150 +2453,217 @@ mod tests {
     }
 
     #[test]
-    fn non_retryable_detects_status_in_wrapped_source() {
-        let err = wrapped_provider_error(r#"{"statusCode": 401, "message": "Unauthorized"}"#);
-        // `to_string()` only renders the top-level context — proves we must look deeper.
-        assert!(!err.to_string().contains("401"));
-        assert!(is_non_retryable_client_error(&err));
+    fn classifiers_use_captured_http_status() {
+        let unauthorized = provider_error(Some(401), r#"{"message":"Unauthorized"}"#);
+        assert!(!unauthorized.to_string().contains("401"));
+        assert_eq!(provider_http_status(&unauthorized), Some(401));
+        assert!(is_non_retryable_client_error(&unauthorized));
+
+        let throttled = provider_error(Some(429), r#"{"message":"slow down"}"#);
+        assert!(is_rate_limit_error(&throttled));
+        assert_eq!(
+            retry_policy(&throttled).max_attempts,
+            RATE_LIMIT_MAX_COMPLETION_ATTEMPTS
+        );
+
+        let server = provider_error(Some(503), r#"{"message":"unavailable"}"#);
+        assert_eq!(
+            classify_provider_failure(&server),
+            ProviderFailureClass::Server
+        );
+        assert_eq!(retry_policy(&server).max_attempts, MAX_COMPLETION_ATTEMPTS);
     }
 
     #[test]
-    fn non_retryable_false_for_server_error() {
-        let err = wrapped_provider_error(r#"{"statusCode": 500, "message": "boom"}"#);
-        assert!(!is_non_retryable_client_error(&err));
+    fn exact_quota_codes_skip_same_route_retries() {
+        for code in PERMANENT_QUOTA_ERROR_CODES {
+            let body = format!(r#"{{"error":{{"code":"{code}"}}}}"#);
+            let err = provider_error(Some(429), &body);
+            assert!(is_long_window_quota_error(&err), "{code}");
+            assert!(!is_rate_limit_error(&err), "{code}");
+            assert!(!retry_policy(&err).retry, "{code}");
+            assert!(is_sticky_fallback_error(&err), "{code}");
+        }
     }
 
     #[test]
-    fn rate_limit_detects_429_in_wrapped_source() {
-        let err = wrapped_provider_error(r#"{"statusCode": 429, "message": "Too Many Requests"}"#);
+    fn structured_kimi_quota_messages_are_the_narrow_compatibility_fallback() {
+        for (status, message) in [
+            (429, "out of tokens per 5h window; reset in 2h"),
+            (429, "You've hit your usage limit"),
+            (
+                403,
+                "You've reached your usage limit for this billing cycle. Your quota will be refreshed in the next cycle.",
+            ),
+        ] {
+            let body = json!({"error": {"type": "access_terminated_error", "message": message}});
+            let err = provider_error(Some(status), &body.to_string());
+            assert!(is_long_window_quota_error(&err), "{message}");
+            assert!(!retry_policy(&err).retry, "{message}");
+        }
+
+        // Diagnostic text outside a structured provider body is deliberately ignored.
+        let untyped = eyre::eyre!("insufficient_quota: out of tokens per 5h window");
+        assert_eq!(
+            classify_provider_failure(&untyped),
+            ProviderFailureClass::Unknown
+        );
+        assert_eq!(retry_policy(&untyped).max_attempts, MAX_COMPLETION_ATTEMPTS);
+    }
+
+    #[test]
+    fn real_5xx_status_precedes_nested_quota_and_rate_codes() {
+        for status in (500..600).filter(|&status| status != 529) {
+            for body in [
+                r#"{"upstream":{"error":{"code":"insufficient_quota","message":"out of tokens per 5h window"}}}"#,
+                r#"{"upstream":{"error":{"type":"overloaded_error"}}}"#,
+            ] {
+                let err = provider_error(Some(status), body);
+                assert_eq!(
+                    classify_provider_failure(&err),
+                    ProviderFailureClass::Server
+                );
+                let policy = retry_policy(&err);
+                assert!(policy.retry);
+                assert_eq!(policy.max_attempts, MAX_COMPLETION_ATTEMPTS);
+                assert!(!is_sticky_fallback_error(&err));
+            }
+        }
+    }
+
+    #[test]
+    fn anthropic_529_overload_uses_the_long_overload_policy() {
+        let err = provider_error(
+            Some(529),
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        );
+
+        assert_eq!(
+            classify_provider_failure(&err),
+            ProviderFailureClass::RateLimit
+        );
+        let policy = retry_policy(&err);
+        assert!(policy.retry);
+        assert_eq!(policy.max_attempts, RATE_LIMIT_MAX_COMPLETION_ATTEMPTS);
+        assert_eq!(policy.base_backoff_ms, RATE_LIMIT_BASE_BACKOFF_MS);
+        assert!(is_sticky_fallback_error(&err));
+    }
+
+    #[test]
+    fn exact_provider_codes_classify_without_http_status() {
+        for code in [
+            "authentication_error",
+            "invalid_api_key",
+            "permission_error",
+        ] {
+            let body = format!(r#"{{"error":{{"type":"{code}"}}}}"#);
+            let err = provider_error(None, &body);
+            assert!(is_non_retryable_client_error(&err), "{code}");
+        }
+
+        for code in RATE_LIMIT_ERROR_CODES {
+            let body = format!(r#"{{"error":{{"code":"{code}"}}}}"#);
+            let err = provider_error(None, &body);
+            assert!(is_rate_limit_error(&err), "{code}");
+        }
+    }
+
+    #[test]
+    fn context_length_uses_exact_code_and_structured_message() {
+        let openai = provider_error(Some(400), r#"{"error":{"code":"context_length_exceeded"}}"#);
+        assert!(is_context_length_error(&openai));
+
+        let anthropic = provider_error(
+            Some(400),
+            r#"{"error":{"type":"invalid_request_error","message":"prompt is too long"}}"#,
+        );
+        assert!(is_context_length_error(&anthropic));
+
+        let malformed = provider_error(
+            Some(400),
+            r#"{"error":{"type":"invalid_request_error","message":"tools[0] is invalid"}}"#,
+        );
+        assert!(!is_context_length_error(&malformed));
+        assert!(is_non_retryable_client_error(&malformed));
+    }
+
+    #[test]
+    fn provider_json_status_hint_handles_success_error_envelopes() {
+        let err = provider_error(
+            Some(200),
+            r#"{"error":{"code":429,"type":"rate_limit_error","message":"slow down"}}"#,
+        );
+        assert_eq!(provider_http_status(&err), Some(429));
         assert!(is_rate_limit_error(&err));
     }
 
     #[test]
-    fn classifiers_detect_compact_json_status() {
-        // Compact bodies (no space after the colon) must still classify — `:401,` / `:429,` would
-        // slip past a plain `" 401"` / `" 429"` substring check.
-        let unauthorized = wrapped_provider_error(r#"{"statusCode":401,"message":"nope"}"#);
-        assert!(is_non_retryable_client_error(&unauthorized));
-        let throttled = wrapped_provider_error(r#"{"statusCode":429,"message":"slow down"}"#);
-        assert!(is_rate_limit_error(&throttled));
+    fn text_provider_body_only_uses_the_quota_message_fallback() {
+        for status in [403, 429] {
+            let err = provider_error(
+                Some(status),
+                "You've reached your usage limit for this billing cycle; refresh in the next cycle",
+            );
+            assert!(is_long_window_quota_error(&err));
+            assert!(!retry_policy(&err).retry);
+            assert!(is_sticky_fallback_error(&err));
+        }
+
+        let err = provider_error(Some(429), "insufficient_quota in a non-JSON response");
+        // Arbitrary body text is not scanned for codes; the captured 429 still classifies.
+        assert!(is_rate_limit_error(&err));
+
+        let statusless = provider_error(None, "insufficient_quota in a non-JSON response");
+        assert_eq!(
+            classify_provider_failure(&statusless),
+            ProviderFailureClass::Unknown
+        );
+        assert!(!is_sticky_fallback_error(&statusless));
     }
 
     #[test]
-    fn mentions_http_status_requires_standalone_number() {
-        assert!(mentions_http_status(r#"{"code":401}"#, 401)); // bounded by punctuation, `code` key
-        assert!(mentions_http_status("got 401 unauthorized", 401)); // reason phrase follows
-        assert!(!mentions_http_status("request id 4017 failed", 401)); // part of a longer run
-        assert!(!mentions_http_status("token count 1401", 401)); // trailing digits
+    fn top_level_status_hint_precedes_nested_numeric_codes() {
+        let err = provider_error(
+            Some(200),
+            r#"{"statusCode":502,"upstream":{"error":{"code":403,"type":"insufficient_quota"}}}"#,
+        );
+        assert_eq!(provider_http_status(&err), Some(502));
+        assert_eq!(
+            classify_provider_failure(&err),
+            ProviderFailureClass::Server
+        );
+        assert!(!is_sticky_fallback_error(&err));
     }
 
     #[test]
-    fn mentions_http_status_requires_status_context() {
-        // A standalone status-valued number that is neither keyed nor followed by its reason phrase
-        // is incidental, not the response status — don't misclassify the surrounding error.
-        assert!(!mentions_http_status("max 400 tokens allowed", 400));
-        assert!(!mentions_http_status("trace 404 emitted", 404));
-        assert!(!mentions_http_status("req_402abc failed", 402)); // embedded in an identifier
-        assert!(!mentions_http_status("retry after 429 seconds", 429)); // bare number, wrong meaning
-        // Genuine status references in their usual shapings still match.
-        assert!(mentions_http_status(
-            r#"{"statusCode":429,"message":"slow"}"#,
-            429
+    fn compact_provider_error_body_keeps_large_json_classifiable() {
+        let body = json!({
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "quota exhausted",
+                "diagnostic": "x".repeat(4_000),
+            }
+        })
+        .to_string();
+        let compact = compact_provider_error_body(&body, 1_000);
+        serde_json::from_str::<Value>(&compact).expect("compacted provider body stays valid JSON");
+        let err = provider_error(Some(429), &compact);
+        assert!(is_long_window_quota_error(&err));
+    }
+
+    #[test]
+    fn provider_error_truncation_reuses_utf8_boundary_handling() {
+        assert_eq!(truncate_utf8("aéz", 2), "a…");
+    }
+
+    #[test]
+    fn openrouter_normalization_preserves_typed_provider_source() {
+        let err = normalize_openrouter_completion_error(CompletionError::from_http_response(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"type":"insufficient_quota"}}"#,
         ));
-        assert!(mentions_http_status(
-            "HttpError: Invalid status code 401",
-            401
-        ));
-        assert!(mentions_http_status("429 Too Many Requests", 429)); // reason phrase
-    }
-
-    #[test]
-    fn key_must_be_a_whole_word_not_a_substring() {
-        // `code` embedded in another word is not a status key, so these transient errors must NOT
-        // be classified as non-retryable client errors (they should keep their retries).
-        assert!(!mentions_http_status("decode error 404", 404)); // decode contains "code"
-        assert!(!mentions_http_status("unicode error 400", 400)); // unicode contains "code"
-        assert!(!mentions_http_status("encode failure 403", 403)); // encode contains "code"
-        assert!(!mentions_http_status("error_code 402 seen", 402)); // underscore is a left edge
-        // right boundary: `code`/`status` as a prefix of a longer word is not a key either.
-        assert!(!mentions_http_status("codec 404 negotiation failed", 404));
-        assert!(!mentions_http_status("statuslike 401 marker", 401));
-        // window edge: even if the 24-byte key window cuts `unicode` right before `code`, the real
-        // preceding char ('i') is still consulted, so it stays a non-match.
-        assert!(!mentions_http_status("xxxxxxxxxxxxxxxxxunicode 404", 404));
-        // `status_code` is still a real key (matched via the `status` word).
-        assert!(mentions_http_status(r#"{"status_code": 401}"#, 401));
-    }
-
-    #[test]
-    fn classifies_provider_error_types_without_numeric_status() {
-        // rig flattens direct Anthropic/OpenAI non-2xx to ProviderError(body) with no numeric status;
-        // these bodies carry only string error types. Confirm the type matchers fire.
-        let anthropic_auth = wrapped_provider_error(
-            r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
-        );
-        assert!(!anthropic_auth.to_string().contains("401"));
-        assert!(is_non_retryable_client_error(&anthropic_auth));
-        assert!(!is_rate_limit_error(&anthropic_auth));
-
-        let openai_key =
-            wrapped_provider_error(r#"{"error":{"code":"invalid_api_key","message":"bad key"}}"#);
-        assert!(is_non_retryable_client_error(&openai_key));
-
-        let bad_request = wrapped_provider_error(
-            r#"{"error":{"type":"invalid_request_error","message":"prompt is too long"}}"#,
-        );
-        assert!(is_non_retryable_client_error(&bad_request));
-
-        let ctx_len = wrapped_provider_error(r#"{"error":{"code":"context_length_exceeded"}}"#);
-        assert!(is_non_retryable_client_error(&ctx_len));
-
-        // Both provider shapes of a context overflow classify as such; a generic
-        // invalid_request_error must NOT — the fewer-presets remediation would be
-        // misdirection on a malformed-request bug.
-        assert!(is_context_length_error(&ctx_len));
-        assert!(is_context_length_error(&bad_request));
-        let malformed = wrapped_provider_error(
-            r#"{"error":{"type":"invalid_request_error","message":"tools[0] is invalid"}}"#,
-        );
-        assert!(!is_context_length_error(&malformed));
-
-        // insufficient_quota is permanent (out of credits) despite arriving as HTTP 429.
-        let quota = wrapped_provider_error(
-            r#"{"error":{"type":"insufficient_quota","message":"exceeded your current quota"}}"#,
-        );
-        assert!(is_non_retryable_client_error(&quota));
-        assert!(!is_rate_limit_error(&quota));
-
-        let quota_with_429 = wrapped_provider_error(
-            r#"{"statusCode":429,"error":{"type":"insufficient_quota","message":"Too Many Requests"}}"#,
-        );
-        assert!(is_non_retryable_client_error(&quota_with_429));
-        assert!(!is_rate_limit_error(&quota_with_429));
-        assert!(!retry_policy(&quota_with_429).retry);
-
-        // Transient overload/throttling types take the rate-limit policy and are not non-retryable.
-        let overloaded =
-            wrapped_provider_error(r#"{"type":"error","error":{"type":"overloaded_error"}}"#);
-        assert!(is_rate_limit_error(&overloaded));
-        assert!(!is_non_retryable_client_error(&overloaded));
-
-        let throttled = wrapped_provider_error(r#"{"error":{"code":"rate_limit_exceeded"}}"#);
-        assert!(is_rate_limit_error(&throttled));
-    }
-
-    #[test]
-    fn server_error_takes_precedence_over_nested_4xx() {
-        // a 5xx response whose body nests a 4xx (e.g. an upstream code) is a retryable server
-        // error, not a permanent client error — so it must NOT be classified non-retryable.
-        let err = wrapped_provider_error(r#"{"statusCode":502,"error":{"code":403}}"#);
-        assert!(!is_non_retryable_client_error(&err));
-        // 5xx codes without a reason phrase here (501) are still matched via the status key.
-        let nested = wrapped_provider_error(r#"{"statusCode":501,"error":{"code":403}}"#);
-        assert!(!is_non_retryable_client_error(&nested));
-        // a genuine 4xx with no 5xx in the chain is still non-retryable.
-        let pure_4xx = wrapped_provider_error(r#"{"statusCode":403,"message":"forbidden"}"#);
-        assert!(is_non_retryable_client_error(&pure_4xx));
+        assert_eq!(provider_http_status(&err), Some(429));
+        assert!(is_long_window_quota_error(&err));
     }
 
     fn tool_call_content() -> AssistantContent {

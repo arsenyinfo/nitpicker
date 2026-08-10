@@ -33,6 +33,10 @@ struct CommonArgs {
 
     #[arg(long, short, global = true)]
     verbose: bool,
+
+    /// Try the next configured reviewer when the selected model fails
+    #[arg(long, global = true)]
+    fallback: bool,
 }
 
 /// `--context-file`, kept out of the global `CommonArgs` deliberately: clap propagates a global
@@ -79,6 +83,22 @@ fn presets_allowed(command: &Option<Command>) -> bool {
         None | Some(Command::Pr(_)) => true,
         Some(Command::Ask { .. } | Command::Init { .. } | Command::Reflect { .. }) => false,
     }
+}
+
+fn fallback_allowed(command: &Option<Command>) -> bool {
+    matches!(command, None | Some(Command::Ask { .. } | Command::Pr(_)))
+}
+
+pub(crate) fn resolve_routing_modes(
+    config: &config::Config,
+    cli_alloy: bool,
+    cli_fallback: bool,
+) -> Result<(bool, bool)> {
+    let alloy = cli_alloy || config.default_alloy();
+    config.validate_alloy(alloy)?;
+    let fallback = cli_fallback || config.default_fallback();
+    config.validate_fallback(fallback)?;
+    Ok((alloy, fallback))
 }
 
 #[derive(Debug, Parser)]
@@ -198,6 +218,9 @@ async fn main() -> Result<()> {
     if !presets_allowed(&args.command) && !args.presets.preset.is_empty() {
         eyre::bail!("--preset applies to review modes only (default review, --analyze, pr)");
     }
+    if args.common.fallback && !fallback_allowed(&args.command) {
+        eyre::bail!("--fallback applies to review and ask modes only");
+    }
 
     // note: no json panic hook. reviewer work runs in tokio::spawn tasks whose
     // panics are caught as JoinError and folded into a degraded report (exit 3
@@ -227,14 +250,17 @@ async fn main() -> Result<()> {
             max_turns,
         }) => {
             let repo = resolve_repo_root(&args.common.repo)?;
-            let config = load_resolved_config(args.common.config.as_deref(), &repo).await?;
+            let mut config = load_config(args.common.config.as_deref(), &repo)?;
+            // CLI-only routing validation must precede free-model smoke completions.
+            let (use_alloy, use_fallback) =
+                resolve_routing_modes(&config, alloy, args.common.fallback)?;
+            finalize_routing_config(&mut config, use_fallback).await?;
+            let config = config;
             let topic = context::append_to_prompt(
                 topic,
                 &context::load_context_files(&merged_context_files(&args.context, &context))?,
             );
             let max_turns = config.max_turns(max_turns)?;
-            let use_alloy = alloy || config.default_alloy();
-            config.validate_alloy(use_alloy)?;
 
             if use_alloy && no_debate {
                 eprintln!("warning: --alloy has no effect with --no-debate");
@@ -257,6 +283,7 @@ async fn main() -> Result<()> {
                         verbose: args.common.verbose,
                         task: prompts::RunTask::Ask,
                         alloy: use_alloy,
+                        fallback: use_fallback,
                         format: output::OutputFormat::Text,
                     },
                 )
@@ -279,6 +306,7 @@ async fn main() -> Result<()> {
                 max_turns,
                 args.common.verbose,
                 prompts::RunTask::Ask,
+                use_fallback,
             )
             .await?;
             println!("{}", outcome.report);
@@ -310,10 +338,12 @@ async fn main() -> Result<()> {
     let repo = resolve_repo_root(&args.common.repo)?;
 
     let mut config = load_config(args.common.config.as_deref(), &repo)?;
-    // resolved before free-model resolution: a bad preset name must fail before any
-    // network call (resolve_free_models can run live smoke completions)
+    // Resolve presets and CLI-only routing validation before free-model resolution: pure usage
+    // errors must fail before any network call (the resolver can run live smoke completions).
     let presets = presets::resolve(&args.presets.preset, &config)?;
-    openrouter::resolve_free_models(&mut config).await?;
+    let (use_alloy, use_fallback) =
+        resolve_routing_modes(&config, args.alloy, args.common.fallback)?;
+    finalize_routing_config(&mut config, use_fallback).await?;
     let config = config;
     let max_turns = config.max_turns(args.max_turns)?;
 
@@ -340,8 +370,6 @@ async fn main() -> Result<()> {
         &context::load_context_files(&args.context.context_file)?,
     );
 
-    let use_alloy = args.alloy || config.default_alloy();
-    config.validate_alloy(use_alloy)?;
     if use_alloy && args.no_debate {
         eprintln!("warning: --alloy has no effect with --no-debate");
     }
@@ -366,6 +394,7 @@ async fn main() -> Result<()> {
                     presets: &presets,
                 },
                 alloy: use_alloy,
+                fallback: use_fallback,
                 format: output::OutputFormat::Text,
             },
         )
@@ -390,6 +419,7 @@ async fn main() -> Result<()> {
                 scope,
                 presets: &presets,
             },
+            use_fallback,
         )
         .await?;
         println!("{}", outcome.report);
@@ -400,7 +430,7 @@ async fn main() -> Result<()> {
 
 /// Exit-code contract for the default-review, `ask`, and `pr` arms: 0 = clean verdict,
 /// 1 = hard failure (no verdict), 3 = degraded verdict (report printed, but at least one
-/// reviewer or debate turn failed or fell back). 2 is deliberately unused — clap exits 2
+/// reviewer or debate turn failed). 2 is deliberately unused — clap exits 2
 /// on usage errors, and the whole point is an unambiguous subprocess signal.
 /// In `pr --json` the envelope (carrying `degraded: true`) is emitted and flushed first,
 /// and `run_pr` returns before this runs, so its checkout-restore guards have dropped.
@@ -417,9 +447,7 @@ fn exit_if_degraded(degraded: bool) {
             std::process::exit(1);
         }
     }
-    eprintln!(
-        "warning: degraded verdict — a reviewer or debate turn failed or ended without submit_verdict (exit code 3)"
-    );
+    eprintln!("warning: degraded verdict — a reviewer or debate turn failed (exit code 3)");
     std::process::exit(3);
 }
 
@@ -436,7 +464,7 @@ pub(crate) fn load_config(explicit_path: Option<&Path>, repo: &Path) -> Result<c
     } else {
         return load_global_config();
     };
-    config.validate()?;
+    config.validate_structure()?;
     Ok(config)
 }
 
@@ -477,7 +505,7 @@ pub(crate) fn load_global_config() -> Result<config::Config> {
         .map_err(|e| eyre::eyre!("failed to read config {:?}: {e}", path))?;
     let config: config::Config =
         toml::from_str(&content).map_err(|e| eyre::eyre!("invalid config: {e}"))?;
-    config.validate()?;
+    config.validate_structure()?;
     Ok(config)
 }
 
@@ -486,8 +514,21 @@ pub(crate) async fn load_resolved_config(
     repo: &Path,
 ) -> Result<config::Config> {
     let mut config = load_config(explicit_path, repo)?;
-    openrouter::resolve_free_models(&mut config).await?;
+    finalize_routing_config(&mut config, false).await?;
     Ok(config)
+}
+
+/// Finish config validation and experimental route resolution after the caller has resolved the
+/// effective CLI/config fallback mode. Strict execution requires every credential up front;
+/// fallback execution lets route construction skip unusable entries.
+pub(crate) async fn finalize_routing_config(
+    config: &mut config::Config,
+    fallback: bool,
+) -> Result<()> {
+    if !fallback {
+        config.validate_credentials()?;
+    }
+    openrouter::resolve_free_models_with_fallback(config, fallback).await
 }
 
 async fn run_init(path: PathBuf, prefer_free: bool) -> eyre::Result<()> {
@@ -598,13 +639,21 @@ fn build_init_config(
         azure_credentials: None,
     };
 
-    let reviewer_slots = if debate { 2 } else { 1 };
+    // Fallback needs a second route even when debate is disabled. OpenRouter free selection can
+    // produce two distinct model routes from its one detected credential.
+    let reviewer_slots = if detected.len() >= 2 || prefer_openrouter_free {
+        2
+    } else {
+        1
+    };
     let reviewers = pick_reviewers(detected, reviewer_slots, prefer_openrouter_free);
+    let fallback = reviewers.len() >= 2;
 
     config::Config {
         defaults: Some(config::DefaultsConfig {
             debate: Some(debate),
             alloy: None,
+            fallback: Some(fallback),
             max_turns: Some(config::DEFAULT_MAX_TURNS),
             compact_threshold: Some(100_000),
             log_trajectories: Some(false),
@@ -980,12 +1029,69 @@ mod tests {
         assert!(!args.common.verbose);
         assert_eq!(args.common.repo, PathBuf::from("/x"));
         assert_eq!(args.common.config, Some(PathBuf::from("/c.toml")));
+
+        let args = parse(&["nitpicker", "--fallback", "ask", "topic"]);
+        assert!(args.common.fallback);
+        let args = parse(&["nitpicker", "pr", "--fallback"]);
+        assert!(args.common.fallback);
     }
 
     #[test]
     fn init_writes_into_the_repo_named_by_the_global_repo_flag() {
         let path = init_config_path(false, Path::new("/some/repo")).unwrap();
         assert_eq!(path, PathBuf::from("/some/repo/nitpicker.toml"));
+    }
+
+    fn detected_provider(name: &'static str, provider: &'static str) -> detect::Detected {
+        detect::Detected {
+            name,
+            provider,
+            model: format!("{name}-model"),
+            base_url: None,
+            api_key_env: None,
+            auth: None,
+            source: "test",
+            local_server: false,
+        }
+    }
+
+    #[test]
+    fn init_enables_fallback_when_it_can_generate_two_routes() {
+        let first = detected_provider("first", "openai");
+        let second = detected_provider("second", "anthropic");
+        let config = build_init_config(&[&first, &second], false);
+
+        assert_eq!(config.reviewer.len(), 2);
+        assert!(config.default_fallback());
+        assert!(
+            toml::to_string_pretty(&config)
+                .unwrap()
+                .contains("fallback = true")
+        );
+    }
+
+    #[test]
+    fn free_init_generates_two_fallback_routes_from_openrouter() {
+        let openrouter = detected_provider("openrouter", "openrouter");
+        let config = build_init_config(&[&openrouter], true);
+
+        assert_eq!(config.reviewer.len(), 2);
+        assert!(config.reviewer.iter().all(|route| route.model == "free"));
+        assert!(config.default_fallback());
+        assert!(
+            toml::to_string_pretty(&config)
+                .unwrap()
+                .contains("fallback = true")
+        );
+    }
+
+    #[test]
+    fn init_does_not_enable_impossible_single_route_fallback() {
+        let only = detected_provider("only", "openai");
+        let config = build_init_config(&[&only], false);
+
+        assert_eq!(config.reviewer.len(), 1);
+        assert!(!config.default_fallback());
     }
 
     #[test]
@@ -1112,6 +1218,52 @@ mod tests {
         assert!(presets_allowed(&args.command));
         let args = parse(&["nitpicker", "--preset", "security"]);
         assert!(presets_allowed(&args.command));
+    }
+
+    #[test]
+    fn fallback_is_scoped_to_review_and_ask_commands() {
+        for argv in [
+            &["nitpicker", "--fallback"][..],
+            &["nitpicker", "--fallback", "ask", "topic"][..],
+            &["nitpicker", "pr", "--fallback"][..],
+        ] {
+            let args = parse(argv);
+            assert!(fallback_allowed(&args.command), "argv: {argv:?}");
+        }
+        for argv in [
+            &["nitpicker", "init", "--fallback"][..],
+            &["nitpicker", "reflect", "--fallback"][..],
+        ] {
+            let args = parse(argv);
+            assert!(!fallback_allowed(&args.command), "argv: {argv:?}");
+        }
+    }
+
+    #[test]
+    fn routing_modes_reject_cli_pooling_with_one_reviewer() {
+        let config: config::Config = toml::from_str(
+            r#"
+                [aggregator]
+                model = "m"
+                provider = "openai"
+                auth = "codex"
+
+                [[reviewer]]
+                model = "m"
+                provider = "openai"
+                auth = "codex"
+            "#,
+        )
+        .unwrap();
+
+        let err = resolve_routing_modes(&config, false, true).unwrap_err();
+        assert!(format!("{err:#}").contains("requires at least 2 reviewers"));
+        let err = resolve_routing_modes(&config, true, false).unwrap_err();
+        assert!(format!("{err:#}").contains("--alloy requires at least 2 reviewers"));
+        assert_eq!(
+            resolve_routing_modes(&config, false, false).unwrap(),
+            (false, false)
+        );
     }
 
     /// The config file shape for presets: `[presets.<name>]` tables and the

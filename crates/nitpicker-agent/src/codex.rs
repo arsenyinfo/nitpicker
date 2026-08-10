@@ -15,6 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use eyre::{Result, WrapErr};
+use rig_core::completion::CompletionError;
 use rig_core::completion::message::{AssistantContent, UserContent};
 use rig_core::providers::openai::responses_api::{
     CompletionRequest as ResponsesBody, CompletionResponse as ResponsesResp, Include,
@@ -24,7 +25,7 @@ use tokio::sync::Mutex;
 
 use crate::llm::{
     CacheAccounting, Completion, CompletionResponse, FinishReason, LLMClient, LLMClientDyn,
-    TokenUsage, WithRetryExt, mentions_http_status,
+    TokenUsage, WithRetryExt, compact_provider_error_body, provider_http_status,
 };
 
 /// Codex CLI's public OAuth client id (PKCE, no secret) — shared with the official CLI.
@@ -245,13 +246,11 @@ async fn refresh_tokens(
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        // surface the HTTP status (with reason phrase) so the 4xx/refresh-rotation logic can
-        // classify it. The OAuth error body is `{"error": ...}` and doesn't echo the submitted
-        // tokens, but truncate it anyway so nothing unbounded reaches logs.
-        eyre::bail!(
-            "Codex token refresh returned HTTP {status}: {}",
-            truncate(&body, 1000)
-        );
+        return Err(eyre::Report::new(CompletionError::from_http_response(
+            status,
+            compact_provider_error_body(&body, 1000),
+        )))
+        .wrap_err("Codex token refresh failed");
     }
     let parsed: RefreshResponse =
         serde_json::from_str(&body).wrap_err("parsing Codex token refresh response")?;
@@ -394,8 +393,11 @@ impl CodexClient {
             .await
             .wrap_err("reading Codex completion response")?;
         if !status.is_success() {
-            // `{status}` renders as e.g. "401 Unauthorized", which `mentions_http_status` recognizes.
-            eyre::bail!("Codex API HTTP {status}: {}", truncate(&text, 1000));
+            return Err(eyre::Report::new(CompletionError::from_http_response(
+                status,
+                compact_provider_error_body(&text, 1000),
+            )))
+            .wrap_err("Codex completion failed");
         }
         let raw = parse_sse(&text)?;
         let model = completion.model.clone();
@@ -430,7 +432,7 @@ impl LLMClient for CodexClient {
             Ok(response) => Ok(response),
             // The token can lapse/revoke between our expiry check and the call landing. Force a
             // single refresh-and-retry rather than surfacing a 401 (RetryingLLM treats it as fatal).
-            Err(err) if mentions_http_status(&format!("{err:#}"), 401) => {
+            Err(err) if provider_http_status(&err) == Some(401) => {
                 let (access, account_id) = self.force_refresh(&access).await?;
                 self.send(&completion, &access, account_id.as_deref()).await
             }
@@ -597,10 +599,10 @@ fn parse_sse(text: &str) -> Result<ResponsesResp> {
                     .wrap_err("parsing Codex terminal response payload");
             }
             Some("response.failed") | Some("error") => {
-                eyre::bail!(
-                    "Codex stream error event: {}",
-                    truncate(&ev.to_string(), 1000)
-                );
+                return Err(eyre::Report::new(CompletionError::from_provider_body(
+                    compact_provider_error_body(&ev.to_string(), 1000),
+                )))
+                .wrap_err("Codex stream error event");
             }
             _ => {}
         }
@@ -658,10 +660,7 @@ fn truncate(s: &str, max: usize) -> String {
 /// refresh is transient and reloading `auth.json` can't fix it, so it should bubble up to the outer
 /// retry/backoff instead of immediately firing a second refresh.
 fn is_rotation_4xx(err: &eyre::Report) -> bool {
-    let msg = format!("{err:#}");
-    (400..500)
-        .filter(|status| *status != 429)
-        .any(|status| mentions_http_status(&msg, status))
+    provider_http_status(err).is_some_and(|status| (400..500).contains(&status) && status != 429)
 }
 
 #[cfg(test)]
@@ -1053,6 +1052,26 @@ mod tests {
         assert!(parse_sse(&sse).is_err());
     }
 
+    #[test]
+    fn parse_sse_preserves_codes_from_large_error_events() {
+        let sse = format!(
+            "data: {}\n",
+            json!({
+                "type": "response.failed",
+                "error": {
+                    "type": "usage_limit_reached",
+                    "message": "quota exhausted",
+                    "diagnostic": "x".repeat(4_000),
+                }
+            })
+        );
+        let err = parse_sse(&sse).unwrap_err();
+        assert!(crate::llm::provider_error_has_code(
+            &err,
+            &["usage_limit_reached"]
+        ));
+    }
+
     fn usage_json() -> Value {
         json!({
             "input_tokens": 5,
@@ -1114,11 +1133,16 @@ mod tests {
 
     #[test]
     fn is_rotation_4xx_excludes_429_and_5xx() {
-        let mk = |s: &str| eyre::eyre!("Codex token refresh returned HTTP {s}");
-        assert!(is_rotation_4xx(&mk("400 Bad Request")));
-        assert!(is_rotation_4xx(&mk("401 Unauthorized")));
+        let mk = |status| {
+            eyre::Report::new(CompletionError::from_http_response(
+                reqwest::StatusCode::from_u16(status).unwrap(),
+                r#"{"error":"test"}"#,
+            ))
+        };
+        assert!(is_rotation_4xx(&mk(400)));
+        assert!(is_rotation_4xx(&mk(401)));
         // 429 is transient — must NOT trigger the reload-from-disk rotation path
-        assert!(!is_rotation_4xx(&mk("429 Too Many Requests")));
-        assert!(!is_rotation_4xx(&mk("500 Internal Server Error")));
+        assert!(!is_rotation_4xx(&mk(429)));
+        assert!(!is_rotation_4xx(&mk(500)));
     }
 }

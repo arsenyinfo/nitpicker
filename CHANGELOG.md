@@ -6,8 +6,26 @@ Notable user-visible changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-08-10
+
+`nitpicker-agent` 0.4.0
+
+### Added
+
+- Add opt-in ordered reviewer fallback with `fallback = true` or `--fallback`, including
+  fallback-capable Alloy routing and aggregator synthesis.
+
+### Changed
+
+- Enable fallback in generated configs whenever `init` can provide at least two reviewer routes.
+- **Breaking (`nitpicker-agent`)**: `DefaultsConfig` adds `fallback: Option<bool>`; downstream
+  struct literals must set `fallback: None` when fallback is not configured.
+
 ### Fixed
 
+- Improve fallback reliability across provider limits, unavailable routes, concurrent review jobs,
+  debate lanes, and subagents.
+- Require debate agents to submit structured verdicts before accepting a turn as successful.
 - Resolve `--repo` through Git so linked worktrees and paths inside a worktree are supported.
 
 ## [0.9.1] - 2026-08-09

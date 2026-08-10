@@ -588,10 +588,16 @@ async fn run_pr_inner(
     // the base ref comes from the PR metadata, and the checkout must already have happened
     // for the working tree to even be the head. Guards restore state if this errors.
     let mut config = load_pr_config(common.config.as_deref(), &prepared)?;
-    // resolved before free-model resolution: a bad preset name must fail before any
-    // network call, and inside run_pr_inner so it honors the --json error contract
+    // Resolve presets and CLI-only routing validation before free-model resolution: pure usage
+    // errors must fail before its smoke calls, and stay inside run_pr_inner for the JSON contract.
     let presets = crate::presets::resolve(&preset_names, &config)?;
-    nitpicker_agent::openrouter::resolve_free_models(&mut config).await?;
+    let (alloy, fallback) = crate::resolve_routing_modes(&config, args.alloy, common.fallback)?;
+    let execution = PrReviewExecution {
+        verbose: common.verbose,
+        alloy,
+        fallback,
+    };
+    crate::finalize_routing_config(&mut config, fallback).await?;
     let config = config;
 
     // `prepared` drops at the end of this scope, after the review completes: HEAD is restored
@@ -603,10 +609,17 @@ async fn run_pr_inner(
         &context_files,
         &presets,
         &config,
-        common.verbose,
+        execution,
         start,
     )
     .await
+}
+
+#[derive(Clone, Copy)]
+struct PrReviewExecution {
+    verbose: bool,
+    alloy: bool,
+    fallback: bool,
 }
 
 /// `pr` mode never reads `nitpicker.toml` from the working tree: the tree holds the PR
@@ -643,7 +656,7 @@ fn load_pr_config(explicit: Option<&Path>, prepared: &PreparedPr) -> Result<Conf
         Some(content) => {
             let config: Config = toml::from_str(&content)
                 .map_err(|e| eyre::eyre!("invalid nitpicker.toml on the PR base branch: {e}"))?;
-            config.validate()?;
+            config.validate_structure()?;
             Ok(config)
         }
         None => crate::load_global_config(),
@@ -953,7 +966,7 @@ async fn run_review_inner(
     context_files: &[PathBuf],
     presets: &[crate::presets::ReviewPreset],
     config: &Config,
-    verbose: bool,
+    execution: PrReviewExecution,
     start: std::time::Instant,
 ) -> Result<bool> {
     use crate::output::{OutputFormat, PrInfo, PrReviewOutput, ReviewMode, Status};
@@ -963,6 +976,11 @@ async fn run_review_inner(
     let pr_number = prepared.pr_number;
     let meta = &prepared.meta;
     let comments: &[PrComment] = &prepared.comments;
+    let PrReviewExecution {
+        verbose,
+        alloy: use_alloy,
+        fallback: use_fallback,
+    } = execution;
 
     const FOOTER: &str =
         "\n\n---\n🔍 Reviewed by [nitpicker](https://github.com/arsenyinfo/nitpicker)";
@@ -975,8 +993,6 @@ async fn run_review_inner(
     );
     let max_turns = config.max_turns(args.max_turns)?;
 
-    let use_alloy = args.alloy || config.default_alloy();
-    config.validate_alloy(use_alloy)?;
     if use_alloy && args.no_debate {
         eprintln!("warning: --alloy has no effect with --no-debate");
     }
@@ -995,6 +1011,7 @@ async fn run_review_inner(
                     presets,
                 },
                 alloy: use_alloy,
+                fallback: use_fallback,
                 format,
             },
         )
@@ -1017,6 +1034,7 @@ async fn run_review_inner(
                 scope: ReviewScope::Diff,
                 presets,
             },
+            use_fallback,
         )
         .await?;
         (
