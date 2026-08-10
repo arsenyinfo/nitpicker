@@ -1251,10 +1251,10 @@ mod tests {
 
     #[test]
     fn operational_failure_warning_is_concise_and_emitted_once() {
-        let err = eyre::eyre!(
-            "403 Forbidden: You've reached your usage limit for this billing cycle. Your quota \
-             will be refreshed in the next cycle"
-        );
+        let err = eyre::Report::new(rig_core::completion::CompletionError::from_http_response(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"error":{"type":"access_terminated_error","message":"You've reached your usage limit for this billing cycle. Your quota will be refreshed in the next cycle"}}"#,
+        ));
         assert_eq!(
             debate_failure_warning(&err),
             "A model reached its usage limit; continuing with the remaining debate where possible"

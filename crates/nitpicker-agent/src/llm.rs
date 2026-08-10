@@ -794,187 +794,266 @@ struct RetryPolicy {
 }
 
 fn retry_policy(err: &eyre::Report) -> RetryPolicy {
-    let msg = format!("{err:#}").to_ascii_lowercase();
-    // A rolling subscription allowance measured in hours cannot recover within this command.
-    // Surface it immediately so fallback mode can move to the next configured reviewer instead
-    // of spending several minutes in the ordinary 429 backoff loop.
-    if is_long_window_quota_message(&msg) {
-        return RetryPolicy {
+    match classify_provider_failure(err) {
+        // A rolling subscription allowance measured in hours cannot recover within this command.
+        // Surface it immediately so fallback can move on instead of entering the 429 backoff loop.
+        ProviderFailureClass::PermanentQuota => RetryPolicy {
             retry: false,
             max_attempts: 0,
             base_backoff_ms: 0,
             max_backoff_ms: 0,
-        };
-    }
-
-    if is_rate_limit_message(&msg) {
-        return RetryPolicy {
+        },
+        ProviderFailureClass::RateLimit => RetryPolicy {
             retry: true,
             max_attempts: RATE_LIMIT_MAX_COMPLETION_ATTEMPTS,
             base_backoff_ms: RATE_LIMIT_BASE_BACKOFF_MS,
             max_backoff_ms: RATE_LIMIT_MAX_BACKOFF_MS,
-        };
-    }
-
-    if is_non_retryable_client_error_message(&msg) {
-        return RetryPolicy {
-            retry: false,
-            max_attempts: 0,
-            base_backoff_ms: 0,
-            max_backoff_ms: 0,
-        };
-    }
-
-    RetryPolicy {
-        retry: true,
-        max_attempts: MAX_COMPLETION_ATTEMPTS,
-        base_backoff_ms: BASE_BACKOFF_MS,
-        max_backoff_ms: MAX_BACKOFF_MS,
-    }
-}
-
-/// HTTP status codes the retry/refresh classifiers key on, paired with their canonical reason
-/// phrase. The phrase lets us recognize the plain-text `"<code> <reason>"` status-line form
-/// (`401 Unauthorized`, `429 Too Many Requests`) that carries no JSON status key.
-const STATUS_REASONS: &[(u16, &str)] = &[
-    (400, "bad request"),
-    (401, "unauthorized"),
-    (402, "payment required"),
-    (403, "forbidden"),
-    (404, "not found"),
-    (429, "too many requests"),
-    (500, "internal server error"),
-    (502, "bad gateway"),
-    (503, "service unavailable"),
-    (504, "gateway timeout"),
-];
-
-/// How far back (in bytes) to scan for a status key before a candidate number. Comfortably covers
-/// `"statusCode": ` even with extra spacing, while staying local enough that an unrelated
-/// `code`/`status` field elsewhere in the body doesn't bleed in.
-const STATUS_KEY_WINDOW: usize = 24;
-
-/// True if `status` (an HTTP status code) appears in `msg` as a genuine status reference: a
-/// standalone number (not part of a longer digit run) that is *also* in an HTTP-status context —
-/// either immediately followed by its canonical reason phrase (`401 Unauthorized`) or preceded
-/// within [`STATUS_KEY_WINDOW`] by a `status`/`code` key (covering `"statusCode": 401`, `:401`,
-/// `Invalid status code 401`, ...). The context requirement keeps incidental standalone numbers in
-/// a raw provider body — `400 tokens`, `trace 404`, `req_402abc` — from being misread as the
-/// response status. Provider errors surface the status only inside the raw body, whose punctuation
-/// varies (spaced `"statusCode": 401` vs compact `"statusCode":401`), so we can't rely on fixed
-/// delimiters; the trade-off is that a status carrying neither a nearby key nor a reason phrase is
-/// not recognized (rare in practice, and recoverable — at worst a retried/failed request).
-pub(crate) fn mentions_http_status(msg: &str, status: u16) -> bool {
-    let lower = msg.to_ascii_lowercase();
-    mentions_http_status_lower(&lower, status)
-}
-
-/// Lowercase-input variant used by the completion classifiers, which normalize one rendered error
-/// chain once before applying the ordered predicates.
-fn mentions_http_status_lower(lower: &str, status: u16) -> bool {
-    let needle = status.to_string();
-    let reason = STATUS_REASONS
-        .iter()
-        .find(|(code, _)| *code == status)
-        .map(|(_, phrase)| *phrase);
-    let bytes = lower.as_bytes();
-    let mut from = 0;
-    while let Some(rel) = lower[from..].find(&needle) {
-        let start = from + rel;
-        let end = start + needle.len();
-        let prev_digit = start > 0 && bytes[start - 1].is_ascii_digit();
-        let next_digit = end < bytes.len() && bytes[end].is_ascii_digit();
-        if !prev_digit && !next_digit && status_in_context(lower, start, end, reason) {
-            return true;
+        },
+        ProviderFailureClass::ContextLength | ProviderFailureClass::NonRetryableClient => {
+            RetryPolicy {
+                retry: false,
+                max_attempts: 0,
+                base_backoff_ms: 0,
+                max_backoff_ms: 0,
+            }
         }
-        from = start + 1;
+        ProviderFailureClass::Server | ProviderFailureClass::Unknown => RetryPolicy {
+            retry: true,
+            max_attempts: MAX_COMPLETION_ATTEMPTS,
+            base_backoff_ms: BASE_BACKOFF_MS,
+            max_backoff_ms: MAX_BACKOFF_MS,
+        },
     }
-    false
 }
 
-/// Whether the standalone number at `start..end` in `lower` (already lowercased) sits in an
-/// HTTP-status context: followed by its reason phrase, or preceded within [`STATUS_KEY_WINDOW`] by a
-/// `status`/`code` key. `start`/`end` are byte offsets on char boundaries (the needle is ASCII); the
-/// preceding-window start is floored to a boundary so a multibyte char in the body can't panic the
-/// slice.
-fn status_in_context(lower: &str, start: usize, end: usize, reason: Option<&str>) -> bool {
-    if let Some(reason) = reason {
-        if lower[end..].trim_start().starts_with(reason) {
-            return true;
-        }
-    }
-    let mut window_start = start.saturating_sub(STATUS_KEY_WINDOW);
-    while !lower.is_char_boundary(window_start) {
-        window_start += 1;
-    }
-    // `statuscode` is the lowercased compact `statusCode` (no separator), where neither `status`
-    // nor `code` is a whole word on its own, so it needs its own key.
-    key_word_present(lower, window_start, start, "status")
-        || key_word_present(lower, window_start, start, "code")
-        || key_word_present(lower, window_start, start, "statuscode")
-}
-
-/// Whether `key` appears as a whole word within `lower[lo..hi]`. The left edge must be the string
-/// start or a non-`[a-z0-9_]` byte; the right edge must be the string end or a non-`[a-z0-9]` byte
-/// (`_` is allowed on the right so `status_code` still matches via the `status` key, while
-/// `decode`/`encode`/`unicode`/`error_code`/`codec`/`statuslike` do NOT count as keys). Boundary
-/// checks read `lower`'s absolute bytes, so a word split by the `[lo..hi]` window edge is judged
-/// against its real neighbours. `key` is ASCII; `lo`/`hi` are on char boundaries.
-fn key_word_present(lower: &str, lo: usize, hi: usize, key: &str) -> bool {
-    let bytes = lower.as_bytes();
-    let region = &lower[lo..hi];
-    let mut from = 0;
-    while let Some(rel) = region[from..].find(key) {
-        let abs = lo + from + rel;
-        let left_ok = abs == 0 || {
-            let b = bytes[abs - 1];
-            !b.is_ascii_alphanumeric() && b != b'_'
-        };
-        let after = abs + key.len();
-        let right_ok = after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
-        if left_ok && right_ok {
-            return true;
-        }
-        from += rel + 1;
-    }
-    false
-}
-
-/// Permanent error *types* that direct Anthropic/OpenAI bodies carry instead of a numeric status.
-/// rig flattens a non-2xx response to `ProviderError(<raw body>)` with the HTTP status dropped, so
-/// for those providers the numeric-status matchers never fire — these strings are the only signal.
-/// `insufficient_quota` (out of credits) is permanent despite arriving as HTTP 429: retrying never
-/// helps. Auth/permission `403`-class types are deliberately included here, *not* in the rate-limit
-/// set. All lowercase; matched as substrings on the lowercased chain.
-const NON_RETRYABLE_ERROR_TYPES: &[&str] = &[
+/// Exact provider error codes which describe a request that cannot succeed unchanged. These are
+/// read from structured `error.code` / `error.type` / `error.status` fields, never searched for in
+/// a rendered error string.
+const NON_RETRYABLE_ERROR_CODES: &[&str] = &[
     "authentication_error",
     "invalid_api_key",
     "permission_error",
     "permission_denied",
     "invalid_request_error",
     "not_found_error",
-    "context_length_exceeded",
-    "insufficient_quota",
 ];
 
-/// Transient error *types* (overload / throttling) that warrant the rate-limit backoff policy.
-const RATE_LIMIT_ERROR_TYPES: &[&str] = &[
+/// Exact transient overload/throttling codes which warrant the longer rate-limit backoff policy.
+const RATE_LIMIT_ERROR_CODES: &[&str] = &[
     "rate_limit_error",
     "rate_limit_exceeded",
     "overloaded_error",
 ];
 
-/// Error types that often arrive with HTTP 429 but are not transient throttles.
-const PERMANENT_QUOTA_ERROR_TYPES: &[&str] = &["insufficient_quota"];
+/// Exact provider codes for allowance exhaustion which cannot recover during this command.
+const PERMANENT_QUOTA_ERROR_CODES: &[&str] = &["insufficient_quota", "usage_limit_reached"];
 
-/// Registered server-error statuses. When one is the outer response status, it takes precedence
-/// over client/quota text nested in a gateway body because the request itself remains retryable.
-const SERVER_ERROR_STATUSES: &[u16] = &[500, 501, 502, 503, 504, 505, 506, 507, 508, 510, 511];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderFailureClass {
+    Server,
+    PermanentQuota,
+    RateLimit,
+    ContextLength,
+    NonRetryableClient,
+    Unknown,
+}
 
-fn mentions_server_error_status_lower(msg: &str) -> bool {
-    SERVER_ERROR_STATUSES
-        .iter()
-        .any(|&status| mentions_http_status_lower(msg, status))
+#[derive(Debug, Default)]
+struct ProviderErrorFacts {
+    status: Option<u16>,
+    body_status: Option<u16>,
+    body_code_status: Option<u16>,
+    codes: Vec<String>,
+    messages: Vec<String>,
+}
+
+impl ProviderErrorFacts {
+    fn from_report(err: &eyre::Report) -> Option<Self> {
+        let completion_error = err
+            .chain()
+            .find_map(|source| source.downcast_ref::<CompletionError>())?;
+        let mut facts = Self {
+            status: completion_error
+                .provider_response_status()
+                .map(|status| status.as_u16()),
+            ..Self::default()
+        };
+        match completion_error.provider_response_json() {
+            Ok(Some(body)) => {
+                collect_provider_status_hints(&body, &mut facts);
+                collect_provider_error_fields(&body, &mut facts);
+            }
+            Err(_) => {
+                if let Some(body) = completion_error.provider_response_body() {
+                    // Some compatible gateways return text/plain. This is the sole unstructured
+                    // compatibility input: it is still the provider body, never the rendered
+                    // eyre chain or surrounding diagnostic text.
+                    facts.messages.push(body.to_string());
+                }
+            }
+            Ok(None) => {}
+        }
+        Some(facts)
+    }
+
+    fn effective_status(&self) -> Option<u16> {
+        match self.status {
+            Some(status) if !(200..300).contains(&status) => Some(status),
+            _ => self.body_status.or(self.body_code_status).or(self.status),
+        }
+    }
+
+    fn has_code(&self, expected: &[&str]) -> bool {
+        self.codes
+            .iter()
+            .any(|code| expected.contains(&code.as_str()))
+    }
+}
+
+fn numeric_field(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<u16> {
+    keys.iter().find_map(|key| {
+        object
+            .get(*key)
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+    })
+}
+
+/// Rank body-carried status hints by their semantic position instead of whichever numeric field a
+/// recursive traversal happens to encounter first. Top-level status fields describe an envelope;
+/// a numeric provider `code` is only a fallback for 2xx/statusless error envelopes.
+fn collect_provider_status_hints(value: &Value, facts: &mut ProviderErrorFacts) {
+    let Some(root) = value.as_object() else {
+        return;
+    };
+    facts.body_status = numeric_field(root, &["status", "statusCode", "status_code"]);
+    facts.body_code_status = numeric_field(root, &["code"]);
+
+    if let Some(error) = root.get("error").and_then(Value::as_object) {
+        facts.body_status = facts
+            .body_status
+            .or_else(|| numeric_field(error, &["status", "statusCode", "status_code"]));
+        facts.body_code_status = facts
+            .body_code_status
+            .or_else(|| numeric_field(error, &["code"]));
+    }
+}
+
+/// Collect only semantically named scalar fields from a provider JSON error envelope. Recursing
+/// covers gateway shapes such as `{ "upstream": { "error": ... } }`; the real outer HTTP status
+/// is stored separately and always wins over nested provider facts.
+fn collect_provider_error_fields(value: &Value, facts: &mut ProviderErrorFacts) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                match (key.as_str(), value) {
+                    ("code" | "type" | "status", Value::String(value)) => {
+                        facts.codes.push(value.to_ascii_lowercase());
+                    }
+                    ("message", Value::String(value)) => facts.messages.push(value.clone()),
+                    _ => collect_provider_error_fields(value, facts),
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_provider_error_fields(value, facts);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Keep Codex's stored provider error bounded without turning valid JSON into an unparseable
+/// prefix. Large structured bodies are projected to the exact facts used by the classifier;
+/// malformed/text bodies retain the old bounded-prefix behavior.
+pub(crate) fn compact_provider_error_body(body: &str, compact_above_bytes: usize) -> String {
+    if body.len() <= compact_above_bytes {
+        return body.to_string();
+    }
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return truncate_utf8(body, compact_above_bytes);
+    };
+    let mut facts = ProviderErrorFacts::default();
+    collect_provider_status_hints(&value, &mut facts);
+    collect_provider_error_fields(&value, &mut facts);
+    let codes = facts
+        .codes
+        .into_iter()
+        .take(16)
+        .map(|code| serde_json::json!({ "code": truncate_utf8(&code, 128) }))
+        .collect::<Vec<_>>();
+    let messages = facts
+        .messages
+        .into_iter()
+        .take(4)
+        .map(|message| serde_json::json!({ "message": truncate_utf8(&message, 512) }))
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "status": facts.body_status,
+        "code": facts.body_code_status,
+        "details": codes,
+        "messages": messages,
+    })
+    .to_string()
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &value[..end])
+}
+
+fn classify_provider_failure(err: &eyre::Report) -> ProviderFailureClass {
+    let Some(facts) = ProviderErrorFacts::from_report(err) else {
+        return ProviderFailureClass::Unknown;
+    };
+    let status = facts.effective_status();
+
+    // The captured HTTP status is the outer response. A gateway 5xx therefore remains transient
+    // even when its JSON body embeds an upstream quota or client-error payload.
+    if status.is_some_and(|status| (500..600).contains(&status)) {
+        return ProviderFailureClass::Server;
+    }
+    if facts.has_code(PERMANENT_QUOTA_ERROR_CODES)
+        || facts
+            .messages
+            .iter()
+            .any(|message| is_long_window_quota_message(message))
+    {
+        return ProviderFailureClass::PermanentQuota;
+    }
+    if facts.has_code(RATE_LIMIT_ERROR_CODES) || status == Some(429) {
+        return ProviderFailureClass::RateLimit;
+    }
+    if facts.has_code(&["context_length_exceeded"])
+        || (facts.has_code(&["invalid_request_error"])
+            && facts
+                .messages
+                .iter()
+                .any(|message| message.to_ascii_lowercase().contains("prompt is too long")))
+    {
+        return ProviderFailureClass::ContextLength;
+    }
+    if facts.has_code(NON_RETRYABLE_ERROR_CODES)
+        || status.is_some_and(|status| (400..=404).contains(&status))
+    {
+        return ProviderFailureClass::NonRetryableClient;
+    }
+    ProviderFailureClass::Unknown
+}
+
+pub(crate) fn provider_http_status(err: &eyre::Report) -> Option<u16> {
+    ProviderErrorFacts::from_report(err).and_then(|facts| facts.effective_status())
+}
+
+pub(crate) fn provider_error_has_code(err: &eyre::Report, expected: &[&str]) -> bool {
+    ProviderErrorFacts::from_report(err).is_some_and(|facts| facts.has_code(expected))
 }
 
 /// Whether an error chain reports a context-window overflow — the one synthesis failure
@@ -983,75 +1062,30 @@ fn mentions_server_error_status_lower(msg: &str) -> bool {
 /// message says the prompt is too long; a generic `invalid_request_error` alone does NOT
 /// qualify (those are malformed-request bugs, not size problems).
 pub fn is_context_length_error(err: &eyre::Report) -> bool {
-    let msg = format!("{err:#}").to_ascii_lowercase();
-    msg.contains("context_length_exceeded")
-        || (msg.contains("invalid_request_error") && msg.contains("prompt is too long"))
+    classify_provider_failure(err) == ProviderFailureClass::ContextLength
 }
 
 #[cfg(test)]
 fn is_non_retryable_client_error(err: &eyre::Report) -> bool {
-    // Walk the whole chain: provider clients map non-2xx to a `ProviderError` carrying the raw
-    // response body, then `.wrap_err_with(...)` adds a top-level context. `err.to_string()` renders
-    // only that context, so the status code would be invisible; `{err:#}` joins the full chain.
-    let msg = format!("{err:#}").to_ascii_lowercase();
-    is_non_retryable_client_error_message(&msg)
-}
-
-fn is_non_retryable_client_error_message(msg: &str) -> bool {
-    // a 5xx response takes precedence: even when a 4xx is nested in the body (e.g. an upstream
-    // `"code": 403` inside a 502 envelope), the response itself is a retryable server error, so we
-    // must not classify it as a permanent client error. Cover the full registered 5xx range; the
-    // JSON `status`/`code`-key form is matched even for codes without a reason phrase here.
-    if mentions_server_error_status_lower(msg) {
-        return false;
-    }
-    if [400, 401, 402, 403, 404]
-        .iter()
-        .any(|&status| mentions_http_status_lower(msg, status))
-    {
-        return true;
-    }
-    NON_RETRYABLE_ERROR_TYPES.iter().any(|t| msg.contains(t))
+    matches!(
+        classify_provider_failure(err),
+        ProviderFailureClass::ContextLength | ProviderFailureClass::NonRetryableClient
+    )
 }
 
 #[cfg(test)]
 fn is_rate_limit_error(err: &eyre::Report) -> bool {
-    // Same reasoning as `is_non_retryable_client_error`: walk the full chain so a 429 carried in a
-    // wrapped `ProviderError` body still maps to the rate-limit backoff policy. Permanent quota
-    // types are excluded first because retrying them only burns the full rate-limit retry budget.
-    let msg = format!("{err:#}").to_ascii_lowercase();
-    is_rate_limit_message(&msg)
-}
-
-fn is_rate_limit_message(msg: &str) -> bool {
-    if mentions_server_error_status_lower(msg) {
-        return false;
-    }
-    if PERMANENT_QUOTA_ERROR_TYPES.iter().any(|t| msg.contains(t)) {
-        return false;
-    }
-    mentions_http_status_lower(msg, 429)
-        || msg.contains("rate limit")
-        || msg.contains("too many requests")
-        || msg.contains("tokens per minute")
-        || msg.contains("requests per minute")
-        || RATE_LIMIT_ERROR_TYPES.iter().any(|t| msg.contains(t))
+    classify_provider_failure(err) == ProviderFailureClass::RateLimit
 }
 
 #[cfg(test)]
 fn is_long_window_quota_error(err: &eyre::Report) -> bool {
-    let msg = format!("{err:#}").to_ascii_lowercase();
-    is_long_window_quota_message(&msg)
+    classify_provider_failure(err) == ProviderFailureClass::PermanentQuota
 }
 
 fn is_long_window_quota_message(msg: &str) -> bool {
-    // Gateways sometimes wrap an upstream quota payload in a transient 5xx response. The outer
-    // status wins: retry this route instead of treating it as exhausted for the rest of the run.
-    if mentions_server_error_status_lower(msg) {
-        return false;
-    }
+    let msg = msg.to_ascii_lowercase();
     msg.contains("out of tokens")
-        || msg.contains("usage_limit_reached")
         || msg.contains("hit your usage limit")
         || msg.contains("usage limit has been reached")
         || ((msg.contains("usage limit") || msg.contains("token limit"))
@@ -1072,21 +1106,10 @@ pub fn is_operational_limit_error(err: &eyre::Report) -> bool {
 }
 
 fn is_sticky_fallback_error(err: &eyre::Report) -> bool {
-    let msg = format!("{err:#}").to_ascii_lowercase();
-    is_sticky_fallback_message(&msg)
-}
-
-fn is_sticky_fallback_message(msg: &str) -> bool {
-    // Do not blacklist a route based on quota/rate-limit text nested inside a transient gateway
-    // response. The retry wrapper should get the same opportunity it would for a plain 5xx.
-    if mentions_server_error_status_lower(msg) {
-        return false;
-    }
-    is_long_window_quota_message(msg)
-        || is_rate_limit_message(msg)
-        || PERMANENT_QUOTA_ERROR_TYPES
-            .iter()
-            .any(|kind| msg.contains(kind))
+    matches!(
+        classify_provider_failure(err),
+        ProviderFailureClass::PermanentQuota | ProviderFailureClass::RateLimit
+    )
 }
 
 fn jittered_backoff(attempt: usize, base_backoff_ms: u64, max_backoff_ms: u64) -> Duration {
@@ -1106,48 +1129,18 @@ fn jitter_factor() -> f64 {
     0.5 + scaled
 }
 
-#[derive(Debug, Deserialize)]
-struct OpenRouterErrorEnvelope {
-    error: OpenRouterErrorBody,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenRouterErrorBody {
-    message: String,
-    code: Option<u16>,
-}
-
-fn normalize_openrouter_completion_error(err: &CompletionError) -> eyre::Report {
-    match err {
-        CompletionError::ResponseError(msg) => normalize_openrouter_response_error(msg),
-        CompletionError::ProviderError(msg) => eyre::eyre!("ProviderError: {msg}"),
-        _ => eyre::eyre!("{err}"),
+fn normalize_openrouter_completion_error(err: CompletionError) -> eyre::Report {
+    let empty_response = matches!(
+        &err,
+        CompletionError::ResponseError(msg)
+            if msg.contains("no message or tool call") || msg.contains("no choices")
+    );
+    let report = eyre::Report::new(err);
+    if empty_response {
+        report.wrap_err("empty response from model (no message or tool call)")
+    } else {
+        report
     }
-}
-
-fn normalize_openrouter_response_error(msg: &str) -> eyre::Report {
-    if msg.contains("no message or tool call") || msg.contains("no choices") {
-        return eyre::eyre!("empty response from model (no message or tool call)");
-    }
-
-    if let Some(err) = parse_openrouter_error_envelope(msg) {
-        return match err.code {
-            Some(code) => eyre::eyre!(
-                "HttpError: Invalid status code {code} OpenRouter provider error: {}",
-                err.message
-            ),
-            None => eyre::eyre!("ProviderError: {}", err.message),
-        };
-    }
-
-    eyre::eyre!("ResponseError: {msg}")
-}
-
-fn parse_openrouter_error_envelope(msg: &str) -> Option<OpenRouterErrorBody> {
-    let body = msg.split_once("response body:")?.1.trim();
-    serde_json::from_str::<OpenRouterErrorEnvelope>(body)
-        .ok()
-        .map(|envelope| envelope.error)
 }
 
 fn is_local_base_url(base_url: Option<&str>) -> bool {
@@ -1276,7 +1269,8 @@ impl LLMClient for openrouter::Client {
         let response = model
             .completion(request)
             .await
-            .map_err(|e| normalize_openrouter_completion_error(&e))?;
+            .map_err(normalize_openrouter_completion_error)
+            .wrap_err_with(|| format!("OpenRouter completion failed for model '{model_name}'"))?;
         let finish_reason = response
             .raw_response
             .choices
@@ -1982,7 +1976,10 @@ mod tests {
     impl LLMClient for QuotaClient {
         async fn completion(&self, _completion: Completion) -> Result<CompletionResponse> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            eyre::bail!("out of tokens per 5h window")
+            Err(eyre::Report::new(CompletionError::from_http_response(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":{"code":"usage_limit_reached"}}"#,
+            )))
         }
     }
 
@@ -2276,15 +2273,15 @@ mod tests {
         assert_eq!(usage.cached_input_tokens, 0);
     }
 
-    /// Reproduce how a provider 401 actually reaches the retry layer: rig surfaces the raw
-    /// response body as `ProviderError`, and the per-provider `completion` impls wrap it with
-    /// `.wrap_err_with(...)`. The status only lives in the source, so the classifier must walk
-    /// the chain rather than read `err.to_string()`.
-    fn wrapped_provider_error(body: &str) -> eyre::Report {
-        let inner = eyre::eyre!("ProviderError: {body}");
-        Err::<(), _>(inner)
-            .wrap_err("Anthropic completion failed for model 'claude'")
-            .unwrap_err()
+    fn provider_error(status: Option<u16>, body: &str) -> eyre::Report {
+        let error = match status {
+            Some(status) => CompletionError::from_http_response(
+                reqwest::StatusCode::from_u16(status).unwrap(),
+                body,
+            ),
+            None => CompletionError::from_provider_body(body),
+        };
+        eyre::Report::new(error).wrap_err("completion failed for model 'test'")
     }
 
     fn gemini_completion(max_tokens: Option<u64>, additional_params: Option<Value>) -> Completion {
@@ -2414,199 +2411,192 @@ mod tests {
     }
 
     #[test]
-    fn non_retryable_detects_status_in_wrapped_source() {
-        let err = wrapped_provider_error(r#"{"statusCode": 401, "message": "Unauthorized"}"#);
-        // `to_string()` only renders the top-level context — proves we must look deeper.
-        assert!(!err.to_string().contains("401"));
-        assert!(is_non_retryable_client_error(&err));
+    fn classifiers_use_captured_http_status() {
+        let unauthorized = provider_error(Some(401), r#"{"message":"Unauthorized"}"#);
+        assert!(!unauthorized.to_string().contains("401"));
+        assert_eq!(provider_http_status(&unauthorized), Some(401));
+        assert!(is_non_retryable_client_error(&unauthorized));
+
+        let throttled = provider_error(Some(429), r#"{"message":"slow down"}"#);
+        assert!(is_rate_limit_error(&throttled));
+        assert_eq!(
+            retry_policy(&throttled).max_attempts,
+            RATE_LIMIT_MAX_COMPLETION_ATTEMPTS
+        );
+
+        let server = provider_error(Some(503), r#"{"message":"unavailable"}"#);
+        assert_eq!(
+            classify_provider_failure(&server),
+            ProviderFailureClass::Server
+        );
+        assert_eq!(retry_policy(&server).max_attempts, MAX_COMPLETION_ATTEMPTS);
     }
 
     #[test]
-    fn non_retryable_false_for_server_error() {
-        let err = wrapped_provider_error(r#"{"statusCode": 500, "message": "boom"}"#);
-        assert!(!is_non_retryable_client_error(&err));
+    fn exact_quota_codes_skip_same_route_retries() {
+        for code in PERMANENT_QUOTA_ERROR_CODES {
+            let body = format!(r#"{{"error":{{"code":"{code}"}}}}"#);
+            let err = provider_error(Some(429), &body);
+            assert!(is_long_window_quota_error(&err), "{code}");
+            assert!(!is_rate_limit_error(&err), "{code}");
+            assert!(!retry_policy(&err).retry, "{code}");
+            assert!(is_sticky_fallback_error(&err), "{code}");
+        }
     }
 
     #[test]
-    fn rate_limit_detects_429_in_wrapped_source() {
-        let err = wrapped_provider_error(r#"{"statusCode": 429, "message": "Too Many Requests"}"#);
+    fn structured_kimi_quota_messages_are_the_narrow_compatibility_fallback() {
+        for (status, message) in [
+            (429, "out of tokens per 5h window; reset in 2h"),
+            (429, "You've hit your usage limit"),
+            (
+                403,
+                "You've reached your usage limit for this billing cycle. Your quota will be refreshed in the next cycle.",
+            ),
+        ] {
+            let body = json!({"error": {"type": "access_terminated_error", "message": message}});
+            let err = provider_error(Some(status), &body.to_string());
+            assert!(is_long_window_quota_error(&err), "{message}");
+            assert!(!retry_policy(&err).retry, "{message}");
+        }
+
+        // Diagnostic text outside a structured provider body is deliberately ignored.
+        let untyped = eyre::eyre!("insufficient_quota: out of tokens per 5h window");
+        assert_eq!(
+            classify_provider_failure(&untyped),
+            ProviderFailureClass::Unknown
+        );
+        assert_eq!(retry_policy(&untyped).max_attempts, MAX_COMPLETION_ATTEMPTS);
+    }
+
+    #[test]
+    fn real_5xx_status_precedes_nested_quota_and_rate_codes() {
+        for status in 500..600 {
+            let err = provider_error(
+                Some(status),
+                r#"{"upstream":{"error":{"code":"insufficient_quota","message":"out of tokens per 5h window"}}}"#,
+            );
+            assert_eq!(
+                classify_provider_failure(&err),
+                ProviderFailureClass::Server
+            );
+            let policy = retry_policy(&err);
+            assert!(policy.retry);
+            assert_eq!(policy.max_attempts, MAX_COMPLETION_ATTEMPTS);
+            assert!(!is_sticky_fallback_error(&err));
+        }
+    }
+
+    #[test]
+    fn exact_provider_codes_classify_without_http_status() {
+        for code in [
+            "authentication_error",
+            "invalid_api_key",
+            "permission_error",
+        ] {
+            let body = format!(r#"{{"error":{{"type":"{code}"}}}}"#);
+            let err = provider_error(None, &body);
+            assert!(is_non_retryable_client_error(&err), "{code}");
+        }
+
+        for code in RATE_LIMIT_ERROR_CODES {
+            let body = format!(r#"{{"error":{{"code":"{code}"}}}}"#);
+            let err = provider_error(None, &body);
+            assert!(is_rate_limit_error(&err), "{code}");
+        }
+    }
+
+    #[test]
+    fn context_length_uses_exact_code_and_structured_message() {
+        let openai = provider_error(Some(400), r#"{"error":{"code":"context_length_exceeded"}}"#);
+        assert!(is_context_length_error(&openai));
+
+        let anthropic = provider_error(
+            Some(400),
+            r#"{"error":{"type":"invalid_request_error","message":"prompt is too long"}}"#,
+        );
+        assert!(is_context_length_error(&anthropic));
+
+        let malformed = provider_error(
+            Some(400),
+            r#"{"error":{"type":"invalid_request_error","message":"tools[0] is invalid"}}"#,
+        );
+        assert!(!is_context_length_error(&malformed));
+        assert!(is_non_retryable_client_error(&malformed));
+    }
+
+    #[test]
+    fn provider_json_status_hint_handles_success_error_envelopes() {
+        let err = provider_error(
+            Some(200),
+            r#"{"error":{"code":429,"type":"rate_limit_error","message":"slow down"}}"#,
+        );
+        assert_eq!(provider_http_status(&err), Some(429));
         assert!(is_rate_limit_error(&err));
     }
 
     #[test]
-    fn long_subscription_window_skips_same_route_retries() {
-        for message in [
-            "out of tokens per 5h window; reset in 2h",
-            "You've hit your usage limit",
-            "You've reached your usage limit for this billing cycle. Your quota will be refreshed in the next cycle.",
-            r#"{"error":{"code":"usage_limit_reached"}}"#,
-        ] {
-            let err = eyre::eyre!(message);
-            assert!(is_long_window_quota_error(&err), "{message}");
-            assert!(!retry_policy(&err).retry, "{message}");
-        }
-        let short_throttle = eyre::eyre!("429 Too Many Requests");
-        assert!(!is_long_window_quota_error(&short_throttle));
-        assert!(retry_policy(&short_throttle).retry);
-    }
-
-    #[test]
-    fn nested_long_window_quota_inside_5xx_stays_transient() {
-        for status in [500, 501, 502, 503, 504, 505, 506, 507, 508, 510, 511] {
-            let body = format!(
-                r#"{{"statusCode":{status},"error":{{"code":"usage_limit_reached","message":"out of tokens per 5h window"}}}}"#
+    fn text_provider_body_only_uses_the_quota_message_fallback() {
+        for status in [403, 429] {
+            let err = provider_error(
+                Some(status),
+                "You've reached your usage limit for this billing cycle; refresh in the next cycle",
             );
-            let err = wrapped_provider_error(&body);
-            assert!(!is_long_window_quota_error(&err), "status {status}");
-            let policy = retry_policy(&err);
-            assert!(policy.retry, "status {status}");
-            assert_eq!(
-                policy.max_attempts, MAX_COMPLETION_ATTEMPTS,
-                "status {status}"
-            );
-            assert!(!is_sticky_fallback_error(&err), "status {status}");
+            assert!(is_long_window_quota_error(&err));
+            assert!(!retry_policy(&err).retry);
+            assert!(is_sticky_fallback_error(&err));
         }
 
-        for nested in [
-            r#"{"error":{"code":"insufficient_quota"}}"#,
-            r#"{"error":{"message":"rate limit exceeded"}}"#,
-        ] {
-            let body = format!(r#"{{"statusCode":502,"upstream":{nested}}}"#);
-            let err = wrapped_provider_error(&body);
-            assert!(!is_rate_limit_error(&err), "{nested}");
-            let policy = retry_policy(&err);
-            assert!(policy.retry, "{nested}");
-            assert_eq!(policy.max_attempts, MAX_COMPLETION_ATTEMPTS, "{nested}");
-            assert_eq!(policy.base_backoff_ms, BASE_BACKOFF_MS, "{nested}");
-            assert!(!is_sticky_fallback_error(&err), "{nested}");
-        }
+        let err = provider_error(Some(429), "insufficient_quota in a non-JSON response");
+        // Arbitrary body text is not scanned for codes; the captured 429 still classifies.
+        assert!(is_rate_limit_error(&err));
+
+        let statusless = provider_error(None, "insufficient_quota in a non-JSON response");
+        assert_eq!(
+            classify_provider_failure(&statusless),
+            ProviderFailureClass::Unknown
+        );
+        assert!(!is_sticky_fallback_error(&statusless));
     }
 
     #[test]
-    fn classifiers_detect_compact_json_status() {
-        // Compact bodies (no space after the colon) must still classify — `:401,` / `:429,` would
-        // slip past a plain `" 401"` / `" 429"` substring check.
-        let unauthorized = wrapped_provider_error(r#"{"statusCode":401,"message":"nope"}"#);
-        assert!(is_non_retryable_client_error(&unauthorized));
-        let throttled = wrapped_provider_error(r#"{"statusCode":429,"message":"slow down"}"#);
-        assert!(is_rate_limit_error(&throttled));
+    fn top_level_status_hint_precedes_nested_numeric_codes() {
+        let err = provider_error(
+            Some(200),
+            r#"{"statusCode":502,"upstream":{"error":{"code":403,"type":"insufficient_quota"}}}"#,
+        );
+        assert_eq!(provider_http_status(&err), Some(502));
+        assert_eq!(
+            classify_provider_failure(&err),
+            ProviderFailureClass::Server
+        );
+        assert!(!is_sticky_fallback_error(&err));
     }
 
     #[test]
-    fn mentions_http_status_requires_standalone_number() {
-        assert!(mentions_http_status(r#"{"code":401}"#, 401)); // bounded by punctuation, `code` key
-        assert!(mentions_http_status("got 401 unauthorized", 401)); // reason phrase follows
-        assert!(!mentions_http_status("request id 4017 failed", 401)); // part of a longer run
-        assert!(!mentions_http_status("token count 1401", 401)); // trailing digits
+    fn compact_provider_error_body_keeps_large_json_classifiable() {
+        let body = json!({
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "quota exhausted",
+                "diagnostic": "x".repeat(4_000),
+            }
+        })
+        .to_string();
+        let compact = compact_provider_error_body(&body, 1_000);
+        serde_json::from_str::<Value>(&compact).expect("compacted provider body stays valid JSON");
+        let err = provider_error(Some(429), &compact);
+        assert!(is_long_window_quota_error(&err));
     }
 
     #[test]
-    fn mentions_http_status_requires_status_context() {
-        // A standalone status-valued number that is neither keyed nor followed by its reason phrase
-        // is incidental, not the response status — don't misclassify the surrounding error.
-        assert!(!mentions_http_status("max 400 tokens allowed", 400));
-        assert!(!mentions_http_status("trace 404 emitted", 404));
-        assert!(!mentions_http_status("req_402abc failed", 402)); // embedded in an identifier
-        assert!(!mentions_http_status("retry after 429 seconds", 429)); // bare number, wrong meaning
-        // Genuine status references in their usual shapings still match.
-        assert!(mentions_http_status(
-            r#"{"statusCode":429,"message":"slow"}"#,
-            429
+    fn openrouter_normalization_preserves_typed_provider_source() {
+        let err = normalize_openrouter_completion_error(CompletionError::from_http_response(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"type":"insufficient_quota"}}"#,
         ));
-        assert!(mentions_http_status(
-            "HttpError: Invalid status code 401",
-            401
-        ));
-        assert!(mentions_http_status("429 Too Many Requests", 429)); // reason phrase
-    }
-
-    #[test]
-    fn key_must_be_a_whole_word_not_a_substring() {
-        // `code` embedded in another word is not a status key, so these transient errors must NOT
-        // be classified as non-retryable client errors (they should keep their retries).
-        assert!(!mentions_http_status("decode error 404", 404)); // decode contains "code"
-        assert!(!mentions_http_status("unicode error 400", 400)); // unicode contains "code"
-        assert!(!mentions_http_status("encode failure 403", 403)); // encode contains "code"
-        assert!(!mentions_http_status("error_code 402 seen", 402)); // underscore is a left edge
-        // right boundary: `code`/`status` as a prefix of a longer word is not a key either.
-        assert!(!mentions_http_status("codec 404 negotiation failed", 404));
-        assert!(!mentions_http_status("statuslike 401 marker", 401));
-        // window edge: even if the 24-byte key window cuts `unicode` right before `code`, the real
-        // preceding char ('i') is still consulted, so it stays a non-match.
-        assert!(!mentions_http_status("xxxxxxxxxxxxxxxxxunicode 404", 404));
-        // `status_code` is still a real key (matched via the `status` word).
-        assert!(mentions_http_status(r#"{"status_code": 401}"#, 401));
-    }
-
-    #[test]
-    fn classifies_provider_error_types_without_numeric_status() {
-        // rig flattens direct Anthropic/OpenAI non-2xx to ProviderError(body) with no numeric status;
-        // these bodies carry only string error types. Confirm the type matchers fire.
-        let anthropic_auth = wrapped_provider_error(
-            r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
-        );
-        assert!(!anthropic_auth.to_string().contains("401"));
-        assert!(is_non_retryable_client_error(&anthropic_auth));
-        assert!(!is_rate_limit_error(&anthropic_auth));
-
-        let openai_key =
-            wrapped_provider_error(r#"{"error":{"code":"invalid_api_key","message":"bad key"}}"#);
-        assert!(is_non_retryable_client_error(&openai_key));
-
-        let bad_request = wrapped_provider_error(
-            r#"{"error":{"type":"invalid_request_error","message":"prompt is too long"}}"#,
-        );
-        assert!(is_non_retryable_client_error(&bad_request));
-
-        let ctx_len = wrapped_provider_error(r#"{"error":{"code":"context_length_exceeded"}}"#);
-        assert!(is_non_retryable_client_error(&ctx_len));
-
-        // Both provider shapes of a context overflow classify as such; a generic
-        // invalid_request_error must NOT — the fewer-presets remediation would be
-        // misdirection on a malformed-request bug.
-        assert!(is_context_length_error(&ctx_len));
-        assert!(is_context_length_error(&bad_request));
-        let malformed = wrapped_provider_error(
-            r#"{"error":{"type":"invalid_request_error","message":"tools[0] is invalid"}}"#,
-        );
-        assert!(!is_context_length_error(&malformed));
-
-        // insufficient_quota is permanent (out of credits) despite arriving as HTTP 429.
-        let quota = wrapped_provider_error(
-            r#"{"error":{"type":"insufficient_quota","message":"exceeded your current quota"}}"#,
-        );
-        assert!(is_non_retryable_client_error(&quota));
-        assert!(!is_rate_limit_error(&quota));
-
-        let quota_with_429 = wrapped_provider_error(
-            r#"{"statusCode":429,"error":{"type":"insufficient_quota","message":"Too Many Requests"}}"#,
-        );
-        assert!(is_non_retryable_client_error(&quota_with_429));
-        assert!(!is_rate_limit_error(&quota_with_429));
-        assert!(!retry_policy(&quota_with_429).retry);
-
-        // Transient overload/throttling types take the rate-limit policy and are not non-retryable.
-        let overloaded =
-            wrapped_provider_error(r#"{"type":"error","error":{"type":"overloaded_error"}}"#);
-        assert!(is_rate_limit_error(&overloaded));
-        assert!(!is_non_retryable_client_error(&overloaded));
-
-        let throttled = wrapped_provider_error(r#"{"error":{"code":"rate_limit_exceeded"}}"#);
-        assert!(is_rate_limit_error(&throttled));
-    }
-
-    #[test]
-    fn server_error_takes_precedence_over_nested_4xx() {
-        // a 5xx response whose body nests a 4xx (e.g. an upstream code) is a retryable server
-        // error, not a permanent client error — so it must NOT be classified non-retryable.
-        let err = wrapped_provider_error(r#"{"statusCode":502,"error":{"code":403}}"#);
-        assert!(!is_non_retryable_client_error(&err));
-        // 5xx codes without a reason phrase here (501) are still matched via the status key.
-        let nested = wrapped_provider_error(r#"{"statusCode":501,"error":{"code":403}}"#);
-        assert!(!is_non_retryable_client_error(&nested));
-        // a genuine 4xx with no 5xx in the chain is still non-retryable.
-        let pure_4xx = wrapped_provider_error(r#"{"statusCode":403,"message":"forbidden"}"#);
-        assert!(is_non_retryable_client_error(&pure_4xx));
+        assert_eq!(provider_http_status(&err), Some(429));
+        assert!(is_long_window_quota_error(&err));
     }
 
     fn tool_call_content() -> AssistantContent {

@@ -24,6 +24,9 @@ Notable user-visible changes are recorded here. The format follows
   terminal-only correction turn with forced tool use, then route fallback on noncompliance.
 - Treat billing-cycle usage exhaustion as a run-long unavailable route and collapse repeated
   debate-turn failures into one concise operational warning.
+- Classify provider failures from Rig's captured HTTP status and structured error codes instead of
+  scanning rendered error text; retain message matching only inside structured long-window quota
+  payloads for providers which do not expose a distinct code.
 - Keep fallback stickiness local to each independent debate lane while sharing run-wide route
   availability, so one lane's request-specific failover cannot reroute another lane.
 - Give spawned subagents independent sticky fallback state while preserving shared route
