@@ -22,6 +22,8 @@ Notable user-visible changes are recorded here. The format follows
 
 - Require debate agents to submit structured verdicts: a plain-text conclusion gets one
   terminal-only correction turn with forced tool use, then route fallback on noncompliance.
+- Treat billing-cycle usage exhaustion as a run-long unavailable route and collapse repeated
+  debate-turn failures into one concise operational warning.
 - Resolve `--repo` through Git so linked worktrees and paths inside a worktree are supported.
 
 ## [0.9.1] - 2026-08-09

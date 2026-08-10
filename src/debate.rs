@@ -7,7 +7,7 @@ use nitpicker_agent::agent::{
     run_agent,
 };
 use nitpicker_agent::config::Config;
-use nitpicker_agent::llm::{Completion, LLMClientDyn, TokenUsage};
+use nitpicker_agent::llm::{Completion, LLMClientDyn, TokenUsage, is_operational_limit_error};
 use nitpicker_agent::provider::{build_aggregator_client, build_reviewer_client};
 use nitpicker_agent::session::{
     AggregationRecord, LaneRecord, SessionLogger, SessionWriter, sanitize_path_component,
@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use termimad::MadSkin;
@@ -79,6 +79,8 @@ struct DebateTurnRequest<'a> {
     /// One per run, shared by every lane and subagent — concurrent lanes must split the
     /// account-wide in-flight cap, not multiply it.
     llm_semaphore: Arc<tokio::sync::Semaphore>,
+    /// One user-facing failure warning per run; full per-turn errors remain available at debug.
+    failure_warning_emitted: Arc<AtomicBool>,
     progress: Option<Arc<dyn Fn(AgentProgress) + Send + Sync>>,
     project_context: Option<String>,
     /// Trajectory identity (`[lane-<j>-<preset>-]<side>-<round>`, the writer's file stem):
@@ -196,7 +198,10 @@ async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnRes
     {
         Ok(r) => r,
         Err(err) => {
-            warn!(model = request.model, error = ?err, "debate agent failed");
+            tracing::debug!(model = request.model, error = ?err, "debate agent failed");
+            if claim_failure_warning(&request.failure_warning_emitted) {
+                warn!("{}", debate_failure_warning(&err));
+            }
             return Ok(DebateTurnResult {
                 verdict: DebateVerdict {
                     text: format!("*Agent failed: {err:#}*"),
@@ -228,6 +233,18 @@ async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnRes
     })
 }
 
+fn debate_failure_warning(err: &eyre::Report) -> &'static str {
+    if is_operational_limit_error(err) {
+        "A model reached its usage limit; continuing with the remaining debate where possible"
+    } else {
+        "A debate turn failed; continuing with the remaining debate where possible"
+    }
+}
+
+fn claim_failure_warning(emitted: &AtomicBool) -> bool {
+    !emitted.swap(true, Ordering::AcqRel)
+}
+
 /// One debater's fixed identity for the whole debate — the per-side inputs that would
 /// otherwise be spelled out twice per round.
 struct DebateSide<'a> {
@@ -253,6 +270,7 @@ struct RoundEnv<'a> {
     verbose: bool,
     stdout_ok: bool,
     llm_semaphore: &'a Arc<tokio::sync::Semaphore>,
+    failure_warning_emitted: &'a Arc<AtomicBool>,
     subagent_system_prompt: Option<&'a str>,
     /// Print verdicts as turns finish (single lane only) — concurrent lanes buffer instead,
     /// since their interleaved output would be unattributable.
@@ -297,6 +315,7 @@ async fn run_debate_side(
         max_turns: env.max_turns,
         work_dir: env.repo,
         llm_semaphore: Arc::clone(env.llm_semaphore),
+        failure_warning_emitted: Arc::clone(env.failure_warning_emitted),
         progress,
         project_context: Some(env.project_context.to_string()),
         session_writer: env
@@ -543,6 +562,7 @@ pub async fn run_debate(
     // one in-flight-LLM cap for the whole run: concurrent lanes and their subagents share
     // it, so lane count scales wall-clock breadth without multiplying provider pressure
     let llm_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LLM_CALLS));
+    let failure_warning_emitted = Arc::new(AtomicBool::new(false));
 
     let done_style = ProgressStyle::with_template("  {prefix:<12} {msg}").unwrap();
     let skin = MadSkin::default();
@@ -589,6 +609,7 @@ pub async fn run_debate(
             let actor_client = Arc::clone(&actor_client);
             let critic_client = Arc::clone(&critic_client);
             let llm_semaphore = &llm_semaphore;
+            let failure_warning_emitted = &failure_warning_emitted;
             let mp = &mp;
             let done_style = &done_style;
             let skin = &skin;
@@ -633,6 +654,7 @@ pub async fn run_debate(
                     verbose,
                     stdout_ok,
                     llm_semaphore,
+                    failure_warning_emitted,
                     subagent_system_prompt: subagent_prompt.as_deref(),
                     live_output,
                     lane_progress,
@@ -1206,6 +1228,21 @@ mod tests {
             definition.parameters["properties"]["agree"]["description"],
             "True only for literal, unchanged agreement; any correction or unresolved point requires false"
         );
+    }
+
+    #[test]
+    fn operational_failure_warning_is_concise_and_emitted_once() {
+        let err = eyre::eyre!(
+            "403 Forbidden: You've reached your usage limit for this billing cycle. Your quota \
+             will be refreshed in the next cycle"
+        );
+        assert_eq!(
+            debate_failure_warning(&err),
+            "A model reached its usage limit; continuing with the remaining debate where possible"
+        );
+        let emitted = AtomicBool::new(false);
+        assert!(claim_failure_warning(&emitted));
+        assert!(!claim_failure_warning(&emitted));
     }
 
     /// Distinct presets that sanitize to the same slug must still produce distinct

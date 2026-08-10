@@ -1024,9 +1024,18 @@ fn is_long_window_quota_error(err: &eyre::Report) -> bool {
         || ((msg.contains("usage limit") || msg.contains("token limit"))
             && (msg.contains("window")
                 || msg.contains("reset")
+                || msg.contains("refresh")
+                || msg.contains("billing cycle")
+                || msg.contains("next cycle")
                 || msg.contains("5h")
                 || msg.contains("5 h")
                 || msg.contains("5 hour")))
+}
+
+/// Whether an error represents an operational provider limit that cannot recover during this run.
+/// CLI layers use this to present a concise message while retaining the full report at debug level.
+pub fn is_operational_limit_error(err: &eyre::Report) -> bool {
+    is_sticky_fallback_error(err)
 }
 
 fn is_sticky_fallback_error(err: &eyre::Report) -> bool {
@@ -2324,6 +2333,7 @@ mod tests {
         for message in [
             "out of tokens per 5h window; reset in 2h",
             "You've hit your usage limit",
+            "You've reached your usage limit for this billing cycle. Your quota will be refreshed in the next cycle.",
             r#"{"error":{"code":"usage_limit_reached"}}"#,
         ] {
             let err = eyre::eyre!(message);
