@@ -1,5 +1,7 @@
 [defaults]
 debate = true
+# Try the next configured reviewer when a provider/model fails.
+# fallback = true
 max_turns = 200
 log_trajectories = true
 compact_threshold = 120000

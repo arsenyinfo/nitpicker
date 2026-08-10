@@ -35,6 +35,9 @@ pub struct DefaultsConfig {
     pub debate: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alloy: Option<bool>,
+    /// Fall through the configured reviewer priority order when a model fails.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -161,6 +164,7 @@ impl Config {
         }
 
         self.validate_alloy(self.default_alloy())?;
+        self.validate_fallback(self.default_fallback())?;
 
         validate_free_model(
             "[aggregator]",
@@ -252,6 +256,23 @@ impl Config {
         self.defaults
             .as_ref()
             .and_then(|d| d.alloy)
+            .unwrap_or(false)
+    }
+
+    pub fn validate_fallback(&self, fallback: bool) -> Result<()> {
+        if fallback && self.reviewer.len() < 2 {
+            eyre::bail!(
+                "fallback = true / --fallback requires at least 2 reviewers, found {}",
+                self.reviewer.len()
+            );
+        }
+        Ok(())
+    }
+
+    pub fn default_fallback(&self) -> bool {
+        self.defaults
+            .as_ref()
+            .and_then(|d| d.fallback)
             .unwrap_or(false)
     }
 
@@ -665,6 +686,37 @@ mod tests {
         assert!(config_with(None, None).validate().is_ok());
         assert!(config_with(Some(0), None).validate().is_err());
         assert!(config_with(None, Some(0)).validate().is_err());
+    }
+
+    #[test]
+    fn fallback_default_is_opt_in_and_requires_a_next_reviewer() {
+        let mut config = config_with(None, None);
+        assert!(!config.default_fallback());
+        config.defaults = Some(DefaultsConfig {
+            debate: None,
+            alloy: None,
+            fallback: Some(true),
+            max_turns: None,
+            compact_threshold: None,
+            log_trajectories: None,
+            presets: None,
+        });
+        assert!(config.default_fallback());
+        assert!(config.validate().is_err());
+
+        config.reviewer.push(ReviewerConfig {
+            name: "r2".to_string(),
+            model: "gpt-5.4".to_string(),
+            provider: ProviderType::OpenAi,
+            base_url: None,
+            api_key_env: None,
+            max_tokens: None,
+            compact_threshold: None,
+            auth: Some("codex".to_string()),
+            azure_scope: None,
+            azure_credentials: None,
+        });
+        assert!(config.validate().is_ok());
     }
 
     #[test]

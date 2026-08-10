@@ -412,6 +412,7 @@ pub struct DebateOptions<'a> {
     pub verbose: bool,
     pub task: RunTask<'a>,
     pub alloy: bool,
+    pub fallback: bool,
     pub format: crate::output::OutputFormat,
 }
 
@@ -453,6 +454,7 @@ pub async fn run_debate(
         verbose,
         task,
         alloy,
+        fallback,
         format,
     } = opts;
     let presets = task.presets();
@@ -481,22 +483,17 @@ pub async fn run_debate(
     let critic_label: ModelLabel;
     let actor_compact_threshold: Option<u64>;
     let critic_compact_threshold: Option<u64>;
-    // In alloy mode the client pools every reviewer, so these come from the same two slots the
-    // roles are otherwise pinned to — the existing convention for per-side settings.
+    // Output caps stay bound to the two logical roles; the routing clients replace them with the
+    // selected route's cap at the completion boundary.
     let actor_max_tokens = actor_cfg.max_tokens;
     let critic_max_tokens = critic_cfg.max_tokens;
 
+    let reviewer_pool = (alloy || fallback)
+        .then(|| crate::review::build_reviewer_pool(config, &gemini_proxy, proxy_url.as_deref()));
+
     if alloy {
-        let mut slots = Vec::new();
-        for r in &config.reviewer {
-            slots.push(nitpicker_agent::llm::AlloySlot {
-                client: gemini_proxy.annotate(build_reviewer_client(r, proxy_url.as_deref()))?,
-                model: r.model.clone(),
-                max_tokens: r.max_tokens,
-            });
-        }
-        let shared: Arc<dyn LLMClientDyn> =
-            Arc::new(nitpicker_agent::llm::AlloyClient::new(slots)?);
+        let pool = reviewer_pool.as_ref().expect("alloy builds reviewer pool");
+        let shared = crate::review::alloy_client(pool, fallback)?;
         actor_client = Arc::clone(&shared);
         critic_client = shared;
         let label = ModelLabel::alloy(config.reviewer.iter().map(|r| r.model.as_str()));
@@ -505,8 +502,20 @@ pub async fn run_debate(
             full: label.full.clone(),
         };
         critic_label = label;
-        actor_compact_threshold = config.reviewer_compact_threshold(actor_cfg);
-        critic_compact_threshold = config.reviewer_compact_threshold(critic_cfg);
+        let threshold = crate::review::reviewer_pool_compact_threshold(config, pool);
+        actor_compact_threshold = threshold;
+        critic_compact_threshold = threshold;
+    } else if fallback {
+        let pool = reviewer_pool
+            .as_ref()
+            .expect("fallback builds reviewer pool");
+        actor_client = crate::review::reviewer_client(pool, 0, true)?;
+        critic_client = crate::review::reviewer_client(pool, 1, true)?;
+        actor_label = ModelLabel::plain(&actor_cfg.model);
+        critic_label = ModelLabel::plain(&critic_cfg.model);
+        let threshold = crate::review::reviewer_pool_compact_threshold(config, pool);
+        actor_compact_threshold = threshold;
+        critic_compact_threshold = threshold;
     } else {
         actor_client =
             gemini_proxy.annotate(build_reviewer_client(actor_cfg, proxy_url.as_deref()))?;
@@ -524,8 +533,16 @@ pub async fn run_debate(
 
     let project_context = crate::context::build_context(repo).await;
 
-    let agg_client: Arc<dyn LLMClientDyn> =
-        gemini_proxy.annotate(build_aggregator_client(agg_cfg, proxy_url.as_deref()))?;
+    let agg_client: Arc<dyn LLMClientDyn> = match &reviewer_pool {
+        Some(pool) if fallback => crate::review::aggregator_client(
+            config,
+            &gemini_proxy,
+            proxy_url.as_deref(),
+            pool,
+            true,
+        )?,
+        _ => gemini_proxy.annotate(build_aggregator_client(agg_cfg, proxy_url.as_deref()))?,
+    };
 
     let actor_role = task.actor_role();
     let critic_role = task.critic_role();
@@ -831,6 +848,10 @@ pub async fn run_debate(
     let meta_result: eyre::Result<nitpicker_agent::llm::CompletionResponse> = agg_client
         .completion(meta_completion)
         .await
+        .and_then(|response| {
+            crate::review::validate_synthesis_response(&response, "meta-review")?;
+            Ok(response)
+        })
         .map_err(|err| match presets {
             Some(presets) => crate::presets::synthesis_failure(
                 err,

@@ -33,6 +33,10 @@ struct CommonArgs {
 
     #[arg(long, short, global = true)]
     verbose: bool,
+
+    /// Try the next configured reviewer when the selected model fails
+    #[arg(long, global = true)]
+    fallback: bool,
 }
 
 /// `--context-file`, kept out of the global `CommonArgs` deliberately: clap propagates a global
@@ -79,6 +83,22 @@ fn presets_allowed(command: &Option<Command>) -> bool {
         None | Some(Command::Pr(_)) => true,
         Some(Command::Ask { .. } | Command::Init { .. } | Command::Reflect { .. }) => false,
     }
+}
+
+fn fallback_allowed(command: &Option<Command>) -> bool {
+    matches!(command, None | Some(Command::Ask { .. } | Command::Pr(_)))
+}
+
+pub(crate) fn resolve_routing_modes(
+    config: &config::Config,
+    cli_alloy: bool,
+    cli_fallback: bool,
+) -> Result<(bool, bool)> {
+    let alloy = cli_alloy || config.default_alloy();
+    config.validate_alloy(alloy)?;
+    let fallback = cli_fallback || config.default_fallback();
+    config.validate_fallback(fallback)?;
+    Ok((alloy, fallback))
 }
 
 #[derive(Debug, Parser)]
@@ -198,6 +218,9 @@ async fn main() -> Result<()> {
     if !presets_allowed(&args.command) && !args.presets.preset.is_empty() {
         eyre::bail!("--preset applies to review modes only (default review, --analyze, pr)");
     }
+    if args.common.fallback && !fallback_allowed(&args.command) {
+        eyre::bail!("--fallback applies to review and ask modes only");
+    }
 
     // note: no json panic hook. reviewer work runs in tokio::spawn tasks whose
     // panics are caught as JoinError and folded into a degraded report (exit 3
@@ -227,14 +250,17 @@ async fn main() -> Result<()> {
             max_turns,
         }) => {
             let repo = resolve_repo_root(&args.common.repo)?;
-            let config = load_resolved_config(args.common.config.as_deref(), &repo).await?;
+            let mut config = load_config(args.common.config.as_deref(), &repo)?;
+            // CLI-only routing validation must precede free-model smoke completions.
+            let (use_alloy, use_fallback) =
+                resolve_routing_modes(&config, alloy, args.common.fallback)?;
+            openrouter::resolve_free_models(&mut config).await?;
+            let config = config;
             let topic = context::append_to_prompt(
                 topic,
                 &context::load_context_files(&merged_context_files(&args.context, &context))?,
             );
             let max_turns = config.max_turns(max_turns)?;
-            let use_alloy = alloy || config.default_alloy();
-            config.validate_alloy(use_alloy)?;
 
             if use_alloy && no_debate {
                 eprintln!("warning: --alloy has no effect with --no-debate");
@@ -257,6 +283,7 @@ async fn main() -> Result<()> {
                         verbose: args.common.verbose,
                         task: prompts::RunTask::Ask,
                         alloy: use_alloy,
+                        fallback: use_fallback,
                         format: output::OutputFormat::Text,
                     },
                 )
@@ -279,6 +306,7 @@ async fn main() -> Result<()> {
                 max_turns,
                 args.common.verbose,
                 prompts::RunTask::Ask,
+                use_fallback,
             )
             .await?;
             println!("{}", outcome.report);
@@ -310,9 +338,11 @@ async fn main() -> Result<()> {
     let repo = resolve_repo_root(&args.common.repo)?;
 
     let mut config = load_config(args.common.config.as_deref(), &repo)?;
-    // resolved before free-model resolution: a bad preset name must fail before any
-    // network call (resolve_free_models can run live smoke completions)
+    // Resolve presets and CLI-only routing validation before free-model resolution: pure usage
+    // errors must fail before any network call (the resolver can run live smoke completions).
     let presets = presets::resolve(&args.presets.preset, &config)?;
+    let (use_alloy, use_fallback) =
+        resolve_routing_modes(&config, args.alloy, args.common.fallback)?;
     openrouter::resolve_free_models(&mut config).await?;
     let config = config;
     let max_turns = config.max_turns(args.max_turns)?;
@@ -340,8 +370,6 @@ async fn main() -> Result<()> {
         &context::load_context_files(&args.context.context_file)?,
     );
 
-    let use_alloy = args.alloy || config.default_alloy();
-    config.validate_alloy(use_alloy)?;
     if use_alloy && args.no_debate {
         eprintln!("warning: --alloy has no effect with --no-debate");
     }
@@ -366,6 +394,7 @@ async fn main() -> Result<()> {
                     presets: &presets,
                 },
                 alloy: use_alloy,
+                fallback: use_fallback,
                 format: output::OutputFormat::Text,
             },
         )
@@ -390,6 +419,7 @@ async fn main() -> Result<()> {
                 scope,
                 presets: &presets,
             },
+            use_fallback,
         )
         .await?;
         println!("{}", outcome.report);
@@ -605,6 +635,7 @@ fn build_init_config(
         defaults: Some(config::DefaultsConfig {
             debate: Some(debate),
             alloy: None,
+            fallback: None,
             max_turns: Some(config::DEFAULT_MAX_TURNS),
             compact_threshold: Some(100_000),
             log_trajectories: Some(false),
@@ -980,6 +1011,11 @@ mod tests {
         assert!(!args.common.verbose);
         assert_eq!(args.common.repo, PathBuf::from("/x"));
         assert_eq!(args.common.config, Some(PathBuf::from("/c.toml")));
+
+        let args = parse(&["nitpicker", "--fallback", "ask", "topic"]);
+        assert!(args.common.fallback);
+        let args = parse(&["nitpicker", "pr", "--fallback"]);
+        assert!(args.common.fallback);
     }
 
     #[test]
@@ -1112,6 +1148,52 @@ mod tests {
         assert!(presets_allowed(&args.command));
         let args = parse(&["nitpicker", "--preset", "security"]);
         assert!(presets_allowed(&args.command));
+    }
+
+    #[test]
+    fn fallback_is_scoped_to_review_and_ask_commands() {
+        for argv in [
+            &["nitpicker", "--fallback"][..],
+            &["nitpicker", "--fallback", "ask", "topic"][..],
+            &["nitpicker", "pr", "--fallback"][..],
+        ] {
+            let args = parse(argv);
+            assert!(fallback_allowed(&args.command), "argv: {argv:?}");
+        }
+        for argv in [
+            &["nitpicker", "init", "--fallback"][..],
+            &["nitpicker", "reflect", "--fallback"][..],
+        ] {
+            let args = parse(argv);
+            assert!(!fallback_allowed(&args.command), "argv: {argv:?}");
+        }
+    }
+
+    #[test]
+    fn routing_modes_reject_cli_pooling_with_one_reviewer() {
+        let config: config::Config = toml::from_str(
+            r#"
+                [aggregator]
+                model = "m"
+                provider = "openai"
+                auth = "codex"
+
+                [[reviewer]]
+                model = "m"
+                provider = "openai"
+                auth = "codex"
+            "#,
+        )
+        .unwrap();
+
+        let err = resolve_routing_modes(&config, false, true).unwrap_err();
+        assert!(format!("{err:#}").contains("requires at least 2 reviewers"));
+        let err = resolve_routing_modes(&config, true, false).unwrap_err();
+        assert!(format!("{err:#}").contains("--alloy requires at least 2 reviewers"));
+        assert_eq!(
+            resolve_routing_modes(&config, false, false).unwrap(),
+            (false, false)
+        );
     }
 
     /// The config file shape for presets: `[presets.<name>]` tables and the
