@@ -8,15 +8,6 @@ Notable user-visible changes are recorded here. The format follows
 
 ## [0.9.2] - 2026-08-10
 
-- Preserve debate model diversity during fallback by trying spare reviewers before the other
-  side's configured primary.
-- Enable fallback in newly generated configs whenever `init` can provide at least two routes.
-- Emit one concise warning when concurrent jobs observe the same run-wide route exhaustion.
-- Treat Anthropic 529 overloads as throttling and stop OpenRouter free-model probing after a
-  credential is rejected, without treating permission-level 403 responses as dead credentials.
-- Fork pristine fallback routing templates per review job and debate lane, avoiding repeated ring
-  construction and unavailable-route warnings while keeping sticky state agent-local.
-
 `nitpicker-agent` 0.4.0
 
 ### Added
@@ -26,25 +17,15 @@ Notable user-visible changes are recorded here. The format follows
 
 ### Changed
 
+- Enable fallback in generated configs whenever `init` can provide at least two reviewer routes.
 - **Breaking (`nitpicker-agent`)**: `DefaultsConfig` adds `fallback: Option<bool>`; downstream
   struct literals must set `fallback: None` when fallback is not configured.
 
 ### Fixed
 
-- Require debate agents to submit structured verdicts: a plain-text conclusion gets one
-  terminal-only correction turn with forced tool use, then route fallback on noncompliance.
-- Treat billing-cycle usage exhaustion as a run-long unavailable route and collapse repeated
-  debate-turn failures into one concise operational warning.
-- Classify provider failures from Rig's captured HTTP status and structured error codes instead of
-  scanning rendered error text; retain message matching only inside structured long-window quota
-  payloads for providers which do not expose a distinct code.
-- Keep fallback stickiness local to each independent debate lane while sharing run-wide route
-  availability, so one lane's request-specific failover cannot reroute another lane.
-- Give spawned subagents independent sticky fallback state while preserving shared route
-  availability, so child prompts cannot reroute their parent or siblings.
-- In fallback mode, skip experimental OpenRouter free routes whose catalog lookup or smoke test
-  fails, while continuing with healthy fixed or auto-resolved routes; unresolved logical reviewers
-  retain stable generated names, and same-key aggregator selection reuses reviewer smoke tests.
+- Improve fallback reliability across provider limits, unavailable routes, concurrent review jobs,
+  debate lanes, and subagents.
+- Require debate agents to submit structured verdicts before accepting a turn as successful.
 - Resolve `--repo` through Git so linked worktrees and paths inside a worktree are supported.
 
 ## [0.9.1] - 2026-08-09
