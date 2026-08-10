@@ -10,6 +10,10 @@ Notable user-visible changes are recorded here. The format follows
   side's configured primary.
 - Enable fallback in newly generated configs whenever `init` can provide at least two routes.
 - Emit one concise warning when concurrent jobs observe the same run-wide route exhaustion.
+- Treat Anthropic 529 overloads as throttling and stop OpenRouter free-model probing after a
+  credential is rejected, without treating permission-level 403 responses as dead credentials.
+- Fork pristine fallback routing templates per review job and debate lane, avoiding repeated ring
+  construction and unavailable-route warnings while keeping sticky state agent-local.
 
 `nitpicker-agent` 0.4.0
 

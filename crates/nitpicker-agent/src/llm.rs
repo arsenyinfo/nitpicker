@@ -1,3 +1,4 @@
+use crate::tools::floor_char_boundary;
 use eyre::{Result, WrapErr};
 use rig_core::OneOrMany;
 use rig_core::client::CompletionClient;
@@ -851,8 +852,8 @@ fn retry_policy(err: &eyre::Report) -> RetryPolicy {
 }
 
 /// Exact provider error codes which describe a request that cannot succeed unchanged. These are
-/// read from structured `error.code` / `error.type` / `error.status` fields, never searched for in
-/// a rendered error string.
+/// read from structured `error.code` / `error.type` / `error.status` / `error_type` fields, never
+/// searched for in a rendered error string.
 const NON_RETRYABLE_ERROR_CODES: &[&str] = &[
     "authentication_error",
     "invalid_api_key",
@@ -971,7 +972,7 @@ fn collect_provider_error_fields(value: &Value, facts: &mut ProviderErrorFacts) 
         Value::Object(object) => {
             for (key, value) in object {
                 match (key.as_str(), value) {
-                    ("code" | "type" | "status", Value::String(value)) => {
+                    ("code" | "type" | "status" | "error_type", Value::String(value)) => {
                         facts.codes.push(value.to_ascii_lowercase());
                     }
                     ("message", Value::String(value)) => facts.messages.push(value.clone()),
@@ -1026,10 +1027,7 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
     if value.len() <= max_bytes {
         return value.to_string();
     }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = floor_char_boundary(value, max_bytes);
     format!("{}…", &value[..end])
 }
 
@@ -1039,8 +1037,14 @@ fn classify_provider_failure(err: &eyre::Report) -> ProviderFailureClass {
     };
     let status = facts.effective_status();
 
-    // The captured HTTP status is the outer response. A gateway 5xx therefore remains transient
-    // even when its JSON body embeds an upstream quota or client-error payload.
+    // Anthropic defines a captured HTTP 529 carrying `overloaded_error` as provider overload. It
+    // follows the longer overload/throttling policy; an arbitrary gateway 5xx with a nested
+    // overload payload must still retain normal server-error precedence.
+    if facts.status == Some(529) && facts.has_code(&["overloaded_error"]) {
+        return ProviderFailureClass::RateLimit;
+    }
+    // The captured HTTP status is otherwise the outer response. A gateway 5xx therefore remains
+    // transient even when its JSON body embeds an upstream quota or client-error payload.
     if status.is_some_and(|status| (500..600).contains(&status)) {
         return ProviderFailureClass::Server;
     }
@@ -1076,7 +1080,6 @@ pub(crate) fn provider_http_status(err: &eyre::Report) -> Option<u16> {
     ProviderErrorFacts::from_report(err).and_then(|facts| facts.effective_status())
 }
 
-#[cfg(any(test, feature = "azure"))]
 pub(crate) fn provider_error_has_code(err: &eyre::Report, expected: &[&str]) -> bool {
     ProviderErrorFacts::from_report(err).is_some_and(|facts| facts.has_code(expected))
 }
@@ -2510,20 +2513,40 @@ mod tests {
 
     #[test]
     fn real_5xx_status_precedes_nested_quota_and_rate_codes() {
-        for status in 500..600 {
-            let err = provider_error(
-                Some(status),
+        for status in (500..600).filter(|&status| status != 529) {
+            for body in [
                 r#"{"upstream":{"error":{"code":"insufficient_quota","message":"out of tokens per 5h window"}}}"#,
-            );
-            assert_eq!(
-                classify_provider_failure(&err),
-                ProviderFailureClass::Server
-            );
-            let policy = retry_policy(&err);
-            assert!(policy.retry);
-            assert_eq!(policy.max_attempts, MAX_COMPLETION_ATTEMPTS);
-            assert!(!is_sticky_fallback_error(&err));
+                r#"{"upstream":{"error":{"type":"overloaded_error"}}}"#,
+            ] {
+                let err = provider_error(Some(status), body);
+                assert_eq!(
+                    classify_provider_failure(&err),
+                    ProviderFailureClass::Server
+                );
+                let policy = retry_policy(&err);
+                assert!(policy.retry);
+                assert_eq!(policy.max_attempts, MAX_COMPLETION_ATTEMPTS);
+                assert!(!is_sticky_fallback_error(&err));
+            }
         }
+    }
+
+    #[test]
+    fn anthropic_529_overload_uses_the_long_overload_policy() {
+        let err = provider_error(
+            Some(529),
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        );
+
+        assert_eq!(
+            classify_provider_failure(&err),
+            ProviderFailureClass::RateLimit
+        );
+        let policy = retry_policy(&err);
+        assert!(policy.retry);
+        assert_eq!(policy.max_attempts, RATE_LIMIT_MAX_COMPLETION_ATTEMPTS);
+        assert_eq!(policy.base_backoff_ms, RATE_LIMIT_BASE_BACKOFF_MS);
+        assert!(is_sticky_fallback_error(&err));
     }
 
     #[test]
@@ -2626,6 +2649,11 @@ mod tests {
         serde_json::from_str::<Value>(&compact).expect("compacted provider body stays valid JSON");
         let err = provider_error(Some(429), &compact);
         assert!(is_long_window_quota_error(&err));
+    }
+
+    #[test]
+    fn provider_error_truncation_reuses_utf8_boundary_handling() {
+        assert_eq!(truncate_utf8("aéz", 2), "a…");
     }
 
     #[test]

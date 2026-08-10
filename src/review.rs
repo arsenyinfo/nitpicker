@@ -9,7 +9,7 @@ use nitpicker_agent::agent::{
 use nitpicker_agent::config::{Config, ReviewerConfig};
 use nitpicker_agent::llm::{
     AlloyClient, AlloySlot, Completion, CompletionResponse, FallbackSlot, FinishReason,
-    PriorityClient,
+    LLMClientDyn, PriorityClient,
 };
 use nitpicker_agent::provider::{build_aggregator_client, build_reviewer_client};
 use nitpicker_agent::session::{
@@ -90,6 +90,15 @@ pub(crate) fn reviewer_client(
     fallback: bool,
 ) -> Result<Arc<dyn nitpicker_agent::llm::LLMClientDyn>> {
     reviewer_client_with_deferred_route(pool, primary_index, None, fallback)
+}
+
+/// Give an independently progressing agent its own mutable routing state. Priority clients fork
+/// their sticky index while retaining the shared route availability carried by `FallbackSlot`;
+/// stateless provider and Alloy clients are safe to share directly.
+pub(crate) fn independent_agent_client(template: &Arc<dyn LLMClientDyn>) -> Arc<dyn LLMClientDyn> {
+    template
+        .fork_for_agent()
+        .unwrap_or_else(|| Arc::clone(template))
 }
 
 /// Build one side of a debate while preserving model diversity for as long as possible. The
@@ -306,13 +315,20 @@ pub async fn run_review(
     let gemini_proxy = crate::proxy::GeminiProxy::maybe_start(config).await;
     let proxy_url = gemini_proxy.url();
 
-    // One client per reviewer, shared by all its preset jobs. eyre::Report is not Clone, so
-    // a build failure is kept as its rendered message and re-raised per job — one broken
-    // reviewer fails its own jobs while the others proceed, exactly as before the fan-out.
+    // Build one pristine routing template per reviewer. Every job forks its template before use,
+    // so sticky failover remains agent-local while cloned FallbackSlots retain run-wide route
+    // availability. eyre::Report is not Clone, so a build failure is kept as its rendered message
+    // and re-raised per job — one broken reviewer fails its own jobs while the others proceed.
     // A dead Gemini proxy degrades only its own jobs normally; fallback mode skips that route and
     // continues through the configured reviewer order, with the startup cause still logged.
     let reviewer_clients = build_reviewer_pool(config, &gemini_proxy, proxy_url.as_deref());
     let fallback_compact_threshold = reviewer_pool_compact_threshold(config, &reviewer_clients);
+    let reviewer_client_templates = (0..config.reviewer.len())
+        .map(|reviewer_index| {
+            reviewer_client(&reviewer_clients, reviewer_index, fallback)
+                .map_err(|err| format!("{err:#}"))
+        })
+        .collect::<Vec<_>>();
 
     for job in &jobs {
         let reviewer = &config.reviewer[job.reviewer_index];
@@ -334,10 +350,10 @@ pub async fn run_review(
         let session_writer = session_logger
             .as_ref()
             .map(|logger| logger.child(format!("{}.jsonl", job.session_agent)));
-        let agent_config = match reviewer_client(&reviewer_clients, job.reviewer_index, fallback) {
-            Ok(client) => Ok(build_agent_config(
+        let agent_config = match &reviewer_client_templates[job.reviewer_index] {
+            Ok(template) => Ok(build_agent_config(
                 reviewer,
-                client,
+                independent_agent_client(template),
                 compact_threshold,
                 job.session_agent.clone(),
                 system_prompts[prompt_index].clone(),
@@ -349,7 +365,7 @@ pub async fn run_review(
             )),
             // re-raise the message verbatim: the Ask path folds this into its aggregator
             // input, whose bytes must not drift from the pre-fan-out rendering
-            Err(err) => Err(err),
+            Err(message) => Err(eyre::eyre!(message.clone())),
         };
         info!(job = %label, "spawning agent");
 

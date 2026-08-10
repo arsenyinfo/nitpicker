@@ -557,24 +557,21 @@ pub async fn run_debate(
         _ => gemini_proxy.annotate(build_aggregator_client(agg_cfg, proxy_url.as_deref()))?,
     };
 
-    // Sticky failover belongs to one logical agent. Preset lanes are independent agents, so they
-    // must not race on one role-wide active index; cloning the pool's FallbackSlots still shares
-    // run-wide route availability (for example, an exhausted subscription) across every lane.
+    // Sticky failover belongs to one logical agent. Treat actor/critic clients as pristine role
+    // templates and fork each preset lane before any of them starts; forks keep independent active
+    // indices while their cloned FallbackSlots share run-wide route availability.
     let lane_role_clients = (0..lane_tasks.len())
-        .map(|lane_index| {
-            if fallback && !alloy && lane_index > 0 {
-                let pool = reviewer_pool
-                    .as_ref()
-                    .expect("fallback builds reviewer pool");
-                Ok((
-                    crate::review::debate_reviewer_client(pool, 0, 1)?,
-                    crate::review::debate_reviewer_client(pool, 1, 0)?,
-                ))
+        .map(|_| {
+            if fallback && !alloy {
+                (
+                    crate::review::independent_agent_client(&actor_client),
+                    crate::review::independent_agent_client(&critic_client),
+                )
             } else {
-                Ok((Arc::clone(&actor_client), Arc::clone(&critic_client)))
+                (Arc::clone(&actor_client), Arc::clone(&critic_client))
             }
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Vec<_>>();
 
     let actor_role = task.actor_role();
     let critic_role = task.critic_role();
