@@ -6,6 +6,9 @@ Notable user-visible changes are recorded here. The format follows
 
 ## [Unreleased]
 
+- Preserve debate model diversity during fallback by trying spare reviewers before the other
+  side's configured primary.
+
 `nitpicker-agent` 0.4.0
 
 ### Added

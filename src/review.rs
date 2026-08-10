@@ -89,6 +89,26 @@ pub(crate) fn reviewer_client(
     primary_index: usize,
     fallback: bool,
 ) -> Result<Arc<dyn nitpicker_agent::llm::LLMClientDyn>> {
+    reviewer_client_with_deferred_route(pool, primary_index, None, fallback)
+}
+
+/// Build one side of a debate while preserving model diversity for as long as possible. The
+/// counterpart's configured primary is still a valid last resort, but spare reviewers are tried
+/// first so one failed side does not immediately collapse both roles onto the same model.
+pub(crate) fn debate_reviewer_client(
+    pool: &ReviewerClientPool,
+    primary_index: usize,
+    counterpart_primary_index: usize,
+) -> Result<Arc<dyn nitpicker_agent::llm::LLMClientDyn>> {
+    reviewer_client_with_deferred_route(pool, primary_index, Some(counterpart_primary_index), true)
+}
+
+fn reviewer_client_with_deferred_route(
+    pool: &ReviewerClientPool,
+    primary_index: usize,
+    deferred_index: Option<usize>,
+    fallback: bool,
+) -> Result<Arc<dyn nitpicker_agent::llm::LLMClientDyn>> {
     if !fallback {
         return match &pool[primary_index] {
             Ok(slot) => Ok(slot.client()),
@@ -98,8 +118,7 @@ pub(crate) fn reviewer_client(
 
     let mut slots = Vec::with_capacity(pool.len());
     let mut build_errors = Vec::new();
-    for offset in 0..pool.len() {
-        let index = (primary_index + offset) % pool.len();
+    for index in reviewer_route_order(pool.len(), primary_index, deferred_index) {
         match &pool[index] {
             Ok(slot) => slots.push(slot.clone()),
             Err(message) => {
@@ -119,6 +138,24 @@ pub(crate) fn reviewer_client(
         );
     }
     Ok(Arc::new(PriorityClient::new(slots)?))
+}
+
+fn reviewer_route_order(
+    reviewer_count: usize,
+    primary_index: usize,
+    deferred_index: Option<usize>,
+) -> Vec<usize> {
+    let mut order = (0..reviewer_count)
+        .map(|offset| (primary_index + offset) % reviewer_count)
+        .collect::<Vec<_>>();
+    if let Some(deferred_index) = deferred_index
+        && deferred_index != primary_index
+        && let Some(position) = order.iter().position(|&index| index == deferred_index)
+    {
+        order.remove(position);
+        order.push(deferred_index);
+    }
+    order
 }
 
 pub(crate) fn alloy_client(
@@ -863,6 +900,22 @@ mod tests {
             reviewer_pool_compact_threshold(&defaulted, &[usable_slot("defaulted")]),
             Some(50_000)
         );
+    }
+
+    #[test]
+    fn debate_fallback_defers_the_counterpart_primary() {
+        assert_eq!(reviewer_route_order(4, 0, Some(1)), vec![0, 2, 3, 1]);
+        assert_eq!(reviewer_route_order(4, 1, Some(0)), vec![1, 2, 3, 0]);
+
+        // With no spare route, using the counterpart is still preferable to aborting the run.
+        assert_eq!(reviewer_route_order(2, 0, Some(1)), vec![0, 1]);
+        assert_eq!(reviewer_route_order(2, 1, Some(0)), vec![1, 0]);
+    }
+
+    #[test]
+    fn ordinary_review_fallback_keeps_declaration_order() {
+        assert_eq!(reviewer_route_order(4, 0, None), vec![0, 1, 2, 3]);
+        assert_eq!(reviewer_route_order(4, 2, None), vec![2, 3, 0, 1]);
     }
 
     #[test]

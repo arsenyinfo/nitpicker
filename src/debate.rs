@@ -522,8 +522,8 @@ pub async fn run_debate(
         let pool = reviewer_pool
             .as_ref()
             .expect("fallback builds reviewer pool");
-        actor_client = crate::review::reviewer_client(pool, 0, true)?;
-        critic_client = crate::review::reviewer_client(pool, 1, true)?;
+        actor_client = crate::review::debate_reviewer_client(pool, 0, 1)?;
+        critic_client = crate::review::debate_reviewer_client(pool, 1, 0)?;
         actor_label = ModelLabel::plain(&actor_cfg.model);
         critic_label = ModelLabel::plain(&critic_cfg.model);
         let threshold = crate::review::reviewer_pool_compact_threshold(config, pool);
@@ -567,8 +567,8 @@ pub async fn run_debate(
                     .as_ref()
                     .expect("fallback builds reviewer pool");
                 Ok((
-                    crate::review::reviewer_client(pool, 0, true)?,
-                    crate::review::reviewer_client(pool, 1, true)?,
+                    crate::review::debate_reviewer_client(pool, 0, 1)?,
+                    crate::review::debate_reviewer_client(pool, 1, 0)?,
                 ))
             } else {
                 Ok((Arc::clone(&actor_client), Arc::clone(&critic_client)))
