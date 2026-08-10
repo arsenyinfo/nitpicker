@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
-use tracing::warn;
+use tracing::{debug, warn};
 
 const MAX_COMPLETION_ATTEMPTS: usize = 4;
 const RATE_LIMIT_MAX_COMPLETION_ATTEMPTS: usize = 8;
@@ -496,14 +496,15 @@ pub struct AlloySlot {
 }
 
 /// A fallback-capable route. Unlike the legacy public [`AlloySlot`] shape, clones share their
-/// run-local availability bit so independent reviewer/aggregator clients stop probing a quota-
-/// exhausted subscription after the first conclusive failure.
+/// run-local availability and warning state so independent reviewer/aggregator clients stop
+/// probing a quota-exhausted subscription and announce that one route failure only once.
 #[derive(Clone)]
 pub struct FallbackSlot {
     client: Arc<dyn LLMClientDyn>,
     model: String,
     max_tokens: Option<u64>,
     unavailable: Arc<AtomicBool>,
+    failover_warning_emitted: Arc<AtomicBool>,
 }
 
 impl FallbackSlot {
@@ -517,6 +518,7 @@ impl FallbackSlot {
             model: model.into(),
             max_tokens,
             unavailable: Arc::new(AtomicBool::new(false)),
+            failover_warning_emitted: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -526,6 +528,10 @@ impl FallbackSlot {
 
     fn mark_unavailable(&self) {
         self.unavailable.store(true, Ordering::Release);
+    }
+
+    fn claim_failover_warning(&self) -> bool {
+        !self.failover_warning_emitted.swap(true, Ordering::AcqRel)
     }
 
     pub fn client(&self) -> Arc<dyn LLMClientDyn> {
@@ -723,7 +729,7 @@ async fn complete_from_slots(
         // A cap belongs to the selected model route, not the logical role whose turn this is.
         request.max_tokens = slot.max_tokens;
         attempted_models.push(slot.model.clone());
-        let err = match slot.client.completion(request).await {
+        let (err, sticky_failure) = match slot.client.completion(request).await {
             Ok(mut response) => {
                 let protocol_error = match &response.finish_reason {
                     FinishReason::MaxTokens => Some(format!(
@@ -734,7 +740,7 @@ async fn complete_from_slots(
                         .map(|reason| format!("model route '{}': {reason}", slot.model)),
                 };
                 if let Some(message) = protocol_error {
-                    eyre::eyre!(message)
+                    (eyre::eyre!(message), false)
                 } else {
                     response.selected_model = Some(slot.model.clone());
                     if let Some(index) = sticky_index {
@@ -744,22 +750,40 @@ async fn complete_from_slots(
                 }
             }
             Err(err) => {
-                if is_sticky_fallback_error(&err) {
+                let sticky_failure = is_sticky_fallback_error(&err);
+                if sticky_failure {
                     slot.mark_unavailable();
                 }
-                err
+                (err, sticky_failure)
             }
         };
         if let Some(next_idx) = (1..attempts - offset)
             .map(|step| (idx + step) % slots.len())
             .find(|&candidate| slots[candidate].is_available())
         {
-            warn!(
-                failed_model = %slot.model,
-                next_model = %slots[next_idx].model,
-                error = %err,
-                "model failed; trying next configured reviewer"
-            );
+            if sticky_failure {
+                if slot.claim_failover_warning() {
+                    warn!(
+                        failed_model = %slot.model,
+                        next_model = %slots[next_idx].model,
+                        "model unavailable; trying next configured reviewer"
+                    );
+                } else {
+                    debug!(
+                        failed_model = %slot.model,
+                        next_model = %slots[next_idx].model,
+                        error = ?err,
+                        "duplicate unavailable-route failure; continuing with fallback"
+                    );
+                }
+            } else {
+                warn!(
+                    failed_model = %slot.model,
+                    next_model = %slots[next_idx].model,
+                    error = %err,
+                    "model failed; trying next configured reviewer"
+                );
+            }
         }
         last_err = Some(err);
     }
@@ -1619,6 +1643,20 @@ mod tests {
         // still starts from its own primary. Shared slot state is tested separately for quota.
         assert_eq!(failed_calls.lock().unwrap().len(), 2);
         assert_eq!(healthy_calls.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn fallback_slot_clones_share_one_failover_warning_claim() {
+        let (slot, _) = recording_slot("shared-route", None, false);
+        let clone = slot.clone();
+
+        assert!(slot.claim_failover_warning());
+        assert!(!clone.claim_failover_warning());
+
+        // Dedupe follows a concrete route, not its model string: distinct credentials using the
+        // same model must each retain their own warning claim.
+        let (same_model_distinct_route, _) = recording_slot("shared-route", None, false);
+        assert!(same_model_distinct_route.claim_failover_warning());
     }
 
     struct FailOnCallClient {

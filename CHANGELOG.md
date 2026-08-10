@@ -8,6 +8,8 @@ Notable user-visible changes are recorded here. The format follows
 
 - Preserve debate model diversity during fallback by trying spare reviewers before the other
   side's configured primary.
+- Enable fallback in newly generated configs whenever `init` can provide at least two routes.
+- Emit one concise warning when concurrent jobs observe the same run-wide route exhaustion.
 
 `nitpicker-agent` 0.4.0
 

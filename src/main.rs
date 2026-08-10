@@ -639,14 +639,21 @@ fn build_init_config(
         azure_credentials: None,
     };
 
-    let reviewer_slots = if debate { 2 } else { 1 };
+    // Fallback needs a second route even when debate is disabled. OpenRouter free selection can
+    // produce two distinct model routes from its one detected credential.
+    let reviewer_slots = if detected.len() >= 2 || prefer_openrouter_free {
+        2
+    } else {
+        1
+    };
     let reviewers = pick_reviewers(detected, reviewer_slots, prefer_openrouter_free);
+    let fallback = reviewers.len() >= 2;
 
     config::Config {
         defaults: Some(config::DefaultsConfig {
             debate: Some(debate),
             alloy: None,
-            fallback: None,
+            fallback: Some(fallback),
             max_turns: Some(config::DEFAULT_MAX_TURNS),
             compact_threshold: Some(100_000),
             log_trajectories: Some(false),
@@ -1033,6 +1040,58 @@ mod tests {
     fn init_writes_into_the_repo_named_by_the_global_repo_flag() {
         let path = init_config_path(false, Path::new("/some/repo")).unwrap();
         assert_eq!(path, PathBuf::from("/some/repo/nitpicker.toml"));
+    }
+
+    fn detected_provider(name: &'static str, provider: &'static str) -> detect::Detected {
+        detect::Detected {
+            name,
+            provider,
+            model: format!("{name}-model"),
+            base_url: None,
+            api_key_env: None,
+            auth: None,
+            source: "test",
+            local_server: false,
+        }
+    }
+
+    #[test]
+    fn init_enables_fallback_when_it_can_generate_two_routes() {
+        let first = detected_provider("first", "openai");
+        let second = detected_provider("second", "anthropic");
+        let config = build_init_config(&[&first, &second], false);
+
+        assert_eq!(config.reviewer.len(), 2);
+        assert!(config.default_fallback());
+        assert!(
+            toml::to_string_pretty(&config)
+                .unwrap()
+                .contains("fallback = true")
+        );
+    }
+
+    #[test]
+    fn free_init_generates_two_fallback_routes_from_openrouter() {
+        let openrouter = detected_provider("openrouter", "openrouter");
+        let config = build_init_config(&[&openrouter], true);
+
+        assert_eq!(config.reviewer.len(), 2);
+        assert!(config.reviewer.iter().all(|route| route.model == "free"));
+        assert!(config.default_fallback());
+        assert!(
+            toml::to_string_pretty(&config)
+                .unwrap()
+                .contains("fallback = true")
+        );
+    }
+
+    #[test]
+    fn init_does_not_enable_impossible_single_route_fallback() {
+        let only = detected_provider("only", "openai");
+        let config = build_init_config(&[&only], false);
+
+        assert_eq!(config.reviewer.len(), 1);
+        assert!(!config.default_fallback());
     }
 
     #[test]
