@@ -50,6 +50,12 @@ pub(crate) fn build_reviewer_pool(
         .reviewer
         .iter()
         .map(|reviewer| {
+            if nitpicker_agent::openrouter::is_unresolved_free_route(
+                &reviewer.provider,
+                &reviewer.model,
+            ) {
+                return Err("experimental OpenRouter free route could not be resolved".to_string());
+            }
             gemini_proxy
                 .annotate(build_reviewer_client(reviewer, proxy_url))
                 .map(|client| {
@@ -143,7 +149,16 @@ pub(crate) fn aggregator_client(
     reviewer_pool: &ReviewerClientPool,
     fallback: bool,
 ) -> Result<Arc<dyn nitpicker_agent::llm::LLMClientDyn>> {
-    let primary = gemini_proxy.annotate(build_aggregator_client(&config.aggregator, proxy_url));
+    let primary = if nitpicker_agent::openrouter::is_unresolved_free_route(
+        &config.aggregator.provider,
+        &config.aggregator.model,
+    ) {
+        Err(eyre::eyre!(
+            "experimental OpenRouter free aggregator could not be resolved"
+        ))
+    } else {
+        gemini_proxy.annotate(build_aggregator_client(&config.aggregator, proxy_url))
+    };
     if !fallback {
         return primary;
     }

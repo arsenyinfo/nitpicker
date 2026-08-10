@@ -557,6 +557,25 @@ pub async fn run_debate(
         _ => gemini_proxy.annotate(build_aggregator_client(agg_cfg, proxy_url.as_deref()))?,
     };
 
+    // Sticky failover belongs to one logical agent. Preset lanes are independent agents, so they
+    // must not race on one role-wide active index; cloning the pool's FallbackSlots still shares
+    // run-wide route availability (for example, an exhausted subscription) across every lane.
+    let lane_role_clients = (0..lane_tasks.len())
+        .map(|lane_index| {
+            if fallback && !alloy && lane_index > 0 {
+                let pool = reviewer_pool
+                    .as_ref()
+                    .expect("fallback builds reviewer pool");
+                Ok((
+                    crate::review::reviewer_client(pool, 0, true)?,
+                    crate::review::reviewer_client(pool, 1, true)?,
+                ))
+            } else {
+                Ok((Arc::clone(&actor_client), Arc::clone(&critic_client)))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     let actor_role = task.actor_role();
     let critic_role = task.critic_role();
     // one in-flight-LLM cap for the whole run: concurrent lanes and their subagents share
@@ -606,8 +625,8 @@ pub async fn run_debate(
         .iter()
         .enumerate()
         .map(|(lane_index, lane_task)| {
-            let actor_client = Arc::clone(&actor_client);
-            let critic_client = Arc::clone(&critic_client);
+            let actor_client = Arc::clone(&lane_role_clients[lane_index].0);
+            let critic_client = Arc::clone(&lane_role_clients[lane_index].1);
             let llm_semaphore = &llm_semaphore;
             let failure_warning_emitted = &failure_warning_emitted;
             let mp = &mp;

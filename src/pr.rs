@@ -597,10 +597,7 @@ async fn run_pr_inner(
         alloy,
         fallback,
     };
-    if !fallback {
-        config.validate_credentials()?;
-    }
-    nitpicker_agent::openrouter::resolve_free_models_with_fallback(&mut config, fallback).await?;
+    crate::finalize_routing_config(&mut config, fallback).await?;
     let config = config;
 
     // `prepared` drops at the end of this scope, after the review completes: HEAD is restored

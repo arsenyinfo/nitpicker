@@ -780,10 +780,11 @@ struct RetryPolicy {
 }
 
 fn retry_policy(err: &eyre::Report) -> RetryPolicy {
+    let msg = format!("{err:#}").to_ascii_lowercase();
     // A rolling subscription allowance measured in hours cannot recover within this command.
     // Surface it immediately so fallback mode can move to the next configured reviewer instead
     // of spending several minutes in the ordinary 429 backoff loop.
-    if is_long_window_quota_error(err) {
+    if is_long_window_quota_message(&msg) {
         return RetryPolicy {
             retry: false,
             max_attempts: 0,
@@ -792,7 +793,7 @@ fn retry_policy(err: &eyre::Report) -> RetryPolicy {
         };
     }
 
-    if is_rate_limit_error(err) {
+    if is_rate_limit_message(&msg) {
         return RetryPolicy {
             retry: true,
             max_attempts: RATE_LIMIT_MAX_COMPLETION_ATTEMPTS,
@@ -801,7 +802,7 @@ fn retry_policy(err: &eyre::Report) -> RetryPolicy {
         };
     }
 
-    if is_non_retryable_client_error(err) {
+    if is_non_retryable_client_error_message(&msg) {
         return RetryPolicy {
             retry: false,
             max_attempts: 0,
@@ -851,6 +852,12 @@ const STATUS_KEY_WINDOW: usize = 24;
 /// not recognized (rare in practice, and recoverable — at worst a retried/failed request).
 pub(crate) fn mentions_http_status(msg: &str, status: u16) -> bool {
     let lower = msg.to_ascii_lowercase();
+    mentions_http_status_lower(&lower, status)
+}
+
+/// Lowercase-input variant used by the completion classifiers, which normalize one rendered error
+/// chain once before applying the ordered predicates.
+fn mentions_http_status_lower(lower: &str, status: u16) -> bool {
     let needle = status.to_string();
     let reason = STATUS_REASONS
         .iter()
@@ -863,7 +870,7 @@ pub(crate) fn mentions_http_status(msg: &str, status: u16) -> bool {
         let end = start + needle.len();
         let prev_digit = start > 0 && bytes[start - 1].is_ascii_digit();
         let next_digit = end < bytes.len() && bytes[end].is_ascii_digit();
-        if !prev_digit && !next_digit && status_in_context(&lower, start, end, reason) {
+        if !prev_digit && !next_digit && status_in_context(lower, start, end, reason) {
             return true;
         }
         from = start + 1;
@@ -950,10 +957,10 @@ const PERMANENT_QUOTA_ERROR_TYPES: &[&str] = &["insufficient_quota"];
 /// over client/quota text nested in a gateway body because the request itself remains retryable.
 const SERVER_ERROR_STATUSES: &[u16] = &[500, 501, 502, 503, 504, 505, 506, 507, 508, 510, 511];
 
-fn mentions_server_error_status(msg: &str) -> bool {
+fn mentions_server_error_status_lower(msg: &str) -> bool {
     SERVER_ERROR_STATUSES
         .iter()
-        .any(|&status| mentions_http_status(msg, status))
+        .any(|&status| mentions_http_status_lower(msg, status))
 }
 
 /// Whether an error chain reports a context-window overflow — the one synthesis failure
@@ -967,41 +974,49 @@ pub fn is_context_length_error(err: &eyre::Report) -> bool {
         || (msg.contains("invalid_request_error") && msg.contains("prompt is too long"))
 }
 
+#[cfg(test)]
 fn is_non_retryable_client_error(err: &eyre::Report) -> bool {
     // Walk the whole chain: provider clients map non-2xx to a `ProviderError` carrying the raw
     // response body, then `.wrap_err_with(...)` adds a top-level context. `err.to_string()` renders
     // only that context, so the status code would be invisible; `{err:#}` joins the full chain.
-    let msg = format!("{err:#}");
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    is_non_retryable_client_error_message(&msg)
+}
+
+fn is_non_retryable_client_error_message(msg: &str) -> bool {
     // a 5xx response takes precedence: even when a 4xx is nested in the body (e.g. an upstream
     // `"code": 403` inside a 502 envelope), the response itself is a retryable server error, so we
     // must not classify it as a permanent client error. Cover the full registered 5xx range; the
     // JSON `status`/`code`-key form is matched even for codes without a reason phrase here.
-    if mentions_server_error_status(&msg) {
+    if mentions_server_error_status_lower(msg) {
         return false;
     }
     if [400, 401, 402, 403, 404]
         .iter()
-        .any(|&status| mentions_http_status(&msg, status))
+        .any(|&status| mentions_http_status_lower(msg, status))
     {
         return true;
     }
-    let lower = msg.to_ascii_lowercase();
-    NON_RETRYABLE_ERROR_TYPES.iter().any(|t| lower.contains(t))
+    NON_RETRYABLE_ERROR_TYPES.iter().any(|t| msg.contains(t))
 }
 
+#[cfg(test)]
 fn is_rate_limit_error(err: &eyre::Report) -> bool {
     // Same reasoning as `is_non_retryable_client_error`: walk the full chain so a 429 carried in a
     // wrapped `ProviderError` body still maps to the rate-limit backoff policy. Permanent quota
     // types are excluded first because retrying them only burns the full rate-limit retry budget.
-    let msg = format!("{err:#}");
-    if mentions_server_error_status(&msg) {
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    is_rate_limit_message(&msg)
+}
+
+fn is_rate_limit_message(msg: &str) -> bool {
+    if mentions_server_error_status_lower(msg) {
         return false;
     }
-    let msg = msg.to_ascii_lowercase();
     if PERMANENT_QUOTA_ERROR_TYPES.iter().any(|t| msg.contains(t)) {
         return false;
     }
-    mentions_http_status(&msg, 429)
+    mentions_http_status_lower(msg, 429)
         || msg.contains("rate limit")
         || msg.contains("too many requests")
         || msg.contains("tokens per minute")
@@ -1009,14 +1024,18 @@ fn is_rate_limit_error(err: &eyre::Report) -> bool {
         || RATE_LIMIT_ERROR_TYPES.iter().any(|t| msg.contains(t))
 }
 
+#[cfg(test)]
 fn is_long_window_quota_error(err: &eyre::Report) -> bool {
-    let msg = format!("{err:#}");
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    is_long_window_quota_message(&msg)
+}
+
+fn is_long_window_quota_message(msg: &str) -> bool {
     // Gateways sometimes wrap an upstream quota payload in a transient 5xx response. The outer
     // status wins: retry this route instead of treating it as exhausted for the rest of the run.
-    if mentions_server_error_status(&msg) {
+    if mentions_server_error_status_lower(msg) {
         return false;
     }
-    let msg = msg.to_ascii_lowercase();
     msg.contains("out of tokens")
         || msg.contains("usage_limit_reached")
         || msg.contains("hit your usage limit")
@@ -1039,15 +1058,18 @@ pub fn is_operational_limit_error(err: &eyre::Report) -> bool {
 }
 
 fn is_sticky_fallback_error(err: &eyre::Report) -> bool {
-    let msg = format!("{err:#}");
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    is_sticky_fallback_message(&msg)
+}
+
+fn is_sticky_fallback_message(msg: &str) -> bool {
     // Do not blacklist a route based on quota/rate-limit text nested inside a transient gateway
     // response. The retry wrapper should get the same opportunity it would for a plain 5xx.
-    if mentions_server_error_status(&msg) {
+    if mentions_server_error_status_lower(msg) {
         return false;
     }
-    let msg = msg.to_ascii_lowercase();
-    is_long_window_quota_error(err)
-        || is_rate_limit_error(err)
+    is_long_window_quota_message(msg)
+        || is_rate_limit_message(msg)
         || PERMANENT_QUOTA_ERROR_TYPES
             .iter()
             .any(|kind| msg.contains(kind))
@@ -1571,6 +1593,23 @@ mod tests {
         client.completion(test_completion()).await.unwrap();
         assert_eq!(first_calls.lock().unwrap().len(), 1);
         assert_eq!(second_calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn priority_clients_share_slots_without_sharing_stickiness() {
+        let (failed, failed_calls) = recording_slot("failed", None, true);
+        let (healthy, healthy_calls) = recording_slot("healthy", None, false);
+        let first = PriorityClient::new(vec![failed.clone(), healthy.clone()]).unwrap();
+        let independent = PriorityClient::new(vec![failed, healthy]).unwrap();
+
+        first.completion(test_completion()).await.unwrap();
+        first.completion(test_completion()).await.unwrap();
+        independent.completion(test_completion()).await.unwrap();
+
+        // The first logical agent sticks to its successful fallback, while the independent agent
+        // still starts from its own primary. Shared slot state is tested separately for quota.
+        assert_eq!(failed_calls.lock().unwrap().len(), 2);
+        assert_eq!(healthy_calls.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]

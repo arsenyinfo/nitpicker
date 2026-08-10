@@ -361,17 +361,20 @@ async fn probe_candidates(
 }
 
 async fn select_reviewer_models(
-    slot_api_keys: &[String],
+    reviewer_routes: &[(usize, String)],
     candidates: Vec<(String, u64)>,
-    reviewer_count: usize,
-) -> Result<(Vec<(String, u64)>, Vec<(String, u64)>)> {
+    fallback: bool,
+) -> Result<(Vec<Option<(String, u64)>>, Vec<(String, u64)>)> {
+    let reviewer_count = reviewer_routes.len();
     if reviewer_count == 0 {
         return Ok((Vec::new(), candidates));
     }
 
     // probe in batches per unique key; probe enough for all reviewer slots in case of overlap
-    let unique_keys: std::collections::HashSet<&str> =
-        slot_api_keys.iter().map(String::as_str).collect();
+    let unique_keys: std::collections::HashSet<&str> = reviewer_routes
+        .iter()
+        .map(|(_, key)| key.as_str())
+        .collect();
     let mut key_passing: std::collections::HashMap<&str, Vec<usize>> = Default::default();
     for &key in &unique_keys {
         key_passing.insert(
@@ -384,11 +387,20 @@ async fn select_reviewer_models(
     let mut assigned = std::collections::HashSet::new();
     let mut selected = Vec::with_capacity(reviewer_count);
 
-    for (slot, slot_key) in slot_api_keys.iter().enumerate().take(reviewer_count) {
+    for (slot, (reviewer_index, slot_key)) in reviewer_routes.iter().enumerate() {
         let slot_label = format!("free_slot_{}", slot + 1);
         let passing = key_passing.get(slot_key.as_str()).expect("key was probed");
 
-        let Some(&winner_idx) = passing.iter().find(|&&idx| !assigned.contains(&idx)) else {
+        let winner_idx = passing.iter().find(|&&idx| !assigned.contains(&idx));
+        let Some(&winner_idx) = winner_idx else {
+            if fallback {
+                tracing::warn!(
+                    reviewer_index,
+                    "experimental OpenRouter route failed smoke testing; leaving it for fallback to skip"
+                );
+                selected.push(None);
+                continue;
+            }
             eyre::bail!(
                 "No usable OpenRouter experimental free model found for {} after smoke tests of {} candidates",
                 slot_label,
@@ -397,7 +409,7 @@ async fn select_reviewer_models(
         };
 
         assigned.insert(winner_idx);
-        selected.push(candidates[winner_idx].clone());
+        selected.push(Some(candidates[winner_idx].clone()));
     }
 
     let remaining = candidates
@@ -421,7 +433,12 @@ async fn select_aggregator_model(
         return Ok(candidates[idx].0.clone());
     }
 
-    if let Some((model, _)) = reviewer_models.first() {
+    // Reusing a reviewer model is safe only after proving that the aggregator's own key can call
+    // it. This matters in fallback mode, where a present but revoked key must leave the route
+    // unresolved instead of borrowing another route's successful probe.
+    let reviewer_passing = probe_candidates(api_key, reviewer_models, "aggregator_probe", 1).await;
+    if let Some(&idx) = reviewer_passing.first() {
+        let model = &reviewer_models[idx].0;
         tracing::info!(
             model = %model,
             "reusing first reviewer model for experimental openrouter free aggregator"
@@ -439,12 +456,19 @@ fn needs_auto_model(provider: &ProviderType, model: &str) -> bool {
     matches!(provider, ProviderType::OpenRouter) && (model.is_empty() || model == "free")
 }
 
+/// Whether experimental OpenRouter auto-selection has not produced a concrete route. Fallback
+/// client pools use this after best-effort resolution to skip routes whose key/catalog/probe failed.
+pub fn is_unresolved_free_route(provider: &ProviderType, model: &str) -> bool {
+    needs_auto_model(provider, model)
+}
+
 pub async fn resolve_free_models(config: &mut Config) -> Result<()> {
     resolve_free_models_with_fallback(config, false).await
 }
 
-/// Resolve experimental free routes while allowing fallback execution to leave routes with
-/// missing credentials unresolved. Client construction will report and skip those routes.
+/// Resolve experimental free routes. Fallback execution is best-effort: missing credentials,
+/// catalog failures, and failed smoke tests leave only the affected auto-routes unresolved, and
+/// client-pool construction reports and skips them. Strict execution preserves fail-fast behavior.
 pub async fn resolve_free_models_with_fallback(config: &mut Config, fallback: bool) -> Result<()> {
     for reviewer in &config.reviewer {
         if !needs_auto_model(&reviewer.provider, &reviewer.model) {
@@ -464,7 +488,7 @@ pub async fn resolve_free_models_with_fallback(config: &mut Config, fallback: bo
         eyre::bail!("[aggregator] must specify a model");
     }
 
-    let reviewer_indices: Vec<usize> = config
+    let reviewer_routes: Vec<(usize, String)> = config
         .reviewer
         .iter()
         .enumerate()
@@ -475,7 +499,7 @@ pub async fn resolve_free_models_with_fallback(config: &mut Config, fallback: bo
                 .as_deref()
                 .unwrap_or(DEFAULT_API_KEY_ENV);
             match std::env::var(key_env) {
-                Ok(_) => Some(Ok(idx)),
+                Ok(key) => Some(Ok((idx, key))),
                 Err(_) if fallback => {
                     tracing::warn!(
                         reviewer_index = idx,
@@ -514,42 +538,80 @@ pub async fn resolve_free_models_with_fallback(config: &mut Config, fallback: bo
         None
     };
 
-    let reviewer_count = reviewer_indices.len();
+    let reviewer_count = reviewer_routes.len();
     if reviewer_count == 0 && agg_api_key.is_none() {
         return Ok(());
     }
 
-    let slot_api_keys = reviewer_indices
+    // A revoked route must not prevent a healthy auto-route from supplying the shared catalog.
+    // Strict mode preserves the historical first-key failure; fallback mode tries every distinct
+    // configured key and leaves all auto-routes unresolved only if none can fetch candidates.
+    let mut seen_fetch_keys = std::collections::HashSet::new();
+    let fetch_keys = reviewer_routes
         .iter()
-        .map(|&idx| {
-            let key_env = config.reviewer[idx]
-                .api_key_env
-                .as_deref()
-                .unwrap_or(DEFAULT_API_KEY_ENV);
-            // Presence was checked while filtering the indices above.
-            std::env::var(key_env).map_err(|_| eyre::eyre!("missing env var {key_env}"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let fetch_key = slot_api_keys
-        .first()
-        .map(String::as_str)
-        .or(agg_api_key.as_deref())
-        .expect("at least one resolvable free route");
-
-    let models = fetch_models(fetch_key, reviewer_count.max(1)).await?;
+        .map(|(_, key)| key.as_str())
+        .chain(agg_api_key.as_deref());
+    let needed_models = if fallback { 1 } else { reviewer_count.max(1) };
+    let mut models = None;
+    let mut last_fetch_error = None;
+    for fetch_key in fetch_keys {
+        if !seen_fetch_keys.insert(fetch_key) {
+            continue;
+        }
+        match fetch_models(fetch_key, needed_models).await {
+            Ok(found) => {
+                models = Some(found);
+                break;
+            }
+            Err(err) if fallback => {
+                tracing::warn!(
+                    error = %err,
+                    "experimental OpenRouter route could not fetch the model catalog; trying another fallback route"
+                );
+                last_fetch_error = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    let Some(models) = models else {
+        if let Some(err) = last_fetch_error {
+            tracing::warn!(
+                error = %err,
+                "no experimental OpenRouter route could resolve free models; leaving them for fallback to skip"
+            );
+        }
+        return Ok(());
+    };
     let (reviewer_models, remaining_models) =
-        select_reviewer_models(&slot_api_keys, models, reviewer_count).await?;
+        select_reviewer_models(&reviewer_routes, models, fallback).await?;
+    let resolved_reviewer_models = reviewer_models
+        .iter()
+        .filter_map(Clone::clone)
+        .collect::<Vec<_>>();
     let aggregator_model = match agg_api_key.as_deref() {
         Some(api_key) => {
-            Some(select_aggregator_model(api_key, &remaining_models, &reviewer_models).await?)
+            match select_aggregator_model(api_key, &remaining_models, &resolved_reviewer_models)
+                .await
+            {
+                Ok(model) => Some(model),
+                Err(err) if fallback => {
+                    tracing::warn!(
+                        error = %err,
+                        "experimental OpenRouter aggregator unavailable; leaving it for fallback to skip"
+                    );
+                    None
+                }
+                Err(err) => return Err(err),
+            }
         }
         None => None,
     };
-    let mut iter = reviewer_models.into_iter();
 
-    for (slot, idx) in reviewer_indices.into_iter().enumerate() {
-        let (model, context_length) = iter.next().expect("checked above");
+    for (slot, ((idx, _), selected)) in reviewer_routes.into_iter().zip(reviewer_models).enumerate()
+    {
+        let Some((model, context_length)) = selected else {
+            continue;
+        };
         if config.reviewer[idx].name.is_empty() {
             config.reviewer[idx].name = format!("free_{slot}");
         }
@@ -632,5 +694,16 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("missing env var"));
+    }
+
+    #[test]
+    fn unresolved_free_route_requires_openrouter_auto_selection() {
+        assert!(is_unresolved_free_route(&ProviderType::OpenRouter, "free"));
+        assert!(is_unresolved_free_route(&ProviderType::OpenRouter, ""));
+        assert!(!is_unresolved_free_route(
+            &ProviderType::OpenRouter,
+            "openai/gpt-oss-120b:free"
+        ));
+        assert!(!is_unresolved_free_route(&ProviderType::OpenAi, "free"));
     }
 }

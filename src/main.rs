@@ -254,10 +254,7 @@ async fn main() -> Result<()> {
             // CLI-only routing validation must precede free-model smoke completions.
             let (use_alloy, use_fallback) =
                 resolve_routing_modes(&config, alloy, args.common.fallback)?;
-            if !use_fallback {
-                config.validate_credentials()?;
-            }
-            openrouter::resolve_free_models_with_fallback(&mut config, use_fallback).await?;
+            finalize_routing_config(&mut config, use_fallback).await?;
             let config = config;
             let topic = context::append_to_prompt(
                 topic,
@@ -346,10 +343,7 @@ async fn main() -> Result<()> {
     let presets = presets::resolve(&args.presets.preset, &config)?;
     let (use_alloy, use_fallback) =
         resolve_routing_modes(&config, args.alloy, args.common.fallback)?;
-    if !use_fallback {
-        config.validate_credentials()?;
-    }
-    openrouter::resolve_free_models_with_fallback(&mut config, use_fallback).await?;
+    finalize_routing_config(&mut config, use_fallback).await?;
     let config = config;
     let max_turns = config.max_turns(args.max_turns)?;
 
@@ -520,9 +514,21 @@ pub(crate) async fn load_resolved_config(
     repo: &Path,
 ) -> Result<config::Config> {
     let mut config = load_config(explicit_path, repo)?;
-    config.validate_credentials()?;
-    openrouter::resolve_free_models(&mut config).await?;
+    finalize_routing_config(&mut config, false).await?;
     Ok(config)
+}
+
+/// Finish config validation and experimental route resolution after the caller has resolved the
+/// effective CLI/config fallback mode. Strict execution requires every credential up front;
+/// fallback execution lets route construction skip unusable entries.
+pub(crate) async fn finalize_routing_config(
+    config: &mut config::Config,
+    fallback: bool,
+) -> Result<()> {
+    if !fallback {
+        config.validate_credentials()?;
+    }
+    openrouter::resolve_free_models_with_fallback(config, fallback).await
 }
 
 async fn run_init(path: PathBuf, prefer_free: bool) -> eyre::Result<()> {
