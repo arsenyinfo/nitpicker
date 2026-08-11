@@ -471,6 +471,30 @@ fn clone_pr(repo_slug: &str, pr_number: u32, dir: &Path) -> Result<()> {
     checkout_pr_branch(dir, pr_number)
 }
 
+/// Create the working directory for a temporary clone under a stable repository basename.
+///
+/// The parent remains the unique `TempDir` that owns cleanup, while the child makes user-facing
+/// path-derived surfaces (notably the terminal title) identify the repository instead of a random
+/// temporary-directory suffix.
+fn create_temp_clone_repo_dir(temp_root: &Path, repo_slug: &str) -> Result<PathBuf> {
+    let repo_name = repo_slug
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty() && *name != "." && *name != ".." && !name.contains('\\'))
+        .ok_or_else(|| eyre::eyre!("invalid GitHub repository slug: {repo_slug}"))?;
+    let path = temp_root.join(repo_name);
+    std::fs::create_dir(&path).wrap_err_with(|| {
+        format!(
+            "failed to create temporary clone directory {}",
+            path.display()
+        )
+    })?;
+    // Canonicalize so the workspace root matches the canonical paths the tools resolve files to
+    // (on macOS the temp dir lives under /var → /private/var).
+    path.canonicalize()
+        .wrap_err("failed to canonicalize temporary clone directory")
+}
+
 fn post_comment(url: Option<&str>, repo: &Path, body: &str) -> Result<()> {
     let mut cmd = Command::new("gh");
     cmd.args(["pr", "comment", "--body", body])
@@ -922,12 +946,7 @@ fn prepare_pr(args: &PrArgs, repo_arg: &Path) -> Result<PreparedPr> {
                 let cwd = std::env::current_dir().wrap_err("failed to get current directory")?;
                 let meta = fetch_pr_meta(Some(&url), &cwd)?;
                 let tmpdir = tempfile::TempDir::new().wrap_err("failed to create temp dir")?;
-                // canonicalize so the workspace root matches the canonical paths the tools
-                // resolve files to (on macOS the temp dir lives under /var → /private/var)
-                let path = tmpdir
-                    .path()
-                    .canonicalize()
-                    .wrap_err("failed to canonicalize temp dir path")?;
+                let path = create_temp_clone_repo_dir(tmpdir.path(), &slug)?;
                 clone_pr(&slug, pr_number, &path)?;
                 _tmpdir_guard = Some(tmpdir);
                 _restore_guard = None;
@@ -1035,6 +1054,7 @@ async fn run_review_inner(
                 presets,
             },
             use_fallback,
+            format,
         )
         .await?;
         (
@@ -1109,9 +1129,9 @@ async fn run_review_inner(
 #[cfg(test)]
 mod tests {
     use super::{
-        BranchRestoreGuard, HeadConfig, HeadState, PrComment, choose_repo_config, get_head_state,
-        head_config_state, is_trusted_github_remote, lock_path, read_base_branch_config,
-        remote_host,
+        BranchRestoreGuard, HeadConfig, HeadState, PrComment, choose_repo_config,
+        create_temp_clone_repo_dir, get_head_state, head_config_state, is_trusted_github_remote,
+        lock_path, read_base_branch_config, remote_host,
     };
     use std::path::Path;
     use std::process::Command;
@@ -1274,6 +1294,28 @@ mod tests {
         .expect("null author must deserialize");
         assert!(comments[0].author.is_none());
         assert_eq!(comments[1].author.as_ref().unwrap().login, "octocat");
+    }
+
+    #[test]
+    fn temp_clone_workdir_uses_the_repository_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = create_temp_clone_repo_dir(temp.path(), "owner/reviewer").unwrap();
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("reviewer")
+        );
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn temp_clone_workdir_rejects_unsafe_repository_names() {
+        let temp = tempfile::tempdir().unwrap();
+        for slug in ["", "owner/..", "owner/repo\\nested"] {
+            assert!(
+                create_temp_clone_repo_dir(temp.path(), slug).is_err(),
+                "must reject {slug:?}"
+            );
+        }
     }
 
     fn git(repo: &Path, args: &[&str]) {

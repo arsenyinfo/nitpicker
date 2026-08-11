@@ -91,7 +91,8 @@ src/  — `nitpicker` binary (CLI)
   pr.rs           GitHub PR subcommand: fetch metadata via gh, review, post comment
   presets.rs      review presets: built-in rubric registry, CLI/config resolution, synthesis-failure wrapping
   output.rs       JSON output contract for `pr --json` (OutputFormat, PrReviewOutput, emit_json)
-  progress.rs     interactive progress formatting + tracing writer bridge for spinner-safe logs
+  progress.rs     interactive progress formatting + tracing writer bridge for spinner-safe logs;
+                  owns the text-mode, TTY-only animated OSC 0 terminal-title indicator used during runs
   reflect.rs      Reflect subcommand: analyze saved session trajectories and synthesize improvements
   detect.rs       provider auto-detection for `init`
   context.rs      `--context-file` loading + prompt injection (ContextFile, load_context_files, append_to_prompt) and project-context discovery (build_context: CLAUDE.md/AGENTS.md)
