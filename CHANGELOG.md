@@ -6,6 +6,11 @@ Notable user-visible changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Show an animated repository activity indicator in supported terminal tab/window titles during
+  interactive review runs, without changing redirected or `pr --json` output.
+
 ## [0.9.2] - 2026-08-10
 
 `nitpicker-agent` 0.4.0

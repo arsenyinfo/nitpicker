@@ -475,6 +475,7 @@ pub async fn run_debate(
     // in json mode stdout is reserved for the final envelope; the cast lines and
     // rendered verdicts below would otherwise corrupt it.
     let stdout_ok = matches!(format, crate::output::OutputFormat::Text);
+    let _terminal_title = crate::progress::start_terminal_title(repo, format);
     if config.reviewer.len() < 2 {
         eyre::bail!(
             "debate requires at least 2 reviewers in config (actor = reviewer[0], critic = reviewer[1])"

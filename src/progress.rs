@@ -1,11 +1,17 @@
 use indicatif::MultiProgress;
 use std::io::{self, IsTerminal, Write};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
+use std::thread;
+use std::time::Duration;
 use unicode_width::UnicodeWidthStr;
 
 const DEFAULT_TERMINAL_COLUMNS: usize = 80;
 const PROGRESS_BAR_RESERVED_COLUMNS: usize = 15;
 const MAX_MESSAGE_COLUMNS: usize = 120;
+const MAX_TERMINAL_PROJECT_CHARS: usize = 24;
+const TERMINAL_TITLE_SPINNER_INTERVAL: Duration = Duration::from_millis(200);
+const TERMINAL_TITLE_SPINNER_FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
 
 static ACTIVE_PROGRESS: OnceLock<Mutex<Option<Weak<MultiProgress>>>> = OnceLock::new();
 
@@ -24,6 +30,154 @@ impl Drop for ActiveProgressGuard {
         let mut active = active_progress().lock().unwrap_or_else(|e| e.into_inner());
         *active = self.previous.take();
     }
+}
+
+/// Keeps the terminal tab/window title animated for the lifetime of a review run.
+///
+/// The title is written only for human text output when stdout is a terminal. That keeps
+/// redirected reports and the `pr --json` contract byte-for-byte clean while matching the surface
+/// a user is actually looking at during an interactive run. Dropping the guard stops the worker
+/// and clears the title we set; terminal titles cannot be read back portably, so restoring an
+/// earlier value is not possible.
+pub(crate) struct TerminalTitleGuard {
+    stop: mpsc::Sender<()>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for TerminalTitleGuard {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Start nitpicker's rotating-lens `spinner project` indicator in the terminal header.
+pub(crate) fn start_terminal_title(
+    repo: &Path,
+    format: crate::output::OutputFormat,
+) -> Option<TerminalTitleGuard> {
+    // JSON owns the entire stdout byte stream even when a caller allocates a PTY. Check the
+    // output contract before TTY detection so no OSC title bytes can precede its one object.
+    let term = std::env::var("TERM").ok();
+    if !terminal_title_enabled(format, io::stdout().is_terminal(), term.as_deref()) {
+        return None;
+    }
+
+    let project = terminal_project_name(repo);
+    let (stop, stopped) = mpsc::channel();
+    let worker = thread::Builder::new()
+        .name("nitpicker-terminal-title".to_string())
+        .spawn(move || {
+            let mut frame = 0usize;
+            loop {
+                if write_osc_title(&format!(
+                    "{} {project}",
+                    TERMINAL_TITLE_SPINNER_FRAMES[frame]
+                ))
+                .is_err()
+                {
+                    break;
+                }
+                match stopped.recv_timeout(TERMINAL_TITLE_SPINNER_INTERVAL) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        frame = (frame + 1) % TERMINAL_TITLE_SPINNER_FRAMES.len();
+                    }
+                }
+            }
+            let _ = clear_terminal_title();
+        })
+        .ok()?;
+
+    Some(TerminalTitleGuard {
+        stop,
+        worker: Some(worker),
+    })
+}
+
+fn terminal_title_enabled(
+    format: crate::output::OutputFormat,
+    stdout_is_terminal: bool,
+    term: Option<&str>,
+) -> bool {
+    format == crate::output::OutputFormat::Text
+        && stdout_is_terminal
+        && !matches!(term, Some("dumb" | "linux"))
+}
+
+fn terminal_project_name(repo: &Path) -> String {
+    let raw = repo
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "nitpicker".to_string());
+    let project = sanitize_terminal_project(&raw);
+    match project.is_empty() {
+        true => "nitpicker".to_string(),
+        false => project,
+    }
+}
+
+fn clear_terminal_title() -> io::Result<()> {
+    write_osc_title("")
+}
+
+fn write_osc_title(title: &str) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    write_osc_title_to(&mut out, title)
+}
+
+fn write_osc_title_to(out: &mut impl Write, title: &str) -> io::Result<()> {
+    write!(out, "\x1b]0;{title}\x07")?;
+    out.flush()
+}
+
+/// Normalize and bound an untrusted path component before placing it inside an OSC sequence.
+fn sanitize_terminal_project(project: &str) -> String {
+    let mut sanitized = String::new();
+    let mut chars_written = 0usize;
+    let mut pending_space = false;
+
+    for ch in project.chars() {
+        if ch.is_whitespace() {
+            pending_space = !sanitized.is_empty();
+            continue;
+        }
+        if is_disallowed_terminal_title_char(ch) {
+            continue;
+        }
+        if pending_space && chars_written + 1 < MAX_TERMINAL_PROJECT_CHARS {
+            sanitized.push(' ');
+            chars_written += 1;
+            pending_space = false;
+        }
+        if chars_written >= MAX_TERMINAL_PROJECT_CHARS {
+            break;
+        }
+        sanitized.push(ch);
+        chars_written += 1;
+    }
+    sanitized
+}
+
+fn is_disallowed_terminal_title_char(ch: char) -> bool {
+    ch.is_control()
+        || matches!(
+            ch,
+            '\u{00AD}'
+                | '\u{034F}'
+                | '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{1BCA0}'..='\u{1BCA3}'
+                | '\u{E0100}'..='\u{E01EF}'
+        )
 }
 
 pub(crate) fn stderr_log_writer() -> ProgressLogWriter {
@@ -187,6 +341,64 @@ fn normalize_whitespace(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn terminal_title_sanitizes_controls_invisible_text_and_whitespace() {
+        assert_eq!(
+            sanitize_terminal_project("  revi\t\u{202e}ewer\n\x1b]0;owned\x07  "),
+            "revi ewer ]0;owned"
+        );
+    }
+
+    #[test]
+    fn terminal_project_bound_counts_only_sanitized_visible_characters() {
+        let project = format!("{}reviewer", "\u{202e}".repeat(40));
+        assert_eq!(sanitize_terminal_project(&project), "reviewer");
+    }
+
+    #[test]
+    fn json_output_disables_terminal_titles_even_inside_a_pty() {
+        assert!(!terminal_title_enabled(
+            crate::output::OutputFormat::Json,
+            true,
+            Some("xterm-256color")
+        ));
+        assert!(terminal_title_enabled(
+            crate::output::OutputFormat::Text,
+            true,
+            Some("xterm-256color")
+        ));
+    }
+
+    #[test]
+    fn terminal_title_excludes_terms_without_window_titles() {
+        for term in ["dumb", "linux"] {
+            assert!(!terminal_title_enabled(
+                crate::output::OutputFormat::Text,
+                true,
+                Some(term)
+            ));
+        }
+    }
+
+    #[test]
+    fn terminal_project_name_is_bounded_and_has_a_root_fallback() {
+        assert_eq!(terminal_project_name(Path::new("/")), "nitpicker");
+        assert_eq!(
+            terminal_project_name(Path::new(
+                "/tmp/a-project-name-that-is-longer-than-twenty-four-characters"
+            )),
+            "a-project-name-that-is-l"
+        );
+    }
+
+    #[test]
+    fn osc_title_uses_bel_terminated_osc_zero() {
+        let mut bytes = Vec::new();
+        write_osc_title_to(&mut bytes, "◐ reviewer").unwrap();
+        assert_eq!(bytes, b"\x1b]0;\xe2\x97\x90 reviewer\x07");
+    }
 
     #[test]
     fn compact_tokens_switches_unit_at_each_boundary() {

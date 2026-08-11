@@ -393,7 +393,7 @@ Two LLM agents take turns exploring the codebase with file/git tools and submitt
 - `reviewer[1]` in config → Critic (review: Validator)
 - `aggregator` → Meta-reviewer
 
-Interactive text runs show a compact cast/progress view while debating, then print the final synthesized result. In a terminal, `--verbose` also shows intermediate debate output and the saved transcript path; redirected stdout stays final-report-only.
+Interactive text runs show a compact cast/progress view while debating, then print the final synthesized result. While a review or debate is active, the terminal tab/window title also shows nitpicker's rotating-lens activity glyph plus the repository name (for example, `◐ reviewer`); it is TTY-only and cleared when the run ends, so redirected and JSON output stay unchanged. In a terminal, `--verbose` also shows intermediate debate output and the saved transcript path; redirected stdout stays final-report-only.
 
 With `--verbose`, the transcript is saved to `{tempdir}/debate-{timestamp}.md` (`ask`) or `review-debate-{timestamp}-{preset-slugs}.md` (review; one section per preset lane). Non-verbose runs skip the write.
 

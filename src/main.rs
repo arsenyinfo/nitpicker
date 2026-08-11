@@ -307,6 +307,7 @@ async fn main() -> Result<()> {
                 args.common.verbose,
                 prompts::RunTask::Ask,
                 use_fallback,
+                output::OutputFormat::Text,
             )
             .await?;
             println!("{}", outcome.report);
@@ -420,6 +421,7 @@ async fn main() -> Result<()> {
                 presets: &presets,
             },
             use_fallback,
+            output::OutputFormat::Text,
         )
         .await?;
         println!("{}", outcome.report);

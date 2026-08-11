@@ -1,4 +1,4 @@
-use crate::output::{PresetCoverage, UsageReport};
+use crate::output::{OutputFormat, PresetCoverage, UsageReport};
 use crate::prompts::RunTask;
 use eyre::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -261,7 +261,9 @@ pub async fn run_review(
     verbose: bool,
     task: RunTask<'_>,
     fallback: bool,
+    format: OutputFormat,
 ) -> Result<ReviewOutcome> {
+    let _terminal_title = crate::progress::start_terminal_title(repo, format);
     let presets = task.presets();
     let lanes = task.lanes();
     let mut tools = all_tools();
