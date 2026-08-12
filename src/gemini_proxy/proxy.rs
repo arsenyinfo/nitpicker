@@ -124,6 +124,14 @@ async fn init_project(state: &ProxyState, token: &TokenData) -> Result<()> {
                 .map_err(|_| eyre::eyre!("Token contains invalid header characters"))?,
         )
         .header(header::CONTENT_TYPE, "application/json")
+        // The CloudCode backend gates free-tier eligibility on a recognizable User-Agent:
+        // a UA-less request is classified as the legacy "Gemini Code Assist for individuals"
+        // client and rejected as UNSUPPORTED_CLIENT, returning no project. Same header the
+        // chat path and fetchAvailableModels already set.
+        .header(
+            header::USER_AGENT,
+            super::build_gemini_user_agent("loadCodeAssist"),
+        )
         .header(
             header::HeaderName::from_static("x-goog-api-client"),
             "google-api-go-client/0.5",
