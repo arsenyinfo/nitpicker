@@ -11,6 +11,12 @@ Notable user-visible changes are recorded here. The format follows
 - Show an animated repository activity indicator in supported terminal tab/window titles during
   interactive review runs, without changing redirected or `pr --json` output.
 
+### Fixed
+
+- Restore `auth = "agy-keyring"`: the proxy's `loadCodeAssist` request now sends a
+  `User-Agent`, without which Google's backend classified the client as the deprecated
+  "Gemini Code Assist for individuals" tier and returned no project, 503-ing every request.
+
 ## [0.9.2] - 2026-08-10
 
 `nitpicker-agent` 0.4.0

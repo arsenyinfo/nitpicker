@@ -1047,14 +1047,16 @@ async fn run_review_inner(
             repo,
             &full_prompt,
             config,
-            max_turns,
-            verbose,
-            RunTask::Review {
-                scope: ReviewScope::Diff,
-                presets,
+            review::ReviewOptions {
+                max_turns,
+                verbose,
+                task: RunTask::Review {
+                    scope: ReviewScope::Diff,
+                    presets,
+                },
+                fallback: use_fallback,
+                format,
             },
-            use_fallback,
-            format,
         )
         .await?;
         (
