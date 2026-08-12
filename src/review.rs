@@ -253,16 +253,29 @@ pub(crate) fn synthesis_model(response: &CompletionResponse, configured_model: &
         .unwrap_or_else(|| configured_model.to_string())
 }
 
+/// Mirrors `DebateOptions`: the trailing run-control params bundled so `run_review` stays
+/// under clippy's argument limit, symmetric with the debate entry point.
+pub struct ReviewOptions<'a> {
+    pub max_turns: usize,
+    pub verbose: bool,
+    pub task: RunTask<'a>,
+    pub fallback: bool,
+    pub format: OutputFormat,
+}
+
 pub async fn run_review(
     repo: &Path,
     user_prompt: &str,
     config: &Config,
-    max_turns: usize,
-    verbose: bool,
-    task: RunTask<'_>,
-    fallback: bool,
-    format: OutputFormat,
+    opts: ReviewOptions<'_>,
 ) -> Result<ReviewOutcome> {
+    let ReviewOptions {
+        max_turns,
+        verbose,
+        task,
+        fallback,
+        format,
+    } = opts;
     let _terminal_title = crate::progress::start_terminal_title(repo, format);
     let presets = task.presets();
     let lanes = task.lanes();

@@ -303,11 +303,13 @@ async fn main() -> Result<()> {
                 &repo,
                 &topic,
                 &config,
-                max_turns,
-                args.common.verbose,
-                prompts::RunTask::Ask,
-                use_fallback,
-                output::OutputFormat::Text,
+                review::ReviewOptions {
+                    max_turns,
+                    verbose: args.common.verbose,
+                    task: prompts::RunTask::Ask,
+                    fallback: use_fallback,
+                    format: output::OutputFormat::Text,
+                },
             )
             .await?;
             println!("{}", outcome.report);
@@ -414,14 +416,16 @@ async fn main() -> Result<()> {
             &repo,
             &prompt,
             &config,
-            max_turns,
-            args.common.verbose,
-            prompts::RunTask::Review {
-                scope,
-                presets: &presets,
+            review::ReviewOptions {
+                max_turns,
+                verbose: args.common.verbose,
+                task: prompts::RunTask::Review {
+                    scope,
+                    presets: &presets,
+                },
+                fallback: use_fallback,
+                format: output::OutputFormat::Text,
             },
-            use_fallback,
-            output::OutputFormat::Text,
         )
         .await?;
         println!("{}", outcome.report);
