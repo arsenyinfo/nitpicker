@@ -6,6 +6,10 @@ Notable user-visible changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-08-13
+
+`nitpicker-agent` 0.5.0
+
 ### Added
 
 - Show an animated repository activity indicator in supported terminal tab/window titles during
