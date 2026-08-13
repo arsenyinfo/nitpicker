@@ -849,19 +849,6 @@ pub(crate) struct BaseBranch {
 const MAX_SNAPSHOT_FILES: usize = 500;
 const MAX_SNAPSHOT_BYTES: usize = 64 * 1024;
 
-struct RenderedFileMap {
-    text: String,
-    included: usize,
-    omitted: usize,
-}
-
-impl RenderedFileMap {
-    fn into_text(self, total: usize) -> String {
-        debug_assert_eq!(self.included + self.omitted, total);
-        self.text
-    }
-}
-
 pub fn detect_diff_context(repo: &Path) -> Result<String> {
     let branch = run_git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     let branch = branch.trim();
@@ -975,13 +962,9 @@ fn nonempty_lines(output: &str) -> Vec<String> {
         .collect()
 }
 
-fn render_snapshot_files(files: &[String], budget: usize) -> RenderedFileMap {
+fn render_snapshot_files(files: &[String], budget: usize) -> String {
     if files.is_empty() {
-        return RenderedFileMap {
-            text: "(none)\n".to_string(),
-            included: 0,
-            omitted: 0,
-        };
+        return "(none)\n".to_string();
     }
 
     let mut text = String::new();
@@ -1003,11 +986,7 @@ fn render_snapshot_files(files: &[String], budget: usize) -> RenderedFileMap {
     if text.len() + marker.len() <= budget {
         text.push_str(&marker);
     }
-    RenderedFileMap {
-        text,
-        included,
-        omitted,
-    }
+    text
 }
 
 fn snapshot_omission_marker(omitted: usize) -> String {
@@ -1036,10 +1015,9 @@ fn append_snapshot_file_sections(
     let working_tree_budget = content_budget.saturating_sub(committed_budget);
 
     let committed = committed_files
-        .map(|files| render_snapshot_files(files, committed_budget).into_text(files.len()))
+        .map(|files| render_snapshot_files(files, committed_budget))
         .unwrap_or_else(|| NO_BASE.to_string());
-    let working_tree = render_snapshot_files(working_tree_files, working_tree_budget)
-        .into_text(working_tree_files.len());
+    let working_tree = render_snapshot_files(working_tree_files, working_tree_budget);
 
     output.push_str(COMMITTED_HEADING);
     output.push_str(&committed);
@@ -1422,9 +1400,19 @@ mod tests {
             .map(|index| format!("{index}-{}", "x".repeat(4_000)))
             .collect::<Vec<_>>();
         let rendered = render_snapshot_files(&files, 16 * 1024);
-        assert!(rendered.text.len() <= 16 * 1024);
-        assert!(rendered.included < files.len());
-        assert_eq!(rendered.included + rendered.omitted, files.len());
+        assert!(rendered.len() <= 16 * 1024);
+        let rendered_files = rendered
+            .lines()
+            .filter(|line| line.starts_with("- `"))
+            .count();
+        assert!(rendered_files < files.len());
+        let omitted = files.len() - rendered_files;
+        assert!(
+            rendered
+                .lines()
+                .last()
+                .is_some_and(|marker| marker.contains(&omitted.to_string()))
+        );
 
         let mut snapshot = String::new();
         append_snapshot_file_sections(&mut snapshot, Some(&files), &files);

@@ -150,9 +150,9 @@ impl SessionData {
 
     fn metrics(&self) -> SessionMetrics {
         // A failed spawn has a `started` then `error` lifecycle pair. Count the underlying
-        // invocation once by its agent/turn/tool/args identity while retaining both statuses in
-        // status_counts, where lifecycle details are useful evidence in their own right.
-        let mut invocations: BTreeMap<String, &ToolCallRecord> = BTreeMap::new();
+        // invocation once while retaining both statuses in status_counts. Every other record is
+        // an invocation in its own right: one model turn may issue identical calls concurrently.
+        let mut failed_spawn_keys = BTreeSet::new();
         let mut status_counts = BTreeMap::new();
         let mut model_turns = BTreeSet::new();
         let mut min_ts = None;
@@ -168,25 +168,25 @@ impl SessionData {
                 model_turns.insert((record.agent.clone(), record.turn, model.clone()));
             }
 
-            let key = format!(
-                "{}\u{1f}{}\u{1f}{}\u{1f}{}",
-                record.agent, record.turn, record.tool, record.args
-            );
-            // Prefer the terminal error record over its preceding `started` record.
-            match invocations.get(&key) {
-                Some(existing) if existing.status == "started" && record.status == "error" => {
-                    invocations.insert(key, record);
-                }
-                None => {
-                    invocations.insert(key, record);
-                }
-                _ => {}
+            if record.tool == "spawn_subagent"
+                && record.status == "error"
+                && record.spawned_agent.is_some()
+            {
+                failed_spawn_keys.insert(spawn_lifecycle_key(record));
             }
         }
 
+        let invocations = self.records.iter().filter(|record| {
+            !(record.tool == "spawn_subagent"
+                && record.status == "started"
+                && failed_spawn_keys.contains(&spawn_lifecycle_key(record)))
+        });
+
         let mut tool_counts = BTreeMap::new();
         let mut repeated: BTreeMap<(String, String), (usize, BTreeSet<String>)> = BTreeMap::new();
-        for record in invocations.values() {
+        let mut invocation_count = 0;
+        for record in invocations {
+            invocation_count += 1;
             *tool_counts.entry(record.tool.clone()).or_insert(0) += 1;
             let entry = repeated
                 .entry((record.tool.clone(), record.args.to_string()))
@@ -220,7 +220,7 @@ impl SessionData {
 
         SessionMetrics {
             duration_ms: max_ts.unwrap_or(0).saturating_sub(min_ts.unwrap_or(0)),
-            invocations: invocations.len(),
+            invocations: invocation_count,
             status_counts,
             tool_counts,
             model_turns: model_turn_counts,
@@ -228,6 +228,17 @@ impl SessionData {
             repeated_calls,
         }
     }
+}
+
+fn spawn_lifecycle_key(record: &ToolCallRecord) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        record.agent,
+        record.turn,
+        record.tool,
+        record.args,
+        record.spawned_agent.as_deref().unwrap_or_default()
+    )
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -883,6 +894,11 @@ mod tests {
             }
         }
 
+        fn spawned(mut record: ToolCallRecord, agent: &str) -> ToolCallRecord {
+            record.spawned_agent = Some(agent.to_string());
+            record
+        }
+
         let grep_args = serde_json::json!({"pattern": "needle", "path": "src"});
         let spawn_args = serde_json::json!({"task": "inspect"});
         let session = SessionData {
@@ -906,22 +922,58 @@ mod tests {
                     "ok",
                     Some("m"),
                 ),
+                spawned(
+                    record(
+                        30,
+                        "reviewer",
+                        2,
+                        "spawn_subagent",
+                        spawn_args.clone(),
+                        "started",
+                        Some("m"),
+                    ),
+                    "reviewer/subagent-2",
+                ),
+                spawned(
+                    record(
+                        31,
+                        "reviewer",
+                        2,
+                        "spawn_subagent",
+                        spawn_args.clone(),
+                        "error",
+                        Some("m"),
+                    ),
+                    "reviewer/subagent-2",
+                ),
+                spawned(
+                    record(
+                        32,
+                        "reviewer",
+                        2,
+                        "spawn_subagent",
+                        spawn_args,
+                        "started",
+                        Some("m"),
+                    ),
+                    "reviewer/subagent-3",
+                ),
                 record(
-                    30,
+                    40,
                     "reviewer",
-                    2,
-                    "spawn_subagent",
-                    spawn_args.clone(),
-                    "started",
+                    3,
+                    "read_file",
+                    serde_json::json!({"path": "src/main.rs"}),
+                    "ok",
                     Some("m"),
                 ),
                 record(
-                    31,
+                    41,
                     "reviewer",
-                    2,
-                    "spawn_subagent",
-                    spawn_args,
-                    "error",
+                    3,
+                    "read_file",
+                    serde_json::json!({"path": "src/main.rs"}),
+                    "ok",
                     Some("m"),
                 ),
             ],
@@ -929,17 +981,22 @@ mod tests {
         };
 
         let metrics = session.metrics();
-        assert_eq!(metrics.duration_ms, 21);
-        assert_eq!(metrics.invocations, 3);
+        assert_eq!(metrics.duration_ms, 31);
+        assert_eq!(metrics.invocations, 6);
         assert_eq!(metrics.tool_counts.get("grep"), Some(&2));
-        assert_eq!(metrics.tool_counts.get("spawn_subagent"), Some(&1));
-        assert_eq!(metrics.status_counts.get("started"), Some(&1));
+        assert_eq!(metrics.tool_counts.get("spawn_subagent"), Some(&2));
+        assert_eq!(metrics.tool_counts.get("read_file"), Some(&2));
+        assert_eq!(metrics.status_counts.get("started"), Some(&2));
         assert_eq!(metrics.status_counts.get("error"), Some(&1));
-        assert_eq!(metrics.model_turns.get("m"), Some(&3));
+        assert_eq!(metrics.model_turns.get("m"), Some(&4));
         assert_eq!(metrics.max_depth, 1);
-        assert_eq!(metrics.repeated_calls.len(), 1);
+        assert_eq!(metrics.repeated_calls.len(), 3);
         assert_eq!(metrics.repeated_calls[0].tool, "grep");
         assert_eq!(metrics.repeated_calls[0].count, 2);
+        assert_eq!(metrics.repeated_calls[1].tool, "read_file");
+        assert_eq!(metrics.repeated_calls[1].count, 2);
+        assert_eq!(metrics.repeated_calls[2].tool, "spawn_subagent");
+        assert_eq!(metrics.repeated_calls[2].count, 2);
     }
 
     #[test]

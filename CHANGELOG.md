@@ -40,6 +40,8 @@ Notable user-visible changes are recorded here. The format follows
 - Reject token-limit-truncated agent answers instead of publishing partial reports as complete.
 - Preserve final per-lane verdicts and both early and late tool evidence within independently
   bounded `reflect` sections.
+- Count identical same-turn tool calls as distinct reflection invocations while still collapsing
+  a failed subagent spawn's started/error lifecycle pair.
 - Persist debate verdict success from the turn outcome rather than inferring it from display text.
 - Restore `auth = "agy-keyring"`: the proxy's `loadCodeAssist` request now sends a
   `User-Agent`, without which Google's backend classified the client as the deprecated
