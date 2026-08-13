@@ -6,13 +6,43 @@ Notable user-visible changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-08-13
+
+`nitpicker-agent` 0.5.0
+
 ### Added
 
 - Show an animated repository activity indicator in supported terminal tab/window titles during
   interactive review runs, without changing redirected or `pr --json` output.
+- Persist staged reviewer and debate verdicts in session aggregation records so reflection can
+  compare execution trajectories with their intermediate and final outcomes.
+
+### Changed
+
+- Calibrate `reflect` with deterministic trace metrics, evidence-counted cross-session claims,
+  explicit confidence/tradeoffs, critic-model synthesis, omission of rejected hypotheses from the
+  final report, and no shared temp dump.
+- Separate debate responsibilities across review and `ask`: Actor/Reviewer owns discovery and
+  recall, while Critic/Validator consolidates evidence-based objections to the submitted set and
+  does not hunt for new findings/options or manufacture disagreement.
+- Give discovery roles an early disjoint delegation default for multi-surface work while limiting
+  validation-role subagents to targeted verification of submitted claims.
+- Inject one deterministic, commit-pinned review snapshot before fan-out, including base/HEAD,
+  merge base, exact comparison semantics, working-tree state, and committed/uncommitted file maps.
+- **Breaking (`nitpicker-agent`)**: `AggregationRecord` adds the required
+  `verdicts: Vec<VerdictRecord>` field; pre-change aggregation records are not accepted by
+  `reflect`.
 
 ### Fixed
 
+- Keep diff reviews available when the detected base and HEAD have no merge base by falling back
+  to a direct tree comparison, and bound frozen snapshot file maps by rendered bytes.
+- Reject token-limit-truncated agent answers instead of publishing partial reports as complete.
+- Preserve final per-lane verdicts and both early and late tool evidence within independently
+  bounded `reflect` sections.
+- Count identical same-turn tool calls as distinct reflection invocations while still collapsing
+  a failed subagent spawn's started/error lifecycle pair.
+- Persist debate verdict success from the turn outcome rather than inferring it from display text.
 - Restore `auth = "agy-keyring"`: the proxy's `loadCodeAssist` request now sends a
   `User-Agent`, without which Google's backend classified the client as the deprecated
   "Gemini Code Assist for individuals" tier and returned no project, 503-ing every request.

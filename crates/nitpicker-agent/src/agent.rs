@@ -1,6 +1,7 @@
 use crate::compact::{CompactionOutcome, compact_history};
 use crate::llm::{
-    Completion, ConversationUsageWindow, LLMClientDyn, TokenUsage, throttled_completion,
+    Completion, ConversationUsageWindow, FinishReason, LLMClientDyn, TokenUsage,
+    throttled_completion,
 };
 use crate::prompts::subagent_system_prompt;
 use crate::session::{SessionWriter, ToolCallRecord, now_unix_ms};
@@ -476,6 +477,13 @@ pub async fn run_agent(
         let selected_model = response.selected_model.clone();
         let assistant_message = response.message();
         history.push(assistant_message.clone());
+
+        if response.finish_reason == FinishReason::MaxTokens {
+            let model = selected_model.as_deref().unwrap_or(&config.model);
+            eyre::bail!(
+                "agent model '{model}' reached its output token limit and returned a truncated answer"
+            );
+        }
 
         if let Some(tool_calls) = response.tool_calls() {
             empty_response_count = 0;
@@ -1294,6 +1302,19 @@ mod tests {
         calls: Arc<Mutex<Vec<Completion>>>,
     }
 
+    struct TruncatedTextClient;
+
+    impl LLMClient for TruncatedTextClient {
+        async fn completion(&self, _completion: Completion) -> Result<CompletionResponse> {
+            Ok(CompletionResponse {
+                choice: OneOrMany::one(AssistantContent::text("partial answer")),
+                finish_reason: FinishReason::MaxTokens,
+                usage: TokenUsage::default(),
+                selected_model: Some("selected-model".to_string()),
+            })
+        }
+    }
+
     impl LLMClient for TerminalScriptClient {
         async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
             let forced = matches!(completion.tool_choice, Some(ToolChoice::Required));
@@ -1424,5 +1445,21 @@ mod tests {
 
         assert!(format!("{err:#}").contains("required terminal tool 'missing' is not available"));
         assert!(calls.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn nonempty_max_tokens_response_is_rejected_as_truncated() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut config = terminal_test_config(calls, 1, Vec::new());
+        config.client = TruncatedTextClient.into_arc();
+        let dir = tempfile::tempdir().unwrap();
+
+        let error = run_agent(config, "investigate", &HashMap::new(), dir.path())
+            .await
+            .err()
+            .expect("truncated output must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("selected-model"));
+        assert!(message.contains("output token limit"));
     }
 }

@@ -10,7 +10,8 @@ use nitpicker_agent::config::Config;
 use nitpicker_agent::llm::{Completion, LLMClientDyn, TokenUsage, is_operational_limit_error};
 use nitpicker_agent::provider::{build_aggregator_client, build_reviewer_client};
 use nitpicker_agent::session::{
-    AggregationRecord, LaneRecord, SessionLogger, SessionWriter, sanitize_path_component,
+    AggregationRecord, LaneRecord, SessionLogger, SessionWriter, VerdictRecord,
+    sanitize_path_component,
 };
 use nitpicker_agent::tools::{Tool, all_tools};
 use rig_core::completion::Message;
@@ -62,6 +63,13 @@ struct DebateTurnResult {
     subagents_spawned: usize,
     usage: TokenUsage,
     /// The agent errored and `verdict` is a synthesized failure stub rather than a real verdict.
+    agent_failed: bool,
+}
+
+struct LaneVerdict {
+    role: String,
+    round: usize,
+    text: String,
     agent_failed: bool,
 }
 
@@ -284,7 +292,7 @@ struct RoundEnv<'a> {
 async fn run_debate_side(
     side: &DebateSide<'_>,
     env: &RoundEnv<'_>,
-    verdicts: &[(String, usize, String)],
+    verdicts: &[LaneVerdict],
     round: usize,
 ) -> Result<DebateTurnResult> {
     let pb = env.lane_progress.clone();
@@ -345,19 +353,17 @@ async fn run_debate_side(
     Ok(result)
 }
 
-fn build_turn_message(
-    topic: &str,
-    verdicts: &[(String, usize, String)],
-    round: usize,
-    role: &str,
-) -> String {
+fn build_turn_message(topic: &str, verdicts: &[LaneVerdict], round: usize, role: &str) -> String {
     let mut msg = format!("Topic: {topic}\n");
     if verdicts.is_empty() {
         msg.push_str("\nNo prior dialogue yet.\n");
     } else {
         msg.push_str("\nDialogue so far:\n");
-        for (label, rnd, text) in verdicts {
-            msg.push_str(&format!("\n### {label} (Round {rnd})\n{text}\n"));
+        for verdict in verdicts {
+            msg.push_str(&format!(
+                "\n### {} (Round {})\n{}\n",
+                verdict.role, verdict.round, verdict.text
+            ));
         }
     }
     msg.push_str(&format!(
@@ -446,8 +452,7 @@ pub struct DebateOutcome {
 /// the global meta-review synthesizes across surviving lanes.
 struct DebateLaneOutcome {
     preset_name: Option<String>,
-    /// (role_label, round_number, verdict_text)
-    verdicts: Vec<(String, usize, String)>,
+    verdicts: Vec<LaneVerdict>,
     converged: bool,
     final_round: usize,
     any_turn_succeeded: bool,
@@ -696,8 +701,12 @@ pub async fn run_debate(
                         .add(actor_turn.usage, actor_turn.subagents_spawned);
                     lane.any_turn_succeeded |= !actor_turn.agent_failed;
                     lane.degraded |= actor_turn.agent_failed;
-                    lane.verdicts
-                        .push((actor_role.to_string(), round, actor_turn.verdict.text));
+                    lane.verdicts.push(LaneVerdict {
+                        role: actor_role.to_string(),
+                        round,
+                        text: actor_turn.verdict.text,
+                        agent_failed: actor_turn.agent_failed,
+                    });
 
                     let critic_turn = run_debate_side(&critic, &env, &lane.verdicts, round).await?;
                     lane.usage
@@ -710,8 +719,12 @@ pub async fn run_debate(
                     let agreed = critic_turn.verdict.agree
                         && !actor_turn.agent_failed
                         && !critic_turn.agent_failed;
-                    lane.verdicts
-                        .push((critic_role.to_string(), round, critic_turn.verdict.text));
+                    lane.verdicts.push(LaneVerdict {
+                        role: critic_role.to_string(),
+                        round,
+                        text: critic_turn.verdict.text,
+                        agent_failed: critic_turn.agent_failed,
+                    });
 
                     if agreed {
                         lane.converged = true;
@@ -765,9 +778,9 @@ pub async fn run_debate(
             if let Some(name) = &lane.preset_name {
                 println!("\n─── {name} ───");
             }
-            for (label, rnd, text) in &lane.verdicts {
-                println!("\n{label} (Round {rnd}):");
-                skin.print_text(text);
+            for verdict in &lane.verdicts {
+                println!("\n{} (Round {}):", verdict.role, verdict.round);
+                skin.print_text(&verdict.text);
             }
         }
     }
@@ -804,6 +817,7 @@ pub async fn run_debate(
                         })
                         .collect()
                 }),
+                verdicts: debate_verdict_records(&lanes),
                 jobs: None,
             };
             match logger.write_aggregation(&record).await {
@@ -930,6 +944,7 @@ pub async fn run_debate(
                     converged,
                     presets: preset_names,
                     lanes: lane_records,
+                    verdicts: debate_verdict_records(&lanes),
                     jobs: None,
                 };
                 match logger.write_aggregation(&record).await {
@@ -955,6 +970,7 @@ pub async fn run_debate(
             converged,
             presets: preset_names,
             lanes: lane_records,
+            verdicts: debate_verdict_records(&lanes),
             jobs: None,
         };
         logger.write_aggregation(&record).await?;
@@ -993,8 +1009,11 @@ pub async fn run_debate(
                     now.format("%Y-%m-%d %H:%M:%S"),
                     lane.final_round,
                 );
-                for (label, rnd, text) in &lane.verdicts {
-                    transcript.push_str(&format!("## {label} — Round {rnd}\n\n{text}\n\n"));
+                for verdict in &lane.verdicts {
+                    transcript.push_str(&format!(
+                        "## {} — Round {}\n\n{}\n\n",
+                        verdict.role, verdict.round, verdict.text
+                    ));
                 }
                 transcript
             }
@@ -1080,6 +1099,20 @@ fn single_lane_scalars(lanes: &[DebateLaneOutcome]) -> (Option<usize>, Option<bo
     }
 }
 
+fn debate_verdict_records(lanes: &[DebateLaneOutcome]) -> Vec<VerdictRecord> {
+    lanes
+        .iter()
+        .flat_map(|lane| {
+            lane.verdicts.iter().map(|verdict| VerdictRecord {
+                lens: lane.preset_name.clone(),
+                stage: format!("{} · round {}", verdict.role, verdict.round),
+                text: verdict.text.clone(),
+                ok: !verdict.agent_failed,
+            })
+        })
+        .collect()
+}
+
 /// A lane survives — and reaches synthesis — iff at least one of its turns really ran.
 fn surviving(lanes: &[DebateLaneOutcome]) -> Vec<&DebateLaneOutcome> {
     lanes
@@ -1125,8 +1158,13 @@ fn lane_pruned_to_final_round(lane: &DebateLaneOutcome) -> bool {
 fn lane_dialogue(lane: &DebateLaneOutcome) -> String {
     lane.verdicts
         .iter()
-        .filter(|(_, rnd, _)| !lane_pruned_to_final_round(lane) || *rnd == lane.final_round)
-        .map(|(label, rnd, text)| format!("### {label} (Round {rnd})\n{text}"))
+        .filter(|verdict| !lane_pruned_to_final_round(lane) || verdict.round == lane.final_round)
+        .map(|verdict| {
+            format!(
+                "### {} (Round {})\n{}",
+                verdict.role, verdict.round, verdict.text
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n\n")
 }
@@ -1201,8 +1239,11 @@ fn render_lane_transcript_section(lane: &DebateLaneOutcome, max_rounds: usize) -
     if !lane.any_turn_succeeded {
         section.push_str("*Lane failed: no successful turns; omitted from synthesis.*\n\n");
     }
-    for (label, rnd, text) in &lane.verdicts {
-        section.push_str(&format!("### {label} — Round {rnd}\n\n{text}\n\n"));
+    for verdict in &lane.verdicts {
+        section.push_str(&format!(
+            "### {} — Round {}\n\n{}\n\n",
+            verdict.role, verdict.round, verdict.text
+        ));
     }
     section
 }
@@ -1224,7 +1265,12 @@ mod tests {
             preset_name: preset_name.map(str::to_string),
             verdicts: verdicts
                 .iter()
-                .map(|(l, r, t)| (l.to_string(), *r, t.to_string()))
+                .map(|(role, round, text)| LaneVerdict {
+                    role: role.to_string(),
+                    round: *round,
+                    text: text.to_string(),
+                    agent_failed: false,
+                })
                 .collect(),
             converged: false,
             final_round: 1,
@@ -1369,6 +1415,24 @@ mod tests {
         let mut degraded = lane(Some("security"), &[("Reviewer", 1, "raw text")]);
         degraded.degraded = true;
         assert_ne!(lane_sections(&[&clean]), lane_sections(&[&degraded]));
+    }
+
+    #[test]
+    fn persisted_verdict_status_uses_turn_outcome_not_rendered_text() {
+        let mut outcome = lane(
+            Some("correctness"),
+            &[("Reviewer", 1, "*Agent failed: finding text*")],
+        );
+        outcome.verdicts.push(LaneVerdict {
+            role: "Validator".to_string(),
+            round: 1,
+            text: "ordinary failure stub wording".to_string(),
+            agent_failed: true,
+        });
+
+        let records = debate_verdict_records(&[outcome]);
+        assert!(records[0].ok);
+        assert!(!records[1].ok);
     }
 
     /// Topic filenames are unchanged; preset filenames append bounded sanitized slugs.

@@ -1968,7 +1968,7 @@ dependencies = [
 
 [[package]]
 name = "nitpicker"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "axum",
  "base64",
@@ -2001,7 +2001,7 @@ dependencies = [
 
 [[package]]
 name = "nitpicker-agent"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "azure_core",
  "azure_identity",

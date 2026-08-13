@@ -3,7 +3,7 @@ use eyre::{Result, WrapErr};
 use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
 
-use nitpicker_agent::{config, openrouter};
+use nitpicker_agent::{config, openrouter, tools::floor_char_boundary};
 
 mod context;
 mod debate;
@@ -846,6 +846,9 @@ pub(crate) struct BaseBranch {
     pub(crate) revision: String,
 }
 
+const MAX_SNAPSHOT_FILES: usize = 500;
+const MAX_SNAPSHOT_BYTES: usize = 64 * 1024;
+
 pub fn detect_diff_context(repo: &Path) -> Result<String> {
     let branch = run_git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     let branch = branch.trim();
@@ -855,26 +858,43 @@ pub fn detect_diff_context(repo: &Path) -> Result<String> {
     }
 
     let base = detect_base_branch(repo);
+    let head_sha = run_git(repo, &["rev-parse", "HEAD"])?.trim().to_string();
+    let working_tree = run_git(repo, &["status", "--short"])?;
+    let working_tree_files = nonempty_lines(&working_tree);
+    let has_uncommitted = !working_tree_files.is_empty();
 
-    let has_uncommitted = !run_git(repo, &["status", "--porcelain"])
-        .unwrap_or_default()
-        .trim()
-        .is_empty();
-
-    let has_branch_commits = match base.as_ref() {
-        Some(base) if branch != base.name => !run_git(
-            repo,
-            &["log", &format!("{}..HEAD", base.revision), "--oneline"],
-        )?
-        .trim()
-        .is_empty(),
-        _ => false,
+    let base_snapshot = match base.as_ref() {
+        Some(base) => {
+            let base_sha = run_git(repo, &["rev-parse", &base.revision])?
+                .trim()
+                .to_string();
+            let merge_base = run_git_optional(repo, &["merge-base", &base_sha, &head_sha])?
+                .map(|sha| sha.trim().to_string())
+                .filter(|sha| !sha.is_empty());
+            let comparison_base = merge_base.as_deref().unwrap_or(&base_sha);
+            let committed = run_git(
+                repo,
+                &[
+                    "diff",
+                    "--name-status",
+                    "-M",
+                    comparison_base,
+                    &head_sha,
+                    "--",
+                ],
+            )?;
+            Some((base, base_sha, merge_base, nonempty_lines(&committed)))
+        }
+        None => None,
     };
+    let has_committed_changes = base_snapshot
+        .as_ref()
+        .is_some_and(|(_, _, _, files)| !files.is_empty());
 
-    if !has_uncommitted && !has_branch_commits {
+    if !has_uncommitted && !has_committed_changes {
         if let Some(base) = base.as_ref() {
             eyre::bail!(
-                "no changes to review: no uncommitted changes and no branch commits vs {}",
+                "no changes to review: no uncommitted changes and no committed changes vs {}",
                 base.name
             );
         }
@@ -883,24 +903,126 @@ pub fn detect_diff_context(repo: &Path) -> Result<String> {
         );
     }
 
-    let mut parts = Vec::new();
-    if has_uncommitted {
-        parts.push("- uncommitted changes (`git diff HEAD`)".to_string());
-    }
-    if has_branch_commits {
-        let base = base
-            .as_ref()
-            .ok_or_else(|| eyre::eyre!("base branch required when branch commits are present"))?;
-        parts.push(format!(
-            "- commits on this branch vs {} (`git log {}..HEAD`, `git diff {}...HEAD`)",
-            base.name, base.revision, base.revision
-        ));
+    let mut snapshot = format!(
+        "Review the following changes. This review snapshot was captured once before reviewers \
+fan out; treat its revisions and file maps as immutable orientation for this run.\n\n\
+## Frozen review snapshot\n\
+- Branch: `{branch}`\n\
+- HEAD: `{head_sha}`\n"
+    );
+
+    match base_snapshot.as_ref() {
+        Some((base, base_sha, merge_base, _)) => {
+            let comparison_base = merge_base.as_deref().unwrap_or(base_sha);
+            snapshot.push_str(&format!(
+                "- Base: `{}` @ `{base_sha}`\n\
+                 - Merge base: {}\n\
+                 - Committed comparison: `git diff {comparison_base} {head_sha} --`\n",
+                base.revision,
+                merge_base
+                    .as_deref()
+                    .map(|sha| format!("`{sha}`"))
+                    .unwrap_or_else(
+                        || "unavailable; using a direct base/HEAD tree comparison".to_string()
+                    )
+            ));
+        }
+        None => {
+            snapshot.push_str("- Base: not detected\n- Merge base: unavailable\n");
+        }
     }
 
-    Ok(format!(
-        "Review the following changes:\n{}",
-        parts.join("\n")
-    ))
+    snapshot.push_str(&format!(
+        "- Working tree: {}\n\
+         - Tracked working-tree comparison: `git diff {head_sha} --`\n\
+         - Untracked files: included in the status map below\n",
+        if has_uncommitted { "dirty" } else { "clean" }
+    ));
+
+    append_snapshot_file_sections(
+        &mut snapshot,
+        base_snapshot
+            .as_ref()
+            .map(|(_, _, _, committed_files)| committed_files.as_slice()),
+        &working_tree_files,
+    );
+
+    if snapshot.len() > MAX_SNAPSHOT_BYTES {
+        snapshot.truncate(floor_char_boundary(&snapshot, MAX_SNAPSHOT_BYTES));
+    }
+
+    Ok(snapshot)
+}
+
+fn nonempty_lines(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn render_snapshot_files(files: &[String], budget: usize) -> String {
+    if files.is_empty() {
+        return "(none)\n".to_string();
+    }
+
+    let mut text = String::new();
+    let mut included = 0;
+    for file in files.iter().take(MAX_SNAPSHOT_FILES) {
+        let line = format!("- `{file}`\n");
+        let next_included = included + 1;
+        let omitted = files.len().saturating_sub(next_included);
+        let marker = snapshot_omission_marker(omitted);
+        if text.len() + line.len() + marker.len() > budget {
+            break;
+        }
+        text.push_str(&line);
+        included = next_included;
+    }
+
+    let omitted = files.len().saturating_sub(included);
+    let marker = snapshot_omission_marker(omitted);
+    if text.len() + marker.len() <= budget {
+        text.push_str(&marker);
+    }
+    text
+}
+
+fn snapshot_omission_marker(omitted: usize) -> String {
+    match omitted {
+        0 => String::new(),
+        count => format!(
+            "- … {count} additional files omitted from the prompt; inspect the pinned comparison if needed\n"
+        ),
+    }
+}
+
+fn append_snapshot_file_sections(
+    output: &mut String,
+    committed_files: Option<&[String]>,
+    working_tree_files: &[String],
+) {
+    const COMMITTED_HEADING: &str = "\n### Committed changed files (name-status)\n";
+    const WORKING_TREE_HEADING: &str = "\n### Uncommitted changed files (`git status --short`)\n";
+    const NO_BASE: &str = "(comparison unavailable: no base detected)\n";
+
+    let fixed_len = COMMITTED_HEADING.len() + WORKING_TREE_HEADING.len();
+    let content_budget = MAX_SNAPSHOT_BYTES
+        .saturating_sub(output.len())
+        .saturating_sub(fixed_len);
+    let committed_budget = content_budget / 2;
+    let working_tree_budget = content_budget.saturating_sub(committed_budget);
+
+    let committed = committed_files
+        .map(|files| render_snapshot_files(files, committed_budget))
+        .unwrap_or_else(|| NO_BASE.to_string());
+    let working_tree = render_snapshot_files(working_tree_files, working_tree_budget);
+
+    output.push_str(COMMITTED_HEADING);
+    output.push_str(&committed);
+    output.push_str(WORKING_TREE_HEADING);
+    output.push_str(&working_tree);
 }
 
 pub(crate) fn detect_base_branch(repo: &Path) -> Option<BaseBranch> {
@@ -949,6 +1071,22 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<String> {
         eyre::bail!("git {}: {}", args.join(" "), stderr.trim());
     }
     Ok(String::from_utf8(output.stdout)?)
+}
+
+/// Some Git plumbing uses exit 1 for a valid negative result. Preserve every other failure.
+fn run_git_optional(repo: &Path, args: &[&str]) -> Result<Option<String>> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()?;
+    match output.status.code() {
+        Some(0) => Ok(Some(String::from_utf8(output.stdout)?)),
+        Some(1) => Ok(None),
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eyre::bail!("git {}: {}", args.join(" "), stderr.trim());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1143,6 +1281,142 @@ mod tests {
         std::fs::create_dir(&fake).unwrap();
         std::fs::write(fake.join(".git"), "not a gitdir pointer").unwrap();
         assert!(git_worktree_root(&fake).is_none());
+    }
+
+    #[test]
+    fn diff_context_is_a_frozen_revision_and_file_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        run_git(repo, &["init", "-b", "main"]).unwrap();
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        run_git(repo, &["add", "base.txt"]).unwrap();
+        run_git(
+            repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        let base_sha = run_git(repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        run_git(repo, &["switch", "-c", "feature"]).unwrap();
+        std::fs::write(repo.join("committed.txt"), "committed\n").unwrap();
+        run_git(repo, &["add", "committed.txt"]).unwrap();
+        run_git(
+            repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "feature",
+            ],
+        )
+        .unwrap();
+        let head_sha = run_git(repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        std::fs::write(repo.join("committed.txt"), "working tree\n").unwrap();
+        std::fs::write(repo.join("untracked.txt"), "untracked\n").unwrap();
+
+        let context = detect_diff_context(repo).unwrap();
+        for expected in [
+            "## Frozen review snapshot".to_string(),
+            "- Branch: `feature`".to_string(),
+            format!("- HEAD: `{head_sha}`"),
+            format!("- Base: `main` @ `{base_sha}`"),
+            format!("- Merge base: `{base_sha}`"),
+            format!("git diff {base_sha} {head_sha} --"),
+            "- Working tree: dirty".to_string(),
+            "- `A\tcommitted.txt`".to_string(),
+            "- ` M committed.txt`".to_string(),
+            "- `?? untracked.txt`".to_string(),
+        ] {
+            assert!(
+                context.contains(&expected),
+                "missing {expected:?}:\n{context}"
+            );
+        }
+    }
+
+    #[test]
+    fn diff_context_falls_back_to_direct_tree_comparison_for_unrelated_histories() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        run_git(repo, &["init", "-b", "main"]).unwrap();
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        run_git(repo, &["add", "base.txt"]).unwrap();
+        run_git(
+            repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "base",
+            ],
+        )
+        .unwrap();
+
+        run_git(repo, &["switch", "--orphan", "feature"]).unwrap();
+        std::fs::write(repo.join("feature.txt"), "feature\n").unwrap();
+        run_git(repo, &["add", "--all"]).unwrap();
+        run_git(
+            repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "feature",
+            ],
+        )
+        .unwrap();
+
+        assert!(run_git(repo, &["merge-base", "main", "HEAD"]).is_err());
+        let context = detect_diff_context(repo).unwrap();
+        assert!(context.len() <= MAX_SNAPSHOT_BYTES);
+    }
+
+    #[test]
+    fn snapshot_file_maps_share_a_fixed_rendered_byte_budget() {
+        let files = (0..1_000)
+            .map(|index| format!("{index}-{}", "x".repeat(4_000)))
+            .collect::<Vec<_>>();
+        let rendered = render_snapshot_files(&files, 16 * 1024);
+        assert!(rendered.len() <= 16 * 1024);
+        let rendered_files = rendered
+            .lines()
+            .filter(|line| line.starts_with("- `"))
+            .count();
+        assert!(rendered_files < files.len());
+        let omitted = files.len() - rendered_files;
+        assert!(
+            rendered
+                .lines()
+                .last()
+                .is_some_and(|marker| marker.contains(&omitted.to_string()))
+        );
+
+        let mut snapshot = String::new();
+        append_snapshot_file_sections(&mut snapshot, Some(&files), &files);
+        assert!(snapshot.len() <= MAX_SNAPSHOT_BYTES);
     }
 
     #[test]

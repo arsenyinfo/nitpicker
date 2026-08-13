@@ -59,6 +59,10 @@ See `examples/file_agent.rs` for a runnable version.
 
 ## Breaking changes
 
+**0.5.0**
+- Added the required `verdicts: Vec<VerdictRecord>` field to `AggregationRecord`; recorded
+  sessions using the older aggregation schema are intentionally not accepted by `reflect`.
+
 **0.4.0**
 - Added `fallback: Option<bool>` to `DefaultsConfig` — source-breaking for code constructing the struct with literals (add `fallback: None`).
 

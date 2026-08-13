@@ -11,7 +11,8 @@ const PROGRESS_BAR_RESERVED_COLUMNS: usize = 15;
 const MAX_MESSAGE_COLUMNS: usize = 120;
 const MAX_TERMINAL_PROJECT_CHARS: usize = 24;
 const TERMINAL_TITLE_SPINNER_INTERVAL: Duration = Duration::from_millis(200);
-const TERMINAL_TITLE_SPINNER_FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
+// Keep the target's outer circle fixed so the repository title does not appear to shift.
+const TERMINAL_TITLE_SPINNER_FRAMES: [&str; 4] = ["⊙", "⊕", "⊗", "⊕"];
 
 static ACTIVE_PROGRESS: OnceLock<Mutex<Option<Weak<MultiProgress>>>> = OnceLock::new();
 
@@ -53,7 +54,7 @@ impl Drop for TerminalTitleGuard {
     }
 }
 
-/// Start nitpicker's rotating-lens `spinner project` indicator in the terminal header.
+/// Start nitpicker's fixed-outline target `spinner project` indicator in the terminal header.
 pub(crate) fn start_terminal_title(
     repo: &Path,
     format: crate::output::OutputFormat,
@@ -396,8 +397,8 @@ mod tests {
     #[test]
     fn osc_title_uses_bel_terminated_osc_zero() {
         let mut bytes = Vec::new();
-        write_osc_title_to(&mut bytes, "◐ reviewer").unwrap();
-        assert_eq!(bytes, b"\x1b]0;\xe2\x97\x90 reviewer\x07");
+        write_osc_title_to(&mut bytes, "⊙ reviewer").unwrap();
+        assert_eq!(bytes, b"\x1b]0;\xe2\x8a\x99 reviewer\x07");
     }
 
     #[test]
