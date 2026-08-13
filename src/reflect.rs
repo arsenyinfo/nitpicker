@@ -14,6 +14,10 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+const MAX_FORMATTED_SESSION_BYTES: usize = 200_000;
+const MAX_STAGED_VERDICTS_BYTES: usize = 40_000;
+const MAX_TOOL_TRACE_BYTES: usize = 120_000;
+
 const MAP_PROMPT: &str = "\
 You are analyzing one recorded nitpicker session. The input contains deterministic metrics,
 staged verdicts, the final outcome, and the tool trace.
@@ -234,6 +238,24 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+fn truncate_middle(s: &str, max: usize) -> String {
+    const MARKER: &str = "\n… middle omitted to preserve both early and late evidence …\n";
+    if s.len() <= max {
+        return s.to_string();
+    }
+    if max <= MARKER.len() {
+        return truncate(s, max);
+    }
+
+    let content_budget = max - MARKER.len();
+    let head_end = floor_char_boundary(s, content_budget / 2);
+    let mut tail_start = s.len().saturating_sub(content_budget - head_end);
+    while tail_start < s.len() && !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!("{}{MARKER}{}", &s[..head_end], &s[tail_start..])
+}
+
 /// Icon per trajectory-log status (`agent.rs::ToolCallStatus::as_str`). Every status needs its
 /// own glyph: rendering "started" (a spawn whose result lives in the subagent's own records) or
 /// "blocked_cycle" as ✗ teaches the analysis model that those calls failed. Unknown vocabulary
@@ -257,6 +279,120 @@ fn format_counts(counts: &BTreeMap<String, usize>) -> String {
             .collect::<Vec<_>>()
             .join(", "),
     }
+}
+
+fn verdict_chunk(verdict: &nitpicker_agent::session::VerdictRecord, text_budget: usize) -> String {
+    let lens = truncate(verdict.lens.as_deref().unwrap_or("unscoped"), 200);
+    let stage = truncate(&verdict.stage, 200);
+    let status = if verdict.ok { "ok" } else { "failed" };
+    format!(
+        "### {lens} · {stage} · {status}\n{}\n",
+        truncate(&verdict.text, text_budget)
+    )
+}
+
+fn final_lane_verdict_indices(agg: &AggregationRecord) -> Vec<usize> {
+    let Some(lanes) = &agg.lanes else {
+        return Vec::new();
+    };
+
+    let mut indices = Vec::new();
+    let mut seen = BTreeSet::new();
+    for lane in lanes {
+        let matches = agg
+            .verdicts
+            .iter()
+            .enumerate()
+            .filter(|(_, verdict)| verdict.lens.as_deref() == Some(lane.preset.as_str()))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for index in matches
+            .into_iter()
+            .rev()
+            .take(2)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            if seen.insert(index) {
+                indices.push(index);
+            }
+        }
+    }
+    indices
+}
+
+fn format_staged_verdicts(agg: &AggregationRecord) -> String {
+    if agg.verdicts.is_empty() {
+        return String::new();
+    }
+
+    const HEADER: &str = "## Recorded staged verdicts\n";
+    const OMISSION_RESERVE: usize = 128;
+    let mut output = HEADER.to_string();
+    let mandatory = final_lane_verdict_indices(agg);
+    let mandatory_set = mandatory.iter().copied().collect::<BTreeSet<_>>();
+    let mut rendered = BTreeSet::new();
+
+    for (position, index) in mandatory.iter().enumerate() {
+        let slots_left = mandatory.len() - position;
+        let remaining = MAX_STAGED_VERDICTS_BYTES
+            .saturating_sub(output.len())
+            .saturating_sub(OMISSION_RESERVE);
+        let slot_budget = remaining / slots_left.max(1);
+        let header_budget = 500;
+        let text_budget = slot_budget.saturating_sub(header_budget).min(4_000);
+        let chunk = verdict_chunk(&agg.verdicts[*index], text_budget);
+        if output.len() + chunk.len() + OMISSION_RESERVE <= MAX_STAGED_VERDICTS_BYTES {
+            output.push_str(&chunk);
+            rendered.insert(*index);
+        }
+    }
+
+    for index in (0..agg.verdicts.len()).rev() {
+        if mandatory_set.contains(&index) {
+            continue;
+        }
+        let chunk = verdict_chunk(&agg.verdicts[index], 4_000);
+        if output.len() + chunk.len() + OMISSION_RESERVE > MAX_STAGED_VERDICTS_BYTES {
+            continue;
+        }
+        output.push_str(&chunk);
+        rendered.insert(index);
+    }
+
+    let omitted = agg.verdicts.len().saturating_sub(rendered.len());
+    if omitted > 0 {
+        output.push_str(&format!(
+            "… {omitted} additional staged verdict(s) omitted within the section budget\n"
+        ));
+    }
+    truncate(&output, MAX_STAGED_VERDICTS_BYTES)
+}
+
+fn format_tool_trace(records: &[ToolCallRecord]) -> String {
+    let mut lines = vec!["## Tool call trace".to_string()];
+    for r in records {
+        let args = truncate(&r.args.to_string(), 4_000);
+        let indent = "  ".repeat(r.depth);
+        let icon = status_icon(&r.status);
+        let model = r
+            .model
+            .as_deref()
+            .map(|model| format!(" [{model}]"))
+            .unwrap_or_default();
+        lines.push(format!(
+            "{indent}{icon} [{}] turn {}{model}: {}({args})",
+            r.agent, r.turn, r.tool,
+        ));
+        if let Some(sp) = &r.spawned_agent {
+            lines.push(format!("{indent}  → spawned: {sp}"));
+        }
+        if let Some(result) = &r.result {
+            lines.push(format!("{indent}  → result: {}", truncate(result, 2000)));
+        }
+    }
+    truncate_middle(&lines.join("\n"), MAX_TOOL_TRACE_BYTES)
 }
 
 fn format_session(session: &SessionData) -> String {
@@ -351,48 +487,21 @@ fn format_session(session: &SessionData) -> String {
         }
     }
 
-    let recorded_verdicts = session
+    if let Some(staged) = session
         .aggregation
         .as_ref()
-        .map(|agg| agg.verdicts.as_slice())
-        .unwrap_or_default();
-    if !recorded_verdicts.is_empty() {
+        .map(format_staged_verdicts)
+        .filter(|staged| !staged.is_empty())
+    {
         lines.push(String::new());
-        lines.push("## Recorded staged verdicts".to_string());
-        for verdict in recorded_verdicts {
-            let lens = verdict.lens.as_deref().unwrap_or("unscoped");
-            let status = if verdict.ok { "ok" } else { "failed" };
-            lines.push(format!("### {lens} · {} · {status}", verdict.stage));
-            lines.push(truncate(&verdict.text, 4_000));
-        }
+        lines.push(staged);
     }
 
     lines.push(String::new());
-    lines.push("## Tool call trace".to_string());
-
-    for r in &session.records {
-        let args = truncate(&r.args.to_string(), 4_000);
-        let indent = "  ".repeat(r.depth);
-        let icon = status_icon(&r.status);
-        let model = r
-            .model
-            .as_deref()
-            .map(|model| format!(" [{model}]"))
-            .unwrap_or_default();
-        lines.push(format!(
-            "{indent}{icon} [{}] turn {}{model}: {}({args})",
-            r.agent, r.turn, r.tool,
-        ));
-        if let Some(sp) = &r.spawned_agent {
-            lines.push(format!("{indent}  → spawned: {sp}"));
-        }
-        if let Some(result) = &r.result {
-            lines.push(format!("{indent}  → result: {}", truncate(result, 2000)));
-        }
-    }
+    lines.push(format_tool_trace(&session.records));
 
     let mut result = lines.join("\n");
-    result = truncate(&result, 200_000);
+    result = truncate_middle(&result, MAX_FORMATTED_SESSION_BYTES);
     result
 }
 
@@ -831,6 +940,84 @@ mod tests {
         assert_eq!(metrics.repeated_calls.len(), 1);
         assert_eq!(metrics.repeated_calls[0].tool, "grep");
         assert_eq!(metrics.repeated_calls[0].count, 2);
+    }
+
+    #[test]
+    fn staged_verdicts_and_late_trace_evidence_survive_independent_budgets() {
+        use nitpicker_agent::session::{LaneRecord, VerdictRecord};
+
+        let lenses = ["correctness", "security", "performance", "simplicity"];
+        let mut verdicts = Vec::new();
+        for lens in lenses {
+            for round in 1..=5 {
+                for role in ["review", "validate"] {
+                    let marker = if round == 5 {
+                        format!("FINAL-{lens}-{role}")
+                    } else {
+                        format!("OLDER-{lens}-{round}-{role}")
+                    };
+                    verdicts.push(VerdictRecord {
+                        lens: Some(lens.to_string()),
+                        stage: format!("{role} · round {round}"),
+                        text: format!("{marker}-{}", "v".repeat(6_000)),
+                        ok: true,
+                    });
+                }
+            }
+        }
+        let lanes = lenses
+            .iter()
+            .map(|lens| LaneRecord {
+                preset: (*lens).to_string(),
+                rounds: 5,
+                converged: false,
+                degraded: false,
+            })
+            .collect();
+        let records = (0..60)
+            .map(|turn| ToolCallRecord {
+                ts_unix_ms: turn as u128,
+                agent: "reviewer".to_string(),
+                depth: 0,
+                turn,
+                tool: "read_file".to_string(),
+                args: serde_json::json!({"path": format!("{turn}-{}", "p".repeat(5_000))}),
+                status: "ok".to_string(),
+                spawned_agent: None,
+                result: Some(if turn == 59 {
+                    format!("LATE-TRACE-EVIDENCE-{}", "r".repeat(3_000))
+                } else {
+                    "r".repeat(3_000)
+                }),
+                model: Some("m".to_string()),
+            })
+            .collect();
+        let session = SessionData {
+            name: "large".to_string(),
+            records,
+            aggregation: Some(AggregationRecord {
+                kind: "aggregation".to_string(),
+                model: "m".to_string(),
+                text: "final".to_string(),
+                error: None,
+                rounds: None,
+                converged: None,
+                presets: Some(lenses.iter().map(|lens| (*lens).to_string()).collect()),
+                lanes: Some(lanes),
+                verdicts,
+                jobs: None,
+            }),
+        };
+
+        let staged = format_staged_verdicts(session.aggregation.as_ref().unwrap());
+        assert!(staged.len() <= MAX_STAGED_VERDICTS_BYTES);
+        let formatted = format_session(&session);
+        assert!(formatted.len() <= MAX_FORMATTED_SESSION_BYTES);
+        for lens in lenses {
+            assert!(formatted.contains(&format!("FINAL-{lens}-review")));
+            assert!(formatted.contains(&format!("FINAL-{lens}-validate")));
+        }
+        assert!(formatted.contains("LATE-TRACE-EVIDENCE"));
     }
 
     #[test]

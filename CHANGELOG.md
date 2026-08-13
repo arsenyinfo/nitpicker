@@ -31,6 +31,12 @@ Notable user-visible changes are recorded here. The format follows
 
 ### Fixed
 
+- Keep diff reviews available when the detected base and HEAD have no merge base by falling back
+  to a direct tree comparison, and bound frozen snapshot file maps by rendered bytes.
+- Reject token-limit-truncated agent answers instead of publishing partial reports as complete.
+- Preserve final per-lane verdicts and both early and late tool evidence within independently
+  bounded `reflect` sections.
+- Persist debate verdict success from the turn outcome rather than inferring it from display text.
 - Restore `auth = "agy-keyring"`: the proxy's `loadCodeAssist` request now sends a
   `User-Agent`, without which Google's backend classified the client as the deprecated
   "Gemini Code Assist for individuals" tier and returned no project, 503-ing every request.
