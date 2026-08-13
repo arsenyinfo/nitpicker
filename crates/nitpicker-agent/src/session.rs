@@ -36,11 +36,25 @@ pub struct AggregationRecord {
     /// Per-lane convergence metadata for preset debate runs; absent elsewhere.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lanes: Option<Vec<LaneRecord>>,
+    /// Reviewer positions that led to this aggregation. Kept separately from tool traces so
+    /// reflection can compare execution with the actual intermediate outcome.
+    pub verdicts: Vec<VerdictRecord>,
     /// Per-job outcomes for parallel review runs; absent elsewhere. The durable record of
     /// what actually ran — a failed job is otherwise only a transient log line, and a
     /// client-build failure writes no trajectory file at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jobs: Option<Vec<JobRecord>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VerdictRecord {
+    /// Review angle / preset. Absent for an unscoped `ask` session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lens: Option<String>,
+    /// Reviewer job, or debate role plus round, that produced this position.
+    pub stage: String,
+    pub text: String,
+    pub ok: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -219,19 +233,10 @@ mod tests {
         assert_eq!(lines[0].agent, "reviewer-1-x");
     }
 
-    /// `reflect` deserializes historical `aggregation.json` files into this exact type and
-    /// discards unparseable ones as incomplete sessions — a legacy record (no presets/lanes
-    /// keys) and a new-shape record must both keep parsing.
+    /// Staged verdicts are a required part of the session evidence contract. Records predating
+    /// that contract must not silently enter reflection with weaker evidence.
     #[test]
-    fn aggregation_records_parse_across_schema_generations() {
-        let legacy = r#"{"kind":"aggregation","model":"m","text":"t","rounds":2,"converged":true}"#;
-        let parsed: AggregationRecord = serde_json::from_str(legacy).unwrap();
-        assert_eq!(parsed.rounds, Some(2));
-        assert!(parsed.error.is_none());
-        assert!(parsed.presets.is_none());
-        assert!(parsed.lanes.is_none());
-        assert!(parsed.jobs.is_none());
-
+    fn aggregation_records_require_and_round_trip_staged_verdicts() {
         let current = AggregationRecord {
             kind: "aggregation".to_string(),
             model: "m".to_string(),
@@ -246,6 +251,12 @@ mod tests {
                 converged: true,
                 degraded: false,
             }]),
+            verdicts: vec![VerdictRecord {
+                lens: Some("security".to_string()),
+                stage: "Reviewer · round 1".to_string(),
+                text: "Looks unsafe.".to_string(),
+                ok: true,
+            }],
             jobs: Some(vec![JobRecord {
                 label: "security · r".to_string(),
                 preset: Some("security".to_string()),
@@ -256,24 +267,10 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&current).unwrap()).unwrap();
         assert_eq!(round_tripped.error.as_deref(), Some("provider 500"));
         assert_eq!(round_tripped.lanes.unwrap()[0].preset, "security");
+        assert_eq!(round_tripped.verdicts[0].stage, "Reviewer · round 1");
         assert!(!round_tripped.jobs.unwrap()[0].ok);
 
-        // absent options serialize to absent keys, keeping old readers indifferent
-        let legacy_shaped = AggregationRecord {
-            kind: "aggregation".to_string(),
-            model: "m".to_string(),
-            text: "t".to_string(),
-            error: None,
-            rounds: Some(1),
-            converged: Some(false),
-            presets: None,
-            lanes: None,
-            jobs: None,
-        };
-        let json = serde_json::to_string(&legacy_shaped).unwrap();
-        assert!(!json.contains("error"));
-        assert!(!json.contains("presets"));
-        assert!(!json.contains("lanes"));
-        assert!(!json.contains("jobs"));
+        let outdated = r#"{"kind":"aggregation","model":"m","text":"t"}"#;
+        assert!(serde_json::from_str::<AggregationRecord>(outdated).is_err());
     }
 }

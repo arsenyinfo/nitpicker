@@ -6,7 +6,12 @@ Multi-reviewer code review using LLMs. Spawns parallel agents with different mod
 
 [**Free Web version**](https://arseny.info/nitpicker) is available for open source projects.
 
-Each reviewer is an agentic loop that can call tools (read files, grep, glob, git commands) to explore the repo before writing its review. Review prompts now encourage a quick initial map, a short working plan, and early subagent delegation for disjoint investigations. Tool outputs include lightweight headers and clearer truncation/no-match messages so agents can reason about partial evidence more reliably. A separate aggregator model deduplicates and synthesizes the individual reviews into a final verdict.
+Each reviewer is an agentic loop that can call tools (read files, grep, glob, git commands) to explore the repo before writing its review. Discovery roles build a quick initial map and default to one early, disjoint subagent wave for multi-surface targets; validation roles delegate only bounded verification of submitted claims. Tool outputs include lightweight headers and clearer truncation/no-match messages so agents can reason about partial evidence more reliably. A separate aggregator model deduplicates and synthesizes the individual reviews into a final verdict.
+
+Diff and PR reviews capture a frozen orientation snapshot before reviewers fan out: full HEAD,
+resolved base and merge-base revisions, the exact committed comparison, working-tree status, and
+committed/uncommitted file maps. Every lane and later debate round receives the same snapshot;
+agents still inspect the actual hunks and code with tools.
 
 ## Requirements
 
@@ -328,6 +333,7 @@ Optional per-reviewer/aggregator fields:
 nitpicker [OPTIONS]
 nitpicker ask [--no-debate] [--rounds N] [--max-turns N] [OPTIONS] <topic>
 nitpicker pr [URL] [--no-comment] [--no-debate] [--rounds N] [--max-turns N] [OPTIONS]
+nitpicker reflect [--sessions-dir DIR] [--n N] [OPTIONS]
 nitpicker init [--global] [--free] [--repo <DIR>]
 ```
 
@@ -384,6 +390,23 @@ nitpicker ask [--no-debate] [--rounds N] [--max-turns N] [--context-file PATH] [
 ```
 
  Runs agents on a free-form question instead of a code diff. By default, two agents take turns as Actor/Critic before a meta-reviewer concludes. Pass `--no-debate` to switch to the parallel reviewer plus aggregator flow.
+
+### Reflect subcommand
+
+```
+nitpicker reflect [--sessions-dir DIR] [--n N] [--repo .] [--config PATH]
+```
+
+Analyzes the most recent recorded sessions (20 by default) and reports recurring execution
+friction. Reflection first computes deterministic trace metrics, then analyzes each session with
+the first reviewer and uses the second reviewer (the critic) for calibrated cross-session
+synthesis, falling back to the first reviewer when only one is configured. The ordinary aggregator
+is intentionally not used because reflection reduction is a tool-using investigation, not report
+formatting. Pattern claims include exact session support, representative trace evidence, confidence,
+and a small measurable experiment. New session records also preserve staged reviewer/debate
+verdicts so reflection can compare execution with the outcome. Set
+`[defaults].log_trajectories = true` beforehand. Sessions recorded before staged verdicts became
+part of the aggregation schema are rejected, and `reflect` does not write extra trace copies.
 
 ### Debate mode (default)
 

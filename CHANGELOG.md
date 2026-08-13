@@ -10,6 +10,24 @@ Notable user-visible changes are recorded here. The format follows
 
 - Show an animated repository activity indicator in supported terminal tab/window titles during
   interactive review runs, without changing redirected or `pr --json` output.
+- Persist staged reviewer and debate verdicts in session aggregation records so reflection can
+  compare execution trajectories with their intermediate and final outcomes.
+
+### Changed
+
+- Calibrate `reflect` with deterministic trace metrics, evidence-counted cross-session claims,
+  explicit confidence/tradeoffs, critic-model synthesis, omission of rejected hypotheses from the
+  final report, and no shared temp dump.
+- Separate debate responsibilities across review and `ask`: Actor/Reviewer owns discovery and
+  recall, while Critic/Validator consolidates evidence-based objections to the submitted set and
+  does not hunt for new findings/options or manufacture disagreement.
+- Give discovery roles an early disjoint delegation default for multi-surface work while limiting
+  validation-role subagents to targeted verification of submitted claims.
+- Inject one deterministic, commit-pinned review snapshot before fan-out, including base/HEAD,
+  merge base, exact comparison semantics, working-tree state, and committed/uncommitted file maps.
+- **Breaking (`nitpicker-agent`)**: `AggregationRecord` adds the required
+  `verdicts: Vec<VerdictRecord>` field; pre-change aggregation records are not accepted by
+  `reflect`.
 
 ### Fixed
 

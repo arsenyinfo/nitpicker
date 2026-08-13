@@ -10,7 +10,8 @@ use nitpicker_agent::config::Config;
 use nitpicker_agent::llm::{Completion, LLMClientDyn, TokenUsage, is_operational_limit_error};
 use nitpicker_agent::provider::{build_aggregator_client, build_reviewer_client};
 use nitpicker_agent::session::{
-    AggregationRecord, LaneRecord, SessionLogger, SessionWriter, sanitize_path_component,
+    AggregationRecord, LaneRecord, SessionLogger, SessionWriter, VerdictRecord,
+    sanitize_path_component,
 };
 use nitpicker_agent::tools::{Tool, all_tools};
 use rig_core::completion::Message;
@@ -804,6 +805,7 @@ pub async fn run_debate(
                         })
                         .collect()
                 }),
+                verdicts: debate_verdict_records(&lanes),
                 jobs: None,
             };
             match logger.write_aggregation(&record).await {
@@ -930,6 +932,7 @@ pub async fn run_debate(
                     converged,
                     presets: preset_names,
                     lanes: lane_records,
+                    verdicts: debate_verdict_records(&lanes),
                     jobs: None,
                 };
                 match logger.write_aggregation(&record).await {
@@ -955,6 +958,7 @@ pub async fn run_debate(
             converged,
             presets: preset_names,
             lanes: lane_records,
+            verdicts: debate_verdict_records(&lanes),
             jobs: None,
         };
         logger.write_aggregation(&record).await?;
@@ -1078,6 +1082,22 @@ fn single_lane_scalars(lanes: &[DebateLaneOutcome]) -> (Option<usize>, Option<bo
         [lane] => (Some(lane.final_round), Some(lane.converged)),
         _ => (None, None),
     }
+}
+
+fn debate_verdict_records(lanes: &[DebateLaneOutcome]) -> Vec<VerdictRecord> {
+    lanes
+        .iter()
+        .flat_map(|lane| {
+            lane.verdicts
+                .iter()
+                .map(|(role, round, text)| VerdictRecord {
+                    lens: lane.preset_name.clone(),
+                    stage: format!("{role} · round {round}"),
+                    text: text.clone(),
+                    ok: !text.starts_with("*Agent failed:"),
+                })
+        })
+        .collect()
 }
 
 /// A lane survives — and reaches synthesis — iff at least one of its turns really ran.

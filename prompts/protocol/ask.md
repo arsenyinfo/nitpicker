@@ -8,3 +8,5 @@ Options schema when applicable:
 {{OPTIONS_SCHEMA}}
 
 For direct answers, give a clear answer grounded in code, then flag any meaningful caveats.
+
+{{INVESTIGATION_GUIDANCE}}

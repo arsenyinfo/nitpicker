@@ -1,4 +1,7 @@
-const INVESTIGATION_GUIDANCE: &str = include_str!("../prompts/protocol/investigation-guidance.md");
+const DISCOVERY_GUIDANCE: &str =
+    include_str!("../prompts/protocol/investigation-guidance-discovery.md");
+const VALIDATION_GUIDANCE: &str =
+    include_str!("../prompts/protocol/investigation-guidance-validation.md");
 const CONFIRMED_FINDING_FIELDS: &str = include_str!("../prompts/protocol/finding-schema.md");
 const CANDIDATE_UNCERTAINTY_FIELD: &str =
     include_str!("../prompts/protocol/candidate-uncertainty-field.md");
@@ -243,7 +246,7 @@ impl LaneTask<'_> {
                     &[
                         ("TARGET", scope.target_noun()),
                         ("SCOPE_RULE", scope.finding_scope_rule()),
-                        ("INVESTIGATION_GUIDANCE", INVESTIGATION_GUIDANCE.trim()),
+                        ("INVESTIGATION_GUIDANCE", DISCOVERY_GUIDANCE.trim()),
                         ("FINDING_SCHEMA", &fields),
                         ("NO_FINDINGS", NO_FINDINGS),
                         ("PRESET_NAME", &preset.name),
@@ -251,7 +254,13 @@ impl LaneTask<'_> {
                     ],
                 )
             }
-            LaneTask::Ask => render(ASK_TEMPLATE, &[("OPTIONS_SCHEMA", OPTIONS_SCHEMA.trim())]),
+            LaneTask::Ask => render(
+                ASK_TEMPLATE,
+                &[
+                    ("OPTIONS_SCHEMA", OPTIONS_SCHEMA.trim()),
+                    ("INVESTIGATION_GUIDANCE", DISCOVERY_GUIDANCE.trim()),
+                ],
+            ),
         }
     }
 
@@ -266,7 +275,7 @@ impl LaneTask<'_> {
         match self {
             LaneTask::Ask => render(
                 DEBATE_ACTOR_TOPIC_TEMPLATE,
-                &[("INVESTIGATION_GUIDANCE", INVESTIGATION_GUIDANCE.trim())],
+                &[("INVESTIGATION_GUIDANCE", DISCOVERY_GUIDANCE.trim())],
             ),
             LaneTask::Review { scope, preset } => {
                 let fields = candidate_finding_fields();
@@ -277,7 +286,7 @@ impl LaneTask<'_> {
                         ("SCOPE_RULE", scope.finding_scope_rule()),
                         ("FINDING_SCHEMA", &fields),
                         ("NO_FINDINGS", NO_FINDINGS),
-                        ("INVESTIGATION_GUIDANCE", INVESTIGATION_GUIDANCE.trim()),
+                        ("INVESTIGATION_GUIDANCE", DISCOVERY_GUIDANCE.trim()),
                         ("PRESET_NAME", &preset.name),
                         ("RUBRIC", &preset.prompt),
                     ],
@@ -290,7 +299,7 @@ impl LaneTask<'_> {
         match self {
             LaneTask::Ask => render(
                 DEBATE_VALIDATOR_TOPIC_TEMPLATE,
-                &[("INVESTIGATION_GUIDANCE", INVESTIGATION_GUIDANCE.trim())],
+                &[("INVESTIGATION_GUIDANCE", VALIDATION_GUIDANCE.trim())],
             ),
             LaneTask::Review { scope, preset } => render(
                 DEBATE_VALIDATOR_REVIEW_TEMPLATE,
@@ -298,7 +307,7 @@ impl LaneTask<'_> {
                     ("REALITY_CHECK", scope.critic_reality_check()),
                     ("FINDING_SCHEMA", CONFIRMED_FINDING_FIELDS.trim()),
                     ("NO_FINDINGS", NO_FINDINGS),
-                    ("INVESTIGATION_GUIDANCE", INVESTIGATION_GUIDANCE.trim()),
+                    ("INVESTIGATION_GUIDANCE", VALIDATION_GUIDANCE.trim()),
                     ("PRESET_NAME", &preset.name),
                     ("RUBRIC", &preset.prompt),
                 ],
@@ -446,7 +455,6 @@ mod tests {
 
         let validator = worker.critic_system();
         assert!(validator.contains(NO_FINDINGS));
-        assert!(validator.contains("forwarded unchanged"));
     }
 
     #[test]

@@ -6,6 +6,7 @@ use nitpicker_agent::provider::build_reviewer_client;
 use nitpicker_agent::session::{AggregationRecord, ToolCallRecord};
 use nitpicker_agent::tools::{floor_char_boundary, reflect_tools};
 use rig_core::completion::Message;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -14,19 +15,56 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 const MAP_PROMPT: &str = "\
-You are analyzing a nitpicker code review session — a multi-agent LLM-based code reviewer.
-Each session records all tool calls (file reads, git diffs, greps, subagent spawns) made by reviewer agents.
+You are analyzing one recorded nitpicker session. The input contains deterministic metrics,
+staged verdicts, the final outcome, and the tool trace.
 
-Analyze this session and produce a concise report covering the friction points observed. Focus in the issues related to agents behavior such as confusing errors, ineffective tool usage and delegation patterns, and overall poor execution. Reference specific tool calls or patterns where possible. Ignore infrastucture level issues (e.g. rate limits, timeouts) and focus on aspect that could be improved through better prompt design, tool configuration, or agent coordination. The report should be actionable and specific, ideally with examples from the session. Keep it under 600 words.
+Assess whether the execution produced a useful outcome and identify avoidable friction in agent
+behavior, tool usage, delegation, or coordination. Repetition is not automatically waste:
+independent reviewers may intentionally verify the same evidence. Distinguish useful replication
+from redundant rediscovery, and distinguish observations from hypotheses.
+
+For every claimed friction point include:
+- Evidence: cite concrete records as `[agent turn N: tool]` and relevant deterministic counts.
+- Outcome effect: explain whether it affected correctness, convergence, cost, or only presentation.
+- Confidence: high, medium, or low.
+- Smallest experiment: the least invasive change that could test the hypothesis.
+
+Do not infer a code-level root cause from the trace alone; the cross-session synthesizer can inspect
+the implementation. Ignore provider outages, rate limits, and timeouts except when agent behavior
+made them worse. Do not use words such as dominant, systemic, nearly all, or widespread in this
+single-session report. Include a short `No material friction observed` conclusion when warranted.
+Keep the report under 700 words.
 ---
 ";
 
 const REDUCE_PROMPT: &str = "\
-You are synthesizing analysis of multiple nitpicker review sessions — a multi-agent LLM-based code reviewer.
+You are synthesizing evidence from multiple recorded nitpicker sessions. The user will use this
+report to decide what to change, so calibration matters more than producing many recommendations.
 
-Based on the reports for individual sessions, synthesize an overall summary of common friction points and potential improvements across sessions. Identify patterns in agent behavior, tool usage, and execution that lead to issues.
+Use repository tools to verify proposed code-level causes against the current implementation.
+Do not convert repeated behavior into an architectural prescription without considering deliberate
+reviewer independence, cache behavior, context cost, and false-negative risk. Prefer the smallest
+reversible experiment over a broad redesign.
 
-Review the nitpicker code (tools, prompts) to cross-reference the identified issues and suggest specific improvements to the system. Focus on actionable changes that could be made to prompts, tool configurations, or agent coordination to address the observed friction points. The summary should be concise and focused on key insights and recommendations for improving nitpicker's performance as a code reviewer.
+Output these sections:
+
+## Overall synthesis
+A short, calibrated assessment.
+
+## Measured patterns
+A table with Pattern, Support (exact `N/M sessions`), Representative evidence (session names plus
+agent/tool references), Outcome effect, and Confidence. Never say dominant, systemic, nearly all,
+or widespread without the corresponding count. Do not combine unlike observations to inflate N.
+
+## Recommended experiments
+For each recommendation give: observed behavior and support; current-code cause (`Verified` with
+paths/symbols, or `Unverified`); smallest change; tradeoff or regression risk; and a metric that
+would show whether it helped. Rank by evidence strength and expected value.
+
+Infrastructure failures are out of scope unless nitpicker behavior amplified them. Separate
+correctness problems from token/latency inefficiency and editorial friction. Be concise.
+Use uncertain or rejected hypotheses only to calibrate the synthesis internally. Do not print them
+or recommendations that lack enough support to act on.
 ---
 ";
 
@@ -34,6 +72,25 @@ struct SessionData {
     name: String,
     records: Vec<ToolCallRecord>,
     aggregation: Option<AggregationRecord>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RepeatedCall {
+    tool: String,
+    args: String,
+    count: usize,
+    agents: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SessionMetrics {
+    duration_ms: u128,
+    invocations: usize,
+    status_counts: BTreeMap<String, usize>,
+    tool_counts: BTreeMap<String, usize>,
+    model_turns: BTreeMap<String, usize>,
+    max_depth: usize,
+    repeated_calls: Vec<RepeatedCall>,
 }
 
 impl SessionData {
@@ -69,6 +126,104 @@ impl SessionData {
         }
         seen
     }
+
+    fn run_kind(&self) -> &'static str {
+        let Some(agg) = &self.aggregation else {
+            return "unknown (incomplete)";
+        };
+        if agg.presets.is_some()
+            || agg
+                .jobs
+                .as_ref()
+                .is_some_and(|jobs| jobs.iter().any(|job| job.preset.is_some()))
+            || agg.verdicts.iter().any(|verdict| verdict.lens.is_some())
+        {
+            "preset review"
+        } else {
+            "unscoped run"
+        }
+    }
+
+    fn metrics(&self) -> SessionMetrics {
+        // A failed spawn has a `started` then `error` lifecycle pair. Count the underlying
+        // invocation once by its agent/turn/tool/args identity while retaining both statuses in
+        // status_counts, where lifecycle details are useful evidence in their own right.
+        let mut invocations: BTreeMap<String, &ToolCallRecord> = BTreeMap::new();
+        let mut status_counts = BTreeMap::new();
+        let mut model_turns = BTreeSet::new();
+        let mut min_ts = None;
+        let mut max_ts = None;
+        let mut max_depth = 0;
+
+        for record in &self.records {
+            *status_counts.entry(record.status.clone()).or_insert(0) += 1;
+            min_ts = Some(min_ts.map_or(record.ts_unix_ms, |ts: u128| ts.min(record.ts_unix_ms)));
+            max_ts = Some(max_ts.map_or(record.ts_unix_ms, |ts: u128| ts.max(record.ts_unix_ms)));
+            max_depth = max_depth.max(record.depth);
+            if let Some(model) = &record.model {
+                model_turns.insert((record.agent.clone(), record.turn, model.clone()));
+            }
+
+            let key = format!(
+                "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                record.agent, record.turn, record.tool, record.args
+            );
+            // Prefer the terminal error record over its preceding `started` record.
+            match invocations.get(&key) {
+                Some(existing) if existing.status == "started" && record.status == "error" => {
+                    invocations.insert(key, record);
+                }
+                None => {
+                    invocations.insert(key, record);
+                }
+                _ => {}
+            }
+        }
+
+        let mut tool_counts = BTreeMap::new();
+        let mut repeated: BTreeMap<(String, String), (usize, BTreeSet<String>)> = BTreeMap::new();
+        for record in invocations.values() {
+            *tool_counts.entry(record.tool.clone()).or_insert(0) += 1;
+            let entry = repeated
+                .entry((record.tool.clone(), record.args.to_string()))
+                .or_insert_with(|| (0, BTreeSet::new()));
+            entry.0 += 1;
+            entry.1.insert(record.agent.clone());
+        }
+
+        let mut repeated_calls: Vec<RepeatedCall> = repeated
+            .into_iter()
+            .filter(|(_, (count, _))| *count > 1)
+            .map(|((tool, args), (count, agents))| RepeatedCall {
+                tool,
+                args,
+                count,
+                agents: agents.into_iter().collect(),
+            })
+            .collect();
+        repeated_calls.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| a.tool.cmp(&b.tool))
+                .then_with(|| a.args.cmp(&b.args))
+        });
+        repeated_calls.truncate(12);
+
+        let mut model_turn_counts = BTreeMap::new();
+        for (_, _, model) in model_turns {
+            *model_turn_counts.entry(model).or_insert(0) += 1;
+        }
+
+        SessionMetrics {
+            duration_ms: max_ts.unwrap_or(0).saturating_sub(min_ts.unwrap_or(0)),
+            invocations: invocations.len(),
+            status_counts,
+            tool_counts,
+            model_turns: model_turn_counts,
+            max_depth,
+            repeated_calls,
+        }
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -93,19 +248,75 @@ fn status_icon(status: &str) -> &'static str {
     }
 }
 
+fn format_counts(counts: &BTreeMap<String, usize>) -> String {
+    match counts.is_empty() {
+        true => "none".to_string(),
+        false => counts
+            .iter()
+            .map(|(name, count)| format!("{name}={count}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
+}
+
 fn format_session(session: &SessionData) -> String {
+    let metrics = session.metrics();
     let mut lines = Vec::new();
     lines.push(format!("# Session: {}", session.name));
+    lines.push(format!("- Run type: {}", session.run_kind()));
     lines.push(format!("- Status: {}", session.status()));
     lines.push(format!("- Agents: {}", session.agent_names().join(", ")));
-    // records, not calls: a failed spawn contributes a started/error lifecycle pair
     lines.push(format!(
-        "- Records: {}, errors: {}",
+        "- Trace records: {}, error records: {}",
         session.records.len(),
         session.error_count()
     ));
+
+    lines.push(String::new());
+    lines.push("## Deterministic trace metrics".to_string());
+    lines.push(format!(
+        "- Observed tool-trace span: {} ms",
+        metrics.duration_ms
+    ));
+    lines.push(format!(
+        "- Unique tool invocations: {}",
+        metrics.invocations
+    ));
+    lines.push(format!(
+        "- Record statuses: {}",
+        format_counts(&metrics.status_counts)
+    ));
+    lines.push(format!(
+        "- Tool invocations: {}",
+        format_counts(&metrics.tool_counts)
+    ));
+    lines.push(format!("- Maximum subagent depth: {}", metrics.max_depth));
+    lines.push(format!(
+        "- Model-attributed tool turns: {}",
+        format_counts(&metrics.model_turns)
+    ));
+    if metrics.repeated_calls.is_empty() {
+        lines.push("- Repeated exact tool requests: none".to_string());
+    } else {
+        lines.push("- Repeated exact tool requests (not automatically waste):".to_string());
+        for repeated in &metrics.repeated_calls {
+            lines.push(format!(
+                "  - {}× {}({}); agents: {}",
+                repeated.count,
+                repeated.tool,
+                truncate(&repeated.args, 500),
+                repeated.agents.join(", ")
+            ));
+        }
+    }
+
     if let Some(agg) = &session.aggregation {
+        lines.push(String::new());
+        lines.push("## Run outcome".to_string());
         lines.push(format!("- Aggregation model: {}", agg.model));
+        if let Some(presets) = &agg.presets {
+            lines.push(format!("- Presets: {}", presets.join(", ")));
+        }
         if let Some(rounds) = agg.rounds {
             lines.push(format!("- Debate rounds: {rounds}"));
         }
@@ -130,13 +341,29 @@ fn format_session(session: &SessionData) -> String {
         lines.push(String::new());
         match &agg.error {
             Some(error) => {
-                lines.push("## Synthesis failure".to_string());
-                lines.push(truncate(error, 600));
+                lines.push("### Synthesis failure".to_string());
+                lines.push(truncate(error, 2_000));
             }
             None => {
-                lines.push("## Verdict summary".to_string());
-                lines.push(truncate(&agg.text, 600));
+                lines.push("### Final verdict".to_string());
+                lines.push(truncate(&agg.text, 12_000));
             }
+        }
+    }
+
+    let recorded_verdicts = session
+        .aggregation
+        .as_ref()
+        .map(|agg| agg.verdicts.as_slice())
+        .unwrap_or_default();
+    if !recorded_verdicts.is_empty() {
+        lines.push(String::new());
+        lines.push("## Recorded staged verdicts".to_string());
+        for verdict in recorded_verdicts {
+            let lens = verdict.lens.as_deref().unwrap_or("unscoped");
+            let status = if verdict.ok { "ok" } else { "failed" };
+            lines.push(format!("### {lens} · {} · {status}", verdict.stage));
+            lines.push(truncate(&verdict.text, 4_000));
         }
     }
 
@@ -144,12 +371,17 @@ fn format_session(session: &SessionData) -> String {
     lines.push("## Tool call trace".to_string());
 
     for r in &session.records {
-        let args = truncate(&r.args.to_string(), 20000);
+        let args = truncate(&r.args.to_string(), 4_000);
         let indent = "  ".repeat(r.depth);
         let icon = status_icon(&r.status);
+        let model = r
+            .model
+            .as_deref()
+            .map(|model| format!(" [{model}]"))
+            .unwrap_or_default();
         lines.push(format!(
-            "{indent}{icon} [{}] turn {}: {}({args})",
-            r.agent, r.turn, r.tool
+            "{indent}{icon} [{}] turn {}{model}: {}({args})",
+            r.agent, r.turn, r.tool,
         ));
         if let Some(sp) = &r.spawned_agent {
             lines.push(format!("{indent}  → spawned: {sp}"));
@@ -197,16 +429,14 @@ fn load_session(path: &Path) -> Result<SessionData> {
     let agg_path = path.join("aggregation.json");
     let aggregation = if agg_path.exists() {
         let content = std::fs::read_to_string(&agg_path)?;
-        match serde_json::from_str::<AggregationRecord>(&content) {
-            Ok(agg) => Some(agg),
-            Err(e) => {
-                warn!(
-                    "failed to parse aggregation.json in {}: {e}",
+        Some(
+            serde_json::from_str::<AggregationRecord>(&content).map_err(|error| {
+                eyre::eyre!(
+                    "unsupported or malformed aggregation.json in {}: {error}",
                     path.display()
-                );
-                None
-            }
-        }
+                )
+            })?,
+        )
     } else {
         None
     };
@@ -256,7 +486,7 @@ async fn analyze_session(
         history: Vec::new(),
         tools: Vec::new(),
         tool_choice: None,
-        max_tokens: Some(1024),
+        max_tokens: Some(1536),
         additional_params: None,
     };
     Ok(throttled_completion(&semaphore, &client, completion)
@@ -268,13 +498,18 @@ async fn synthesize(
     analyses: Vec<(String, String)>,
     model: String,
     client: Arc<dyn LLMClientDyn>,
+    max_tokens: Option<u64>,
     repo: &Path,
 ) -> Result<String> {
-    let body = analyses
+    let session_count = analyses.len();
+    let reports = analyses
         .iter()
         .map(|(name, text)| format!("## {name}\n\n{text}"))
         .collect::<Vec<_>>()
         .join("\n\n---\n\n");
+    let body = format!(
+        "Dataset: {session_count} successfully analyzed session(s). Use this denominator for every support count.\n\n{reports}"
+    );
 
     let tools_map = reflect_tools();
     let config = AgentConfig {
@@ -282,7 +517,7 @@ async fn synthesize(
         session_agent: "synthesizer".to_string(),
         model,
         max_turns: 20,
-        max_tokens: None,
+        max_tokens,
         compact_threshold: None,
         system_prompt: REDUCE_PROMPT.to_string(),
         subagent_system_prompt: None,
@@ -340,24 +575,6 @@ pub async fn run_reflect(args: ReflectArgs) -> Result<()> {
         })
         .collect();
 
-    let tmp_dir = PathBuf::from("/tmp/nitpicker-sessions");
-    match std::fs::create_dir_all(&tmp_dir) {
-        Ok(()) => {
-            for session in &sessions {
-                let md = format_session(session);
-                let out = tmp_dir.join(format!("{}.md", session.name));
-                match std::fs::write(&out, &md) {
-                    Ok(()) => info!("saved formatted session to {}", out.display()),
-                    Err(e) => warn!("failed to save formatted session to {}: {e}", out.display()),
-                }
-            }
-        }
-        Err(e) => warn!(
-            "failed to create session dump directory {}: {e}",
-            tmp_dir.display()
-        ),
-    }
-
     if sessions.is_empty() {
         eyre::bail!("no sessions could be loaded");
     }
@@ -378,14 +595,13 @@ pub async fn run_reflect(args: ReflectArgs) -> Result<()> {
     let map_model = first_reviewer.model.clone();
     let map_client = build_reviewer_client(first_reviewer, None)?;
 
-    let (reduce_model, reduce_client) = if cfg.reviewer.len() >= 2 {
-        let reviewer = &cfg.reviewer[1];
-        let client = build_reviewer_client(reviewer, None)?;
-        (reviewer.model.clone(), client)
-    } else {
-        let client = build_reviewer_client(first_reviewer, None)?;
-        (first_reviewer.model.clone(), client)
-    };
+    // Reflection reduction is an investigative, tool-using agent rather than the ordinary
+    // report-normalization step. Use the critic/reviewer model for it; aggregators are commonly
+    // configured as cheaper models suited only to merging already-resolved findings.
+    let reduce_reviewer = cfg.reviewer.get(1).unwrap_or(first_reviewer);
+    let reduce_model = reduce_reviewer.model.clone();
+    let reduce_client = build_reviewer_client(reduce_reviewer, None)?;
+    let reduce_max_tokens = reduce_reviewer.max_tokens;
 
     info!("analyzing sessions with {}…", map_model);
     // bound concurrent in-flight session-analysis calls the same way the review path does
@@ -419,6 +635,7 @@ pub async fn run_reflect(args: ReflectArgs) -> Result<()> {
         analyses,
         reduce_model.clone(),
         Arc::clone(&reduce_client),
+        reduce_max_tokens,
         &args.repo,
     )
     .await?;
@@ -466,11 +683,26 @@ mod tests {
         assert!(!session.is_complete());
     }
 
+    #[test]
+    fn load_session_rejects_outdated_aggregation_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("aggregation.json"),
+            r#"{"kind":"aggregation","model":"m","text":"old"}"#,
+        )
+        .unwrap();
+
+        let error = load_session(dir.path())
+            .err()
+            .expect("outdated schema fails");
+        assert!(error.to_string().contains("unsupported or malformed"));
+    }
+
     /// Lane/job metadata and synthesis failures must reach the analysis model — and an
     /// error-flagged record renders its error, never its text slot as a verdict.
     #[test]
     fn format_session_renders_lanes_jobs_and_synthesis_failure() {
-        use nitpicker_agent::session::{JobRecord, LaneRecord};
+        use nitpicker_agent::session::{JobRecord, LaneRecord, VerdictRecord};
         let session = SessionData {
             name: "s".to_string(),
             records: Vec::new(),
@@ -488,6 +720,12 @@ mod tests {
                     converged: false,
                     degraded: true,
                 }]),
+                verdicts: vec![VerdictRecord {
+                    lens: Some("security".to_string()),
+                    stage: "Reviewer · round 1".to_string(),
+                    text: "STAGED-VERDICT".to_string(),
+                    ok: true,
+                }],
                 jobs: Some(vec![
                     JobRecord {
                         label: "security · a".to_string(),
@@ -505,10 +743,94 @@ mod tests {
         let md = format_session(&session);
         assert!(md.contains("PROVIDER-DIED"));
         assert!(!md.contains("SHOULD-NOT-RENDER"));
-        for needle in ["security", "tone · b", "1/2"] {
+        for needle in ["security", "tone · b", "1/2", "STAGED-VERDICT"] {
             assert!(md.contains(needle), "missing {needle}");
         }
         assert!(!session.is_complete());
+    }
+
+    #[test]
+    fn metrics_deduplicate_spawn_lifecycle_and_measure_repeated_requests() {
+        fn record(
+            ts: u128,
+            agent: &str,
+            turn: usize,
+            tool: &str,
+            args: serde_json::Value,
+            status: &str,
+            model: Option<&str>,
+        ) -> ToolCallRecord {
+            ToolCallRecord {
+                ts_unix_ms: ts,
+                agent: agent.to_string(),
+                depth: usize::from(agent.contains("subagent")),
+                turn,
+                tool: tool.to_string(),
+                args,
+                status: status.to_string(),
+                spawned_agent: None,
+                result: None,
+                model: model.map(str::to_string),
+            }
+        }
+
+        let grep_args = serde_json::json!({"pattern": "needle", "path": "src"});
+        let spawn_args = serde_json::json!({"task": "inspect"});
+        let session = SessionData {
+            name: "s".to_string(),
+            records: vec![
+                record(
+                    10,
+                    "reviewer",
+                    1,
+                    "grep",
+                    grep_args.clone(),
+                    "ok",
+                    Some("m"),
+                ),
+                record(
+                    20,
+                    "reviewer/subagent-1",
+                    1,
+                    "grep",
+                    grep_args,
+                    "ok",
+                    Some("m"),
+                ),
+                record(
+                    30,
+                    "reviewer",
+                    2,
+                    "spawn_subagent",
+                    spawn_args.clone(),
+                    "started",
+                    Some("m"),
+                ),
+                record(
+                    31,
+                    "reviewer",
+                    2,
+                    "spawn_subagent",
+                    spawn_args,
+                    "error",
+                    Some("m"),
+                ),
+            ],
+            aggregation: None,
+        };
+
+        let metrics = session.metrics();
+        assert_eq!(metrics.duration_ms, 21);
+        assert_eq!(metrics.invocations, 3);
+        assert_eq!(metrics.tool_counts.get("grep"), Some(&2));
+        assert_eq!(metrics.tool_counts.get("spawn_subagent"), Some(&1));
+        assert_eq!(metrics.status_counts.get("started"), Some(&1));
+        assert_eq!(metrics.status_counts.get("error"), Some(&1));
+        assert_eq!(metrics.model_turns.get("m"), Some(&3));
+        assert_eq!(metrics.max_depth, 1);
+        assert_eq!(metrics.repeated_calls.len(), 1);
+        assert_eq!(metrics.repeated_calls[0].tool, "grep");
+        assert_eq!(metrics.repeated_calls[0].count, 2);
     }
 
     #[test]

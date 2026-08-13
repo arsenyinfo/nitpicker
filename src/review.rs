@@ -13,7 +13,7 @@ use nitpicker_agent::llm::{
 };
 use nitpicker_agent::provider::{build_aggregator_client, build_reviewer_client};
 use nitpicker_agent::session::{
-    AggregationRecord, JobRecord, SessionLogger, sanitize_path_component,
+    AggregationRecord, JobRecord, SessionLogger, VerdictRecord, sanitize_path_component,
 };
 use nitpicker_agent::tools::{all_tools, floor_char_boundary};
 use rig_core::completion::Message;
@@ -459,6 +459,7 @@ pub async fn run_review(
     let mut success_count = 0usize;
     let mut surviving_preset_indices = std::collections::HashSet::new();
     let mut job_records: Vec<JobRecord> = Vec::new();
+    let mut verdict_records: Vec<VerdictRecord> = Vec::new();
     for (label, preset_index, handle) in handles {
         let preset_name = match (presets, preset_index) {
             (Some(ps), Some(j)) => Some(ps[j].name.clone()),
@@ -468,6 +469,12 @@ pub async fn run_review(
             Ok(Ok(result)) => {
                 usage.add(result.usage, result.subagents_spawned);
                 rendered.extend(rendered_section(&label, Ok(&result.text), preset_run));
+                verdict_records.push(VerdictRecord {
+                    lens: preset_name.clone(),
+                    stage: label.clone(),
+                    text: result.text,
+                    ok: true,
+                });
                 success_count += 1;
                 if let Some(j) = preset_index {
                     surviving_preset_indices.insert(j);
@@ -478,12 +485,24 @@ pub async fn run_review(
             Ok(Err(err)) => {
                 let stub = format!("*Failed: {err:#}*");
                 rendered.extend(rendered_section(&label, Err(&stub), preset_run));
+                verdict_records.push(VerdictRecord {
+                    lens: preset_name.clone(),
+                    stage: label.clone(),
+                    text: stub,
+                    ok: false,
+                });
                 warn!(job = %label, error = ?err, "review failed");
                 false
             }
             Err(err) => {
                 let stub = format!("*Failed (task panicked): {err:#}*");
                 rendered.extend(rendered_section(&label, Err(&stub), preset_run));
+                verdict_records.push(VerdictRecord {
+                    lens: preset_name.clone(),
+                    stage: label.clone(),
+                    text: stub,
+                    ok: false,
+                });
                 error!(job = %label, error = ?err, "review task panicked");
                 false
             }
@@ -515,6 +534,7 @@ pub async fn run_review(
                 converged: None,
                 presets: presets.map(|ps| ps.iter().map(|p| p.name.clone()).collect()),
                 lanes: None,
+                verdicts: verdict_records,
                 jobs: Some(job_records),
             };
             match logger.write_aggregation(&record).await {
@@ -619,6 +639,7 @@ pub async fn run_review(
                     converged: None,
                     presets: presets.map(|ps| ps.iter().map(|p| p.name.clone()).collect()),
                     lanes: None,
+                    verdicts: verdict_records,
                     jobs: Some(job_records),
                 };
                 match logger.write_aggregation(&record).await {
@@ -642,6 +663,7 @@ pub async fn run_review(
                 converged: None,
                 presets: presets.map(|ps| ps.iter().map(|p| p.name.clone()).collect()),
                 lanes: None,
+                verdicts: verdict_records,
                 jobs: Some(job_records),
             })
             .await?;
