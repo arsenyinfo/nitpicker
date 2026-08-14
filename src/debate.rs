@@ -475,6 +475,7 @@ pub async fn run_debate(
         fallback,
         format,
     } = opts;
+    let session_attribution = crate::prompts::session_attribution();
     let presets = task.presets();
     let lane_tasks = task.lanes();
     // in json mode stdout is reserved for the final envelope; the cast lines and
@@ -548,6 +549,9 @@ pub async fn run_debate(
     let session_logger = SessionLogger::maybe_new(config.log_trajectories())?;
     if let Some(logger) = &session_logger {
         info!(path = %logger.root().display(), "trajectory logging enabled");
+        if let Err(err) = logger.write_attribution(&session_attribution).await {
+            warn!(error = ?err, "failed to persist session attribution");
+        }
     }
 
     let project_context = crate::context::build_context(repo).await;

@@ -59,6 +59,9 @@ See `examples/file_agent.rs` for a runnable version.
 
 ## Breaking changes
 
+`SessionAttribution` and `SessionLogger::write_attribution` are additive APIs for writing optional
+experiment metadata beside an aggregation record; they do not change `AggregationRecord` literals.
+
 **0.5.0**
 - Added the required `verdicts: Vec<VerdictRecord>` field to `AggregationRecord`; recorded
   sessions using the older aggregation schema are intentionally not accepted by `reflect`.

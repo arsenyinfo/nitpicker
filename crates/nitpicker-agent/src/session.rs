@@ -15,6 +15,17 @@ pub struct SessionLogger {
     write_lock: Arc<Mutex<()>>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionAttribution {
+    /// Package version of the binary that produced this session.
+    pub binary_version: String,
+    /// Source revision captured at build time. Absent when built outside a Git checkout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary_revision: Option<String>,
+    /// SHA-256 over the protocol prompt sources compiled into that binary.
+    pub protocol_prompt_sha256: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AggregationRecord {
     pub kind: String,
@@ -134,6 +145,15 @@ impl SessionLogger {
         tokio::fs::write(&path, body)
             .await
             .wrap_err_with(|| format!("failed to write aggregation log {}", path.display()))?;
+        Ok(())
+    }
+
+    pub async fn write_attribution(&self, record: &SessionAttribution) -> Result<()> {
+        let path = self.root.join("attribution.json");
+        let body = serde_json::to_vec_pretty(record)?;
+        tokio::fs::write(&path, body)
+            .await
+            .wrap_err_with(|| format!("failed to write session attribution {}", path.display()))?;
         Ok(())
     }
 }
@@ -269,8 +289,29 @@ mod tests {
         assert_eq!(round_tripped.lanes.unwrap()[0].preset, "security");
         assert_eq!(round_tripped.verdicts[0].stage, "Reviewer · round 1");
         assert!(!round_tripped.jobs.unwrap()[0].ok);
-
         let outdated = r#"{"kind":"aggregation","model":"m","text":"t"}"#;
         assert!(serde_json::from_str::<AggregationRecord>(outdated).is_err());
+    }
+
+    #[tokio::test]
+    async fn session_attribution_round_trips_as_a_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = SessionLogger {
+            root: Arc::new(dir.path().to_path_buf()),
+            write_lock: Arc::new(Mutex::new(())),
+        };
+        let attribution = SessionAttribution {
+            binary_version: "0.9.3".to_string(),
+            binary_revision: Some("abc123-dirty".to_string()),
+            protocol_prompt_sha256: "f".repeat(64),
+        };
+
+        logger.write_attribution(&attribution).await.unwrap();
+
+        let body = std::fs::read_to_string(dir.path().join("attribution.json")).unwrap();
+        let restored: SessionAttribution = serde_json::from_str(&body).unwrap();
+        assert_eq!(restored.binary_version, "0.9.3");
+        assert_eq!(restored.binary_revision.as_deref(), Some("abc123-dirty"));
+        assert_eq!(restored.protocol_prompt_sha256, "f".repeat(64));
     }
 }

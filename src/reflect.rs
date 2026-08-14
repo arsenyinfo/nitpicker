@@ -3,7 +3,7 @@ use nitpicker_agent::agent::{AgentConfig, AgentDepth, MAX_CONCURRENT_LLM_CALLS, 
 use nitpicker_agent::config::Config;
 use nitpicker_agent::llm::{Completion, LLMClientDyn, throttled_completion};
 use nitpicker_agent::provider::build_reviewer_client;
-use nitpicker_agent::session::{AggregationRecord, ToolCallRecord};
+use nitpicker_agent::session::{AggregationRecord, SessionAttribution, ToolCallRecord};
 use nitpicker_agent::tools::{floor_char_boundary, reflect_tools};
 use rig_core::completion::Message;
 use std::collections::{BTreeMap, BTreeSet};
@@ -76,6 +76,7 @@ struct SessionData {
     name: String,
     records: Vec<ToolCallRecord>,
     aggregation: Option<AggregationRecord>,
+    attribution: Option<SessionAttribution>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -457,6 +458,23 @@ fn format_session(session: &SessionData) -> String {
         }
     }
 
+    lines.push(String::new());
+    lines.push("## Experiment attribution".to_string());
+    match &session.attribution {
+        Some(attribution) => {
+            let revision = attribution.binary_revision.as_deref().unwrap_or("unknown");
+            lines.push(format!(
+                "- Binary: nitpicker {} ({revision})",
+                attribution.binary_version
+            ));
+            lines.push(format!(
+                "- Protocol prompt SHA-256: {}",
+                attribution.protocol_prompt_sha256
+            ));
+        }
+        None => lines.push("- Unavailable (session predates attribution)".to_string()),
+    }
+
     if let Some(agg) = &session.aggregation {
         lines.push(String::new());
         lines.push("## Run outcome".to_string());
@@ -561,10 +579,31 @@ fn load_session(path: &Path) -> Result<SessionData> {
         None
     };
 
+    let attribution_path = path.join("attribution.json");
+    let attribution = if attribution_path.exists() {
+        match std::fs::read_to_string(&attribution_path)
+            .map_err(eyre::Report::from)
+            .and_then(|content| serde_json::from_str(&content).map_err(eyre::Report::from))
+        {
+            Ok(attribution) => Some(attribution),
+            Err(error) => {
+                warn!(
+                    path = %attribution_path.display(),
+                    error = ?error,
+                    "ignoring malformed session attribution"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     Ok(SessionData {
         name,
         records,
         aggregation,
+        attribution,
     })
 }
 
@@ -793,6 +832,11 @@ mod tests {
             ),
         )
         .unwrap();
+        std::fs::write(
+            dir.path().join("attribution.json"),
+            r#"{"binary_version":"0.9.3","binary_revision":"abc123","protocol_prompt_sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}"#,
+        )
+        .unwrap();
 
         let session = load_session(dir.path()).unwrap();
         let agents: Vec<&str> = session.records.iter().map(|r| r.agent.as_str()).collect();
@@ -800,6 +844,8 @@ mod tests {
             agents,
             ["reviewer-2-x", "reviewer-1-x", "reviewer-1-x/subagent-1"]
         );
+        let attribution = session.attribution.as_ref().unwrap();
+        assert_eq!(attribution.binary_revision.as_deref(), Some("abc123"));
         assert!(!session.is_complete());
     }
 
@@ -818,11 +864,21 @@ mod tests {
         assert!(error.to_string().contains("unsupported or malformed"));
     }
 
+    #[test]
+    fn load_session_tolerates_malformed_optional_attribution() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("attribution.json"), "not json").unwrap();
+
+        let session = load_session(dir.path()).unwrap();
+
+        assert!(session.attribution.is_none());
+    }
+
     /// Lane/job metadata and synthesis failures must reach the analysis model — and an
     /// error-flagged record renders its error, never its text slot as a verdict.
     #[test]
     fn format_session_renders_lanes_jobs_and_synthesis_failure() {
-        use nitpicker_agent::session::{JobRecord, LaneRecord, VerdictRecord};
+        use nitpicker_agent::session::{JobRecord, LaneRecord, SessionAttribution, VerdictRecord};
         let session = SessionData {
             name: "s".to_string(),
             records: Vec::new(),
@@ -859,11 +915,23 @@ mod tests {
                     },
                 ]),
             }),
+            attribution: Some(SessionAttribution {
+                binary_version: "0.9.3".to_string(),
+                binary_revision: Some("abc123-dirty".to_string()),
+                protocol_prompt_sha256: "f".repeat(64),
+            }),
         };
         let md = format_session(&session);
         assert!(md.contains("PROVIDER-DIED"));
         assert!(!md.contains("SHOULD-NOT-RENDER"));
-        for needle in ["security", "tone · b", "1/2", "STAGED-VERDICT"] {
+        for needle in [
+            "security",
+            "tone · b",
+            "1/2",
+            "STAGED-VERDICT",
+            "nitpicker 0.9.3 (abc123-dirty)",
+            "ffffffffffffffff",
+        ] {
             assert!(md.contains(needle), "missing {needle}");
         }
         assert!(!session.is_complete());
@@ -978,6 +1046,7 @@ mod tests {
                 ),
             ],
             aggregation: None,
+            attribution: None,
         };
 
         let metrics = session.metrics();
@@ -1064,6 +1133,7 @@ mod tests {
                 verdicts,
                 jobs: None,
             }),
+            attribution: None,
         };
 
         let staged = format_staged_verdicts(session.aggregation.as_ref().unwrap());
