@@ -276,6 +276,7 @@ pub async fn run_review(
         fallback,
         format,
     } = opts;
+    let session_attribution = crate::prompts::session_attribution();
     let _terminal_title = crate::progress::start_terminal_title(repo, format);
     let presets = task.presets();
     let lanes = task.lanes();
@@ -284,6 +285,9 @@ pub async fn run_review(
     let session_logger = SessionLogger::maybe_new(config.log_trajectories())?;
     if let Some(logger) = &session_logger {
         info!(path = %logger.root().display(), "trajectory logging enabled");
+        if let Err(err) = logger.write_attribution(&session_attribution).await {
+            warn!(error = ?err, "failed to persist session attribution");
+        }
     }
     let context = crate::context::build_context(repo).await;
     let initial_message = task.initial_message(user_prompt);

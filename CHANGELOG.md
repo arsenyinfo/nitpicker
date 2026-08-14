@@ -6,6 +6,17 @@ Notable user-visible changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Record the nitpicker version, build revision, and compiled protocol-prompt fingerprint in each
+  logged session so `reflect` experiments can compare attributable cohorts.
+
+### Changed
+
+- Give validators one independent rubric-scoped pass when the reviewer's initial verdict is clean,
+  require evidence for technical premises newly added during revision, and require follow-up
+  findings to resolve uncertainty and propose one smallest correction.
+
 ## [0.9.3] - 2026-08-13
 
 `nitpicker-agent` 0.5.0
