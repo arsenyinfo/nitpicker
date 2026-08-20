@@ -1,6 +1,6 @@
 [package]
 name = "nitpicker-agent"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 # Matches the workspace floor; the optional `azure` feature raises it to 1.88 via azure_core.
 rust-version = "1.85"
@@ -29,6 +29,7 @@ dirs = "6"
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.10"
 base64 = "0.22"
+sha2 = "0.11"
 # Azure AD (Entra ID) auth for Foundry-hosted models — opt-in, see `azure` feature below.
 azure_identity = { version = "1", optional = true }
 azure_core = { version = "1", optional = true }
