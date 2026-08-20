@@ -6,6 +6,22 @@ Notable user-visible changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-08-20
+
+`nitpicker-agent` 0.5.1
+
+### Changed
+
+- Enable prompt caching for first-party Anthropic and Azure Foundry routes, and give Codex
+  requests a stable cache-routing key derived from their reusable prefix.
+- Keep terminal tool schemas stable when provider-side tool choice can safely constrain execution;
+  fall back to the terminal-only subset when multiple terminal tools require structural isolation.
+
+### Fixed
+
+- Prevent non-terminal tool calls from consuming the final turn when multiple terminal tools are
+  configured, and report the sorted executable-tool allowlist when the harness rejects a call.
+
 ## [0.9.3] - 2026-08-13
 
 `nitpicker-agent` 0.5.0

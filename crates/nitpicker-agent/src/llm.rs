@@ -1346,12 +1346,12 @@ pub fn create_gemini_client_with_proxy(
 
 /// Anthropic client policy used by first-party and Foundry routes. Rig's typed caching modes add
 /// stable tools/system breakpoints plus a moving top-level conversation breakpoint.
-pub struct AnthropicPromptCachingClient {
+pub(crate) struct AnthropicPromptCachingClient {
     inner: anthropic::Client,
 }
 
 impl AnthropicPromptCachingClient {
-    pub fn new(inner: anthropic::Client) -> Self {
+    pub(crate) fn new(inner: anthropic::Client) -> Self {
         Self { inner }
     }
 }
