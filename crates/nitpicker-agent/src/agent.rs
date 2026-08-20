@@ -387,6 +387,17 @@ pub async fn run_agent(
         advertised_tools.remove("spawn_subagent");
     }
     let advertised_tool_definitions = tool_definitions(&advertised_tools);
+    // The provider-neutral ToolChoice can name exactly one tool or require any advertised tool,
+    // but cannot require one of several named tools. Preserve the stable schema prefix whenever
+    // the choice itself is sufficient; for multiple terminal tools, retain the old structural
+    // guarantee that no non-terminal schema is callable on the terminal request.
+    let multiple_terminal_tool_definitions = (terminal_tools.len() > 1).then(|| {
+        advertised_tool_definitions
+            .iter()
+            .filter(|tool| terminal_tools.iter().any(|name| name == &tool.name))
+            .cloned()
+            .collect::<Vec<_>>()
+    });
 
     let mut effective_system_prompt = config.system_prompt.clone();
     match &config.project_context {
@@ -418,6 +429,7 @@ pub async fn run_agent(
 
     for turn in 0..config.max_turns {
         let is_final_turn = turn + 1 == config.max_turns;
+        let terminal_phase = is_final_turn || terminal_submission_requested;
         let force_terminal_submission =
             terminal_submission_requested || (is_final_turn && !terminal_tools.is_empty());
         let mut executable_tools: HashSet<String> = runtime_tools.keys().cloned().collect();
@@ -449,7 +461,7 @@ pub async fn run_agent(
             .await;
         }
 
-        if is_final_turn || terminal_submission_requested {
+        if terminal_phase {
             executable_tools.retain(|name| terminal_tools.iter().any(|tool| tool == name));
         }
 
@@ -467,26 +479,28 @@ pub async fn run_agent(
             prompt = wrap_up_prompt;
         }
 
-        let tool_choice = if is_final_turn || terminal_submission_requested {
+        let tool_choice = if terminal_phase {
             match terminal_tools.as_slice() {
                 [] => Some(ToolChoice::None),
                 [name] => Some(ToolChoice::Specific {
                     function_names: vec![name.clone()],
                 }),
-                // Anthropic can force one named tool but cannot express an allowed subset. Keep
-                // the schemas stable and let the harness enforce the subset for this uncommon
-                // provider-neutral case.
                 _ => Some(ToolChoice::Required),
             }
         } else {
             None
         };
+        let request_tool_definitions =
+            match (terminal_phase, multiple_terminal_tool_definitions.as_ref()) {
+                (true, Some(definitions)) => definitions.clone(),
+                _ => advertised_tool_definitions.clone(),
+            };
         let completion = Completion {
             model: config.model.clone(),
             prompt: prompt.clone(),
             preamble: Some(effective_system_prompt.clone()),
             history: history[..history.len().saturating_sub(1)].to_vec(),
-            tools: advertised_tool_definitions.clone(),
+            tools: request_tool_definitions,
             tool_choice,
             max_tokens: config.max_tokens,
             additional_params: None,
@@ -1054,30 +1068,6 @@ async fn execute_tool_call(
     }
 
     if tool_name == "spawn_subagent" {
-        if !ctx.config.depth.can_spawn_subagent()
-            || !ctx.runtime_tools.contains_key("spawn_subagent")
-        {
-            let outcome = ToolCallOutcome {
-                output: "Error: subagent depth limit reached; cannot spawn another subagent"
-                    .to_string(),
-                nested_tool_calls: 0,
-                status: ToolCallStatus::Error,
-                spawned_agent: None,
-                subagent_usage: TokenUsage::default(),
-            };
-            log_tool_call(
-                ctx.config,
-                ctx.turn + 1,
-                tool_name,
-                &args,
-                outcome.status,
-                outcome.spawned_agent.as_deref(),
-                None,
-                ctx.selected_model,
-            )
-            .await;
-            return Ok(outcome);
-        }
         info!(agent = %ctx.config.name, turn = ctx.turn, "spawning subagent");
         let prepared = match prepare_subagent(
             ctx.config,
@@ -1499,6 +1489,28 @@ mod tests {
                 function_names: vec!["finish".to_string()]
             })
         );
+    }
+
+    #[tokio::test]
+    async fn final_turn_with_multiple_terminal_tools_advertises_only_that_subset() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let terminal_tools = vec!["finish".to_string(), "read_file".to_string()];
+        let config = terminal_test_config(Arc::clone(&calls), 1, terminal_tools.clone());
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = run_agent(config, "investigate", &terminal_test_tools(), dir.path())
+            .await
+            .unwrap();
+
+        assert_eq!(result.turns, 1);
+        let calls = calls.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls[0].tool_choice, Some(ToolChoice::Required));
+        let advertised_names = calls[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(advertised_names, terminal_tools);
     }
 
     #[tokio::test]
