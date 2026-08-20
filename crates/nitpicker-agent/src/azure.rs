@@ -18,8 +18,8 @@ use tokio::sync::Mutex;
 
 use crate::config::ProviderType;
 use crate::llm::{
-    Completion, CompletionResponse, LLMClient, LLMClientDyn, provider_error_has_code,
-    provider_http_status,
+    AnthropicPromptCachingClient, Completion, CompletionResponse, LLMClient, LLMClientDyn,
+    provider_error_has_code, provider_http_status,
 };
 
 /// Default AAD scope for Azure AI Foundry / Cognitive Services.
@@ -184,7 +184,7 @@ pub fn build_azure_client(
                     .http_headers(headers)
                     .build()
                     .wrap_err("failed to build Azure Anthropic client")?;
-                Ok(client.into_arc())
+                Ok(AnthropicPromptCachingClient::new(client).into_arc())
             })
         }
         _ => eyre::bail!(

@@ -29,6 +29,7 @@ dirs = "6"
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.10"
 base64 = "0.22"
+sha2 = "0.11"
 # Azure AD (Entra ID) auth for Foundry-hosted models — opt-in, see `azure` feature below.
 azure_identity = { version = "1", optional = true }
 azure_core = { version = "1", optional = true }

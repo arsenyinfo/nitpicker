@@ -21,6 +21,7 @@ use rig_core::providers::openai::responses_api::{
     CompletionRequest as ResponsesBody, CompletionResponse as ResponsesResp, Include,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::llm::{
@@ -449,6 +450,7 @@ impl LLMClient for CodexClient {
 fn build_body(completion: &Completion) -> Result<ResponsesBody> {
     let mut c = completion.clone();
     normalize_codex_completion_history(&mut c);
+    let prompt_cache_key = codex_prompt_cache_key(&c)?;
     // codex rejects max_output_tokens outright (matches the Codex CLI, which omits it).
     c.max_tokens = None;
     // the system prompt must be sent as top-level `instructions`, not an input item, so take it out
@@ -476,6 +478,7 @@ fn build_body(completion: &Completion) -> Result<ResponsesBody> {
     // `reasoning` config is present, which we don't set) so any caller additional_params survive.
     let params = &mut body.additional_parameters;
     params.store = Some(false);
+    params.prompt_cache_key = Some(prompt_cache_key);
     let include = params.include.get_or_insert_with(Vec::new);
     if !include
         .iter()
@@ -484,6 +487,37 @@ fn build_body(completion: &Completion) -> Result<ResponsesBody> {
         include.push(Include::ReasoningEncryptedContent);
     }
     Ok(body)
+}
+
+/// Stable, opaque cache-routing key for the prefix that remains fixed during one conversation.
+/// OpenAI still matches the actual prompt prefix; this only keeps requests with the same
+/// model/system/tool family routed together. Including the project-aware system prompt naturally
+/// partitions unrelated reviews instead of concentrating all traffic on one hot key.
+fn codex_prompt_cache_key(completion: &Completion) -> Result<String> {
+    fn hash_part(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+
+    let mut hasher = Sha256::new();
+    hash_part(&mut hasher, completion.model.as_bytes());
+    hash_part(
+        &mut hasher,
+        completion
+            .preamble
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    let tools = serde_json::to_vec(&completion.tools)
+        .wrap_err("serializing Codex tools for prompt cache routing")?;
+    hash_part(&mut hasher, &tools);
+    let digest = hasher.finalize();
+    let suffix = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("nitpicker-{suffix}"))
 }
 
 // rig lowers assistant text into a valid Responses shape itself, and since 0.41 also drops
@@ -791,6 +825,12 @@ mod tests {
         // store:false ends up in the flattened additional parameters
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json.get("store"), Some(&Value::Bool(false)));
+        assert!(
+            json.get("prompt_cache_key")
+                .and_then(Value::as_str)
+                .is_some_and(|key| key.starts_with("nitpicker-")),
+            "Codex requests must carry a stable prompt cache routing key"
+        );
         // encrypted reasoning content is requested so reasoning items survive store:false round-trips
         assert_eq!(
             json.get("include").and_then(Value::as_array),
@@ -828,6 +868,54 @@ mod tests {
             additional_params: None,
         };
         assert!(build_body(&completion).is_err());
+    }
+
+    #[test]
+    fn prompt_cache_key_tracks_the_stable_prefix_not_the_conversation_tail() {
+        let first = Completion {
+            model: "gpt-5.4".to_string(),
+            prompt: Message::user("initial request"),
+            preamble: Some("stable reviewer and project context".to_string()),
+            history: vec![],
+            tools: vec![rig_core::completion::ToolDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } }
+                }),
+            }],
+            tool_choice: None,
+            max_tokens: None,
+            additional_params: None,
+        };
+        let mut later_turn = first.clone();
+        later_turn.history = vec![
+            Message::user("initial request"),
+            Message::assistant("intermediate answer"),
+        ];
+        later_turn.prompt = Message::user("continue");
+
+        let first_key = build_body(&first)
+            .unwrap()
+            .additional_parameters
+            .prompt_cache_key
+            .unwrap();
+        let later_key = build_body(&later_turn)
+            .unwrap()
+            .additional_parameters
+            .prompt_cache_key
+            .unwrap();
+        assert_eq!(first_key, later_key);
+
+        let mut different_prefix = later_turn;
+        different_prefix.preamble = Some("different reviewer or project context".to_string());
+        let different_key = build_body(&different_prefix)
+            .unwrap()
+            .additional_parameters
+            .prompt_cache_key
+            .unwrap();
+        assert_ne!(first_key, different_key);
     }
 
     #[test]

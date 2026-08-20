@@ -184,6 +184,11 @@ Set `[defaults].log_trajectories = true` to save per-agent JSONL traces and a fi
 
 `anthropic_compatible` and `openai_compatible` are accepted as aliases for backward compatibility.
 
+First-party Anthropic routes enable five-minute prompt caching automatically, with stable
+tool/system breakpoints and a moving conversation breakpoint. Azure AI Foundry Anthropic routes
+use the same policy. An explicit custom Anthropic `base_url` keeps the compatibility request shape
+without cache fields because not every Anthropic-shaped gateway accepts `cache_control`.
+
 `auth = "azure-ad"` authenticates with a refreshing Azure AD (Entra ID) token instead of a static key — for OpenAI and Anthropic models hosted on Azure AI Foundry. Requires a build with the `azure` feature, [see below](#azure-ad-azure-ai-foundry).
 
 `auth = "codex"` authenticates with your ChatGPT Plus/Pro (Codex) subscription instead of a paid API key, reusing the token the Codex CLI stores on disk, [see below](#chatgptcodex-subscription-research-only).
@@ -270,7 +275,7 @@ auth = "agy-keyring"
 
 `auth = "codex"` (on an `openai` reviewer/aggregator) reuses the OAuth token the [Codex CLI](https://developers.openai.com/codex) stores in `~/.codex/auth.json`. Log in once with `codex login` (choosing your ChatGPT account, not an API key); nitpicker reads the token **read-only** and refreshes the short-lived access token in-memory via the refresh token — it never writes back to `auth.json`. Set `CODEX_HOME` to override the token directory.
 
-Under the hood this talks to the Codex subscription endpoint (`chatgpt.com/backend-api/codex/responses`), which speaks the OpenAI Responses API with subscription-specific quirks (a required top-level system prompt, mandatory streaming, `store: false`, no `max_output_tokens`, and encrypted reasoning items round-tripped across turns since nothing is server-side persisted); nitpicker handles all of that transparently. No API-key env var is needed.
+Under the hood this talks to the Codex subscription endpoint (`chatgpt.com/backend-api/codex/responses`), which speaks the OpenAI Responses API with subscription-specific quirks (a required top-level system prompt, mandatory streaming, `store: false`, no `max_output_tokens`, and encrypted reasoning items round-tripped across turns since nothing is server-side persisted); nitpicker handles all of that transparently. Requests also carry an opaque, deterministic `prompt_cache_key` derived from the model/system/tool prefix so successive turns route consistently without putting prompt text in the key. No API-key env var is needed.
 
 Models are your subscription's Codex models (e.g. `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`):
 
