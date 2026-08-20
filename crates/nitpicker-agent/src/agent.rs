@@ -1044,9 +1044,15 @@ async fn execute_tool_call(
     }
 
     if !ctx.executable_tools.contains(tool_name) {
+        let mut allowed_tools = ctx.executable_tools.iter().cloned().collect::<Vec<_>>();
+        allowed_tools.sort();
+        let allowed_tools = match allowed_tools.is_empty() {
+            true => "none".to_string(),
+            false => allowed_tools.join(", "),
+        };
         let outcome = ToolCallOutcome {
             output: format!(
-                "Error: tool '{tool_name}' is disabled for this turn; use one of the allowed tools"
+                "Error: tool '{tool_name}' is disabled for this turn; allowed tools: {allowed_tools}"
             ),
             nested_tool_calls: 0,
             status: ToolCallStatus::Error,
@@ -1534,14 +1540,14 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let config = terminal_test_config(calls, 1, vec!["finish".to_string()]);
         let result_store = Arc::new(Mutex::new(None));
-        let mut runtime_tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
+        let mut runtime_tools = terminal_test_tools();
         runtime_tools.insert(
             "finish".to_string(),
             Arc::new(FinishTool {
                 result: Arc::clone(&result_store),
             }),
         );
-        let executable_tools = HashSet::new();
+        let executable_tools = HashSet::from(["read_file".to_string(), "grep".to_string()]);
         let dir = tempfile::tempdir().unwrap();
 
         let outcome = execute_tool_call(
@@ -1565,7 +1571,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome.status, ToolCallStatus::Error);
-        assert!(outcome.output.contains("disabled for this turn"));
+        assert_eq!(
+            outcome.output,
+            "Error: tool 'finish' is disabled for this turn; allowed tools: grep, read_file"
+        );
         assert!(
             result_store
                 .lock()
