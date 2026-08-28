@@ -1160,22 +1160,13 @@ async fn execute_tool_call(
     let logged_args = args.clone();
     let outcome = match ctx.runtime_tools.get(tool_name) {
         Some(tool) => match tool.call(args, ctx.work_dir.to_path_buf()).await {
-            Ok(output) => {
-                // Tools report recoverable failures as `Error: …` text so the model can
-                // self-correct; the trajectory must still classify them as errors, or `reflect`
-                // counts a failed git pipe or an out-of-range read as a successful call.
-                let status = match output.starts_with("Error:") {
-                    true => ToolCallStatus::Error,
-                    false => ToolCallStatus::Ok,
-                };
-                ToolCallOutcome {
-                    output,
-                    nested_tool_calls: 0,
-                    status,
-                    spawned_agent: None,
-                    subagent_usage: TokenUsage::default(),
-                }
-            }
+            Ok(output) => ToolCallOutcome {
+                output,
+                nested_tool_calls: 0,
+                status: ToolCallStatus::Ok,
+                spawned_agent: None,
+                subagent_usage: TokenUsage::default(),
+            },
             Err(err) => {
                 debug!(agent = %ctx.config.name, tool = %tool_name, error = %err, "tool error");
                 ToolCallOutcome {
@@ -1446,7 +1437,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn error_text_from_a_runtime_tool_is_classified_as_an_error() {
+    async fn runtime_tool_failure_is_fed_back_as_error_text_with_error_status() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let config = terminal_test_config(calls, 1, vec!["finish".to_string()]);
         let runtime_tools = terminal_test_tools();

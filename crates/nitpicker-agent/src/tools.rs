@@ -78,7 +78,7 @@ fn reject_shell_syntax(tokens: &[&str]) -> std::result::Result<(), String> {
     }) {
         None => Ok(()),
         Some(token) => Err(format!(
-            "Error: the git tool runs one git invocation with whitespace-split arguments and no \
+            "the git tool runs one git invocation with whitespace-split arguments and no \
              shell, so `{token}` is not interpreted. To read part of a file at a revision use \
              `blame -L <start>,<end> <rev> -- <path>`; for the working-tree version use read_file \
              with a line range."
@@ -104,7 +104,7 @@ fn ensure_readonly_git(subcommand: &str, rest: &[&str]) -> std::result::Result<(
         };
         if looks_like_external_path(value) {
             return Err(format!(
-                "Error: git argument '{token}' references a path outside the repository"
+                "git argument '{token}' references a path outside the repository"
             ));
         }
     }
@@ -122,7 +122,7 @@ fn ensure_readonly_git(subcommand: &str, rest: &[&str]) -> std::result::Result<(
             .any(|token| blocked_fs_reading_flag_matches(token, flag))
         {
             return Err(format!(
-                "Error: git --{flag} reads files outside the repository and is not allowed"
+                "git --{flag} reads files outside the repository and is not allowed"
             ));
         }
     }
@@ -135,9 +135,7 @@ fn ensure_readonly_git(subcommand: &str, rest: &[&str]) -> std::result::Result<(
                 || *token == "-o"
                 || (token.starts_with("-o") && !token.starts_with("--") && token.len() > 2)
             {
-                return Err(
-                    "Error: writing git output to a file (--output/-o) is not allowed".into(),
-                );
+                return Err("writing git output to a file (--output/-o) is not allowed".into());
             }
         }
     }
@@ -641,17 +639,19 @@ impl Tool for GitTool {
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| eyre::eyre!("missing command"))?;
             let tokens = command.split_whitespace().collect::<Vec<_>>();
+            // Failures are `Err`: the agent feeds them back to the model as `Error: …` text and
+            // records the call with error status, so the classification never depends on stdout.
             if let Err(msg) = reject_shell_syntax(&tokens) {
-                return Ok(msg);
+                eyre::bail!(msg);
             }
             let Some((subcommand, rest)) = tokens.split_first() else {
-                return Ok("Error: empty git command".to_string());
+                eyre::bail!("empty git command");
             };
             if !ALLOWED_GIT_SUBCOMMANDS.contains(subcommand) {
-                return Ok(format!("Error: git subcommand '{subcommand}' not allowed"));
+                eyre::bail!("git subcommand '{subcommand}' not allowed");
             }
             if let Err(msg) = ensure_readonly_git(subcommand, rest) {
-                return Ok(msg);
+                eyre::bail!(msg);
             }
             // GIT_OPTIONAL_LOCKS=0 keeps even nominally-read commands side-effect-free: it stops
             // e.g. `git status` from refreshing/rewriting `.git/index` stat caches and avoids
@@ -674,7 +674,7 @@ impl Tool for GitTool {
             }
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                return Ok(format!("Error: {stderr}"));
+                eyre::bail!("{}", stderr.trim_end());
             }
             Ok(stdout)
         })
@@ -829,19 +829,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn git_tool_returns_error_text_for_shell_syntax_without_running_git() {
+    async fn git_tool_fails_on_shell_syntax_without_running_git() {
         // not a git repo: a real invocation would fail differently, so the message proves the
         // operator check fired first
         let dir = tempfile::tempdir().unwrap();
-        let output = GitTool
+        let err = GitTool
             .call(
                 json!({ "command": "log --oneline | head -n 3" }),
                 dir.path().to_path_buf(),
             )
             .await
-            .unwrap();
-        assert!(output.starts_with("Error:"));
-        assert!(output.contains("`|`"));
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`|`"));
     }
 
     #[tokio::test]

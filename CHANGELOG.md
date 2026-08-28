@@ -24,8 +24,9 @@ Notable user-visible changes are recorded here. The format follows
 - The git tool rejects shell operators (`|`, `&&`, `>`, …) with a message naming the working
   alternative instead of passing them to git as literal arguments.
 - `read_file` rejects `end_line < start_line` instead of silently clamping to one line.
-- Tool results reported as `Error: …` text are recorded with error status and their message in
-  session trajectories, so `reflect` no longer counts them as successes.
+- Git tool failures (rejected or non-zero-exit commands) are tool errors rather than successful
+  `Error: …` text, so session trajectories record them with error status and message and
+  `reflect` no longer counts them as successes.
 
 ## [0.9.4] - 2026-08-20
 
