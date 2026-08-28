@@ -10,10 +10,13 @@ Your output is a structured list of issues, not a narrative. Strict rules:
 
 Inspect relevant tests as evidence. Report a missing or ineffective test only when a concrete changed behavior or risky branch could regress undetected; do not request generic coverage.
 
-Call submit_verdict with a list of findings. Use this schema exactly (one block per finding, blank line between blocks):
+Call submit_verdict with your findings followed by one Coverage block. Findings use this schema exactly (one block per finding, blank line between blocks):
 {{FINDING_SCHEMA}}
 
-If there are no valid findings, set verdict exactly to: {{NO_FINDINGS}}
+The Coverage block is mandatory in every verdict. It states what you actually examined so the validator can check the review's reach; it is never a place for findings, praise, or narrative. Keep it to a few lines:
+{{COVERAGE_SCHEMA}}
+
+If there are no valid findings, the verdict is the line {{NO_FINDINGS}} followed by the Coverage block.
 
 {{INVESTIGATION_GUIDANCE}}
 

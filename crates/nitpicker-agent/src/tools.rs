@@ -64,6 +64,28 @@ fn blocked_fs_reading_flag_matches(token: &str, name: &str) -> bool {
     long_flag_matches(token, name)
 }
 
+/// Shell operators a model glues onto a git command out of habit. Tokens go to git's argv with no
+/// shell, so `|`, `&&`, or `>` reach git as literal arguments: usually a loud failure, sometimes a
+/// silently wrong result that the agent then works around by dumping whole files. Exact-token
+/// matching keeps `--format=%h|%an` legal.
+const SHELL_OPERATOR_TOKENS: &[&str] = &[
+    "&&", "||", "|", ";", "&", ">", ">>", "<", "1>", "2>", "&>", "2>&1",
+];
+
+fn reject_shell_syntax(tokens: &[&str]) -> std::result::Result<(), String> {
+    match tokens.iter().find(|token| {
+        SHELL_OPERATOR_TOKENS.contains(token) || token.starts_with("$(") || token.starts_with('`')
+    }) {
+        None => Ok(()),
+        Some(token) => Err(format!(
+            "Error: the git tool runs one git invocation with whitespace-split arguments and no \
+             shell, so `{token}` is not interpreted. To read part of a file at a revision use \
+             `blame -L <start>,<end> <rev> -- <path>`; for the working-tree version use read_file \
+             with a line range."
+        )),
+    }
+}
+
 /// Reject git invocations that aren't genuinely read-only or that escape the repository. The
 /// subcommand allowlist alone is not enough — `read_file`/`grep`/`glob` confine reads to `work_dir`
 /// via canonicalize, but several git flags read straight from the filesystem and would bypass that
@@ -255,6 +277,12 @@ impl Tool for ReadFileTool {
                 }
                 Err(err) => return Err(err.into()),
             };
+            match end_line {
+                Some(end) if end < start_line => eyre::bail!(
+                    "end_line ({end}) is less than start_line ({start_line}); swap them or omit end_line"
+                ),
+                _ => {}
+            }
             let lines = content.lines().collect::<Vec<_>>();
             let total = lines.len();
             let start = start_line.max(1).min(total.max(1));
@@ -586,14 +614,14 @@ impl Tool for GitTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "git".to_string(),
-            description: "Run an allowlisted read-only git command for review context: diff, log, show, blame, status, rev-parse, shortlog, ls-files, for-each-ref, show-ref. To list or query branches/tags use for-each-ref (e.g. `for-each-ref --contains <sha> refs/heads/`), not branch/tag. Use this for repository history or patch context, not for general file search."
+            description: "Run an allowlisted read-only git command for review context: diff, log, show, blame, status, rev-parse, shortlog, ls-files, for-each-ref, show-ref. To list or query branches/tags use for-each-ref (e.g. `for-each-ref --contains <sha> refs/heads/`), not branch/tag. Use this for repository history or patch context, not for general file search. Arguments are split on whitespace and passed straight to git: there is no shell, so pipes, redirects, `&&`, and command substitution do not work."
                 .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "Read-only git command to run, for example 'diff --stat HEAD~1' or 'log --oneline -n 20'."
+                        "description": "One read-only git command without the leading 'git' and without shell operators, for example 'diff --stat HEAD~1' or 'log --oneline -n 20'."
                     }
                 },
                 "required": ["command"],
@@ -613,6 +641,9 @@ impl Tool for GitTool {
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| eyre::eyre!("missing command"))?;
             let tokens = command.split_whitespace().collect::<Vec<_>>();
+            if let Err(msg) = reject_shell_syntax(&tokens) {
+                return Ok(msg);
+            }
             let Some((subcommand, rest)) = tokens.split_first() else {
                 return Ok("Error: empty git command".to_string());
             };
@@ -654,7 +685,8 @@ impl Tool for GitTool {
 mod tests {
     use super::{
         ALLOWED_GIT_SUBCOMMANDS, GitTool, GlobTool, GrepTool, ReadFileTool, Tool,
-        ensure_readonly_git, floor_char_boundary, is_binary_file, search_file, tool_definitions,
+        ensure_readonly_git, floor_char_boundary, is_binary_file, reject_shell_syntax, search_file,
+        tool_definitions,
     };
     use regex::Regex;
     use serde_json::json;
@@ -783,6 +815,54 @@ mod tests {
         assert!(check("blame --ignore-revs-file=README.md -- src/tools.rs").is_err());
         assert!(check("blame --ignore-revs README.md -- src/tools.rs").is_err());
         assert!(check("blame --ignore-revs-f=README.md -- src/tools.rs").is_err());
+    }
+
+    #[test]
+    fn rejects_shell_operators_but_not_glued_format_pipes() {
+        assert!(reject_shell_syntax(&["log", "--oneline", "|", "head", "-n", "3"]).is_err());
+        assert!(reject_shell_syntax(&["show", "HEAD:src/a.rs", "&&", "git", "log"]).is_err());
+        assert!(reject_shell_syntax(&["diff", "HEAD~1", ">", "out.txt"]).is_err());
+        assert!(reject_shell_syntax(&["log", "2>&1"]).is_err());
+        assert!(reject_shell_syntax(&["show", "$(cat", "x)"]).is_err());
+        assert!(reject_shell_syntax(&["log", "--format=%h|%an", "-n", "5"]).is_ok());
+        assert!(reject_shell_syntax(&["diff", "HEAD~1", "--", "a|b.txt"]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn git_tool_returns_error_text_for_shell_syntax_without_running_git() {
+        // not a git repo: a real invocation would fail differently, so the message proves the
+        // operator check fired first
+        let dir = tempfile::tempdir().unwrap();
+        let output = GitTool
+            .call(
+                json!({ "command": "log --oneline | head -n 3" }),
+                dir.path().to_path_buf(),
+            )
+            .await
+            .unwrap();
+        assert!(output.starts_with("Error:"));
+        assert!(output.contains("`|`"));
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_inverted_range() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "1\n2\n3\n").unwrap();
+        let work_dir = dir.path().canonicalize().unwrap();
+
+        let err = ReadFileTool
+            .call(
+                json!({ "path": "a.txt", "start_line": 3, "end_line": 1 }),
+                work_dir,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            err,
+            "end_line (1) is less than start_line (3); swap them or omit end_line"
+        );
     }
 
     #[tokio::test]

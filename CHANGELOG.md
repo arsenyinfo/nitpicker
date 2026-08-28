@@ -6,6 +6,27 @@ Notable user-visible changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Review debates: every Reviewer verdict ends with a mandatory Coverage block; the Validator
+  checks it against the review snapshot and rejects gaps, and rejecting every submitted finding is
+  now `agree=false` with the critique instead of an agreeing empty verdict.
+- Follow-up debate rounds carry a "respond only to disputed points" instruction in both review and
+  `ask` mode.
+- `spawn_subagent` tells the parent that the subagent starts from an empty conversation and must be
+  given revision ids, paths, and claims verbatim; subagents are told to do the task themselves
+  rather than re-delegating.
+- Diff review base selection prefers `origin/<branch>` when the local branch is behind it (newer
+  merge-base with HEAD), with a warning.
+
+### Fixed
+
+- The git tool rejects shell operators (`|`, `&&`, `>`, …) with a message naming the working
+  alternative instead of passing them to git as literal arguments.
+- `read_file` rejects `end_line < start_line` instead of silently clamping to one line.
+- Tool results reported as `Error: …` text are recorded with error status and their message in
+  session trajectories, so `reflect` no longer counts them as successes.
+
 ## [0.9.4] - 2026-08-20
 
 `nitpicker-agent` 0.5.1

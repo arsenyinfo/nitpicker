@@ -853,7 +853,7 @@ impl Tool for SpawnSubagentTool {
                 "properties": {
                     "task": {
                         "type": "string",
-                        "description": "A compact self-contained task for the subagent"
+                        "description": "A compact self-contained task. The subagent starts from an empty conversation: it sees none of your messages, plan labels, prior tool results, or the original question and review snapshot. Restate verbatim the revision ids, paths, and claims it needs."
                     }
                 },
                 "required": ["task"],
@@ -1160,13 +1160,22 @@ async fn execute_tool_call(
     let logged_args = args.clone();
     let outcome = match ctx.runtime_tools.get(tool_name) {
         Some(tool) => match tool.call(args, ctx.work_dir.to_path_buf()).await {
-            Ok(output) => ToolCallOutcome {
-                output,
-                nested_tool_calls: 0,
-                status: ToolCallStatus::Ok,
-                spawned_agent: None,
-                subagent_usage: TokenUsage::default(),
-            },
+            Ok(output) => {
+                // Tools report recoverable failures as `Error: …` text so the model can
+                // self-correct; the trajectory must still classify them as errors, or `reflect`
+                // counts a failed git pipe or an out-of-range read as a successful call.
+                let status = match output.starts_with("Error:") {
+                    true => ToolCallStatus::Error,
+                    false => ToolCallStatus::Ok,
+                };
+                ToolCallOutcome {
+                    output,
+                    nested_tool_calls: 0,
+                    status,
+                    spawned_agent: None,
+                    subagent_usage: TokenUsage::default(),
+                }
+            }
             Err(err) => {
                 debug!(agent = %ctx.config.name, tool = %tool_name, error = %err, "tool error");
                 ToolCallOutcome {
@@ -1191,6 +1200,10 @@ async fn execute_tool_call(
         }
     };
 
+    let logged_result = match outcome.status {
+        ToolCallStatus::Error => Some(truncate_for_trajectory(outcome.output.clone())),
+        _ => None,
+    };
     log_tool_call(
         ctx.config,
         ctx.turn + 1,
@@ -1198,7 +1211,7 @@ async fn execute_tool_call(
         &logged_args,
         outcome.status,
         outcome.spawned_agent.as_deref(),
-        None,
+        logged_result.as_deref(),
         ctx.selected_model,
     )
     .await;
@@ -1430,6 +1443,38 @@ mod tests {
             Arc::new(FinishTool { result }) as Arc<dyn Tool>,
         );
         tools
+    }
+
+    #[tokio::test]
+    async fn error_text_from_a_runtime_tool_is_classified_as_an_error() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let config = terminal_test_config(calls, 1, vec!["finish".to_string()]);
+        let runtime_tools = terminal_test_tools();
+        let executable_tools = HashSet::from(["git".to_string()]);
+        let dir = tempfile::tempdir().unwrap();
+
+        let outcome = execute_tool_call(
+            ToolCallContext {
+                config: &config,
+                runtime_tools: &runtime_tools,
+                executable_tools: &executable_tools,
+                tools_map: &runtime_tools,
+                work_dir: dir.path(),
+                turn: 0,
+                current_turns: 1,
+                total_tool_calls: 1,
+                initial_subagent_count: 0,
+                selected_model: Some("scripted"),
+            },
+            "git",
+            json!({"command": "log --oneline | head -n 3"}),
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.status, ToolCallStatus::Error);
+        assert!(outcome.output.starts_with("Error:"));
     }
 
     #[tokio::test]
