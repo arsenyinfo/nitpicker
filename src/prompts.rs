@@ -3,6 +3,7 @@ const DISCOVERY_GUIDANCE: &str =
 const VALIDATION_GUIDANCE: &str =
     include_str!("../prompts/protocol/investigation-guidance-validation.md");
 const CONFIRMED_FINDING_FIELDS: &str = include_str!("../prompts/protocol/finding-schema.md");
+const COVERAGE_SCHEMA: &str = include_str!("../prompts/protocol/coverage-schema.md");
 const CANDIDATE_UNCERTAINTY_FIELD: &str =
     include_str!("../prompts/protocol/candidate-uncertainty-field.md");
 const OPTIONS_SCHEMA: &str = include_str!("../prompts/protocol/options-schema.md");
@@ -285,6 +286,7 @@ impl LaneTask<'_> {
                         ("TARGET", scope.target_noun()),
                         ("SCOPE_RULE", scope.finding_scope_rule()),
                         ("FINDING_SCHEMA", &fields),
+                        ("COVERAGE_SCHEMA", COVERAGE_SCHEMA.trim()),
                         ("NO_FINDINGS", NO_FINDINGS),
                         ("INVESTIGATION_GUIDANCE", DISCOVERY_GUIDANCE.trim()),
                         ("PRESET_NAME", &preset.name),

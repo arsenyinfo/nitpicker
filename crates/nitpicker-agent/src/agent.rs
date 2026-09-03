@@ -853,7 +853,7 @@ impl Tool for SpawnSubagentTool {
                 "properties": {
                     "task": {
                         "type": "string",
-                        "description": "A compact self-contained task for the subagent"
+                        "description": "A compact self-contained task. The subagent starts from an empty conversation: it sees none of your messages, plan labels, prior tool results, or the original question and review snapshot. Restate verbatim the revision ids, paths, and claims it needs."
                     }
                 },
                 "required": ["task"],
@@ -1191,6 +1191,10 @@ async fn execute_tool_call(
         }
     };
 
+    let logged_result = match outcome.status {
+        ToolCallStatus::Error => Some(truncate_for_trajectory(outcome.output.clone())),
+        _ => None,
+    };
     log_tool_call(
         ctx.config,
         ctx.turn + 1,
@@ -1198,7 +1202,7 @@ async fn execute_tool_call(
         &logged_args,
         outcome.status,
         outcome.spawned_agent.as_deref(),
-        None,
+        logged_result.as_deref(),
         ctx.selected_model,
     )
     .await;
@@ -1430,6 +1434,38 @@ mod tests {
             Arc::new(FinishTool { result }) as Arc<dyn Tool>,
         );
         tools
+    }
+
+    #[tokio::test]
+    async fn runtime_tool_failure_is_fed_back_as_error_text_with_error_status() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let config = terminal_test_config(calls, 1, vec!["finish".to_string()]);
+        let runtime_tools = terminal_test_tools();
+        let executable_tools = HashSet::from(["git".to_string()]);
+        let dir = tempfile::tempdir().unwrap();
+
+        let outcome = execute_tool_call(
+            ToolCallContext {
+                config: &config,
+                runtime_tools: &runtime_tools,
+                executable_tools: &executable_tools,
+                tools_map: &runtime_tools,
+                work_dir: dir.path(),
+                turn: 0,
+                current_turns: 1,
+                total_tool_calls: 1,
+                initial_subagent_count: 0,
+                selected_model: Some("scripted"),
+            },
+            "git",
+            json!({"command": "log --oneline | head -n 3"}),
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.status, ToolCallStatus::Error);
+        assert!(outcome.output.starts_with("Error:"));
     }
 
     #[tokio::test]

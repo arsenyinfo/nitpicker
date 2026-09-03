@@ -5,6 +5,7 @@ Rules:
 - Drop {{DROP_CLAUSE}}.
 - Drop items where the reviewer flagged uncertainty and the validator did not confirm them with code evidence. The final schema has no Uncertainty field: unresolved findings are dropped, not forwarded.
 - Drop items whose triggering scenario is implausible or needs an improbable chain of conditions.
+- Coverage blocks describe what a lane inspected; they are not findings. Never output them or turn a Not inspected entry into a finding.
 - Reassess priority from the verified trigger, impact, reach, and supported surface; do not inherit a lane's label mechanically.
 - Group duplicates and closely related points into a single finding.
 - Set Lens to the exact active preset name whose lane produced the evidence. When merging the same finding from multiple lanes, list every contributing lens once, in active-preset order.

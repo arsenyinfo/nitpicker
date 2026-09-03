@@ -6,12 +6,14 @@ Multi-reviewer code review using LLMs. Spawns parallel agents with different mod
 
 [**Free Web version**](https://arseny.info/nitpicker) is available for open source projects.
 
-Each reviewer is an agentic loop that can call tools (read files, grep, glob, git commands) to explore the repo before writing its review. Discovery roles build a quick initial map and default to one early, disjoint subagent wave for multi-surface targets; validation roles delegate only bounded verification of submitted claims. Tool outputs include lightweight headers and clearer truncation/no-match messages so agents can reason about partial evidence more reliably. A separate aggregator model deduplicates and synthesizes the individual reviews into a final verdict.
+Each reviewer is an agentic loop that can call tools (read files, grep, glob, git commands) to explore the repo before writing its review. Discovery roles build a quick initial map and default to one early, disjoint subagent wave for multi-surface targets; validation roles delegate only bounded verification of submitted claims. Tool outputs include lightweight headers and clearer truncation/no-match messages so agents can reason about partial evidence more reliably; the git tool runs one invocation with no shell and rejects pipes/redirects with a pointer to the working alternative. A separate aggregator model deduplicates and synthesizes the individual reviews into a final verdict.
 
 Diff and PR reviews capture a frozen orientation snapshot before reviewers fan out: full HEAD,
 resolved base and merge-base revisions, the exact committed comparison, working-tree status, and
 committed/uncommitted file maps. Every lane and later debate round receives the same snapshot;
-agents still inspect the actual hunks and code with tools.
+agents still inspect the actual hunks and code with tools. The base is the local default branch
+unless its `origin/` counterpart yields a newer merge-base with HEAD — a branch cut from
+`origin/main` while local `main` lags behind is compared against `origin/main`, with a warning.
 
 ## Requirements
 
@@ -416,6 +418,8 @@ part of the aggregation schema are rejected, and `reflect` does not write extra 
 ### Debate mode (default)
 
 Two LLM agents take turns exploring the codebase with file/git tools and submitting verdicts. The Critic can signal agreement (`agree=true`) to end early. A meta-reviewer synthesizes the dialogue.
+
+In review mode every Reviewer verdict ends with a Coverage block — what was inspected, which risk classes of the lane's angle were checked, what was skipped. The Validator checks it against the review snapshot and rejects gaps, so a review with no findings still gets a bounded coverage check rather than a rubber stamp. Rejecting every finding is `agree=false` with the critique, so the reasons survive in the transcript. Follow-up rounds address only the disputed points.
 
 - `reviewer[0]` in config → Actor (review: Reviewer)
 - `reviewer[1]` in config → Critic (review: Validator)
