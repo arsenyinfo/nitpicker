@@ -1,3 +1,6 @@
+use nitpicker_agent::session::SessionAttribution;
+use sha2::{Digest, Sha256};
+
 const DISCOVERY_GUIDANCE: &str =
     include_str!("../prompts/protocol/investigation-guidance-discovery.md");
 const VALIDATION_GUIDANCE: &str =
@@ -25,6 +28,63 @@ const DEBATE_META_TOPIC_TEMPLATE: &str = include_str!("../prompts/protocol/debat
 const DEBATE_META_REVIEW_TEMPLATE: &str = include_str!("../prompts/protocol/debate-meta-review.md");
 
 const NO_FINDINGS: &str = "No findings. Great job! 🎉";
+
+pub(crate) fn session_attribution() -> SessionAttribution {
+    SessionAttribution {
+        binary_version: env!("CARGO_PKG_VERSION").to_string(),
+        binary_revision: option_env!("NITPICKER_BUILD_REVISION").map(str::to_string),
+        protocol_prompt_sha256: protocol_prompt_sha256(),
+    }
+}
+
+/// Fingerprint the rendered protocol, not user tasks or configured rubrics, so reflection can
+/// compare cohorts that ran the same orchestration instructions over different review targets.
+fn protocol_prompt_sha256() -> String {
+    let preset = crate::presets::ReviewPreset {
+        name: "<preset>".to_string(),
+        prompt: "<rubric>".to_string(),
+    };
+    let presets = [preset.clone()];
+    let mut prompts = vec![
+        LaneTask::Ask.reviewer_system(),
+        LaneTask::Ask.actor_system(),
+        LaneTask::Ask.critic_system(),
+        RunTask::Ask.aggregator_preamble(),
+        RunTask::Ask.meta_preamble(),
+        nitpicker_agent::prompts::subagent_system_prompt().to_string(),
+        include_str!("../crates/nitpicker-agent/prompts/compaction-summary.md").to_string(),
+        include_str!("../crates/nitpicker-agent/prompts/final-turn-wrap-up.md").to_string(),
+    ];
+    for scope in [ReviewScope::Diff, ReviewScope::Static] {
+        let lane = LaneTask::Review {
+            scope,
+            preset: &preset,
+        };
+        let run = RunTask::Review {
+            scope,
+            presets: &presets,
+        };
+        prompts.extend([
+            lane.reviewer_system(),
+            lane.actor_system(),
+            lane.critic_system(),
+            lane.subagent_prompt().unwrap_or_default(),
+            run.aggregator_preamble(),
+            run.meta_preamble(),
+        ]);
+    }
+
+    let mut hasher = Sha256::new();
+    for prompt in prompts {
+        hasher.update((prompt.len() as u64).to_le_bytes());
+        hasher.update(prompt.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 fn candidate_finding_fields() -> String {
     format!(
@@ -457,6 +517,21 @@ mod tests {
 
         let validator = worker.critic_system();
         assert!(validator.contains(NO_FINDINGS));
+    }
+
+    #[test]
+    fn session_attribution_has_a_stable_protocol_fingerprint() {
+        let first = session_attribution();
+        let second = session_attribution();
+        assert_eq!(first.binary_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(first.protocol_prompt_sha256, second.protocol_prompt_sha256);
+        assert_eq!(first.protocol_prompt_sha256.len(), 64);
+        assert!(
+            first
+                .protocol_prompt_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        );
     }
 
     #[test]

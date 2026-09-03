@@ -6,11 +6,18 @@ Notable user-visible changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Record the nitpicker version, build revision, and compiled protocol-prompt fingerprint in each
+  logged session (`attribution.json`) so `reflect` experiments can compare attributable cohorts.
+
 ### Changed
 
 - Review debates: every Reviewer verdict ends with a mandatory Coverage block; the Validator
   checks it against the review snapshot and rejects gaps, and rejecting every submitted finding is
   now `agree=false` with the critique instead of an agreeing empty verdict.
+- Reviewer follow-up turns must verify technical premises newly entering the verdict against the
+  repository, resolve any first-turn uncertainty, and keep one smallest correction per finding.
 - Follow-up debate rounds carry a "respond only to disputed points" instruction in both review and
   `ask` mode.
 - `spawn_subagent` tells the parent that the subagent starts from an empty conversation and must be

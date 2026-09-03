@@ -411,7 +411,9 @@ synthesis, falling back to the first reviewer when only one is configured. The o
 is intentionally not used because reflection reduction is a tool-using investigation, not report
 formatting. Pattern claims include exact session support, representative trace evidence, confidence,
 and a small measurable experiment. New session records also preserve staged reviewer/debate
-verdicts so reflection can compare execution with the outcome. Set
+verdicts so reflection can compare execution with the outcome, plus an `attribution.json` sidecar
+with the nitpicker version, build revision when available, and protocol-prompt SHA-256 so prompt
+experiments can be compared by cohort. Set
 `[defaults].log_trajectories = true` beforehand. Sessions recorded before staged verdicts became
 part of the aggregation schema are rejected, and `reflect` does not write extra trace copies.
 
