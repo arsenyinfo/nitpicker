@@ -275,12 +275,10 @@ impl Tool for ReadFileTool {
                 }
                 Err(err) => return Err(err.into()),
             };
-            match end_line {
-                Some(end) if end < start_line => eyre::bail!(
-                    "end_line ({end}) is less than start_line ({start_line}); swap them or omit end_line"
-                ),
-                _ => {}
-            }
+            let (start_line, end_line, swapped) = match end_line {
+                Some(end) if end < start_line => (end, Some(start_line), true),
+                _ => (start_line, end_line, false),
+            };
             let lines = content.lines().collect::<Vec<_>>();
             let total = lines.len();
             let start = start_line.max(1).min(total.max(1));
@@ -290,7 +288,11 @@ impl Tool for ReadFileTool {
                 .unwrap_or(&full_path)
                 .display()
                 .to_string();
-            let mut output = format!("File: {relative}\nLines: {start}-{end} of {total}\n\n");
+            let mut output = format!("File: {relative}\nLines: {start}-{end} of {total}\n");
+            if swapped {
+                output.push_str("Note: start_line and end_line were given in reverse order and swapped\n");
+            }
+            output.push('\n');
             for (idx, line) in lines.iter().enumerate() {
                 let line_num = idx + 1;
                 if line_num < start || line_num > end {
@@ -845,23 +847,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_file_rejects_inverted_range() {
+    async fn read_file_swaps_inverted_range() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "1\n2\n3\n").unwrap();
+        std::fs::write(dir.path().join("a.txt"), "1\n2\n3\n4\n").unwrap();
         let work_dir = dir.path().canonicalize().unwrap();
 
-        let err = ReadFileTool
+        let output = ReadFileTool
             .call(
-                json!({ "path": "a.txt", "start_line": 3, "end_line": 1 }),
+                json!({ "path": "a.txt", "start_line": 3, "end_line": 2 }),
                 work_dir,
             )
             .await
-            .unwrap_err()
-            .to_string();
+            .unwrap();
 
         assert_eq!(
-            err,
-            "end_line (1) is less than start_line (3); swap them or omit end_line"
+            output,
+            "File: a.txt\nLines: 2-3 of 4\nNote: start_line and end_line were given in reverse order and swapped\n\n   2 2\n   3 3\n"
         );
     }
 

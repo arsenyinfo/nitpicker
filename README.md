@@ -421,7 +421,7 @@ part of the aggregation schema are rejected, and `reflect` does not write extra 
 
 Two LLM agents take turns exploring the codebase with file/git tools and submitting verdicts. The Critic can signal agreement (`agree=true`) to end early. A meta-reviewer synthesizes the dialogue.
 
-In review mode every Reviewer verdict ends with a Coverage block — what was inspected, which risk classes of the lane's angle were checked, what was skipped. The Validator checks it against the review snapshot and rejects gaps, so a review with no findings still gets a bounded coverage check rather than a rubber stamp. Rejecting every finding is `agree=false` with the critique, so the reasons survive in the transcript. Follow-up rounds address only the disputed points.
+In review mode every Reviewer verdict ends with a Coverage block — what was inspected, which risk classes of the lane's angle were checked, what was skipped. The Validator checks it against the review snapshot and rejects gaps that could change the finding set (not wording), so a review with no findings still gets a bounded coverage check rather than a rubber stamp. Rejecting every finding is `agree=false` with the critique, so the reasons survive in the transcript. Follow-up rounds address only the disputed points.
 
 - `reviewer[0]` in config → Actor (review: Reviewer)
 - `reviewer[1]` in config → Critic (review: Validator)

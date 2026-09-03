@@ -14,7 +14,8 @@ Notable user-visible changes are recorded here. The format follows
 ### Changed
 
 - Review debates: every Reviewer verdict ends with a mandatory Coverage block; the Validator
-  checks it against the review snapshot and rejects gaps, and rejecting every submitted finding is
+  checks it against the review snapshot and rejects only gaps that could change the finding set
+  (wording or grouping differences are not grounds), and rejecting every submitted finding is
   now `agree=false` with the critique instead of an agreeing empty verdict.
 - Reviewer follow-up turns must verify technical premises newly entering the verdict against the
   repository, resolve any first-turn uncertainty, and keep one smallest correction per finding.
@@ -30,7 +31,8 @@ Notable user-visible changes are recorded here. The format follows
 
 - The git tool rejects shell operators (`|`, `&&`, `>`, …) with a message naming the working
   alternative instead of passing them to git as literal arguments.
-- `read_file` rejects `end_line < start_line` instead of silently clamping to one line.
+- `read_file` swaps an inverted `start_line`/`end_line` pair (with a note in the output) instead of
+  silently clamping to one line.
 - Git tool failures (rejected or non-zero-exit commands) are tool errors rather than successful
   `Error: …` text, so session trajectories record them with error status and message and
   `reflect` no longer counts them as successes.
