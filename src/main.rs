@@ -1043,22 +1043,49 @@ pub(crate) fn detect_base_branch(repo: &Path) -> Option<BaseBranch> {
 
 fn resolve_base_branch(repo: &Path, branch: &str) -> Option<BaseBranch> {
     let local = format!("refs/heads/{branch}");
-    if run_git(repo, &["rev-parse", "--verify", &local]).is_ok() {
-        return Some(BaseBranch {
-            name: branch.to_string(),
-            revision: branch.to_string(),
-        });
-    }
-
     let remote = format!("refs/remotes/origin/{branch}");
-    if run_git(repo, &["rev-parse", "--verify", &remote]).is_ok() {
-        return Some(BaseBranch {
-            name: branch.to_string(),
-            revision: format!("origin/{branch}"),
-        });
-    }
+    let has_local = run_git(repo, &["rev-parse", "--verify", &local]).is_ok();
+    let has_remote = run_git(repo, &["rev-parse", "--verify", &remote]).is_ok();
+    let use_remote = match (has_local, has_remote) {
+        (false, false) => return None,
+        (true, false) => false,
+        (false, true) => true,
+        (true, true) => {
+            let behind = local_base_is_behind_remote(repo, &local, &remote);
+            if behind {
+                tracing::warn!(
+                    "local {branch} is behind origin/{branch}; using origin/{branch} as the review base"
+                );
+            }
+            behind
+        }
+    };
+    Some(BaseBranch {
+        name: branch.to_string(),
+        revision: match use_remote {
+            true => format!("origin/{branch}"),
+            false => branch.to_string(),
+        },
+    })
+}
 
-    None
+/// A branch cut from `origin/main` while local `main` lags behind it has an older merge-base with
+/// local `main`, so the "committed comparison" would include upstream commits that are not part
+/// of the change. Prefer the candidate whose merge-base with HEAD is the newer one; equal or
+/// diverged merge-bases keep the local ref. No network involved: only remote-tracking refs are
+/// consulted.
+fn local_base_is_behind_remote(repo: &Path, local: &str, remote: &str) -> bool {
+    let merge_base = |candidate: &str| {
+        run_git(repo, &["merge-base", "HEAD", candidate]).map(|sha| sha.trim().to_string())
+    };
+    match (merge_base(local), merge_base(remote)) {
+        (Ok(local_base), Ok(remote_base)) if local_base != remote_base => run_git(
+            repo,
+            &["merge-base", "--is-ancestor", &local_base, &remote_base],
+        )
+        .is_ok(),
+        _ => false,
+    }
 }
 
 fn run_git(repo: &Path, args: &[&str]) -> Result<String> {
@@ -1281,6 +1308,60 @@ mod tests {
         std::fs::create_dir(&fake).unwrap();
         std::fs::write(fake.join(".git"), "not a gitdir pointer").unwrap();
         assert!(git_worktree_root(&fake).is_none());
+    }
+
+    #[test]
+    fn base_branch_prefers_origin_only_when_local_is_behind_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let commit = |msg: &str| {
+            run_git(
+                repo,
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    msg,
+                ],
+            )
+            .unwrap()
+        };
+        let sha = || {
+            run_git(repo, &["rev-parse", "HEAD"])
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        run_git(repo, &["init", "-b", "main"]).unwrap();
+        commit("a");
+        let a = sha();
+        commit("b");
+        let b = sha();
+        run_git(repo, &["switch", "-c", "feature"]).unwrap();
+        commit("c");
+        let revision = |remote: Option<&str>| {
+            match remote {
+                Some(sha) => run_git(repo, &["update-ref", "refs/remotes/origin/main", sha]),
+                None => run_git(repo, &["update-ref", "-d", "refs/remotes/origin/main"]),
+            }
+            .unwrap();
+            resolve_base_branch(repo, "main").unwrap().revision
+        };
+
+        // feature was cut from b, but local main was never fast-forwarded past a
+        run_git(repo, &["update-ref", "refs/heads/main", &a]).unwrap();
+        assert_eq!(revision(Some(&b)), "origin/main");
+        assert_eq!(revision(Some(&a)), "main");
+        assert_eq!(revision(None), "main");
+
+        // local main ahead of, or equal to, origin keeps the local ref
+        run_git(repo, &["update-ref", "refs/heads/main", &b]).unwrap();
+        assert_eq!(revision(Some(&a)), "main");
+        assert_eq!(revision(Some(&b)), "main");
     }
 
     #[test]

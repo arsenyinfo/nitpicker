@@ -9,13 +9,47 @@ Notable user-visible changes are recorded here. The format follows
 ### Added
 
 - Record the nitpicker version, build revision, and compiled protocol-prompt fingerprint in each
-  logged session so `reflect` experiments can compare attributable cohorts.
+  logged session (`attribution.json`) so `reflect` experiments can compare attributable cohorts.
 
 ### Changed
 
-- Give validators one independent rubric-scoped pass when the reviewer's initial verdict is clean,
-  require evidence for technical premises newly added during revision, and require follow-up
-  findings to resolve uncertainty and propose one smallest correction.
+- Review debates: every Reviewer verdict ends with a mandatory Coverage block; the Validator
+  checks it against the review snapshot and rejects gaps, and rejecting every submitted finding is
+  now `agree=false` with the critique instead of an agreeing empty verdict.
+- Reviewer follow-up turns must verify technical premises newly entering the verdict against the
+  repository, resolve any first-turn uncertainty, and keep one smallest correction per finding.
+- Follow-up debate rounds carry a "respond only to disputed points" instruction in both review and
+  `ask` mode.
+- `spawn_subagent` tells the parent that the subagent starts from an empty conversation and must be
+  given revision ids, paths, and claims verbatim; subagents are told to do the task themselves
+  rather than re-delegating.
+- Diff review base selection prefers `origin/<branch>` when the local branch is behind it (newer
+  merge-base with HEAD), with a warning.
+
+### Fixed
+
+- The git tool rejects shell operators (`|`, `&&`, `>`, …) with a message naming the working
+  alternative instead of passing them to git as literal arguments.
+- `read_file` rejects `end_line < start_line` instead of silently clamping to one line.
+- Git tool failures (rejected or non-zero-exit commands) are tool errors rather than successful
+  `Error: …` text, so session trajectories record them with error status and message and
+  `reflect` no longer counts them as successes.
+
+## [0.9.4] - 2026-08-20
+
+`nitpicker-agent` 0.5.1
+
+### Changed
+
+- Enable prompt caching for first-party Anthropic and Azure Foundry routes, and give Codex
+  requests a stable cache-routing key derived from their reusable prefix.
+- Keep terminal tool schemas stable when provider-side tool choice can safely constrain execution;
+  fall back to the terminal-only subset when multiple terminal tools require structural isolation.
+
+### Fixed
+
+- Prevent non-terminal tool calls from consuming the final turn when multiple terminal tools are
+  configured, and report the sorted executable-tool allowlist when the harness rejects a call.
 
 ## [0.9.3] - 2026-08-13
 

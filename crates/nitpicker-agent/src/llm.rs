@@ -1212,6 +1212,10 @@ impl LLMProvider {
                 base_url,
                 api_key_env,
             } => {
+                // First-party Anthropic supports cache_control. An arbitrary compatible gateway
+                // may reject that field, so custom base URLs keep the legacy request shape unless
+                // they are constructed explicitly as an AnthropicPromptCachingClient.
+                let enable_prompt_caching = base_url.is_none();
                 let key_env = api_key_env.as_deref().unwrap_or("ANTHROPIC_API_KEY");
                 let api_key = std::env::var(key_env)
                     .or_else(|_| missing_or_local(key_env, base_url.as_deref()))?;
@@ -1219,7 +1223,11 @@ impl LLMProvider {
                 if let Some(url) = base_url {
                     builder = builder.base_url(url);
                 }
-                Ok(Box::new(builder.build()?))
+                let client = builder.build()?;
+                match enable_prompt_caching {
+                    true => Ok(Box::new(AnthropicPromptCachingClient::new(client))),
+                    false => Ok(Box::new(client)),
+                }
             }
             LLMProvider::Gemini {
                 base_url,
@@ -1336,40 +1344,69 @@ pub fn create_gemini_client_with_proxy(
     Ok(client.with_retry().into_arc())
 }
 
+/// Anthropic client policy used by first-party and Foundry routes. Rig's typed caching modes add
+/// stable tools/system breakpoints plus a moving top-level conversation breakpoint.
+pub(crate) struct AnthropicPromptCachingClient {
+    inner: anthropic::Client,
+}
+
+impl AnthropicPromptCachingClient {
+    pub(crate) fn new(inner: anthropic::Client) -> Self {
+        Self { inner }
+    }
+}
+
+async fn complete_anthropic(
+    client: &anthropic::Client,
+    completion: Completion,
+    prompt_caching: bool,
+) -> Result<CompletionResponse> {
+    let model_name = completion.model.clone();
+    let mut request: rig_core::completion::CompletionRequest = completion.into();
+    request.model = Some(model_name.clone());
+    // Anthropic requires `max_tokens`, so "no cap" cannot be expressed here. rig's own default
+    // covers only model names it recognizes and falls back to 2048 for every compatible gateway —
+    // less than one review turn spends on reasoning.
+    request
+        .max_tokens
+        .get_or_insert(ANTHROPIC_DEFAULT_MAX_TOKENS);
+    let mut model = client.completion_model(model_name.clone());
+    if prompt_caching {
+        model = model.with_prompt_caching().with_automatic_caching();
+    }
+    let response = model
+        .completion(request)
+        .await
+        .wrap_err_with(|| format!("Anthropic completion failed for model '{model_name}'"))?;
+    let finish_reason = response
+        .raw_response
+        .stop_reason
+        .clone()
+        .map(|reason| match reason.as_str() {
+            "end_turn" => FinishReason::Stop,
+            "max_tokens" => FinishReason::MaxTokens,
+            "tool_use" => FinishReason::ToolUse,
+            other => FinishReason::Other(other.to_string()),
+        })
+        .unwrap_or(FinishReason::None);
+    let finish_reason = resolve_finish_reason(&response.choice, finish_reason);
+    Ok(CompletionResponse {
+        choice: response.choice,
+        finish_reason,
+        usage: TokenUsage::from_provider(&response.usage, CacheAccounting::OutsidePrompt),
+        selected_model: Some(model_name),
+    })
+}
+
 impl LLMClient for anthropic::Client {
     async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
-        let model_name = completion.model.clone();
-        let mut request: rig_core::completion::CompletionRequest = completion.into();
-        request.model = Some(model_name.clone());
-        // Anthropic requires `max_tokens`, so "no cap" cannot be expressed here. rig's own default
-        // covers only model names it recognizes and falls back to 2048 for every compatible
-        // gateway — less than one review turn spends on reasoning.
-        request
-            .max_tokens
-            .get_or_insert(ANTHROPIC_DEFAULT_MAX_TOKENS);
-        let model = self.completion_model(model_name.clone());
-        let response = model
-            .completion(request)
-            .await
-            .wrap_err_with(|| format!("Anthropic completion failed for model '{model_name}'"))?;
-        let finish_reason = response
-            .raw_response
-            .stop_reason
-            .clone()
-            .map(|reason| match reason.as_str() {
-                "end_turn" => FinishReason::Stop,
-                "max_tokens" => FinishReason::MaxTokens,
-                "tool_use" => FinishReason::ToolUse,
-                other => FinishReason::Other(other.to_string()),
-            })
-            .unwrap_or(FinishReason::None);
-        let finish_reason = resolve_finish_reason(&response.choice, finish_reason);
-        Ok(CompletionResponse {
-            choice: response.choice,
-            finish_reason,
-            usage: TokenUsage::from_provider(&response.usage, CacheAccounting::OutsidePrompt),
-            selected_model: Some(model_name),
-        })
+        complete_anthropic(self, completion, false).await
+    }
+}
+
+impl LLMClient for AnthropicPromptCachingClient {
+    async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
+        complete_anthropic(&self.inner, completion, true).await
     }
 }
 
@@ -1545,6 +1582,8 @@ mod tests {
     use super::*;
     use rig_core::completion::Usage;
     use std::sync::Mutex as StdMutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn strip_think_blocks(text: &str) -> String {
         scan_think_blocks(text).0
@@ -1600,6 +1639,88 @@ mod tests {
             max_tokens: Some(999),
             additional_params: None,
         }
+    }
+
+    #[tokio::test]
+    async fn anthropic_first_party_policy_emits_cache_control_on_the_wire() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0_u8; 4096];
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before sending HTTP headers");
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(index) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .expect("request must carry content-length");
+            while request.len() < header_end + content_length {
+                let mut chunk = [0_u8; 4096];
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before sending the request body");
+                request.extend_from_slice(&chunk[..read]);
+            }
+
+            let response_body = json!({
+                "content": [{ "type": "text", "text": "ok" }],
+                "id": "msg_test",
+                "model": "claude-test",
+                "role": "assistant",
+                "type": "message",
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+                "usage": { "input_tokens": 1, "output_tokens": 1 }
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            serde_json::from_slice::<Value>(&request[header_end..header_end + content_length])
+                .unwrap()
+        });
+
+        let client = anthropic::Client::builder()
+            .api_key("test-key")
+            .base_url(format!("http://{address}"))
+            .build()
+            .unwrap();
+        let caching_client = AnthropicPromptCachingClient::new(client);
+        let mut completion = test_completion();
+        completion.model = "claude-test".to_string();
+        completion.tools = vec![rig_core::completion::ToolDefinition {
+            name: "read_file".to_string(),
+            description: "Read a file".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"]
+            }),
+        }];
+
+        LLMClient::completion(&caching_client, completion)
+            .await
+            .unwrap();
+        let body = server.await.unwrap();
+        assert_eq!(body["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            body["tools"].as_array().unwrap().last().unwrap()["cache_control"]["type"],
+            "ephemeral"
+        );
     }
 
     #[tokio::test]

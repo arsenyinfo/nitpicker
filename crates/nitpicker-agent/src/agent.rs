@@ -12,7 +12,7 @@ use rig_core::OneOrMany;
 use rig_core::completion::Message;
 use rig_core::completion::message::{ToolChoice, ToolResult, ToolResultContent, UserContent};
 use serde_json::{Value, json};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -210,6 +210,7 @@ struct FinishTool {
 struct ToolCallContext<'a> {
     config: &'a AgentConfig,
     runtime_tools: &'a HashMap<String, Arc<dyn Tool>>,
+    executable_tools: &'a HashSet<String>,
     tools_map: &'a HashMap<String, Arc<dyn Tool>>,
     work_dir: &'a Path,
     turn: usize,
@@ -377,6 +378,26 @@ pub async fn run_agent(
             eyre::bail!("required terminal tool '{name}' is not available")
         }
     }
+    // Tools that are impossible for this agent's entire lifetime are omitted consistently. Tools
+    // disabled only for a particular phase stay advertised so the provider's tool-schema prefix
+    // remains byte-stable across the conversation; the harness allowlist below remains
+    // authoritative for execution.
+    let mut advertised_tools = runtime_tools.clone();
+    if !config.depth.can_spawn_subagent() {
+        advertised_tools.remove("spawn_subagent");
+    }
+    let advertised_tool_definitions = tool_definitions(&advertised_tools);
+    // The provider-neutral ToolChoice can name exactly one tool or require any advertised tool,
+    // but cannot require one of several named tools. Preserve the stable schema prefix whenever
+    // the choice itself is sufficient; for multiple terminal tools, retain the old structural
+    // guarantee that no non-terminal schema is callable on the terminal request.
+    let multiple_terminal_tool_definitions = (terminal_tools.len() > 1).then(|| {
+        advertised_tool_definitions
+            .iter()
+            .filter(|tool| terminal_tools.iter().any(|name| name == &tool.name))
+            .cloned()
+            .collect::<Vec<_>>()
+    });
 
     let mut effective_system_prompt = config.system_prompt.clone();
     match &config.project_context {
@@ -408,11 +429,12 @@ pub async fn run_agent(
 
     for turn in 0..config.max_turns {
         let is_final_turn = turn + 1 == config.max_turns;
+        let terminal_phase = is_final_turn || terminal_submission_requested;
         let force_terminal_submission =
             terminal_submission_requested || (is_final_turn && !terminal_tools.is_empty());
-        let mut available_tools = runtime_tools.clone();
+        let mut executable_tools: HashSet<String> = runtime_tools.keys().cloned().collect();
         if !config.depth.can_spawn_subagent() || is_final_turn {
-            available_tools.remove("spawn_subagent");
+            executable_tools.remove("spawn_subagent");
         }
 
         if !is_final_turn && conversation_usage.should_compact() {
@@ -439,8 +461,8 @@ pub async fn run_agent(
             .await;
         }
 
-        if is_final_turn || terminal_submission_requested {
-            available_tools.retain(|name, _| terminal_tools.iter().any(|tool| tool == name));
+        if terminal_phase {
+            executable_tools.retain(|name| terminal_tools.iter().any(|tool| tool == name));
         }
 
         if is_final_turn {
@@ -457,13 +479,29 @@ pub async fn run_agent(
             prompt = wrap_up_prompt;
         }
 
+        let tool_choice = if terminal_phase {
+            match terminal_tools.as_slice() {
+                [] => Some(ToolChoice::None),
+                [name] => Some(ToolChoice::Specific {
+                    function_names: vec![name.clone()],
+                }),
+                _ => Some(ToolChoice::Required),
+            }
+        } else {
+            None
+        };
+        let request_tool_definitions =
+            match (terminal_phase, multiple_terminal_tool_definitions.as_ref()) {
+                (true, Some(definitions)) => definitions.clone(),
+                _ => advertised_tool_definitions.clone(),
+            };
         let completion = Completion {
             model: config.model.clone(),
             prompt: prompt.clone(),
             preamble: Some(effective_system_prompt.clone()),
             history: history[..history.len().saturating_sub(1)].to_vec(),
-            tools: tool_definitions(&available_tools),
-            tool_choice: force_terminal_submission.then_some(ToolChoice::Required),
+            tools: request_tool_definitions,
+            tool_choice,
             max_tokens: config.max_tokens,
             additional_params: None,
         };
@@ -531,7 +569,8 @@ pub async fn run_agent(
                     execute_tool_call(
                         ToolCallContext {
                             config: &config,
-                            runtime_tools: &available_tools,
+                            runtime_tools: &runtime_tools,
+                            executable_tools: &executable_tools,
                             tools_map,
                             work_dir,
                             turn,
@@ -814,7 +853,7 @@ impl Tool for SpawnSubagentTool {
                 "properties": {
                     "task": {
                         "type": "string",
-                        "description": "A compact self-contained task for the subagent"
+                        "description": "A compact self-contained task. The subagent starts from an empty conversation: it sees none of your messages, plan labels, prior tool results, or the original question and review snapshot. Restate verbatim the revision ids, paths, and claims it needs."
                     }
                 },
                 "required": ["task"],
@@ -1004,31 +1043,37 @@ async fn execute_tool_call(
         return Ok(outcome);
     }
 
+    if !ctx.executable_tools.contains(tool_name) {
+        let mut allowed_tools = ctx.executable_tools.iter().cloned().collect::<Vec<_>>();
+        allowed_tools.sort();
+        let allowed_tools = match allowed_tools.is_empty() {
+            true => "none".to_string(),
+            false => allowed_tools.join(", "),
+        };
+        let outcome = ToolCallOutcome {
+            output: format!(
+                "Error: tool '{tool_name}' is disabled for this turn; allowed tools: {allowed_tools}"
+            ),
+            nested_tool_calls: 0,
+            status: ToolCallStatus::Error,
+            spawned_agent: None,
+            subagent_usage: TokenUsage::default(),
+        };
+        log_tool_call(
+            ctx.config,
+            ctx.turn + 1,
+            tool_name,
+            &args,
+            outcome.status,
+            outcome.spawned_agent.as_deref(),
+            None,
+            ctx.selected_model,
+        )
+        .await;
+        return Ok(outcome);
+    }
+
     if tool_name == "spawn_subagent" {
-        if !ctx.config.depth.can_spawn_subagent()
-            || !ctx.runtime_tools.contains_key("spawn_subagent")
-        {
-            let outcome = ToolCallOutcome {
-                output: "Error: subagent depth limit reached; cannot spawn another subagent"
-                    .to_string(),
-                nested_tool_calls: 0,
-                status: ToolCallStatus::Error,
-                spawned_agent: None,
-                subagent_usage: TokenUsage::default(),
-            };
-            log_tool_call(
-                ctx.config,
-                ctx.turn + 1,
-                tool_name,
-                &args,
-                outcome.status,
-                outcome.spawned_agent.as_deref(),
-                None,
-                ctx.selected_model,
-            )
-            .await;
-            return Ok(outcome);
-        }
         info!(agent = %ctx.config.name, turn = ctx.turn, "spawning subagent");
         let prepared = match prepare_subagent(
             ctx.config,
@@ -1146,6 +1191,10 @@ async fn execute_tool_call(
         }
     };
 
+    let logged_result = match outcome.status {
+        ToolCallStatus::Error => Some(truncate_for_trajectory(outcome.output.clone())),
+        _ => None,
+    };
     log_tool_call(
         ctx.config,
         ctx.turn + 1,
@@ -1153,7 +1202,7 @@ async fn execute_tool_call(
         &logged_args,
         outcome.status,
         outcome.spawned_agent.as_deref(),
-        None,
+        logged_result.as_deref(),
         ctx.selected_model,
     )
     .await;
@@ -1317,7 +1366,10 @@ mod tests {
 
     impl LLMClient for TerminalScriptClient {
         async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
-            let forced = matches!(completion.tool_choice, Some(ToolChoice::Required));
+            let forced = matches!(
+                completion.tool_choice,
+                Some(ToolChoice::Required | ToolChoice::Specific { .. })
+            );
             self.calls
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1385,6 +1437,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_tool_failure_is_fed_back_as_error_text_with_error_status() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let config = terminal_test_config(calls, 1, vec!["finish".to_string()]);
+        let runtime_tools = terminal_test_tools();
+        let executable_tools = HashSet::from(["git".to_string()]);
+        let dir = tempfile::tempdir().unwrap();
+
+        let outcome = execute_tool_call(
+            ToolCallContext {
+                config: &config,
+                runtime_tools: &runtime_tools,
+                executable_tools: &executable_tools,
+                tools_map: &runtime_tools,
+                work_dir: dir.path(),
+                turn: 0,
+                current_turns: 1,
+                total_tool_calls: 1,
+                initial_subagent_count: 0,
+                selected_model: Some("scripted"),
+            },
+            "git",
+            json!({"command": "log --oneline | head -n 3"}),
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.status, ToolCallStatus::Error);
+        assert!(outcome.output.starts_with("Error:"));
+    }
+
+    #[tokio::test]
     async fn plain_text_is_repackaged_through_a_forced_terminal_turn() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let config = terminal_test_config(Arc::clone(&calls), 3, vec!["finish".to_string()]);
@@ -1399,14 +1483,26 @@ mod tests {
         let calls = calls.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].tool_choice, None);
-        assert_eq!(calls[1].tool_choice, Some(ToolChoice::Required));
         assert_eq!(
-            calls[1]
-                .tools
-                .iter()
-                .map(|tool| tool.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["finish"]
+            calls[1].tool_choice,
+            Some(ToolChoice::Specific {
+                function_names: vec!["finish".to_string()]
+            })
+        );
+        let first_tool_names = calls[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        let terminal_tool_names = calls[1]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(first_tool_names, terminal_tool_names);
+        assert!(
+            calls[1].tools.iter().any(|tool| tool.name != "finish"),
+            "terminal turn must retain non-terminal tool schemas for cache stability"
         );
         assert!(
             calls[1]
@@ -1429,7 +1525,98 @@ mod tests {
 
         assert_eq!(result.turns, 1);
         let calls = calls.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            calls[0].tool_choice,
+            Some(ToolChoice::Specific {
+                function_names: vec!["finish".to_string()]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn final_turn_with_multiple_terminal_tools_advertises_only_that_subset() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let terminal_tools = vec!["finish".to_string(), "read_file".to_string()];
+        let config = terminal_test_config(Arc::clone(&calls), 1, terminal_tools.clone());
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = run_agent(config, "investigate", &terminal_test_tools(), dir.path())
+            .await
+            .unwrap();
+
+        assert_eq!(result.turns, 1);
+        let calls = calls.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(calls[0].tool_choice, Some(ToolChoice::Required));
+        let advertised_names = calls[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(advertised_names, terminal_tools);
+    }
+
+    #[tokio::test]
+    async fn text_only_final_turn_retains_tool_schemas_but_disables_tool_choice() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let config = terminal_test_config(Arc::clone(&calls), 1, Vec::new());
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = run_agent(config, "investigate", &terminal_test_tools(), dir.path())
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "plain-text conclusion");
+        let calls = calls.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls[0].tool_choice, Some(ToolChoice::None));
+        assert!(!calls[0].tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn harness_does_not_execute_a_tool_disabled_for_the_turn() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let config = terminal_test_config(calls, 1, vec!["finish".to_string()]);
+        let result_store = Arc::new(Mutex::new(None));
+        let mut runtime_tools = terminal_test_tools();
+        runtime_tools.insert(
+            "finish".to_string(),
+            Arc::new(FinishTool {
+                result: Arc::clone(&result_store),
+            }),
+        );
+        let executable_tools = HashSet::from(["read_file".to_string(), "grep".to_string()]);
+        let dir = tempfile::tempdir().unwrap();
+
+        let outcome = execute_tool_call(
+            ToolCallContext {
+                config: &config,
+                runtime_tools: &runtime_tools,
+                executable_tools: &executable_tools,
+                tools_map: &runtime_tools,
+                work_dir: dir.path(),
+                turn: 0,
+                current_turns: 1,
+                total_tool_calls: 1,
+                initial_subagent_count: 0,
+                selected_model: Some("scripted"),
+            },
+            "finish",
+            json!({"result": "must not be stored"}),
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.status, ToolCallStatus::Error);
+        assert_eq!(
+            outcome.output,
+            "Error: tool 'finish' is disabled for this turn; allowed tools: grep, read_file"
+        );
+        assert!(
+            result_store
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none()
+        );
     }
 
     #[tokio::test]

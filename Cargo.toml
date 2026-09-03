@@ -1,6 +1,6 @@
 [package]
 name = "nitpicker"
-version = "0.9.3"
+version = "0.9.4"
 edition = "2024"
 # MSRV of the default (azure-off) build. The optional `azure` feature raises the floor to 1.88
 # via azure_core's own rust-version; cargo enforces that when `--features azure` is enabled.
@@ -19,7 +19,7 @@ path = "src/main.rs"
 members = ["crates/nitpicker-agent"]
 
 [dependencies]
-nitpicker-agent = { path = "crates/nitpicker-agent", version = "0.5.0" }
+nitpicker-agent = { path = "crates/nitpicker-agent", version = "0.5.1" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "time", "sync", "net"] }
 futures = "0.3"
 rig-core = "0.41"

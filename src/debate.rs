@@ -366,6 +366,12 @@ fn build_turn_message(topic: &str, verdicts: &[LaneVerdict], round: usize, role:
             ));
         }
     }
+    if round > 1 {
+        msg.push_str(
+            "\nThis is a follow-up round: respond to the latest opposing verdict and investigate \
+             only its disputed or changed points; do not re-run discovery over the whole target.\n",
+        );
+    }
     msg.push_str(&format!(
         "\n---\nRound {round} — your turn as {role}. Explore the codebase as needed, then call submit_verdict."
     ));
