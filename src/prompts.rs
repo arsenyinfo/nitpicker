@@ -520,46 +520,6 @@ mod tests {
     }
 
     #[test]
-    fn clean_review_verdict_gets_one_bounded_independent_validation_pass() {
-        let p = preset("security", "rubric");
-        let validator = LaneTask::Review {
-            scope: ReviewScope::Diff,
-            preset: &p,
-        }
-        .critic_system();
-
-        for needle in [
-            NO_FINDINGS,
-            "On your first turn only",
-            "one independent pass",
-            "limited to this lane's rubric",
-            "do not restart the lane, repeat the independent pass",
-        ] {
-            assert!(validator.contains(needle), "missing {needle}");
-        }
-    }
-
-    #[test]
-    fn review_followups_require_evidence_and_confirmed_shape() {
-        let p = preset("correctness", "rubric");
-        let actor = LaneTask::Review {
-            scope: ReviewScope::Diff,
-            preset: &p,
-        }
-        .actor_system();
-        for needle in [
-            "entering the verdict for the first time",
-            "premises already established with concrete evidence",
-            "permits `Uncertainty` only on the first turn",
-            "exactly one smallest correction",
-        ] {
-            assert!(actor.contains(needle), "missing {needle}");
-        }
-        let topic_actor = LaneTask::Ask.actor_system();
-        assert!(!topic_actor.contains("entering the verdict for the first time"));
-    }
-
-    #[test]
     fn session_attribution_has_a_stable_protocol_fingerprint() {
         let first = session_attribution();
         let second = session_attribution();

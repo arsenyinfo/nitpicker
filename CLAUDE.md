@@ -252,9 +252,10 @@ path surfaces after the clone/checkout but still before the first model call.
 ### Reflect flow (`reflect.rs`)
 
 1. Load recent session directories from `~/.nitpicker/sessions` or an explicit `--sessions-dir`
-2. Parse per-agent JSONL tool traces and `aggregation.json` into typed session records. Staged
+2. Parse per-agent JSONL tool traces, `aggregation.json`, and the optional `attribution.json` sidecar into typed session records. Staged
    verdicts are required; outdated or malformed aggregation records reject that session instead of
-   entering reflection with incomplete evidence
+   entering reflection with incomplete evidence. A missing or malformed attribution sidecar is
+   rendered as unavailable rather than rejecting the session
 3. Deterministically calculate unique invocation/status/tool/model counts, maximum delegation depth,
    duration, and repeated exact requests (spawn `started`/`error` lifecycle pairs count as one
    invocation). Format those metrics with agents, per-lane/per-job outcomes, staged verdicts, the
@@ -320,6 +321,7 @@ Tool outputs are intentionally a bit self-describing: `read_file` includes file/
 - A failed `spawn_subagent` appends an error completion record in the parent's trace (a successful one deliberately doesn't — the subagent's own records, written under its own label to the shared session file, carry its result); `compact` records use the same 1-based turn numbering as tool records and name the turn they precede
 - Appends are flushed before returning, so write errors propagate to the caller's warn and `process::exit` paths can't drop the tail record
 - Final synthesized output is saved as `aggregation.json`; on parallel runs it carries a per-job outcome list (`jobs`: label, preset, ok) — the durable record of jobs whose failures are otherwise only transient logs (a client-build failure writes no trace file at all) — and preset debate runs carry the analogous `lanes`. A synthesis failure *after* job/lane collection still writes the record: `error` set, `text` empty, jobs/lanes intact (all three post-collection failure paths in `review.rs`, debate's meta failure, **and** both refuse-to-synthesize bails — total failure is when the record matters most; a failed record write warns rather than masking the original error). `ToolCallRecord` carries `model` when the client reports the turn's selected model — the only durable per-turn attribution on alloy runs (text-only turns write no record; compaction records stay unattributed)
+- `attribution.json` (written by both `run_review` and `run_debate` once the logger exists; a write failure warns) records the nitpicker package version, the build-time git revision (`build.rs`, `-dirty` suffix on an unclean tree, absent outside a checkout), and a SHA-256 over the rendered protocol prompts (`prompts::protocol_prompt_sha256`: every role/scope system prompt and synthesis preamble with placeholder preset/rubric, plus the library's subagent/compaction/final-turn prompts). The fingerprint covers orchestration instructions only, never user tasks or configured rubrics, so `reflect` can compare cohorts that ran the same protocol over different targets. It is a sidecar rather than an `AggregationRecord` field so the library's public record literal stays source-compatible
 
 ### Gemini AG2 proxy (`gemini_proxy/`)
 
