@@ -6,6 +6,10 @@ Notable user-visible changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-09-03
+
+`nitpicker-agent` 0.5.2
+
 ### Added
 
 - Record the nitpicker version, build revision, and compiled protocol-prompt fingerprint in each

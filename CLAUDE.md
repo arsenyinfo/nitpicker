@@ -5,7 +5,7 @@ Multi-reviewer code review using LLMs. Spawns parallel agents with different mod
 ## Contributor memo
 
 - Before opening a PR, update `README.md` and `CLAUDE.md` for any user-facing or architecture-relevant changes.
-- If you bump the version, add a short summary entry to the changelog in `README.md`.
+- If you bump the version, add a short summary entry to the changelog in `CHANGELOG.md`.
 
 ## Quick start
 
