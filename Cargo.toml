@@ -10,6 +10,12 @@ description = "Multi-reviewer code review using LLMs with parallel agents and de
 license = "MIT"
 repository = "https://github.com/arsenyinfo/nitpicker"
 documentation = "https://github.com/arsenyinfo/nitpicker"
+exclude = [
+    "assets/",
+    "slides.md",
+    "nitpicker-presentation.pdf",
+    "1b_tokens.png",
+]
 
 [[bin]]
 name = "nitpicker"
@@ -19,7 +25,7 @@ path = "src/main.rs"
 members = ["crates/nitpicker-agent"]
 
 [dependencies]
-nitpicker-agent = { path = "crates/nitpicker-agent", version = "0.5.2" }
+nitpicker-agent = { path = "crates/nitpicker-agent", version = "0.5.3" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "time", "sync", "net"] }
 futures = "0.3"
 rig-core = "0.41"

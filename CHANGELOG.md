@@ -8,7 +8,7 @@ Notable user-visible changes are recorded here. The format follows
 
 ## [0.9.5] - 2026-09-03
 
-`nitpicker-agent` 0.5.2
+`nitpicker-agent` 0.5.3
 
 ### Added
 

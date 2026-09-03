@@ -52,8 +52,8 @@ fn protocol_prompt_sha256() -> String {
         RunTask::Ask.aggregator_preamble(),
         RunTask::Ask.meta_preamble(),
         nitpicker_agent::prompts::subagent_system_prompt().to_string(),
-        include_str!("../crates/nitpicker-agent/prompts/compaction-summary.md").to_string(),
-        include_str!("../crates/nitpicker-agent/prompts/final-turn-wrap-up.md").to_string(),
+        nitpicker_agent::prompts::compaction_summary_prompt().to_string(),
+        nitpicker_agent::prompts::final_turn_wrap_up_prompt().to_string(),
     ];
     for scope in [ReviewScope::Diff, ReviewScope::Static] {
         let lane = LaneTask::Review {
