@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::future::Future;
 use std::time::Instant;
+use tracing::Instrument;
 
 const MODELS_URL: &str =
     "https://openrouter.ai/api/v1/models?supported_parameters=tools%2Ctemperature";
@@ -427,10 +428,17 @@ where
                 let model = model_id.to_string();
                 let label = slot_label.to_string();
                 let probe = probe.clone();
-                tokio::spawn(async move {
-                    let outcome = probe(key, model, label).await;
-                    (idx, outcome)
-                })
+                let span = tracing::info_span!(
+                    "openrouter.probe",
+                    gen_ai.request.model = %crate::telemetry::bounded(model_id)
+                );
+                tokio::spawn(
+                    async move {
+                        let outcome = probe(key, model, label).await;
+                        (idx, outcome)
+                    }
+                    .instrument(span),
+                )
             })
             .collect();
         let mut credential_rejected = false;

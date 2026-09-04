@@ -131,6 +131,15 @@ impl SessionLogger {
         self.root.as_ref()
     }
 
+    /// The session directory's basename (`session-<ts>-<pid>`): the run's durable identifier,
+    /// safe to export where the full path is not.
+    pub fn id(&self) -> &str {
+        self.root()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+    }
+
     pub fn child(&self, relative_path: impl AsRef<Path>) -> SessionWriter {
         SessionWriter {
             root: Arc::clone(&self.root),

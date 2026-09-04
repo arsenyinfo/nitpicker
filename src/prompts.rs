@@ -195,6 +195,21 @@ pub(crate) enum LaneTask<'a> {
 }
 
 impl RunTask<'_> {
+    /// Stable run-kind name for telemetry.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            RunTask::Ask => "ask",
+            RunTask::Review {
+                scope: ReviewScope::Diff,
+                ..
+            } => "review",
+            RunTask::Review {
+                scope: ReviewScope::Static,
+                ..
+            } => "analyze",
+        }
+    }
+
     pub fn presets(&self) -> Option<&[crate::presets::ReviewPreset]> {
         match self {
             RunTask::Ask => None,

@@ -2,6 +2,8 @@ use clap::{Args as ClapArgs, Parser, Subcommand};
 use eyre::{Result, WrapErr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use tracing::field::Empty;
+use tracing::{Instrument, info_span};
 
 use nitpicker_agent::{config, openrouter, tools::floor_char_boundary};
 
@@ -267,7 +269,36 @@ fn finish(outcome: Result<Exit>, stdout: &mut impl std::io::Write) -> u8 {
     }
 }
 
+/// The root span of every run; the orchestration spans below it are per-mode.
 async fn run(args: Args) -> Result<Exit> {
+    let command = match &args.command {
+        None => "review",
+        Some(Command::Init { .. }) => "init",
+        Some(Command::Ask { .. }) => "ask",
+        Some(Command::Pr(_)) => "pr",
+        Some(Command::Reflect { .. }) => "reflect",
+    };
+    let span = info_span!(
+        "nitpicker.run",
+        otel.status_code = Empty,
+        nitpicker.command = command,
+        nitpicker.degraded = Empty,
+        nitpicker.pr.number = Empty,
+    );
+    let outcome = dispatch(args).instrument(span.clone()).await;
+    match &outcome {
+        Ok(Exit::Clean) => {}
+        Ok(Exit::Degraded) => {
+            span.record("nitpicker.degraded", true);
+        }
+        Ok(Exit::Failed) | Err(_) => {
+            span.record("otel.status_code", "ERROR");
+        }
+    }
+    outcome
+}
+
+async fn dispatch(args: Args) -> Result<Exit> {
     if !presets_allowed(&args.command) && !args.presets.preset.is_empty() {
         eyre::bail!("--preset applies to review modes only (default review, --analyze, pr)");
     }

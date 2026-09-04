@@ -618,6 +618,9 @@ async fn run_pr_inner(
     check_gh()?;
 
     let prepared = prepare_pr(&args, &common.repo)?;
+    if let Some(number) = prepared.pr_number {
+        tracing::Span::current().record("nitpicker.pr.number", u64::from(number));
+    }
 
     // Config loads AFTER prep because its repo-level source is the PR base branch blob —
     // the base ref comes from the PR metadata, and the checkout must already have happened

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
+use tracing::Instrument;
 use tracing::{info, warn};
 
 const MAX_FORMATTED_SESSION_BYTES: usize = 200_000;
@@ -772,8 +773,14 @@ pub async fn run_reflect(args: ReflectArgs) -> Result<()> {
         let model = map_model.clone();
         let client = Arc::clone(&map_client);
         let semaphore = Arc::clone(&map_semaphore);
-        let handle =
-            tokio::spawn(async move { analyze_session(md, model, client, semaphore).await });
+        // spawned tasks do not inherit the current span: attach the run's context explicitly
+        let span = tracing::info_span!(
+            "reflect.analysis",
+            nitpicker.session.id = %nitpicker_agent::telemetry::bounded(&name)
+        );
+        let handle = tokio::spawn(
+            async move { analyze_session(md, model, client, semaphore).await }.instrument(span),
+        );
         handles.push((name, handle));
     }
 

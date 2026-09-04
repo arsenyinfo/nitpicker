@@ -7,12 +7,15 @@ use nitpicker_agent::agent::{
     run_agent,
 };
 use nitpicker_agent::config::Config;
-use nitpicker_agent::llm::{Completion, LLMClientDyn, TokenUsage, is_operational_limit_error};
+use nitpicker_agent::llm::{
+    Completion, LLMClientDyn, TokenUsage, is_operational_limit_error, throttled_completion,
+};
 use nitpicker_agent::provider::{build_aggregator_client, build_reviewer_client};
 use nitpicker_agent::session::{
     AggregationRecord, LaneRecord, SessionLogger, SessionWriter, VerdictRecord,
     sanitize_path_component,
 };
+use nitpicker_agent::telemetry::bounded;
 use nitpicker_agent::tools::{Tool, all_tools};
 use rig_core::completion::Message;
 use serde_json::{Value, json};
@@ -23,8 +26,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use termimad::MadSkin;
-use tracing::info;
-use tracing::warn;
+use tracing::field::Empty;
+use tracing::{Instrument, info, info_span, warn};
 
 struct ModelLabel {
     alias: String, // short name used in agent name / logs
@@ -312,6 +315,14 @@ async fn run_debate_side(
     }) as Arc<dyn Fn(AgentProgress) + Send + Sync>);
 
     let session_agent = format!("{}-{round}", side.session_stem);
+    let turn_span = info_span!(
+        "debate.turn",
+        otel.status_code = Empty,
+        nitpicker.role = %bounded(side.role),
+        nitpicker.round = round as u64,
+        gen_ai.request.model = %bounded(side.model),
+        nitpicker.agree = Empty,
+    );
     let result = run_debate_turn(DebateTurnRequest {
         client: Arc::clone(&side.client),
         compact_threshold: side.compact_threshold,
@@ -331,7 +342,12 @@ async fn run_debate_side(
             .map(|logger| logger.child(format!("{session_agent}.jsonl"))),
         session_agent,
     })
+    .instrument(turn_span.clone())
     .await?;
+    turn_span.record("nitpicker.agree", result.verdict.agree);
+    if result.agent_failed {
+        turn_span.record("otel.status_code", "ERROR");
+    }
 
     let elapsed = start.elapsed().as_secs();
     pb.set_message(crate::progress::bar_message(format!(
@@ -472,6 +488,40 @@ pub async fn run_debate(
     config: &Config,
     opts: DebateOptions<'_>,
 ) -> Result<DebateOutcome> {
+    let span = info_span!(
+        "debate",
+        otel.status_code = Empty,
+        nitpicker.mode = "debate",
+        nitpicker.task = opts.task.kind(),
+        nitpicker.presets = opts.task.presets().map_or(0, <[_]>::len) as u64,
+        nitpicker.reviewers = config.reviewer.len() as u64,
+        nitpicker.session.id = Empty,
+        nitpicker.degraded = Empty,
+        gen_ai.usage.input_tokens = Empty,
+        gen_ai.usage.output_tokens = Empty,
+    );
+    let result = run_debate_inner(repo, prompt, config, opts)
+        .instrument(span.clone())
+        .await;
+    match &result {
+        Ok(outcome) => {
+            span.record("nitpicker.degraded", outcome.degraded);
+            span.record("gen_ai.usage.input_tokens", outcome.usage.input_tokens);
+            span.record("gen_ai.usage.output_tokens", outcome.usage.output_tokens);
+        }
+        Err(_) => {
+            span.record("otel.status_code", "ERROR");
+        }
+    }
+    result
+}
+
+async fn run_debate_inner(
+    repo: &Path,
+    prompt: &str,
+    config: &Config,
+    opts: DebateOptions<'_>,
+) -> Result<DebateOutcome> {
     let DebateOptions {
         max_rounds,
         max_turns,
@@ -555,6 +605,7 @@ pub async fn run_debate(
     let session_logger = SessionLogger::maybe_new(config.log_trajectories())?;
     if let Some(logger) = &session_logger {
         info!(path = %logger.root().display(), "trajectory logging enabled");
+        tracing::Span::current().record("nitpicker.session.id", logger.id());
         if let Err(err) = logger.write_attribution(&session_attribution).await {
             warn!(error = ?err, "failed to persist session attribution");
         }
@@ -649,6 +700,14 @@ pub async fn run_debate(
             let session_logger = session_logger.as_ref();
             let actor_alias = &actor_label.alias;
             let critic_alias = &critic_label.alias;
+            let lane_span = info_span!(
+                "debate.lane",
+                nitpicker.lane = lane_index as u64,
+                nitpicker.preset = lane_task.preset().map_or("", |p| bounded(&p.name)),
+                nitpicker.rounds = Empty,
+                nitpicker.converged = Empty,
+                nitpicker.degraded = Empty,
+            );
             async move {
                 let preset = lane_task.preset();
                 let (lane_progress, _) = make_spinner(mp);
@@ -748,8 +807,13 @@ pub async fn run_debate(
                         &lane,
                         started.elapsed().as_secs(),
                     )));
+                let span = tracing::Span::current();
+                span.record("nitpicker.rounds", lane.final_round as u64);
+                span.record("nitpicker.converged", lane.converged);
+                span.record("nitpicker.degraded", lane.degraded);
                 Ok::<DebateLaneOutcome, eyre::Report>(lane)
             }
+            .instrument(lane_span)
         });
     let lane_results = futures::future::join_all(lane_futures).await;
 
@@ -901,24 +965,34 @@ pub async fn run_debate(
     pb.set_message(crate::progress::bar_message("synthesizing…"));
     // preset runs get the count/context wrapping; Topic propagates the provider error
     // untouched, as it did before lanes existed
-    let meta_result: eyre::Result<nitpicker_agent::llm::CompletionResponse> = agg_client
-        .completion(meta_completion)
-        .await
-        .and_then(|response| {
-            crate::review::validate_synthesis_response(&response, "meta-review")?;
-            Ok(response)
-        })
-        .map_err(|err| match presets {
-            Some(presets) => crate::presets::synthesis_failure(
-                err,
-                format!(
-                    "meta-review failed over {} surviving lane(s) across {} preset(s)",
-                    survivors.len(),
-                    presets.len()
+    let synthesis_span = info_span!(
+        "synthesis",
+        otel.status_code = Empty,
+        gen_ai.request.model = %bounded(&agg_cfg.model)
+    );
+    // all lanes have finished, so the permit is free; the chokepoint gives this call its chat span
+    let meta_result: eyre::Result<nitpicker_agent::llm::CompletionResponse> =
+        throttled_completion(&llm_semaphore, &agg_client, meta_completion)
+            .instrument(synthesis_span.clone())
+            .await
+            .and_then(|response| {
+                crate::review::validate_synthesis_response(&response, "meta-review")?;
+                Ok(response)
+            })
+            .map_err(|err| match presets {
+                Some(presets) => crate::presets::synthesis_failure(
+                    err,
+                    format!(
+                        "meta-review failed over {} surviving lane(s) across {} preset(s)",
+                        survivors.len(),
+                        presets.len()
+                    ),
                 ),
-            ),
-            None => err,
-        });
+                None => err,
+            });
+    if meta_result.is_err() {
+        synthesis_span.record("otel.status_code", "ERROR");
+    }
     pb.set_style(done_style);
     // Lane metadata travels on both outcomes: a meta failure still persists the per-lane
     // record (the durable trace of what ran), flagged with `error` and an empty `text` so
