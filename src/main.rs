@@ -1,7 +1,7 @@
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use eyre::{Result, WrapErr};
 use std::path::{Path, PathBuf};
-use tracing_subscriber::EnvFilter;
+use std::process::ExitCode;
 
 use nitpicker_agent::{config, openrouter, tools::floor_char_boundary};
 
@@ -18,6 +18,7 @@ mod prompts;
 mod proxy;
 mod reflect;
 mod review;
+mod telemetry;
 
 /// Flags shared across the default review mode and the subcommands. Declared once here and
 /// marked `global`, so they are accepted before or after a subcommand and always land in
@@ -187,8 +188,29 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Outcome of a run, mapped to the exit-code contract by [`finish`]: 0 = clean verdict,
+/// 1 = hard failure (no verdict), 3 = degraded verdict (report printed, but at least one
+/// reviewer or debate turn failed). 2 is deliberately unused — clap exits 2 on usage errors,
+/// and the whole point is an unambiguous subprocess signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Exit {
+    Clean,
+    Degraded,
+    /// The failure was already reported to the consumer (a `pr --json` error envelope), so
+    /// nothing more is printed.
+    Failed,
+}
+
+impl Exit {
+    pub(crate) fn from_degraded(degraded: bool) -> Self {
+        match degraded {
+            true => Self::Degraded,
+            false => Self::Clean,
+        }
+    }
+}
+
+fn main() -> ExitCode {
     let args = Args::parse();
 
     let verbose = args.common.verbose;
@@ -198,23 +220,54 @@ async fn main() -> Result<()> {
     } else {
         "warn"
     };
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
-    // logs are never the report — keep stdout reserved for the deliverable so
-    // `pr --format json` emits a clean single JSON object.
-    tracing_subscriber::fmt()
-        .with_writer(progress::stderr_log_writer)
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_thread_ids(false)
-        .with_thread_names(false)
-        .with_file(false)
-        .with_line_number(false)
-        .with_level(true)
-        .with_ansi(progress::stderr_supports_color())
-        .compact()
-        .init();
+    let telemetry = telemetry::init(default_level);
 
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("Error: failed to start the async runtime: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    let outcome = runtime.block_on(run(args));
+    // the runtime goes first so no task is still producing spans while the exporter drains;
+    // every guard inside `run` (checkout restore, PR lock) has already dropped with it
+    drop(runtime);
+    telemetry.shutdown();
+    ExitCode::from(finish(outcome, &mut std::io::stdout()))
+}
+
+/// Map a run's outcome to its exit code, reporting what the consumer has not seen yet: a
+/// degraded verdict gets its warning, an unreported error is rendered the way eyre's default
+/// `main` handler would. The report on stdout is flushed explicitly so a piped consumer never
+/// loses its tail; a flush failure is a hard failure, not a degraded verdict.
+fn finish(outcome: Result<Exit>, stdout: &mut impl std::io::Write) -> u8 {
+    match outcome {
+        Ok(Exit::Clean) => 0,
+        Ok(Exit::Failed) => 1,
+        Ok(Exit::Degraded) => match stdout.flush() {
+            Ok(()) => {
+                eprintln!(
+                    "warning: degraded verdict — a reviewer or debate turn failed (exit code 3)"
+                );
+                3
+            }
+            Err(err) => {
+                eprintln!("error: failed to flush report to stdout: {err}");
+                1
+            }
+        },
+        Err(err) => {
+            eprintln!("Error: {err:?}");
+            1
+        }
+    }
+}
+
+async fn run(args: Args) -> Result<Exit> {
     if !presets_allowed(&args.command) && !args.presets.preset.is_empty() {
         eyre::bail!("--preset applies to review modes only (default review, --analyze, pr)");
     }
@@ -239,7 +292,7 @@ async fn main() -> Result<()> {
                 eyre::bail!("{} already exists", path.display());
             }
             run_init(path, free).await?;
-            return Ok(());
+            return Ok(Exit::Clean);
         }
         Some(Command::Ask {
             context,
@@ -295,8 +348,7 @@ async fn main() -> Result<()> {
                         outcome.transcript_path.display()
                     );
                 }
-                exit_if_degraded(outcome.degraded);
-                return Ok(());
+                return Ok(Exit::from_degraded(outcome.degraded));
             }
 
             let outcome = review::run_review(
@@ -313,27 +365,25 @@ async fn main() -> Result<()> {
             )
             .await?;
             println!("{}", outcome.report);
-            exit_if_degraded(outcome.degraded);
-            return Ok(());
+            return Ok(Exit::from_degraded(outcome.degraded));
         }
         Some(Command::Pr(pr_args)) => {
             let context_files = merged_context_files(&args.context, &pr_args.context);
             let preset_names = merged_presets(&args.presets, &pr_args.presets);
             // config loading happens inside run_pr so its failures honor --format json too
-            let degraded = pr::run_pr(pr_args, args.common, context_files, preset_names).await?;
-            exit_if_degraded(degraded);
-            return Ok(());
+            return pr::run_pr(pr_args, args.common, context_files, preset_names).await;
         }
         Some(Command::Reflect { sessions_dir, n }) => {
             let repo = resolve_repo_root(&args.common.repo)?;
             let config = load_resolved_config(args.common.config.as_deref(), &repo).await?;
-            return reflect::run_reflect(reflect::ReflectArgs {
+            reflect::run_reflect(reflect::ReflectArgs {
                 sessions_dir,
                 n,
                 repo,
                 config,
             })
-            .await;
+            .await?;
+            return Ok(Exit::Clean);
         }
         None => {}
     }
@@ -409,8 +459,7 @@ async fn main() -> Result<()> {
                 outcome.transcript_path.display()
             );
         }
-        exit_if_degraded(outcome.degraded);
-        Ok(())
+        Ok(Exit::from_degraded(outcome.degraded))
     } else {
         let outcome = review::run_review(
             &repo,
@@ -429,32 +478,8 @@ async fn main() -> Result<()> {
         )
         .await?;
         println!("{}", outcome.report);
-        exit_if_degraded(outcome.degraded);
-        Ok(())
+        Ok(Exit::from_degraded(outcome.degraded))
     }
-}
-
-/// Exit-code contract for the default-review, `ask`, and `pr` arms: 0 = clean verdict,
-/// 1 = hard failure (no verdict), 3 = degraded verdict (report printed, but at least one
-/// reviewer or debate turn failed). 2 is deliberately unused — clap exits 2
-/// on usage errors, and the whole point is an unambiguous subprocess signal.
-/// In `pr --json` the envelope (carrying `degraded: true`) is emitted and flushed first,
-/// and `run_pr` returns before this runs, so its checkout-restore guards have dropped.
-fn exit_if_degraded(degraded: bool) {
-    if !degraded {
-        return;
-    }
-    // process::exit skips stdout teardown; without a flush a piped report would be lost
-    // (same reasoning as output::emit_json).
-    match std::io::Write::flush(&mut std::io::stdout()) {
-        Ok(()) => {}
-        Err(err) => {
-            eprintln!("error: failed to flush report to stdout: {err}");
-            std::process::exit(1);
-        }
-    }
-    eprintln!("warning: degraded verdict — a reviewer or debate turn failed (exit code 3)");
-    std::process::exit(3);
 }
 
 pub(crate) fn load_config(explicit_path: Option<&Path>, repo: &Path) -> Result<config::Config> {
@@ -1120,6 +1145,29 @@ fn run_git_optional(repo: &Path, args: &[&str]) -> Result<Option<String>> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    struct FailingFlush;
+
+    impl std::io::Write for FailingFlush {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("closed pipe"))
+        }
+    }
+
+    /// 0 / 1 / 3 is a subprocess contract; a degraded verdict whose report cannot be flushed is
+    /// a hard failure, not a degraded one, and an already-reported failure adds no output.
+    #[test]
+    fn exit_codes_follow_the_contract() {
+        assert_eq!(finish(Ok(Exit::Clean), &mut Vec::new()), 0);
+        assert_eq!(finish(Ok(Exit::Degraded), &mut Vec::new()), 3);
+        assert_eq!(finish(Ok(Exit::Failed), &mut Vec::new()), 1);
+        assert_eq!(finish(Err(eyre::eyre!("boom")), &mut Vec::new()), 1);
+        assert_eq!(finish(Ok(Exit::Degraded), &mut FailingFlush), 1);
+        assert_eq!(finish(Ok(Exit::Clean), &mut FailingFlush), 0);
+    }
 
     #[test]
     fn cli_definition_is_valid() {

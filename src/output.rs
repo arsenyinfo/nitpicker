@@ -170,8 +170,12 @@ pub struct PresetCoverage {
 /// flushing explicitly matters because callers exit via `std::process::exit`,
 /// which skips the normal stdout teardown that would otherwise drain the buffer.
 pub fn emit_json<T: Serialize>(value: &T) -> Result<()> {
+    write_json(&mut std::io::stdout().lock(), value)
+}
+
+/// `emit_json` against an arbitrary writer: one line, flushed.
+pub fn write_json<T: Serialize>(out: &mut impl Write, value: &T) -> Result<()> {
     let line = serde_json::to_string(value)?;
-    let mut out = std::io::stdout().lock();
     writeln!(out, "{line}")?;
     out.flush()?;
     Ok(())

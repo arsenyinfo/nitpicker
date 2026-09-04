@@ -567,33 +567,44 @@ impl PrFlow {
     }
 }
 
-/// Returns the run's degraded flag; the caller maps it to exit code 3 — after this
-/// function returns, so the checkout-restore/lock guards inside have already dropped
-/// (`process::exit` skips destructors).
+/// Returns the run's outcome for `main` to map to an exit code — after this function
+/// returns, so the checkout-restore/lock guards inside have already dropped.
 pub async fn run_pr(
     args: PrArgs,
     common: crate::CommonArgs,
     context_files: Vec<PathBuf>,
     preset_names: Vec<String>,
-) -> Result<bool> {
+) -> Result<crate::Exit> {
     let start = std::time::Instant::now();
     let format = args.output_format();
-    // in json mode every failure (incl. config loading) must still leave a
-    // parseable object on stdout and exit non-zero; text mode keeps the
-    // eyre-to-stderr behavior.
     match run_pr_inner(args, common, context_files, preset_names, start).await {
-        Ok(degraded) => Ok(degraded),
-        Err(e) => match format {
-            crate::output::OutputFormat::Text => Err(e),
-            crate::output::OutputFormat::Json => {
-                let env = crate::output::PrReviewOutput::error(
-                    format!("{e:#}"),
-                    start.elapsed().as_millis() as u64,
-                );
-                let _ = crate::output::emit_json(&env);
-                std::process::exit(1);
-            }
-        },
+        Ok(degraded) => Ok(crate::Exit::from_degraded(degraded)),
+        Err(e) => pr_failure_exit(
+            format,
+            e,
+            start.elapsed().as_millis() as u64,
+            &mut std::io::stdout().lock(),
+        ),
+    }
+}
+
+/// In json mode every failure (incl. config loading) must still leave exactly one parseable
+/// object on stdout and exit non-zero with nothing else printed; text mode hands the error
+/// back for eyre to render once on stderr.
+fn pr_failure_exit(
+    format: crate::output::OutputFormat,
+    err: eyre::Report,
+    elapsed_ms: u64,
+    stdout: &mut impl std::io::Write,
+) -> Result<crate::Exit> {
+    match format {
+        crate::output::OutputFormat::Text => Err(err),
+        crate::output::OutputFormat::Json => {
+            let env = crate::output::PrReviewOutput::error(format!("{err:#}"), elapsed_ms);
+            // a consumer that cannot read the envelope still gets the non-zero exit
+            let _ = crate::output::write_json(stdout, &env);
+            Ok(crate::Exit::Failed)
+        }
     }
 }
 
@@ -1133,7 +1144,7 @@ mod tests {
     use super::{
         BranchRestoreGuard, HeadConfig, HeadState, PrComment, choose_repo_config,
         create_temp_clone_repo_dir, get_head_state, head_config_state, is_trusted_github_remote,
-        lock_path, read_base_branch_config, remote_host,
+        lock_path, pr_failure_exit, read_base_branch_config, remote_host,
     };
     use std::path::Path;
     use std::process::Command;
@@ -1417,5 +1428,40 @@ mod tests {
             HeadState::Detached(sha) => assert_eq!(sha, original_sha),
             HeadState::Branch(_) => panic!("expected HEAD re-detached onto the original commit"),
         }
+    }
+
+    #[test]
+    fn json_failures_become_one_error_envelope_and_a_silent_failed_exit() {
+        let mut out = Vec::new();
+        let exit = pr_failure_exit(
+            crate::output::OutputFormat::Json,
+            eyre::eyre!("gh missing"),
+            7,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(exit, crate::Exit::Failed);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.ends_with('\n'));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "exactly one envelope: {text:?}");
+        let envelope: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(envelope["status"], "error");
+        assert_eq!(envelope["error"], "gh missing");
+        assert_eq!(envelope["duration_ms"], 7);
+    }
+
+    #[test]
+    fn text_failures_are_handed_back_for_eyre_to_render() {
+        let mut out = Vec::new();
+        let err = pr_failure_exit(
+            crate::output::OutputFormat::Text,
+            eyre::eyre!("gh missing"),
+            7,
+            &mut out,
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "gh missing");
+        assert!(out.is_empty(), "text mode writes nothing to stdout");
     }
 }

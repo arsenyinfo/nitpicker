@@ -50,6 +50,11 @@ rand = "0.10"
 base64 = "0.22"
 url = "2"
 tempfile = "3"
+# OpenTelemetry trace export — opt-in, see the `otel` feature below
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"], optional = true }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"], optional = true }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "internal-logs"], optional = true }
+tracing-opentelemetry = { version = "0.33", default-features = false, optional = true }
 # Antigravity Gemini proxy deps — opt-in, see the `antigravity` feature below
 axum = { version = "0.8", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
@@ -66,6 +71,10 @@ azure = ["nitpicker-agent/azure"]
 # Off by default: pulls in axum + keyring (native crypto/secret-service backends) for the proxy
 # server here, and forwards to the core crate's `antigravity` code-gate. Build with `--features antigravity`.
 antigravity = ["nitpicker-agent/antigravity", "dep:axum", "dep:uuid", "dep:keyring"]
+# Exports each run as an OpenTelemetry trace over OTLP/HTTP when `OTEL_EXPORTER_OTLP_ENDPOINT`
+# is set. Binary-only: the core crate emits plain `tracing` spans unconditionally. Off by
+# default: pulls in the OpenTelemetry SDK + protobuf codec. Build with `--features otel`.
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 
 # thin LTO + opt-level "z" trims the binary (~12M → ~8.7M) while keeping clean release
 # builds faster than the no-LTO default; codegen-units stays at the default 16 for build
