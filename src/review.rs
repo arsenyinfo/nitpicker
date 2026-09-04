@@ -1,5 +1,6 @@
 use crate::output::{OutputFormat, PresetCoverage, UsageReport};
 use crate::prompts::RunTask;
+use crate::telemetry;
 use eyre::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use nitpicker_agent::agent::{
@@ -283,20 +284,12 @@ pub async fn run_review(
         gen_ai.usage.input_tokens = Empty,
         gen_ai.usage.output_tokens = Empty,
     );
-    let result = run_review_inner(repo, user_prompt, config, opts)
-        .instrument(span.clone())
-        .await;
-    match &result {
-        Ok(outcome) => {
-            span.record("nitpicker.degraded", outcome.degraded);
-            span.record("gen_ai.usage.input_tokens", outcome.usage.input_tokens);
-            span.record("gen_ai.usage.output_tokens", outcome.usage.output_tokens);
-        }
-        Err(_) => {
-            span.record("otel.status_code", "ERROR");
-        }
-    }
-    result
+    telemetry::record_run(
+        span,
+        run_review_inner(repo, user_prompt, config, opts),
+        |o| (o.degraded, &o.usage),
+    )
+    .await
 }
 
 async fn run_review_inner(

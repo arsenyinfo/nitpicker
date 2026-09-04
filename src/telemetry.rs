@@ -10,11 +10,16 @@
 //! is attached. The exporter sees spans only — no log events — so the `info!`/`warn!` lines that
 //! carry tool arguments or provider error bodies never leave the process.
 
+use std::future::Future;
+
+use eyre::Result;
+use tracing::{Instrument, Span};
 use tracing_subscriber::filter::{FilterExt, filter_fn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
+use crate::output::UsageReport;
 use crate::progress;
 
 const SUPPORTED_PROTOCOL: &str = "http/protobuf";
@@ -85,6 +90,28 @@ pub enum Activation {
 #[cfg(any(feature = "otel", test))]
 pub fn exported_span(meta: &tracing::Metadata<'_>) -> bool {
     meta.is_span() && meta.target().starts_with("nitpicker")
+}
+
+/// Run a review or debate body under its root span and close the span's outcome fields:
+/// `nitpicker.degraded` and the usage totals on success, `otel.status_code = ERROR` on failure.
+pub async fn record_run<T>(
+    span: Span,
+    body: impl Future<Output = Result<T>>,
+    summary: impl FnOnce(&T) -> (bool, &UsageReport),
+) -> Result<T> {
+    let result = body.instrument(span.clone()).await;
+    match &result {
+        Ok(outcome) => {
+            let (degraded, usage) = summary(outcome);
+            span.record("nitpicker.degraded", degraded);
+            span.record("gen_ai.usage.input_tokens", usage.input_tokens);
+            span.record("gen_ai.usage.output_tokens", usage.output_tokens);
+        }
+        Err(_) => {
+            span.record("otel.status_code", "ERROR");
+        }
+    }
+    result
 }
 
 /// Handle to the exporter, if one was attached. Dropping it without `shutdown` loses the tail
