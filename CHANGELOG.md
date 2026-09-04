@@ -6,7 +6,12 @@ Notable user-visible changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-05
+
+`nitpicker-agent` 0.5.4
+
 ### Added
+
 - Optional OpenTelemetry trace export behind the new `otel` cargo feature (off by default):
   set `OTEL_EXPORTER_OTLP_ENDPOINT` and each run ships one OTLP/HTTP-protobuf trace covering the
   run, review jobs / debate lanes and turns, agents and subagents, LLM calls (usage, answering
@@ -19,6 +24,7 @@ Notable user-visible changes are recorded here. The format follows
   `telemetry` module documents the attribute contract, and `SessionLogger::id` names the session.
 
 ### Changed
+
 - `main` no longer calls `process::exit`: the outcome is mapped to the unchanged 0/1/3 contract
   after the runtime is torn down and telemetry is flushed. Stderr log lines keep their shape.
 
