@@ -11,9 +11,9 @@ use crate::llm::FinishReason;
 use crate::tools::floor_char_boundary;
 
 /// Upper bound on any exported string attribute (model ids, agent names, tool names).
-pub const MAX_ATTR_CHARS: usize = 128;
+const MAX_ATTR_CHARS: usize = 128;
 
-/// Truncate an identifier to [`MAX_ATTR_CHARS`] bytes on a char boundary. Every string that
+/// Truncate an identifier to `MAX_ATTR_CHARS` bytes on a char boundary. Every string that
 /// becomes a span attribute passes through here so a pathological config value stays bounded.
 pub fn bounded(s: &str) -> &str {
     &s[..floor_char_boundary(s, MAX_ATTR_CHARS)]

@@ -648,7 +648,6 @@ async fn run_agent_inner(
             // for the provider, and the running counters must apply deterministically)
             let mut results = Vec::with_capacity(tool_calls.len());
             for (call, outcome) in tool_calls.iter().zip(outcomes) {
-                let outcome = outcome?;
                 let blocked = outcome.status == ToolCallStatus::BlockedCycle;
                 if blocked {
                     consecutive_blocked_count += 1;
@@ -1060,7 +1059,7 @@ async fn execute_tool_call(
     tool_name: &str,
     args: Value,
     cycle_len: usize,
-) -> Result<ToolCallOutcome> {
+) -> ToolCallOutcome {
     // the tool name comes from model output: only a registered tool may name the span, and
     // the arguments never reach it
     let registered = ctx.runtime_tools.contains_key(tool_name);
@@ -1081,21 +1080,14 @@ async fn execute_tool_call(
         nitpicker.turn = (ctx.turn + 1) as u64,
         nitpicker.tool.status = Empty,
     );
-    let result = execute_tool_call_inner(ctx, tool_name, args, cycle_len)
+    let outcome = execute_tool_call_inner(ctx, tool_name, args, cycle_len)
         .instrument(span.clone())
         .await;
-    match &result {
-        Ok(outcome) => {
-            span.record("nitpicker.tool.status", outcome.status.as_str());
-            if outcome.status == ToolCallStatus::Error {
-                span.record("otel.status_code", "ERROR");
-            }
-        }
-        Err(_) => {
-            span.record("otel.status_code", "ERROR");
-        }
+    span.record("nitpicker.tool.status", outcome.status.as_str());
+    if outcome.status == ToolCallStatus::Error {
+        span.record("otel.status_code", "ERROR");
     }
-    result
+    outcome
 }
 
 async fn execute_tool_call_inner(
@@ -1103,7 +1095,7 @@ async fn execute_tool_call_inner(
     tool_name: &str,
     args: Value,
     cycle_len: usize,
-) -> Result<ToolCallOutcome> {
+) -> ToolCallOutcome {
     if cycle_len > 0 {
         warn!(
             agent = %ctx.config.name,
@@ -1140,7 +1132,7 @@ async fn execute_tool_call_inner(
             ctx.selected_model,
         )
         .await;
-        return Ok(outcome);
+        return outcome;
     }
 
     if !ctx.executable_tools.contains(tool_name) {
@@ -1170,7 +1162,7 @@ async fn execute_tool_call_inner(
             ctx.selected_model,
         )
         .await;
-        return Ok(outcome);
+        return outcome;
     }
 
     if tool_name == "spawn_subagent" {
@@ -1202,7 +1194,7 @@ async fn execute_tool_call_inner(
                     ctx.selected_model,
                 )
                 .await;
-                return Ok(outcome);
+                return outcome;
             }
         };
         log_tool_call(
@@ -1254,7 +1246,7 @@ async fn execute_tool_call_inner(
             spawned_agent: sub.spawned_agent,
             subagent_usage: sub.usage,
         };
-        return Ok(outcome);
+        return outcome;
     }
 
     let logged_args = args.clone();
@@ -1307,7 +1299,7 @@ async fn execute_tool_call_inner(
     )
     .await;
 
-    Ok(outcome)
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1561,8 +1553,7 @@ mod tests {
             json!({"command": "log --oneline | head -n 3"}),
             0,
         )
-        .await
-        .unwrap();
+        .await;
 
         assert_eq!(outcome.status, ToolCallStatus::Error);
         assert!(outcome.output.starts_with("Error:"));
@@ -1703,8 +1694,7 @@ mod tests {
             json!({"result": "must not be stored"}),
             0,
         )
-        .await
-        .unwrap();
+        .await;
 
         assert_eq!(outcome.status, ToolCallStatus::Error);
         assert_eq!(
