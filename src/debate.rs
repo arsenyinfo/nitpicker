@@ -1,6 +1,6 @@
 use crate::output::UsageReport;
 use crate::prompts::RunTask;
-use crate::telemetry;
+use crate::telemetry::{self, RunMode};
 use eyre::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use nitpicker_agent::agent::{
@@ -489,18 +489,7 @@ pub async fn run_debate(
     config: &Config,
     opts: DebateOptions<'_>,
 ) -> Result<DebateOutcome> {
-    let span = info_span!(
-        "debate",
-        otel.status_code = Empty,
-        nitpicker.mode = "debate",
-        nitpicker.task = opts.task.kind(),
-        nitpicker.presets = opts.task.presets().map_or(0, <[_]>::len) as u64,
-        nitpicker.reviewers = config.reviewer.len() as u64,
-        nitpicker.session.id = Empty,
-        nitpicker.degraded = Empty,
-        gen_ai.usage.input_tokens = Empty,
-        gen_ai.usage.output_tokens = Empty,
-    );
+    let span = telemetry::run_span(RunMode::Debate, &opts.task, config.reviewer.len());
     telemetry::record_run(span, run_debate_inner(repo, prompt, config, opts), |o| {
         (o.degraded, &o.usage)
     })
@@ -956,11 +945,7 @@ async fn run_debate_inner(
     pb.set_message(crate::progress::bar_message("synthesizing…"));
     // preset runs get the count/context wrapping; Topic propagates the provider error
     // untouched, as it did before lanes existed
-    let synthesis_span = info_span!(
-        "synthesis",
-        otel.status_code = Empty,
-        gen_ai.request.model = %bounded(&agg_cfg.model)
-    );
+    let synthesis_span = telemetry::synthesis_span(&agg_cfg.model);
     // all lanes have finished, so the permit is free; the chokepoint gives this call its chat span
     let meta_result: eyre::Result<nitpicker_agent::llm::CompletionResponse> =
         throttled_completion(&llm_semaphore, &agg_client, meta_completion)

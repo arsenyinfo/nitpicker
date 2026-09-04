@@ -2966,23 +2966,6 @@ mod tests {
             completion
         }
 
-        fn assert_no_secret(capture: &SpanCapture) {
-            for span in capture.spans() {
-                assert!(
-                    !span.name.contains(SECRET),
-                    "span name leaks: {}",
-                    span.name
-                );
-                for (key, value) in &span.fields {
-                    assert!(
-                        !value.contains(SECRET),
-                        "{}.{key} leaks: {value}",
-                        span.name
-                    );
-                }
-            }
-        }
-
         #[tokio::test]
         async fn throttled_completion_records_one_chat_span_with_usage() {
             let capture = SpanCapture::default();
@@ -3050,7 +3033,7 @@ mod tests {
             assert_eq!(attempts[1].field("nitpicker.attempt"), Some("2"));
             assert_eq!(attempts[1].field("otel.status_code"), None);
             assert_eq!(attempts[1].field("error.type"), None);
-            assert_no_secret(&capture);
+            capture.assert_no_secret(SECRET);
         }
 
         #[tokio::test(start_paused = true)]
@@ -3076,7 +3059,7 @@ mod tests {
             assert_eq!(chat.field("otel.status_code"), Some("ERROR"));
             assert_eq!(chat.field("gen_ai.response.model"), None);
             assert_eq!(capture.named("llm.attempt").len(), MAX_COMPLETION_ATTEMPTS);
-            assert_no_secret(&capture);
+            capture.assert_no_secret(SECRET);
         }
 
         #[tokio::test(start_paused = true)]

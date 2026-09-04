@@ -100,6 +100,24 @@ pub(crate) mod capture {
             self.spans.lock().unwrap_or_else(|e| e.into_inner()).clone()
         }
 
+        /// Fail if `secret` appears in any captured span name or field value.
+        pub fn assert_no_secret(&self, secret: &str) {
+            for span in self.spans() {
+                assert!(
+                    !span.name.contains(secret),
+                    "span name leaks: {}",
+                    span.name
+                );
+                for (key, value) in &span.fields {
+                    assert!(
+                        !value.contains(secret),
+                        "{}.{key} leaks: {value}",
+                        span.name
+                    );
+                }
+            }
+        }
+
         pub fn named(&self, name: &str) -> Vec<CapturedSpan> {
             self.spans()
                 .into_iter()

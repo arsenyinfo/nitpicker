@@ -1,6 +1,6 @@
 use crate::output::{OutputFormat, PresetCoverage, UsageReport};
 use crate::prompts::RunTask;
-use crate::telemetry;
+use crate::telemetry::{self, RunMode};
 use eyre::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use nitpicker_agent::agent::{
@@ -272,18 +272,7 @@ pub async fn run_review(
     config: &Config,
     opts: ReviewOptions<'_>,
 ) -> Result<ReviewOutcome> {
-    let span = info_span!(
-        "review",
-        otel.status_code = Empty,
-        nitpicker.mode = "parallel",
-        nitpicker.task = opts.task.kind(),
-        nitpicker.presets = opts.task.presets().map_or(0, <[_]>::len) as u64,
-        nitpicker.reviewers = config.reviewer.len() as u64,
-        nitpicker.session.id = Empty,
-        nitpicker.degraded = Empty,
-        gen_ai.usage.input_tokens = Empty,
-        gen_ai.usage.output_tokens = Empty,
-    );
+    let span = telemetry::run_span(RunMode::Parallel, &opts.task, config.reviewer.len());
     telemetry::record_run(
         span,
         run_review_inner(repo, user_prompt, config, opts),
@@ -631,11 +620,7 @@ async fn run_review_inner(
     pb_agg.enable_steady_tick(Duration::from_millis(80));
 
     let agg = &config.aggregator;
-    let synthesis_span = info_span!(
-        "synthesis",
-        otel.status_code = Empty,
-        gen_ai.request.model = %bounded(&agg.model)
-    );
+    let synthesis_span = telemetry::synthesis_span(&agg.model);
     let synthesis: Result<(String, String)> = async {
         let client = aggregator_client(
             config,

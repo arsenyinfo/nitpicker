@@ -13,7 +13,9 @@
 use std::future::Future;
 
 use eyre::Result;
-use tracing::{Instrument, Span};
+use nitpicker_agent::telemetry::bounded;
+use tracing::field::Empty;
+use tracing::{Instrument, Span, info_span};
 use tracing_subscriber::filter::{FilterExt, filter_fn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -21,6 +23,7 @@ use tracing_subscriber::{EnvFilter, Layer};
 
 use crate::output::UsageReport;
 use crate::progress;
+use crate::prompts::RunTask;
 
 const SUPPORTED_PROTOCOL: &str = "http/protobuf";
 
@@ -92,8 +95,50 @@ pub fn exported_span(meta: &tracing::Metadata<'_>) -> bool {
     meta.is_span() && meta.target().starts_with("nitpicker")
 }
 
-/// Run a review or debate body under its root span and close the span's outcome fields:
-/// `nitpicker.degraded` and the usage totals on success, `otel.status_code = ERROR` on failure.
+/// Which orchestration owns a run's root span.
+#[derive(Clone, Copy)]
+pub enum RunMode {
+    Parallel,
+    Debate,
+}
+
+impl RunMode {
+    /// Exported span name.
+    fn span_name(self) -> &'static str {
+        match self {
+            Self::Parallel => "review",
+            Self::Debate => "debate",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Parallel => "parallel",
+            Self::Debate => "debate",
+        }
+    }
+}
+
+/// Root span of a review or debate run, exported as `review` / `debate`. The body records
+/// `nitpicker.session.id` once the logger exists; `record_run` closes the outcome fields.
+pub fn run_span(mode: RunMode, task: &RunTask<'_>, reviewers: usize) -> Span {
+    info_span!(
+        "run",
+        otel.name = mode.span_name(),
+        otel.status_code = Empty,
+        nitpicker.mode = mode.label(),
+        nitpicker.task = task.kind(),
+        nitpicker.presets = task.presets().map_or(0, <[_]>::len) as u64,
+        nitpicker.reviewers = reviewers as u64,
+        nitpicker.session.id = Empty,
+        nitpicker.degraded = Empty,
+        gen_ai.usage.input_tokens = Empty,
+        gen_ai.usage.output_tokens = Empty,
+    )
+}
+
+/// Run the body under its root span and close the outcome fields: `nitpicker.degraded` and the
+/// usage totals on success, `otel.status_code = ERROR` on failure.
 pub async fn record_run<T>(
     span: Span,
     body: impl Future<Output = Result<T>>,
@@ -112,6 +157,15 @@ pub async fn record_run<T>(
         }
     }
     result
+}
+
+/// Span for the one aggregator / meta-review completion; the caller records `ERROR` on failure.
+pub fn synthesis_span(model: &str) -> Span {
+    info_span!(
+        "synthesis",
+        otel.status_code = Empty,
+        gen_ai.request.model = %bounded(model)
+    )
 }
 
 /// Handle to the exporter, if one was attached. Dropping it without `shutdown` loses the tail

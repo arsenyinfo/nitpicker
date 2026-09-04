@@ -2044,20 +2044,7 @@ mod tests {
 
             let spans = capture.spans();
             assert!(spans.len() >= 8, "expected a full tree, got {spans:?}");
-            for span in &spans {
-                assert!(
-                    !span.name.contains(SECRET),
-                    "span name leaks: {}",
-                    span.name
-                );
-                for (key, value) in &span.fields {
-                    assert!(
-                        !value.contains(SECRET),
-                        "{}.{key} leaks: {value}",
-                        span.name
-                    );
-                }
-            }
+            capture.assert_no_secret(SECRET);
         }
     }
 }
