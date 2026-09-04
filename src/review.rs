@@ -1,5 +1,6 @@
 use crate::output::{OutputFormat, PresetCoverage, UsageReport};
 use crate::prompts::RunTask;
+use crate::telemetry::{self, RunMode};
 use eyre::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use nitpicker_agent::agent::{
@@ -9,12 +10,13 @@ use nitpicker_agent::agent::{
 use nitpicker_agent::config::{Config, ReviewerConfig};
 use nitpicker_agent::llm::{
     AlloyClient, AlloySlot, Completion, CompletionResponse, FallbackSlot, FinishReason,
-    LLMClientDyn, PriorityClient,
+    LLMClientDyn, PriorityClient, throttled_completion,
 };
 use nitpicker_agent::provider::{build_aggregator_client, build_reviewer_client};
 use nitpicker_agent::session::{
     AggregationRecord, JobRecord, SessionLogger, VerdictRecord, sanitize_path_component,
 };
+use nitpicker_agent::telemetry::bounded;
 use nitpicker_agent::tools::{all_tools, floor_char_boundary};
 use rig_core::completion::Message;
 use std::path::Path;
@@ -24,7 +26,8 @@ use tokio::sync::Semaphore;
 
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
-use tracing::{error, info, warn};
+use tracing::field::Empty;
+use tracing::{Instrument, error, info, info_span, warn};
 
 /// The pre-preset whole-agent concurrency bound, kept for the Ask path only.
 const LEGACY_ASK_CONCURRENT_AGENTS: usize = 8;
@@ -269,6 +272,21 @@ pub async fn run_review(
     config: &Config,
     opts: ReviewOptions<'_>,
 ) -> Result<ReviewOutcome> {
+    let span = telemetry::run_span(RunMode::Parallel, &opts.task, config.reviewer.len());
+    telemetry::record_run(
+        span,
+        run_review_inner(repo, user_prompt, config, opts),
+        |o| (o.degraded, &o.usage),
+    )
+    .await
+}
+
+async fn run_review_inner(
+    repo: &Path,
+    user_prompt: &str,
+    config: &Config,
+    opts: ReviewOptions<'_>,
+) -> Result<ReviewOutcome> {
     let ReviewOptions {
         max_turns,
         verbose,
@@ -285,6 +303,7 @@ pub async fn run_review(
     let session_logger = SessionLogger::maybe_new(config.log_trajectories())?;
     if let Some(logger) = &session_logger {
         info!(path = %logger.root().display(), "trajectory logging enabled");
+        tracing::Span::current().record("nitpicker.session.id", logger.id());
         if let Err(err) = logger.write_attribution(&session_attribution).await {
             warn!(error = ?err, "failed to persist session attribution");
         }
@@ -401,58 +420,80 @@ pub async fn run_review(
         let initial_message = initial_message.clone();
         let context = context.clone();
         let agent_sem = ask_agent_semaphore.clone();
-        let handle: JoinHandle<Result<AgentResult>> = tokio::spawn(async move {
-            let _agent_permit = match &agent_sem {
-                Some(sem) => Some(sem.acquire().await.expect("semaphore closed")),
-                None => None,
-            };
-            let mut config = match agent_config {
-                Ok(config) => config,
-                Err(err) => {
-                    pb.set_style(done.clone());
-                    pb.finish_with_message(crate::progress::bar_message(format!("✗ error: {err}")));
-                    sub_pb.finish_and_clear();
-                    return Err(err);
+        let preset_name = match (presets, job.preset_index) {
+            (Some(presets), Some(j)) => bounded(&presets[j].name),
+            _ => "",
+        };
+        // created outside the spawn so it parents under `review`: spawned tasks don't inherit
+        let job_span = info_span!(
+            "review.job",
+            otel.status_code = Empty,
+            nitpicker.job = %bounded(&label),
+            nitpicker.reviewer = %bounded(&reviewer.name),
+            nitpicker.preset = preset_name,
+            gen_ai.request.model = %bounded(&reviewer.model),
+        );
+        let handle: JoinHandle<Result<AgentResult>> = tokio::spawn(
+            async move {
+                let _agent_permit = match &agent_sem {
+                    Some(sem) => Some(sem.acquire().await.expect("semaphore closed")),
+                    None => None,
+                };
+                let mut config = match agent_config {
+                    Ok(config) => config,
+                    Err(err) => {
+                        pb.set_style(done.clone());
+                        pb.finish_with_message(crate::progress::bar_message(format!(
+                            "✗ error: {err}"
+                        )));
+                        sub_pb.finish_and_clear();
+                        tracing::Span::current().record("otel.status_code", "ERROR");
+                        return Err(err);
+                    }
+                };
+                config.project_context = Some(context);
+                if !verbose {
+                    let progress_pb = pb.clone();
+                    let progress_sub_pb = sub_pb.clone();
+                    config.progress = Some(Arc::new(move |progress: AgentProgress| {
+                        progress_pb.set_message(crate::progress::bar_message(format!(
+                            "reviewing… ({} turns, {} tool calls, {} subagents)",
+                            progress.turns, progress.tool_calls, progress.subagents_spawned
+                        )));
+                        progress_sub_pb.set_message(crate::progress::detail_message(
+                            "    ↳ ",
+                            progress.last_subagent.as_deref(),
+                        ));
+                    }));
                 }
-            };
-            config.project_context = Some(context);
-            if !verbose {
-                let progress_pb = pb.clone();
-                let progress_sub_pb = sub_pb.clone();
-                config.progress = Some(Arc::new(move |progress: AgentProgress| {
-                    progress_pb.set_message(crate::progress::bar_message(format!(
-                        "reviewing… ({} turns, {} tool calls, {} subagents)",
-                        progress.turns, progress.tool_calls, progress.subagents_spawned
-                    )));
-                    progress_sub_pb.set_message(crate::progress::detail_message(
-                        "    ↳ ",
-                        progress.last_subagent.as_deref(),
-                    ));
-                }));
-            }
-            let start = Instant::now();
-            let result = run_agent(config, &initial_message, &tools_map, &repo).await;
-            let elapsed = start.elapsed().as_secs();
-            sub_pb.finish_and_clear();
-            pb.set_style(done);
-            match &result {
-                Ok(r) => pb.finish_with_message(crate::progress::bar_message(format!(
-                    "✓ done ({elapsed}s, {} turns, {} tool calls, {} subagents, {}, {} out)",
-                    r.turns,
-                    r.tool_calls,
-                    r.subagents_spawned,
-                    crate::progress::input_with_cache_share(
-                        r.usage.input_tokens,
-                        r.usage.cached_input_tokens
-                    ),
-                    crate::progress::compact_tokens(r.usage.output_tokens)
-                ))),
-                Err(e) => {
-                    pb.finish_with_message(crate::progress::bar_message(format!("✗ failed: {e}")))
+                let start = Instant::now();
+                let result = run_agent(config, &initial_message, &tools_map, &repo).await;
+                let elapsed = start.elapsed().as_secs();
+                sub_pb.finish_and_clear();
+                pb.set_style(done);
+                match &result {
+                    Ok(r) => pb.finish_with_message(crate::progress::bar_message(format!(
+                        "✓ done ({elapsed}s, {} turns, {} tool calls, {} subagents, {}, {} out)",
+                        r.turns,
+                        r.tool_calls,
+                        r.subagents_spawned,
+                        crate::progress::input_with_cache_share(
+                            r.usage.input_tokens,
+                            r.usage.cached_input_tokens
+                        ),
+                        crate::progress::compact_tokens(r.usage.output_tokens)
+                    ))),
+                    Err(e) => pb.finish_with_message(crate::progress::bar_message(format!(
+                        "✗ failed: {e}"
+                    ))),
                 }
+                if result.is_err() {
+                    tracing::Span::current().record("otel.status_code", "ERROR");
+                }
+                result
             }
-            result
-        });
+            .instrument(job_span),
+        );
         handles.push((label, job.preset_index, handle));
     }
 
@@ -579,6 +620,7 @@ pub async fn run_review(
     pb_agg.enable_steady_tick(Duration::from_millis(80));
 
     let agg = &config.aggregator;
+    let synthesis_span = telemetry::synthesis_span(&agg.model);
     let synthesis: Result<(String, String)> = async {
         let client = aggregator_client(
             config,
@@ -599,8 +641,9 @@ pub async fn run_review(
         };
         // preset runs get the count/context wrapping; the Ask path propagates the provider
         // error untouched, as it did before the fan-out
-        let response = client
-            .completion(completion)
+        // every job has finished, so the permit is free; routing through the chokepoint keeps
+        // "every completion is a chat span" true for the synthesis too
+        let response = throttled_completion(&llm_semaphore, &client, completion)
             .await
             .and_then(|response| {
                 validate_synthesis_response(&response, "aggregator")?;
@@ -620,7 +663,11 @@ pub async fn run_review(
         let model = synthesis_model(&response, &agg.model);
         Ok((response.text(), model))
     }
+    .instrument(synthesis_span.clone())
     .await;
+    if synthesis.is_err() {
+        synthesis_span.record("otel.status_code", "ERROR");
+    }
     pb_agg.set_style(done_style);
     // A post-collection synthesis failure still persists the per-job outcomes: the jobs
     // list is the durable record of what ran, and losing it because the aggregator died

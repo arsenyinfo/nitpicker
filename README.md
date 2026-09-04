@@ -334,6 +334,43 @@ Optional per-reviewer/aggregator fields:
 
   If unset, the `AZURE_TOKEN_CREDENTIALS` env var is honored as a fallback.
 
+### OpenTelemetry
+
+Each run can be exported as one [OpenTelemetry](https://opentelemetry.io) trace: the run, its
+review jobs or debate lanes and turns, every agent and subagent, every LLM call (with token usage,
+the model that actually answered, retries and failovers as child spans) and every tool call, using
+the OpenTelemetry GenAI semantic-convention attribute names (`gen_ai.*`) plus `nitpicker.*` for
+harness-specific ones. Only identifiers, counts and timings are recorded — prompts, tool arguments,
+tool output and provider error text never leave the process.
+
+This path requires a build with the `otel` feature (off by default, since it pulls in the
+OpenTelemetry SDK and protobuf codec):
+
+```bash
+cargo build --release --features otel
+# or: cargo install --features otel ...
+```
+
+Export is configured through the standard `OTEL_*` environment variables only — never through
+`nitpicker.toml` (in `pr` mode that file comes from the target repository). Setting an endpoint
+turns it on:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318      # any OTLP/HTTP collector or backend
+export OTEL_EXPORTER_OTLP_HEADERS="x-honeycomb-team=..."       # optional: backend auth
+export OTEL_SERVICE_NAME=nitpicker                             # optional: the default
+nitpicker pr https://github.com/owner/repo/pull/42
+```
+
+Supported: `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `_HEADERS`,
+`_TIMEOUT`, `_COMPRESSION`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_TRACES_SAMPLER`,
+`OTEL_SDK_DISABLED`. The wire protocol is OTLP over HTTP/protobuf; a request for `grpc` or
+`http/json` logs a warning and disables export. Traces only — no metrics or log signals; a backend
+can derive token and latency metrics from the `chat` spans. Without the feature, a set endpoint
+logs one warning naming `--features otel` and the run proceeds unchanged. The `nitpicker.session.id`
+attribute on the `review`/`debate` span is the session directory name under `~/.nitpicker/sessions`,
+so a trace can be matched to its trajectory files.
+
 ## CLI reference
 
 ```
@@ -440,7 +477,7 @@ With `--verbose`, the transcript is saved to `{tempdir}/debate-{timestamp}.md` (
 | 2 | CLI usage error (clap's exit code for bad arguments) |
 | 3 | degraded verdict — report printed, but a reviewer or debate turn failed |
 
-Non-interactive, non-verbose stdout carries exactly the final report, so the binary can be driven as a subprocess: read stdout for the verdict, branch on the exit code. `pr` follows the same codes; in `--json` mode the envelope (`status: ok|error`, with `degraded: true` on an exit-3 run) is emitted and flushed before the exit.
+Non-interactive, non-verbose stdout carries exactly the final report, so the binary can be driven as a subprocess: read stdout for the verdict, branch on the exit code. `pr` follows the same codes; in `--json` mode the envelope (`status: ok|error`, with `degraded: true` on an exit-3 run) is emitted and flushed before the exit. Telemetry export (see [OpenTelemetry](#opentelemetry)) is flushed after the run and never changes the exit code.
 
 ## Using the agent as a library
 

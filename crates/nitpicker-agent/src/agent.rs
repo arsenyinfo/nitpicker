@@ -17,7 +17,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
-use tracing::{debug, info, warn};
+use tracing::field::Empty;
+use tracing::{Instrument, debug, info, info_span, warn};
+
+use crate::telemetry::bounded;
 
 const MAX_TOOL_RESULT_BYTES: usize = 50_000;
 /// Global cap on concurrent in-flight LLM completion calls (reviewers + subagents share it),
@@ -172,6 +175,13 @@ async fn compact_and_account(
     // +1 again converts to the 1-based vocabulary tool records and the "before turn N"
     // summary prose use, so the record names the turn it precedes at both sites
     let compaction_turn = upcoming_turn + 1;
+    let span = info_span!(
+        "compact",
+        otel.status_code = Empty,
+        gen_ai.agent.name = %bounded(&config.name),
+        nitpicker.reason = reason,
+        nitpicker.turn = compaction_turn as u64,
+    );
     let compaction = match compact_history(
         &config.llm_semaphore,
         Arc::clone(&config.client),
@@ -183,11 +193,13 @@ async fn compact_and_account(
         compaction_turn,
         conversation_usage.usage(),
     )
+    .instrument(span.clone())
     .await
     {
         Ok(Some(outcome)) => Compaction::Done(outcome),
         Ok(None) => Compaction::Skipped,
         Err(err) => {
+            span.record("otel.status_code", "ERROR");
             let error = truncate_for_trajectory(format!("{err:#}"));
             warn!(agent = %config.name, turn = compaction_turn, "compaction failed ({error}); continuing uncompacted");
             Compaction::Failed(error)
@@ -354,6 +366,51 @@ impl Tool for FinishTool {
 }
 
 pub async fn run_agent(
+    config: AgentConfig,
+    initial_message: &str,
+    tools_map: &HashMap<String, Arc<dyn Tool>>,
+    work_dir: &Path,
+) -> Result<AgentResult> {
+    // one span per agent (subagents included, nested under the parent's execute_tool span);
+    // identifiers and counts only — see `telemetry` for the contract
+    let span = info_span!(
+        "invoke_agent",
+        otel.name = %format!("invoke_agent {}", bounded(&config.name)),
+        otel.status_code = Empty,
+        gen_ai.operation.name = "invoke_agent",
+        gen_ai.agent.name = %bounded(&config.name),
+        gen_ai.agent.id = %bounded(&config.session_agent),
+        gen_ai.request.model = %bounded(&config.model),
+        gen_ai.usage.input_tokens = Empty,
+        gen_ai.usage.output_tokens = Empty,
+        nitpicker.agent.depth = config.depth.level() as u64,
+        nitpicker.max_turns = config.max_turns as u64,
+        nitpicker.turns = Empty,
+        nitpicker.tool_calls = Empty,
+        nitpicker.subagents_spawned = Empty,
+    );
+    let result = run_agent_inner(config, initial_message, tools_map, work_dir)
+        .instrument(span.clone())
+        .await;
+    match &result {
+        Ok(result) => {
+            span.record("nitpicker.turns", result.turns as u64);
+            span.record("nitpicker.tool_calls", result.tool_calls as u64);
+            span.record(
+                "nitpicker.subagents_spawned",
+                result.subagents_spawned as u64,
+            );
+            span.record("gen_ai.usage.input_tokens", result.usage.input_tokens);
+            span.record("gen_ai.usage.output_tokens", result.usage.output_tokens);
+        }
+        Err(_) => {
+            span.record("otel.status_code", "ERROR");
+        }
+    }
+    result
+}
+
+async fn run_agent_inner(
     config: AgentConfig,
     initial_message: &str,
     tools_map: &HashMap<String, Arc<dyn Tool>>,
@@ -591,7 +648,6 @@ pub async fn run_agent(
             // for the provider, and the running counters must apply deterministically)
             let mut results = Vec::with_capacity(tool_calls.len());
             for (call, outcome) in tool_calls.iter().zip(outcomes) {
-                let outcome = outcome?;
                 let blocked = outcome.status == ToolCallStatus::BlockedCycle;
                 if blocked {
                     consecutive_blocked_count += 1;
@@ -1003,7 +1059,43 @@ async fn execute_tool_call(
     tool_name: &str,
     args: Value,
     cycle_len: usize,
-) -> Result<ToolCallOutcome> {
+) -> ToolCallOutcome {
+    // the tool name comes from model output: only a registered tool may name the span, and
+    // the arguments never reach it
+    let registered = ctx.runtime_tools.contains_key(tool_name);
+    let span_tool = match registered {
+        true => bounded(tool_name),
+        false => "unknown",
+    };
+    let span_name = match registered {
+        true => format!("execute_tool {span_tool}"),
+        false => "execute_tool".to_string(),
+    };
+    let span = info_span!(
+        "execute_tool",
+        otel.name = %span_name,
+        otel.status_code = Empty,
+        gen_ai.operation.name = "execute_tool",
+        gen_ai.tool.name = span_tool,
+        nitpicker.turn = (ctx.turn + 1) as u64,
+        nitpicker.tool.status = Empty,
+    );
+    let outcome = execute_tool_call_inner(ctx, tool_name, args, cycle_len)
+        .instrument(span.clone())
+        .await;
+    span.record("nitpicker.tool.status", outcome.status.as_str());
+    if outcome.status == ToolCallStatus::Error {
+        span.record("otel.status_code", "ERROR");
+    }
+    outcome
+}
+
+async fn execute_tool_call_inner(
+    ctx: ToolCallContext<'_>,
+    tool_name: &str,
+    args: Value,
+    cycle_len: usize,
+) -> ToolCallOutcome {
     if cycle_len > 0 {
         warn!(
             agent = %ctx.config.name,
@@ -1040,7 +1132,7 @@ async fn execute_tool_call(
             ctx.selected_model,
         )
         .await;
-        return Ok(outcome);
+        return outcome;
     }
 
     if !ctx.executable_tools.contains(tool_name) {
@@ -1070,7 +1162,7 @@ async fn execute_tool_call(
             ctx.selected_model,
         )
         .await;
-        return Ok(outcome);
+        return outcome;
     }
 
     if tool_name == "spawn_subagent" {
@@ -1102,7 +1194,7 @@ async fn execute_tool_call(
                     ctx.selected_model,
                 )
                 .await;
-                return Ok(outcome);
+                return outcome;
             }
         };
         log_tool_call(
@@ -1154,7 +1246,7 @@ async fn execute_tool_call(
             spawned_agent: sub.spawned_agent,
             subagent_usage: sub.usage,
         };
-        return Ok(outcome);
+        return outcome;
     }
 
     let logged_args = args.clone();
@@ -1207,7 +1299,7 @@ async fn execute_tool_call(
     )
     .await;
 
-    Ok(outcome)
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1461,8 +1553,7 @@ mod tests {
             json!({"command": "log --oneline | head -n 3"}),
             0,
         )
-        .await
-        .unwrap();
+        .await;
 
         assert_eq!(outcome.status, ToolCallStatus::Error);
         assert!(outcome.output.starts_with("Error:"));
@@ -1603,8 +1694,7 @@ mod tests {
             json!({"result": "must not be stored"}),
             0,
         )
-        .await
-        .unwrap();
+        .await;
 
         assert_eq!(outcome.status, ToolCallStatus::Error);
         assert_eq!(
@@ -1648,5 +1738,313 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("selected-model"));
         assert!(message.contains("output token limit"));
+    }
+
+    mod spans {
+        use super::*;
+        use crate::telemetry::capture::{CapturedSpan, SpanCapture};
+
+        const SECRET: &str = "SENTINEL-9c1e";
+
+        /// Replays scripted completions in order; parent and subagent share the queue, and the
+        /// loop is sequential enough that the order is deterministic.
+        struct ScriptClient {
+            script: Mutex<VecDeque<Result<CompletionResponse>>>,
+        }
+
+        impl LLMClient for ScriptClient {
+            async fn completion(&self, _completion: Completion) -> Result<CompletionResponse> {
+                self.script
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pop_front()
+                    .expect("script exhausted")
+            }
+        }
+
+        fn tool_call(id: &str, name: &str, args: Value) -> AssistantContent {
+            AssistantContent::ToolCall(ToolCall::new(
+                id.to_string(),
+                ToolFunction::new(name.to_string(), args),
+            ))
+        }
+
+        fn turn(contents: Vec<AssistantContent>, input_tokens: u64) -> Result<CompletionResponse> {
+            let finish_reason = match contents
+                .iter()
+                .any(|c| matches!(c, AssistantContent::ToolCall(_)))
+            {
+                true => FinishReason::ToolUse,
+                false => FinishReason::Stop,
+            };
+            Ok(CompletionResponse {
+                choice: OneOrMany::many(contents).expect("non-empty"),
+                finish_reason,
+                usage: TokenUsage {
+                    input_tokens,
+                    output_tokens: 1,
+                    total_tokens: input_tokens + 1,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                },
+                selected_model: None,
+            })
+        }
+
+        fn script_config(
+            script: Vec<Result<CompletionResponse>>,
+            max_turns: usize,
+            compact_threshold: Option<u64>,
+        ) -> AgentConfig {
+            AgentConfig {
+                name: "top".to_string(),
+                session_agent: "reviewer-0-top".to_string(),
+                model: "scripted-model".to_string(),
+                max_turns,
+                max_tokens: None,
+                compact_threshold,
+                system_prompt: "system".to_string(),
+                subagent_system_prompt: None,
+                client: ScriptClient {
+                    script: Mutex::new(script.into()),
+                }
+                .into_arc(),
+                depth: AgentDepth::TopLevel,
+                terminal_tools: Vec::new(),
+                empty_response_nudge: None,
+                max_empty_responses: 0,
+                subagent_counter: Arc::new(AtomicUsize::new(0)),
+                llm_semaphore: Arc::new(Semaphore::new(4)),
+                progress: None,
+                project_context: None,
+                session_writer: None,
+            }
+        }
+
+        fn tools() -> HashMap<String, Arc<dyn Tool>> {
+            let mut tools = crate::tools::all_tools();
+            add_spawn_subagent_tool(&mut tools);
+            tools
+        }
+
+        fn only(mut spans: Vec<CapturedSpan>) -> CapturedSpan {
+            assert_eq!(spans.len(), 1, "expected exactly one span, got {spans:?}");
+            spans.remove(0)
+        }
+
+        #[tokio::test]
+        async fn a_tool_wave_yields_sibling_spans_under_one_agent_span() {
+            let dir = tempfile::tempdir().unwrap();
+            let work_dir = dir.path().canonicalize().unwrap();
+            std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+            let config = script_config(
+                vec![
+                    turn(
+                        vec![
+                            tool_call("c1", "read_file", json!({"path": "a.txt"})),
+                            tool_call("c2", "made_up_tool", json!({"x": 1})),
+                        ],
+                        10,
+                    ),
+                    turn(vec![AssistantContent::text("done")], 20),
+                ],
+                3,
+                None,
+            );
+            let capture = SpanCapture::default();
+            let _active = capture.activate();
+            let result = run_agent(config, "go", &tools(), &work_dir).await.unwrap();
+            assert_eq!(result.tool_calls, 2);
+
+            let agent = only(capture.named("invoke_agent"));
+            assert_eq!(agent.parent, None);
+            assert_eq!(agent.field("otel.name"), Some("invoke_agent top"));
+            assert_eq!(agent.field("gen_ai.agent.id"), Some("reviewer-0-top"));
+            assert_eq!(agent.field("nitpicker.agent.depth"), Some("0"));
+            assert_eq!(agent.field("nitpicker.turns"), Some("2"));
+            assert_eq!(agent.field("nitpicker.tool_calls"), Some("2"));
+            assert_eq!(agent.field("nitpicker.subagents_spawned"), Some("0"));
+            assert_eq!(agent.field("gen_ai.usage.input_tokens"), Some("30"));
+            assert_eq!(agent.field("otel.status_code"), None);
+
+            let chats = capture.named("chat");
+            assert_eq!(chats.len(), 2);
+            assert!(chats.iter().all(|c| c.parent == Some(agent.id)));
+
+            let tools = capture.named("execute_tool");
+            assert_eq!(tools.len(), 2);
+            assert!(
+                tools.iter().all(|t| t.parent == Some(agent.id)),
+                "each tool span hangs off the agent, never off a sibling: {tools:?}"
+            );
+            assert_eq!(tools[0].field("otel.name"), Some("execute_tool read_file"));
+            assert_eq!(tools[0].field("gen_ai.tool.name"), Some("read_file"));
+            assert_eq!(tools[0].field("nitpicker.turn"), Some("1"));
+            assert_eq!(tools[0].field("nitpicker.tool.status"), Some("ok"));
+            assert_eq!(tools[0].field("otel.status_code"), None);
+            assert_eq!(tools[1].field("otel.name"), Some("execute_tool"));
+            assert_eq!(tools[1].field("gen_ai.tool.name"), Some("unknown"));
+            assert_eq!(tools[1].field("nitpicker.tool.status"), Some("error"));
+            assert_eq!(tools[1].field("otel.status_code"), Some("ERROR"));
+        }
+
+        #[tokio::test]
+        async fn a_subagent_span_nests_under_the_spawning_tool_span() {
+            let dir = tempfile::tempdir().unwrap();
+            let work_dir = dir.path().canonicalize().unwrap();
+            let config = script_config(
+                vec![
+                    turn(
+                        vec![tool_call(
+                            "c1",
+                            "spawn_subagent",
+                            json!({"task": "look around"}),
+                        )],
+                        10,
+                    ),
+                    turn(
+                        vec![tool_call("f1", "finish", json!({"result": "nothing"}))],
+                        5,
+                    ),
+                    turn(vec![AssistantContent::text("done")], 20),
+                ],
+                3,
+                None,
+            );
+            let capture = SpanCapture::default();
+            let _active = capture.activate();
+            run_agent(config, "go", &tools(), &work_dir).await.unwrap();
+
+            let agents = capture.named("invoke_agent");
+            assert_eq!(agents.len(), 2);
+            let top = &agents[0];
+            let child = &agents[1];
+            assert_eq!(top.field("nitpicker.subagents_spawned"), Some("1"));
+            assert_eq!(
+                child.field("gen_ai.agent.id"),
+                Some("reviewer-0-top/subagent-1")
+            );
+            assert_eq!(child.field("nitpicker.agent.depth"), Some("1"));
+            let spawn = only(
+                capture
+                    .named("execute_tool")
+                    .into_iter()
+                    .filter(|t| t.field("gen_ai.tool.name") == Some("spawn_subagent"))
+                    .collect::<Vec<_>>(),
+            );
+            assert_eq!(spawn.parent, Some(top.id));
+            assert_eq!(child.parent, Some(spawn.id));
+            let finish = capture
+                .named("execute_tool")
+                .into_iter()
+                .find(|t| t.field("gen_ai.tool.name") == Some("finish"))
+                .expect("finish span");
+            assert_eq!(finish.parent, Some(child.id));
+        }
+
+        #[tokio::test]
+        async fn a_failed_compaction_marks_its_span_as_error() {
+            let dir = tempfile::tempdir().unwrap();
+            let work_dir = dir.path().canonicalize().unwrap();
+            std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+            let config = script_config(
+                vec![
+                    turn(
+                        vec![tool_call("c1", "read_file", json!({"path": "a.txt"}))],
+                        5_000,
+                    ),
+                    Err(eyre::eyre!("summarizer down")),
+                    Err(eyre::eyre!("summarizer down again")),
+                    turn(vec![AssistantContent::text("done")], 20),
+                ],
+                3,
+                Some(1_000),
+            );
+            let capture = SpanCapture::default();
+            let _active = capture.activate();
+            run_agent(config, "go", &tools(), &work_dir).await.unwrap();
+
+            let agent = only(capture.named("invoke_agent"));
+            let compact = only(capture.named("compact"));
+            assert_eq!(compact.parent, Some(agent.id));
+            assert_eq!(compact.field("nitpicker.reason"), Some("threshold"));
+            assert_eq!(compact.field("nitpicker.turn"), Some("2"));
+            assert_eq!(compact.field("otel.status_code"), Some("ERROR"));
+            let summarizer_chats: Vec<_> = capture
+                .named("chat")
+                .into_iter()
+                .filter(|c| c.parent == Some(compact.id))
+                .collect();
+            assert_eq!(
+                summarizer_chats.len(),
+                2,
+                "both summarizer attempts nest under compact"
+            );
+            assert!(
+                summarizer_chats
+                    .iter()
+                    .all(|c| c.field("otel.status_code") == Some("ERROR"))
+            );
+        }
+
+        /// Plants a secret everywhere content flows — prompt, project context, tool arguments,
+        /// tool output, tool error, a model-invented tool name, the subagent task and result, and
+        /// the final answer — and checks no exported span name or attribute carries it.
+        #[tokio::test]
+        async fn exported_spans_never_carry_content() {
+            let dir = tempfile::tempdir().unwrap();
+            let work_dir = dir.path().canonicalize().unwrap();
+            let secret_file = format!("{SECRET}.txt");
+            std::fs::write(dir.path().join(&secret_file), format!("body {SECRET}\n")).unwrap();
+            let mut config = script_config(
+                vec![
+                    turn(
+                        vec![
+                            tool_call("c1", "read_file", json!({"path": secret_file})),
+                            tool_call(
+                                "c2",
+                                "read_file",
+                                json!({"path": format!("missing-{SECRET}")}),
+                            ),
+                            tool_call("c3", &format!("tool_{SECRET}"), json!({"arg": SECRET})),
+                            tool_call(
+                                "c4",
+                                "spawn_subagent",
+                                json!({"task": format!("task {SECRET}")}),
+                            ),
+                        ],
+                        10,
+                    ),
+                    turn(
+                        vec![tool_call(
+                            "f1",
+                            "finish",
+                            json!({"result": format!("found {SECRET}")}),
+                        )],
+                        5,
+                    ),
+                    turn(
+                        vec![AssistantContent::text(format!("verdict {SECRET}"))],
+                        20,
+                    ),
+                ],
+                3,
+                None,
+            );
+            config.project_context = Some(format!("CLAUDE.md {SECRET}"));
+            let capture = SpanCapture::default();
+            let _active = capture.activate();
+            let result = run_agent(config, &format!("review {SECRET}"), &tools(), &work_dir)
+                .await
+                .unwrap();
+            assert!(
+                result.text.contains(SECRET),
+                "the agent's own output is untouched"
+            );
+
+            let spans = capture.spans();
+            assert!(spans.len() >= 8, "expected a full tree, got {spans:?}");
+            capture.assert_no_secret(SECRET);
+        }
     }
 }

@@ -6,6 +6,22 @@ Notable user-visible changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Optional OpenTelemetry trace export behind the new `otel` cargo feature (off by default):
+  set `OTEL_EXPORTER_OTLP_ENDPOINT` and each run ships one OTLP/HTTP-protobuf trace covering the
+  run, review jobs / debate lanes and turns, agents and subagents, LLM calls (usage, answering
+  model, retries and failovers), tool calls and compaction, with GenAI semantic-convention
+  attributes. Configured only through the standard `OTEL_*` environment variables; prompts, tool
+  arguments, tool output and provider error text are never exported. Without the feature a set
+  endpoint logs one warning and the run proceeds unchanged.
+- `nitpicker-agent`: the agent loop and LLM boundary now emit `tracing` spans (`invoke_agent`,
+  `chat`, `llm.attempt`, `execute_tool`, `compact`) that any subscriber can consume; new
+  `telemetry` module documents the attribute contract, and `SessionLogger::id` names the session.
+
+### Changed
+- `main` no longer calls `process::exit`: the outcome is mapped to the unchanged 0/1/3 contract
+  after the runtime is torn down and telemetry is flushed. Stderr log lines keep their shape.
+
 ## [0.9.5] - 2026-09-03
 
 `nitpicker-agent` 0.5.3

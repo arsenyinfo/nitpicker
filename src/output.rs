@@ -165,13 +165,15 @@ pub struct PresetCoverage {
     pub succeeded: usize,
 }
 
-/// serialize `value` as one line on stdout and flush before returning.
-///
-/// flushing explicitly matters because callers exit via `std::process::exit`,
-/// which skips the normal stdout teardown that would otherwise drain the buffer.
+/// serialize `value` as one line on stdout, flushed before returning so the envelope has
+/// landed whatever exit path follows.
 pub fn emit_json<T: Serialize>(value: &T) -> Result<()> {
+    write_json(&mut std::io::stdout().lock(), value)
+}
+
+/// `emit_json` against an arbitrary writer: one line, flushed.
+pub fn write_json<T: Serialize>(out: &mut impl Write, value: &T) -> Result<()> {
     let line = serde_json::to_string(value)?;
-    let mut out = std::io::stdout().lock();
     writeln!(out, "{line}")?;
     out.flush()?;
     Ok(())

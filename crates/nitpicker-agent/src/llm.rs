@@ -14,9 +14,12 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
-use tracing::{debug, warn};
+use tracing::field::Empty;
+use tracing::{Instrument, debug, info_span, warn};
+
+use crate::telemetry::{bounded, finish_reason_label};
 
 const MAX_COMPLETION_ATTEMPTS: usize = 4;
 const RATE_LIMIT_MAX_COMPLETION_ATTEMPTS: usize = 8;
@@ -442,9 +445,24 @@ impl<C: LLMClient> LLMClient for RetryingLLM<C> {
         let mut attempt = 0usize;
         loop {
             attempt += 1;
-            match self.inner.completion(completion.clone()).await {
+            // one span per provider round-trip: the failure CLASS is recorded, never the error text
+            let span = info_span!(
+                "llm.attempt",
+                otel.status_code = Empty,
+                "error.type" = Empty,
+                gen_ai.request.model = %bounded(&completion.model),
+                nitpicker.attempt = attempt as u64,
+            );
+            match self
+                .inner
+                .completion(completion.clone())
+                .instrument(span.clone())
+                .await
+            {
                 Ok(response) => {
                     if response.text().is_empty() && response.tool_calls().is_none() {
+                        span.record("otel.status_code", "ERROR");
+                        span.record("error.type", "empty_response");
                         let diagnosis = empty_response_diagnosis(&response);
                         if attempt >= MAX_COMPLETION_ATTEMPTS {
                             eyre::bail!(
@@ -466,7 +484,10 @@ impl<C: LLMClient> LLMClient for RetryingLLM<C> {
                     return Ok(response);
                 }
                 Err(err) => {
-                    let policy = retry_policy(&err);
+                    let class = classify_provider_failure(&err);
+                    span.record("otel.status_code", "ERROR");
+                    span.record("error.type", class.as_str());
+                    let policy = retry_policy_for(class);
                     if !policy.retry || attempt >= policy.max_attempts {
                         return Err(err);
                     }
@@ -807,8 +828,55 @@ pub async fn throttled_completion(
     client: &Arc<dyn LLMClientDyn>,
     completion: Completion,
 ) -> Result<CompletionResponse> {
+    let queued = Instant::now();
     let _permit = semaphore.acquire().await.expect("llm semaphore closed");
-    client.completion(completion).await
+    // the span starts after the permit so its duration is provider latency; the wait is an attribute
+    let queue_wait_ms = queued.elapsed().as_millis() as u64;
+    let requested_model = bounded(&completion.model).to_string();
+    let span = info_span!(
+        "chat",
+        otel.name = %format!("chat {requested_model}"),
+        otel.kind = "client",
+        otel.status_code = Empty,
+        gen_ai.operation.name = "chat",
+        gen_ai.request.model = %requested_model,
+        gen_ai.request.max_tokens = completion.max_tokens,
+        gen_ai.response.model = Empty,
+        gen_ai.response.finish_reasons = Empty,
+        gen_ai.usage.input_tokens = Empty,
+        gen_ai.usage.output_tokens = Empty,
+        gen_ai.usage.cache_read.input_tokens = Empty,
+        gen_ai.usage.cache_creation.input_tokens = Empty,
+        nitpicker.queue_wait_ms = queue_wait_ms,
+    );
+    let result = client.completion(completion).instrument(span.clone()).await;
+    match &result {
+        Ok(response) => {
+            let response_model = response
+                .selected_model
+                .as_deref()
+                .map_or(requested_model.as_str(), bounded);
+            span.record("gen_ai.response.model", response_model);
+            span.record(
+                "gen_ai.response.finish_reasons",
+                finish_reason_label(&response.finish_reason),
+            );
+            span.record("gen_ai.usage.input_tokens", response.usage.input_tokens);
+            span.record("gen_ai.usage.output_tokens", response.usage.output_tokens);
+            span.record(
+                "gen_ai.usage.cache_read.input_tokens",
+                response.usage.cached_input_tokens,
+            );
+            span.record(
+                "gen_ai.usage.cache_creation.input_tokens",
+                response.usage.cache_creation_input_tokens,
+            );
+        }
+        Err(_) => {
+            span.record("otel.status_code", "ERROR");
+        }
+    }
+    result
 }
 
 struct RetryPolicy {
@@ -818,8 +886,13 @@ struct RetryPolicy {
     max_backoff_ms: u64,
 }
 
+#[cfg(test)]
 fn retry_policy(err: &eyre::Report) -> RetryPolicy {
-    match classify_provider_failure(err) {
+    retry_policy_for(classify_provider_failure(err))
+}
+
+fn retry_policy_for(class: ProviderFailureClass) -> RetryPolicy {
+    match class {
         // A rolling subscription allowance measured in hours cannot recover within this command.
         // Surface it immediately so fallback can move on instead of entering the 429 backoff loop.
         ProviderFailureClass::PermanentQuota => RetryPolicy {
@@ -881,6 +954,20 @@ enum ProviderFailureClass {
     ContextLength,
     NonRetryableClient,
     Unknown,
+}
+
+impl ProviderFailureClass {
+    /// Stable `error.type` vocabulary for the `llm.attempt` span.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Server => "server",
+            Self::PermanentQuota => "permanent_quota",
+            Self::RateLimit => "rate_limit",
+            Self::ContextLength => "context_length",
+            Self::NonRetryableClient => "non_retryable_client",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -2827,6 +2914,177 @@ mod tests {
             FinishReason::Other("content_filter".to_string()),
         ] {
             assert_eq!(resolve_finish_reason(&choice, wire.clone()), wire);
+        }
+    }
+
+    mod spans {
+        use super::*;
+        use crate::telemetry::capture::SpanCapture;
+
+        struct UsageClient;
+
+        impl LLMClient for UsageClient {
+            async fn completion(&self, _completion: Completion) -> Result<CompletionResponse> {
+                Ok(CompletionResponse {
+                    choice: OneOrMany::one(AssistantContent::text("ok")),
+                    finish_reason: FinishReason::Stop,
+                    usage: TokenUsage {
+                        input_tokens: 100,
+                        output_tokens: 10,
+                        total_tokens: 110,
+                        cached_input_tokens: 80,
+                        cache_creation_input_tokens: 20,
+                    },
+                    selected_model: Some("route-b".to_string()),
+                })
+            }
+        }
+
+        const SECRET: &str = "SENTINEL-4f2a";
+
+        /// Fails the first `failures` calls with an error that quotes the request, like a
+        /// provider echoing a rejected prompt would.
+        struct EchoingFailClient {
+            calls: Arc<AtomicUsize>,
+            failures: usize,
+        }
+
+        impl LLMClient for EchoingFailClient {
+            async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
+                let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+                if call <= self.failures {
+                    eyre::bail!("upstream rejected {SECRET}: {:?}", completion.prompt)
+                }
+                Ok(response_with(vec![AssistantContent::text("ok")]))
+            }
+        }
+
+        fn secret_completion() -> Completion {
+            let mut completion = test_completion();
+            completion.prompt = Message::user(format!("prompt {SECRET}"));
+            completion.preamble = Some(format!("system {SECRET}"));
+            completion
+        }
+
+        #[tokio::test]
+        async fn throttled_completion_records_one_chat_span_with_usage() {
+            let capture = SpanCapture::default();
+            let _active = capture.activate();
+            let semaphore = Semaphore::new(1);
+            let client = UsageClient.into_arc();
+            throttled_completion(&semaphore, &client, test_completion())
+                .await
+                .expect("completion succeeds");
+
+            let chats = capture.named("chat");
+            assert_eq!(chats.len(), 1);
+            let chat = &chats[0];
+            assert_eq!(chat.parent, None);
+            assert_eq!(chat.field("otel.name"), Some("chat logical-primary"));
+            assert_eq!(chat.field("otel.kind"), Some("client"));
+            assert_eq!(chat.field("gen_ai.operation.name"), Some("chat"));
+            assert_eq!(chat.field("gen_ai.request.model"), Some("logical-primary"));
+            assert_eq!(chat.field("gen_ai.request.max_tokens"), Some("999"));
+            assert_eq!(chat.field("gen_ai.response.model"), Some("route-b"));
+            assert_eq!(chat.field("gen_ai.response.finish_reasons"), Some("stop"));
+            assert_eq!(chat.field("gen_ai.usage.input_tokens"), Some("100"));
+            assert_eq!(chat.field("gen_ai.usage.output_tokens"), Some("10"));
+            assert_eq!(
+                chat.field("gen_ai.usage.cache_read.input_tokens"),
+                Some("80")
+            );
+            assert_eq!(
+                chat.field("gen_ai.usage.cache_creation.input_tokens"),
+                Some("20")
+            );
+            assert!(chat.field("nitpicker.queue_wait_ms").is_some());
+            assert_eq!(chat.field("otel.status_code"), None);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn retries_become_attempt_spans_carrying_only_the_failure_class() {
+            let capture = SpanCapture::default();
+            let _active = capture.activate();
+            let semaphore = Semaphore::new(1);
+            let client = EchoingFailClient {
+                calls: Arc::new(AtomicUsize::new(0)),
+                failures: 1,
+            }
+            .with_retry()
+            .into_arc();
+            throttled_completion(&semaphore, &client, secret_completion())
+                .await
+                .expect("second attempt succeeds");
+
+            let chat = &capture.named("chat")[0];
+            assert_eq!(chat.field("otel.status_code"), None);
+            let attempts = capture.named("llm.attempt");
+            assert_eq!(attempts.len(), 2);
+            for attempt in &attempts {
+                assert_eq!(attempt.parent, Some(chat.id), "attempts nest under chat");
+                assert_eq!(
+                    attempt.field("gen_ai.request.model"),
+                    Some("logical-primary")
+                );
+            }
+            assert_eq!(attempts[0].field("nitpicker.attempt"), Some("1"));
+            assert_eq!(attempts[0].field("otel.status_code"), Some("ERROR"));
+            assert_eq!(attempts[0].field("error.type"), Some("unknown"));
+            assert_eq!(attempts[1].field("nitpicker.attempt"), Some("2"));
+            assert_eq!(attempts[1].field("otel.status_code"), None);
+            assert_eq!(attempts[1].field("error.type"), None);
+            capture.assert_no_secret(SECRET);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn exhausted_retries_mark_the_chat_span_as_error() {
+            let capture = SpanCapture::default();
+            let _active = capture.activate();
+            let semaphore = Semaphore::new(1);
+            let client = EchoingFailClient {
+                calls: Arc::new(AtomicUsize::new(0)),
+                failures: usize::MAX,
+            }
+            .with_retry()
+            .into_arc();
+            let err = throttled_completion(&semaphore, &client, secret_completion())
+                .await
+                .expect_err("every attempt fails");
+            assert!(
+                err.to_string().contains(SECRET),
+                "the caller still sees the real error"
+            );
+
+            let chat = &capture.named("chat")[0];
+            assert_eq!(chat.field("otel.status_code"), Some("ERROR"));
+            assert_eq!(chat.field("gen_ai.response.model"), None);
+            assert_eq!(capture.named("llm.attempt").len(), MAX_COMPLETION_ATTEMPTS);
+            capture.assert_no_secret(SECRET);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn empty_responses_are_classified_without_quoting_them() {
+            struct EmptyThenTextClient(Arc<AtomicUsize>);
+            impl LLMClient for EmptyThenTextClient {
+                async fn completion(&self, _c: Completion) -> Result<CompletionResponse> {
+                    let call = self.0.fetch_add(1, Ordering::Relaxed);
+                    let text = if call == 0 { "" } else { "ok" };
+                    Ok(response_with(vec![AssistantContent::text(text)]))
+                }
+            }
+            let capture = SpanCapture::default();
+            let _active = capture.activate();
+            let semaphore = Semaphore::new(1);
+            let client = EmptyThenTextClient(Arc::new(AtomicUsize::new(0)))
+                .with_retry()
+                .into_arc();
+            throttled_completion(&semaphore, &client, test_completion())
+                .await
+                .expect("retry succeeds");
+            let attempts = capture.named("llm.attempt");
+            assert_eq!(attempts.len(), 2);
+            assert_eq!(attempts[0].field("error.type"), Some("empty_response"));
+            assert_eq!(attempts[0].field("otel.status_code"), Some("ERROR"));
         }
     }
 }

@@ -28,6 +28,7 @@ pub mod openrouter;
 pub mod prompts;
 pub mod provider;
 pub mod session;
+pub mod telemetry;
 pub mod tools;
 
 #[cfg(feature = "azure")]

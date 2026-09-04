@@ -11,6 +11,8 @@ use tokio::sync::Mutex;
 #[derive(Clone)]
 pub struct SessionLogger {
     root: Arc<PathBuf>,
+    /// `session-<ts>-<pid>`: the run's durable identifier, safe to export where the path is not.
+    id: Arc<str>,
     // serializes appends so concurrent subagents sharing a writer don't interleave lines
     write_lock: Arc<Mutex<()>>,
 }
@@ -115,20 +117,24 @@ impl SessionLogger {
             dirs::home_dir().ok_or_else(|| eyre::eyre!("failed to resolve home directory"))?;
         let ts = now_unix_ms();
         let pid = std::process::id();
-        let root = home
-            .join(".nitpicker")
-            .join("sessions")
-            .join(format!("session-{ts}-{pid}"));
+        let id = format!("session-{ts}-{pid}");
+        let root = home.join(".nitpicker").join("sessions").join(&id);
         std::fs::create_dir_all(&root)
             .wrap_err_with(|| format!("failed to create session dir {}", root.display()))?;
         Ok(Some(Self {
             root: Arc::new(root),
+            id: Arc::from(id),
             write_lock: Arc::new(Mutex::new(())),
         }))
     }
 
     pub fn root(&self) -> &Path {
         self.root.as_ref()
+    }
+
+    /// The session directory's basename (`session-<ts>-<pid>`).
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
     pub fn child(&self, relative_path: impl AsRef<Path>) -> SessionWriter {
@@ -298,6 +304,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let logger = SessionLogger {
             root: Arc::new(dir.path().to_path_buf()),
+            id: Arc::from("session-test"),
             write_lock: Arc::new(Mutex::new(())),
         };
         let attribution = SessionAttribution {
