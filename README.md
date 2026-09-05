@@ -5,20 +5,18 @@
 
 Multi-model adversarial code review for your terminal and CI.
 
-Supported by [Archestra](https://github.com/archestra-ai/archestra) · [**Free Web Version**](https://arseny.info/nitpicker) for open source projects
+Supported by [Archestra](https://github.com/archestra-ai/archestra) · [Free Web Version](https://arseny.info/nitpicker) for open source projects
 
 ---
 
-![Actor-Critic Architecture](assets/actor-critic.svg)
+Most LLM code reviews suffer from two failure modes: lazy rubber-stamping (*"Looks good! 🎉"*) or hallucinated pedantry (inventing fake bugs because the model lacks repo context).
 
-Most LLM code reviews suffer from two failure modes: **lazy rubber-stamping** (*"Looks good! 🎉"*) or **hallucinated pedantry** (inventing fake bugs because the model lacks repo context).
+nitpicker fixes this by pitching models against each other in an adversarial debate:
 
-**nitpicker** fixes this by pitching models against each other in an adversarial debate:
-
-* **Actor-Critic Dynamics**: The **Reviewer (Actor)** explores the codebase to maximize recall (finding plausible bugs and edge cases). The **Validator (Critic)** aggressively attempts to falsify those claims using actual repo evidence. Disputed claims are debated; only surviving findings make it to the report.
-* **Deep Repo Exploration**: Reviewers don't just stare at a 40-line `git diff`. They run tools (`read_file`, `grep`, `glob`, `git`) and spawn concurrent subagents to trace call graphs, check types, and verify assumptions before claiming an issue exists.
-* **Model Diversity & Economics**: Pit different model families against each other (Claude vs. GPT vs. Gemini), or pair frontier models with fast, inexpensive models via OpenRouter (Qwen, DeepSeek, Kimi). Burn 1M tokens reviewing a complex PR without burning your monthly budget.
-* **Production & CI Ready**: Regularly used across several engineering orgs, including CI pipelines. Features deterministic exit codes (`0`, `1`, `3`), headless `--json` output, and OpenTelemetry tracing.
+* Actor-Critic dynamics: The Reviewer (Actor) explores the codebase to maximize recall (finding plausible bugs and edge cases). The Validator (Critic) aggressively attempts to falsify those claims using actual repo evidence. Disputed claims are debated; only surviving findings make it to the report.
+* Deep repo exploration: Reviewers don't just stare at a 40-line `git diff`. They run tools (`read_file`, `grep`, `glob`, `git`) and spawn concurrent subagents to trace call graphs, check types, and verify assumptions before claiming an issue exists.
+* Model diversity & economics: Pit different model families against each other (Claude vs. GPT vs. Gemini), or pair frontier models with fast, inexpensive models via OpenRouter (Qwen, DeepSeek, Kimi). Burn 1M tokens reviewing a complex PR without burning your monthly budget.
+* Production & CI ready: Regularly used across several engineering orgs, including CI pipelines. Features deterministic exit codes (`0`, `1`, `3`), headless `--json` output, and OpenTelemetry tracing.
 
 ---
 
@@ -102,7 +100,7 @@ nitpicker --analyze                          # audit the entire repository
 
 ## Review Lenses (Presets)
 
-Instead of generic feedback, review against targeted rubrics. Presets control **what** to investigate, while debate or parallel modes control **how**.
+Instead of generic feedback, review against targeted rubrics. Presets control what to investigate, while debate or parallel modes control how.
 
 ```bash
 nitpicker --preset security                  # focus strictly on vulnerabilities
@@ -182,7 +180,7 @@ model = "qwen/qwen3-30b-a3b"
 provider = "openrouter"
 ```
 
-> **Tip:** Pair different model families to avoid shared blind spots.
+> Tip: Pair different model families to avoid shared blind spots.
 
 ---
 
@@ -192,7 +190,7 @@ provider = "openrouter"
 |---|---|---|
 | `anthropic` | `ANTHROPIC_API_KEY` | Automatic 5-minute prompt caching enabled by default. |
 | `openai` | `OPENAI_API_KEY` | Compatible with OpenAI models and custom OpenAI gateways. |
-| `codex` *(OpenAI)* | Reuses `~/.codex/auth.json` | **Popular**: Uses your existing ChatGPT Plus/Pro subscription token from OpenAI Codex CLI. No API key needed. [Details below](#chatgpt--codex-subscription). |
+| `codex` *(OpenAI)* | Reuses `~/.codex/auth.json` | Uses your existing ChatGPT Plus/Pro subscription token from OpenAI Codex CLI. No API key needed. [Details below](#chatgpt--codex-subscription). |
 | `openrouter` | `OPENROUTER_API_KEY` | Access open-weights & Chinese frontier models (Qwen, DeepSeek, Kimi, GLM). |
 | `gemini` | `GEMINI_API_KEY` | Google Gemini models via official API. |
 | `azure` *(Entra ID)* | `auth = "azure-ad"` | Azure AI Foundry models with auto-refreshing tokens (requires `--features azure`). |
@@ -316,7 +314,7 @@ async fn main() -> eyre::Result<()> {
 <summary>Experimental: Antigravity Keyring Auth (Research Only)</summary>
 
 > [!CAUTION]
-> **Research only.** AG2 is Google's internal agentic IDE backend. `auth = "agy-keyring"` reads the `agy` CLI OAuth token from the system keyring to evaluate `gemini-3.x` models. Google actively monitors and suspends accounts using third-party OAuth bridges. For standard Gemini access, use `GEMINI_API_KEY`.
+> Research only. AG2 is Google's internal agentic IDE backend. `auth = "agy-keyring"` reads the `agy` CLI OAuth token from the system keyring to evaluate `gemini-3.x` models. Google actively monitors and suspends accounts using third-party OAuth bridges. For standard Gemini access, use `GEMINI_API_KEY`.
 </details>
 
 ---
