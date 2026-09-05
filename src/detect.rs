@@ -68,7 +68,7 @@ static OPENAI: ProviderDef = ProviderDef {
 static GEMINI_API: ProviderDef = ProviderDef {
     name: "gemini",
     provider: "gemini",
-    model: "gemini-3-flash-preview",
+    model: "gemini-3.8-flash",
     base_url: None,
     api_key_env: "GEMINI_API_KEY",
 };
@@ -96,14 +96,14 @@ static KIMI: ProviderDef = ProviderDef {
 static ZAI: ProviderDef = ProviderDef {
     name: "zai",
     provider: "anthropic",
-    model: "glm-5.1",
+    model: "glm-5.3",
     base_url: Some("https://api.z.ai/api/anthropic"),
     api_key_env: "ZAI_API_KEY",
 };
 static MINIMAX: ProviderDef = ProviderDef {
     name: "minimax",
     provider: "anthropic",
-    model: "MiniMax-M2.7",
+    model: "MiniMax-M3",
     base_url: Some("https://api.minimax.io/anthropic"),
     api_key_env: "MINIMAX_API_KEY",
 };
@@ -235,7 +235,7 @@ fn detect_agy_keyring() -> Option<Detected> {
         Ok(_) => Some(Detected {
             name: "gemini",
             provider: "gemini",
-            model: "gemini-3.1-pro-low".to_string(),
+            model: "gemini-3.5-flash-low".to_string(),
             base_url: None,
             api_key_env: None,
             auth: Some(AGY_KEYRING_AUTH),
