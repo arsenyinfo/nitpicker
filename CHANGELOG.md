@@ -6,6 +6,18 @@ Notable user-visible changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-09-05
+
+`nitpicker-agent` 0.5.4
+
+### Security
+
+- Updated the TLS and HTTP dependency stack reached through `reqwest` to clear ten RUSTSEC
+  advisories (`aws-lc-sys`, `rustls-webpki`, `h2`, `quinn-proto`, `crossbeam-epoch`), plus
+  reported unsoundness in `anyhow` and `event-listener`. Lockfile only — no manifest changes,
+  so this matters for `cargo install --locked`; an ordinary install already resolved the fixed
+  versions.
+
 ## [0.10.0] - 2026-09-05
 
 `nitpicker-agent` 0.5.4
