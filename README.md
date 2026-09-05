@@ -5,7 +5,9 @@
 
 Multi-model adversarial code review for your terminal and CI.
 
-Supported by [Archestra](https://github.com/archestra-ai/archestra) · [Free Web Version](https://arseny.info/nitpicker) for open source projects
+Supported by [Archestra](https://github.com/archestra-ai/archestra)
+
+[Free Web Version](https://arseny.info/nitpicker) for open source projects
 
 ---
 
@@ -17,6 +19,16 @@ nitpicker fixes this by pitching models against each other in an adversarial deb
 * Deep repo exploration: Reviewers don't just stare at a 40-line `git diff`. They run tools (`read_file`, `grep`, `glob`, `git`) and spawn concurrent subagents to trace call graphs, check types, and verify assumptions before claiming an issue exists.
 * Model diversity & economics: Pit different model families against each other (Claude vs. GPT vs. Gemini), or pair frontier models with fast, inexpensive models via OpenRouter (Qwen, DeepSeek, Kimi). Burn 1M tokens reviewing a complex PR without burning your monthly budget.
 * Production & CI ready: Regularly used across several engineering orgs, including CI pipelines. Features deterministic exit codes (`0`, `1`, `3`), headless `--json` output, and OpenTelemetry tracing.
+
+---
+
+- [Quick Start](#quick-start)
+- [Common Workflows](#common-workflows)
+- [Review Lenses (Presets)](#review-lenses-presets)
+- [Configuration](#configuration)
+- [Providers & Authentication](#providers--authentication)
+- [Production & CI Integration](#production--ci-integration)
+- [Advanced Features](#advanced-features)
 
 ---
 
