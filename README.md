@@ -15,10 +15,10 @@ Most LLM code reviews suffer from two failure modes: lazy rubber-stamping (*"Loo
 
 nitpicker fixes this by pitching models against each other in an adversarial debate:
 
-* Actor-Critic dynamics: The Reviewer (Actor) explores the codebase to maximize recall (finding plausible bugs and edge cases). The Validator (Critic) aggressively attempts to falsify those claims using actual repo evidence. Disputed claims are debated; only surviving findings make it to the report.
-* Deep repo exploration: Reviewers don't just stare at a 40-line `git diff`. They run tools (`read_file`, `grep`, `glob`, `git`) and spawn concurrent subagents to trace call graphs, check types, and verify assumptions before claiming an issue exists.
-* Model diversity & economics: Pit different model families against each other (Claude vs. GPT vs. Gemini), or pair frontier models with fast, inexpensive models via OpenRouter (Qwen, DeepSeek, Kimi). Burn 1M tokens reviewing a complex PR without burning your monthly budget.
-* Production & CI ready: Regularly used across several engineering orgs, including CI pipelines. Features deterministic exit codes (`0`, `1`, `3`), headless `--json` output, and OpenTelemetry tracing.
+* **Actor-Critic dynamics**: The Reviewer (Actor) explores the codebase to maximize recall (finding plausible bugs and edge cases). The Validator (Critic) aggressively attempts to falsify those claims using actual repo evidence. Disputed claims are debated; only surviving findings make it to the report.
+* **Deep repo exploration**: Reviewers don't just stare at a 40-line `git diff`. They run tools (`read_file`, `grep`, `glob`, `git`) and spawn concurrent subagents to trace call graphs, check types, and verify assumptions before claiming an issue exists.
+* **Model diversity & economics**: Pit different model families against each other (Claude vs. GPT vs. Gemini), or pair frontier models with fast, inexpensive models via OpenRouter (Qwen, DeepSeek, Kimi). Burn 1M tokens reviewing a complex PR without burning your monthly budget.
+* **Production & CI ready**: Regularly used across several engineering orgs, including CI pipelines. Features deterministic exit codes (`0`, `1`, `3`), headless `--json` output, and OpenTelemetry tracing.
 
 ---
 
@@ -192,7 +192,7 @@ model = "qwen/qwen3-30b-a3b"
 provider = "openrouter"
 ```
 
-> Tip: Pair different model families to avoid shared blind spots.
+> **Tip:** Pair different model families to avoid shared blind spots.
 
 ---
 
