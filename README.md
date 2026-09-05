@@ -1,502 +1,336 @@
 # nitpicker
 
 [![crates.io](https://img.shields.io/crates/v/nitpicker.svg)](https://crates.io/crates/nitpicker)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Multi-reviewer code review using LLMs. Spawns parallel agents with different models/prompts, aggregates their feedback into a final verdict. Supports two modes — parallel aggregation and actor-critic debate — across two task types: code review and free-form questions.
+Multi-model adversarial code review for your terminal and CI.
 
-[**Free Web version**](https://arseny.info/nitpicker) is available for open source projects.
+Supported by [Archestra](https://github.com/archestra-ai/archestra)
 
-Each reviewer is an agentic loop that can call tools (read files, grep, glob, git commands) to explore the repo before writing its review. Discovery roles build a quick initial map and default to one early, disjoint subagent wave for multi-surface targets; validation roles delegate only bounded verification of submitted claims. Tool outputs include lightweight headers and clearer truncation/no-match messages so agents can reason about partial evidence more reliably; the git tool runs one invocation with no shell and rejects pipes/redirects with a pointer to the working alternative. A separate aggregator model deduplicates and synthesizes the individual reviews into a final verdict.
+[Free Web Version](https://arseny.info/nitpicker) for open source projects
 
-Diff and PR reviews capture a frozen orientation snapshot before reviewers fan out: full HEAD,
-resolved base and merge-base revisions, the exact committed comparison, working-tree status, and
-committed/uncommitted file maps. Every lane and later debate round receives the same snapshot;
-agents still inspect the actual hunks and code with tools. The base is the local default branch
-unless its `origin/` counterpart yields a newer merge-base with HEAD — a branch cut from
-`origin/main` while local `main` lags behind is compared against `origin/main`, with a warning.
+---
 
-## Requirements
+Most LLM code reviews suffer from two failure modes: lazy rubber-stamping (*"Looks good! 🎉"*) or hallucinated pedantry (inventing fake bugs because the model lacks repo context).
 
-- Rust toolchain
-- A git repository to review
-- At least one configured LLM (API key or Gemini OAuth)
+nitpicker fixes this by pitching models against each other in an adversarial debate:
 
-## Installation
+* **Actor-Critic dynamics**: The Reviewer (Actor) explores the codebase to maximize recall (finding plausible bugs and edge cases). The Validator (Critic) aggressively attempts to falsify those claims using actual repo evidence. Disputed claims are debated; only surviving findings make it to the report.
+* **Deep repo exploration**: Reviewers don't just stare at a 40-line `git diff`. They run tools (`read_file`, `grep`, `glob`, `git`) and spawn concurrent subagents to trace call graphs, check types, and verify assumptions before claiming an issue exists.
+* **Model diversity & economics**: Pit different model families against each other (Claude vs. GPT vs. Gemini), or pair frontier models with fast, inexpensive models via OpenRouter (Qwen, DeepSeek, Kimi). Burn 1M tokens reviewing a complex PR without burning your monthly budget.
+* **Production & CI ready**: Regularly used across several engineering orgs, including CI pipelines. Features deterministic exit codes (`0`, `1`, `3`), headless `--json` output, and OpenTelemetry tracing.
+
+---
+
+- [Quick Start](#quick-start)
+- [Common Workflows](#common-workflows)
+- [Review Lenses (Presets)](#review-lenses-presets)
+- [Configuration](#configuration)
+- [Providers & Authentication](#providers--authentication)
+- [Production & CI Integration](#production--ci-integration)
+- [Advanced Features](#advanced-features)
+
+---
+
+## Quick Start
 
 ```bash
 cargo install nitpicker
 ```
 
-## Quick start
+Set an API key for your preferred provider:
 
 ```bash
-export ANTHROPIC_API_KEY="your-api-key-here"
+export ANTHROPIC_API_KEY="your-api-key"
+# or: export OPENROUTER_API_KEY="your-api-key"
+# or: export OPENAI_API_KEY="your-api-key"
 ```
 
-### Review
+Run a review:
 
 ```bash
+# Review your current branch / uncommitted changes
 nitpicker
-nitpicker --repo /path/to/repo
-nitpicker --repo /path/to/repo --prompt "focus on src/api/"
-nitpicker --fallback  # try the next configured reviewer if a model fails
-nitpicker --analyze src/components/
-nitpicker --analyze  # entire repo
-```
 
-### Parallel Mode
-
-```bash
-nitpicker --no-debate
-nitpicker --no-debate --analyze src/
-nitpicker --no-debate --max-turns 40
-```
-
-### PR review
-
-```bash
-nitpicker pr
+# Review an open GitHub pull request and post the verdict as a comment
 nitpicker pr https://github.com/owner/repo/pull/42
-nitpicker pr --no-comment
+
+# Ask a technical or architectural question about the repo
+nitpicker ask "should we use eyre or thiserror for error handling?"
+```
+
+---
+
+## Common Workflows
+
+### 1. Review Local Diffs
+By default, nitpicker compares your current branch against its base branch using an adversarial debate:
+
+```bash
+nitpicker                                    # review current diff
+nitpicker --repo /path/to/repo               # review another repo
+nitpicker --prompt "focus on SQL injection"  # add custom reviewer instructions
+nitpicker --no-debate                        # use parallel reviewers instead of debate
+nitpicker --fallback                         # auto-failover to next reviewer if a model hits rate limits
+```
+
+### 2. GitHub PR Reviews & CI
+Review PRs locally or in automated CI workflows (requires GitHub CLI `gh`):
+
+```bash
+# Review current branch's PR and comment on GitHub
+nitpicker pr
+
+# Review any remote PR by URL (clones into temp dir, reviews, cleans up)
+nitpicker pr https://github.com/owner/repo/pull/42
+
+# Review without posting a comment to GitHub
 nitpicker pr https://github.com/owner/repo/pull/42 --no-comment
-# force a fresh temp clone even when the URL points to your current repo
-nitpicker pr https://github.com/owner/repo/pull/42 --clone
-# machine-readable output for embedding (one JSON object on stdout)
+
+# Machine-readable output for CI pipelines (single JSON object on stdout)
 nitpicker pr https://github.com/owner/repo/pull/42 --no-comment --json
 ```
 
-### Ask
+### 3. Ask Architecture & Design Questions
+Debate design choices or sanity-check logic across your codebase:
 
 ```bash
-nitpicker ask "should we use eyre or thiserror for error handling?"
-nitpicker ask --no-debate "is this authentication flow secure?"
-nitpicker ask --rounds 3 "should we split this module?"
-nitpicker ask --max-turns 40 "should we split this module?"
+nitpicker ask "is our token refresh flow thread-safe?"
+nitpicker ask --rounds 3 "should we split this crate into a workspace?"
+nitpicker ask --no-debate "how does configuration loading work?"
 ```
 
-## Configuration
-
-Configuration is loaded from (first match wins):
-
-1. `--config <path>` (explicit flag)
-2. `nitpicker.toml` in repo root
-3. `~/.nitpicker/config.toml` (global config)
+### 4. Audit Existing Code (Static Analysis)
+Audit existing codebases without needing an active diff:
 
 ```bash
-# create a config in current directory
-nitpicker init
-
-# prefer OpenRouter experimental free models when OPENROUTER_API_KEY is set
-nitpicker init --free
-
-# create a global config at ~/.nitpicker/config.toml
-nitpicker init --global
+nitpicker --analyze src/auth/                # audit a specific directory
+nitpicker --analyze                          # audit the entire repository
 ```
 
-Example `nitpicker.toml`:
+---
+
+## Review Lenses (Presets)
+
+Instead of generic feedback, review against targeted rubrics. Presets control what to investigate, while debate or parallel modes control how.
+
+```bash
+nitpicker --preset security                  # focus strictly on vulnerabilities
+nitpicker --preset security,performance      # run both security and performance lanes
+nitpicker --preset ai-systems                # audit agent prompts, tools, and context boundaries
+nitpicker --preset ml-rigor                  # audit ML pipelines, data leakage, and eval hygiene
+```
+
+### Built-in Presets
+
+| Preset | Focus Area |
+|---|---|
+| `correctness` | Logic bugs, race conditions, edge cases, error handling, off-by-one errors. *(Default)* |
+| `security` | Injection, auth boundaries, input validation, secret leaks, SSRF. *(Default)* |
+| `performance` | Unnecessary allocations, N+1 queries, async blocking, algorithmic complexity. *(Default)* |
+| `simplicity` | Over-engineering, dead code, redundant abstractions, readability. *(Default)* |
+| `ai-systems` | Agent tool schemas, prompt injection vectors, context truncation, deterministic fallbacks. *(Opt-in)* |
+| `ml-rigor` | Training/validation leakage, metric gaming, distribution shift, silent failures. *(Opt-in)* |
+| `tone` | Clarity, audience fit, terminology consistency, documentation voice. *(Opt-in)* |
+| `general` | Broad standalone review for unconventional targets. Cannot be combined with other presets. |
+
+You can also define custom presets in `nitpicker.toml`:
 
 ```toml
-[defaults]
-debate = true          # optional, default: true
-fallback = true        # optional, default: false; use reviewer order as a failover ring
-max_turns = 100        # optional, default: 100
-log_trajectories = false # optional, default: false
-# presets = ["correctness", "security"]  # optional; default also includes performance, simplicity
-
-[aggregator]
-model = "claude-sonnet-5"
-provider = "anthropic"
-max_tokens = 16384       # optional, default: 16384
-
-[[reviewer]]
-name = "claude"          # used in output headers and logs
-model = "claude-sonnet-5"
-provider = "anthropic"
-# max_tokens = 32768     # optional, default: unset (the provider's own per-model limit)
-
-[[reviewer]]
-name = "gpt"
-model = "gpt-5.6-sol"
-provider = "openai_compatible"
-base_url = "https://api.openai.com/v1"
-api_key_env = "OPENAI_API_KEY"
-
-# optional: define a custom review angle (or override a built-in by using its name)
 [presets.api-security]
 prompt = """
-Review trust boundaries, authentication, authorization, input handling, and secret exposure.
-Require a concrete attacker-controlled path and plausible impact for every finding.
+Review API trust boundaries, JWT verification, and rate-limiting.
+Require a concrete attacker-controlled call path for every finding.
 """
 ```
 
-> **Tip:** Use providers that were not used for the initial building of your codebase to enforce diversity of thought.
+---
 
-### Review presets
+## Configuration
 
-A preset is one named review angle — a rubric that tells a reviewer *what* to investigate;
-the execution mode (parallel, debate, alloy) decides *how*. Every review run resolves an
-ordered preset list: `--preset` on the command line beats `[defaults].presets`, which beats
-the four-angle built-in default (`correctness`, `security`, `performance`, `simplicity`).
-Domain-specific built-ins `ai-systems`, `ml-rigor`, and `tone` are opt-in. `general` is a
-standalone broad review for unusual targets or user-defined concerns and cannot be combined
-with another preset. A `[presets.<name>]` table with a built-in's name replaces it.
+Initialize a configuration file:
 
 ```bash
-nitpicker --preset security                      # one focused angle
-nitpicker --preset security,ml-rigor             # commas split
-nitpicker --preset ai-systems                    # agent/prompt/tool/context audit
-nitpicker --preset general --prompt "review the plugin contract"
-nitpicker pr --preset api-security               # project-defined preset
+nitpicker init             # creates ./nitpicker.toml
+nitpicker init --global    # creates ~/.nitpicker/config.toml
+nitpicker init --free      # configures free OpenRouter models
 ```
 
-Fan-out: parallel mode runs every configured reviewer against every selected preset
-(reviewers × presets jobs); debate mode runs one independent Reviewer/Validator debate per
-preset, lanes concurrent, with a single meta-review across all lanes. Spend and wall-clock
-scale with the selection: the untouched default runs four lanes (or 4× the parallel jobs)
-where 0.8.x ran one combined review. Names are case-sensitive; unknown or empty names,
-mixing `general` with another preset, or selecting more than 16 presets fails before any
-model call. Every final finding includes a `Lens` field naming the angle that produced it
-(or all contributing angles when synthesis merges duplicates). `ask`, `init`, and `reflect`
-take no presets — the flag is rejected there.
+Configuration resolution order: `--config <path>` > `./nitpicker.toml` > `~/.nitpicker/config.toml`.
 
-Built-in rubrics and review/debate protocols live as auditable Markdown under
-[`prompts/`](prompts/) and are compiled into the binary. Generic loop contracts such as
-compaction and final-turn handling live under
-[`crates/nitpicker-agent/prompts/`](crates/nitpicker-agent/prompts/) and are compiled into the
-library that interprets them. Rust owns selection and interpolation, not the prompt prose.
-
-Unknown config keys are rejected. For example, use `max_tokens` for output length; `token_limit` is not a supported field.
-
-`max_tokens` caps a single response, and on a reasoning model it is a budget for reasoning *plus* the answer — set too low, the model spends it all thinking and returns empty content, which is indistinguishable from a model that said nothing. Reviewers therefore default to no cap (the provider applies its own per-model limit); set one only to bound spend. The aggregator writes one bounded synthesis and defaults to 16384. Two exceptions: Anthropic's API requires the field, so an unset reviewer cap becomes 8192 there — raise it explicitly if your model reasons past that; and `auth = "codex"` ignores the setting entirely, since that endpoint rejects `max_output_tokens`.
-
-Debate mode is enabled by default for `nitpicker`, `nitpicker ask`, and `nitpicker pr`. Pass `--no-debate` to use parallel aggregation for a single run. Use `[defaults].max_turns` or `--max-turns` to control the per-agent tool-use loop limit.
-
-Fallback mode is opt-in with `[defaults].fallback = true` or `--fallback` and requires at least two reviewers. Each logical reviewer keeps its normal primary, then tries subsequent `[[reviewer]]` entries in declaration order, wrapping at the end. Failover retries only the failed completion with the existing conversation history; it does not restart the agent. The successful route remains active for that agent, and a quota-limited route is skipped by the other jobs for the rest of the run. The aggregator tries its configured model first, then the reviewer list. A successful fallback is logged but does not make the verdict degraded. With Alloy, each completion still chooses its first healthy reviewer randomly; a failed choice then follows declaration order.
-
-Set `[defaults].log_trajectories = true` to save per-agent JSONL traces and a final `aggregation.json` under `~/.nitpicker/sessions/session-<timestamp>-<pid>/`.
-
-### Provider types
-
-| `provider` | Auth | Notes |
-|---|---|---|
-| `anthropic` | `ANTHROPIC_API_KEY` env var (or `api_key_env`), or `auth = "azure-ad"` | `base_url` optional |
-| `gemini` | `GEMINI_API_KEY`/`GOOGLE_AI_API_KEY` env var (or `api_key_env`), or `auth = "agy-keyring"` | `base_url` optional (e.g. a local Gemini-compatible server); `agy-keyring` reuses the Antigravity CLI OAuth token from the system keyring — research only, [see warning](#antigravity-keyring-research-only) |
-| `openai` | `OPENAI_API_KEY` env var (or `api_key_env`), `auth = "azure-ad"`, or `auth = "codex"` | `codex` reuses your ChatGPT subscription via the Codex CLI token — research only, [see warning](#chatgptcodex-subscription-research-only) |
-| `openrouter` | `OPENROUTER_API_KEY` env var (or `api_key_env`) | explicit model names are recommended; `model = "free"` is experimental |
-
-`anthropic_compatible` and `openai_compatible` are accepted as aliases for backward compatibility.
-
-First-party Anthropic routes enable five-minute prompt caching automatically, with stable
-tool/system breakpoints and a moving conversation breakpoint. Azure AI Foundry Anthropic routes
-use the same policy. An explicit custom Anthropic `base_url` keeps the compatibility request shape
-without cache fields because not every Anthropic-shaped gateway accepts `cache_control`.
-
-`auth = "azure-ad"` authenticates with a refreshing Azure AD (Entra ID) token instead of a static key — for OpenAI and Anthropic models hosted on Azure AI Foundry. Requires a build with the `azure` feature, [see below](#azure-ad-azure-ai-foundry).
-
-`auth = "codex"` authenticates with your ChatGPT Plus/Pro (Codex) subscription instead of a paid API key, reusing the token the Codex CLI stores on disk, [see below](#chatgptcodex-subscription-research-only).
-
-### OpenRouter models
-
-`openrouter` supports both explicit pinned models and an experimental free auto-selection mode.
-
-Pinned models are the supported default and the recommended setup:
+### Example `nitpicker.toml`
 
 ```toml
-# recommended: explicit model
+[defaults]
+debate = true          # use Actor-Critic debate (default: true)
+fallback = true        # failover to next reviewer if a provider rate-limits (default: false)
+max_turns = 100        # tool-use loop limit per agent
+# presets = ["correctness", "security"]  # default includes performance and simplicity
+
+# Model that synthesizes the final report from surviving debate findings
+[aggregator]
+model = "claude-sonnet-5"
+provider = "anthropic"
+max_tokens = 16384
+
+# Reviewer 1 (Actor / Discovery)
+[[reviewer]]
+name = "claude"
+model = "claude-sonnet-5"
+provider = "anthropic"
+
+# Reviewer 2 (Critic / Validator)
+[[reviewer]]
+name = "gpt"
+model = "gpt-5.6-sol"
+provider = "openai"
+
+# Reviewer 3 (Fast / Inexpensive via OpenRouter)
 [[reviewer]]
 name = "qwen"
 model = "qwen/qwen3-30b-a3b"
 provider = "openrouter"
 ```
 
-Experimental best-effort free auto-selection is also available:
+> **Tip:** Pair different model families to avoid shared blind spots.
+
+---
+
+## Providers & Authentication
+
+| Provider | Authentication | Notes |
+|---|---|---|
+| `anthropic` | `ANTHROPIC_API_KEY` | Automatic 5-minute prompt caching enabled by default. |
+| `openai` | `OPENAI_API_KEY` | Compatible with OpenAI models and custom OpenAI gateways. |
+| `codex` *(OpenAI)* | Reuses `~/.codex/auth.json` | Uses your existing ChatGPT Plus/Pro subscription token from OpenAI Codex CLI. No API key needed. [Details below](#chatgpt--codex-subscription). |
+| `openrouter` | `OPENROUTER_API_KEY` | Access open-weights & Chinese frontier models (Qwen, DeepSeek, Kimi, GLM). |
+| `gemini` | `GEMINI_API_KEY` | Google Gemini models via official API. |
+| `azure` *(Entra ID)* | `auth = "azure-ad"` | Azure AI Foundry models with auto-refreshing tokens (requires `--features azure`). |
+
+### ChatGPT / Codex Subscription
+If you have a ChatGPT Plus or Pro subscription and the [OpenAI Codex CLI](https://developers.openai.com/codex) installed, nitpicker can authenticate through your subscription without a separate paid API key:
+
+```bash
+# 1. Log in once via the official Codex CLI
+codex login
+
+# 2. Configure nitpicker to reuse the token (read-only)
+```
 
 ```toml
-# experimental: auto-select a currently available free model
-# omit `model` or set model = "free"
 [[reviewer]]
+name = "codex"
+model = "gpt-5.6-sol"
+provider = "openai"
+auth = "codex"
+```
+
+### OpenRouter & Model Economics
+For high-volume reviews, OpenRouter gives you access to cost-effective models with large context windows:
+
+```toml
+[[reviewer]]
+name = "deepseek"
+model = "deepseek/deepseek-v4-pro"
 provider = "openrouter"
 
-# explicit experimental form
+# Or experimental auto-selection of currently available free models:
 [[reviewer]]
 model = "free"
 provider = "openrouter"
 ```
 
-When `model` is omitted or set to `"free"`, nitpicker tries to pick a currently working free model at startup.
+---
 
-This mode is convenient, but it is not production-stable and may fail due to upstream availability, routing differences, or timeouts.
+## Production & CI Integration
 
-If you want predictable behavior, pin explicit model names instead of relying on free auto-selection.
+### Deterministic Exit Codes
 
-```bash
-export OPENROUTER_API_KEY="your-key"
-```
+nitpicker uses standard exit codes designed for automated pipelines and scripts:
 
-A free OpenRouter account is sufficient for the experimental free mode — no credit card required, just rate limits.
+| Code | Meaning | CI Recommendation |
+|:---:|---|---|
+| `0` | Clean verdict | Pass pipeline |
+| `1` | Hard failure (network error, bad config, missing keys) | Fail pipeline / Alert |
+| `2` | CLI usage error (invalid flags) | Fix CI script |
+| `3` | Degraded verdict (report printed, but a reviewer/turn failed) | Warning / Soft alert |
 
-### Antigravity Keyring (research only)
-
-> [!CAUTION]
-> **Research only — do not use on a Google account you care about.**
-> AG2's [Additional Terms of Service](https://antigravity.google/terms) Section 6 prohibits "using the Service in connection with products not provided by us", which directly covers reusing the `agy` OAuth token from a third-party client like nitpicker. Google has been actively enforcing this in 2026: paid AI Ultra subscribers have received account suspensions, often without warning, for using third-party AG2 OAuth bridges (OpenClaw, OpenCode, Pi Agent). Detection appears aggressive — even light testing has triggered bans. The earlier `gemini-cli` OAuth path was discouraged on similar grounds ([discussion](https://github.com/google-gemini/gemini-cli/discussions/22970)).
-> If you want billed Gemini access without this risk, set `GEMINI_API_KEY` and drop the `auth` line.
-
-AG2 is Google's current agentic IDE, succeeding both the older Gemini CLI OAuth path and the earlier AG1 preview. The `gemini-3.x` family ships only through AG2's CloudCode backend, so `auth = "agy-keyring"` exists purely as a research path to compare those models against the rest of the reviewer pool, with full awareness of the ToS posture above.
-
-The proxy reads `agy`'s OAuth token from the system keyring (`service=gemini`, `account=antigravity`) via the `keyring` crate (Secret Service on Linux, Keychain on macOS, Credential Manager on Windows), relies on `agy` to refresh it, and routes chat through CloudCode's `v1internal:streamGenerateContent` SSE endpoint. Run `agy` and complete its login first. `NITPICKER_ANTIGRAVITY_PLATFORM` can override the auto-detected platform enum if needed.
-
-This path requires a build with the `antigravity` feature (off by default, since it pulls in the local proxy stack — `axum` — and the `keyring` crate with its native backends):
+### Headless JSON Output
+With `nitpicker pr <url> --json`, nitpicker emits exactly one JSON object on `stdout` with structured findings, token metrics, and coverage data. All progress bars, logs, and diagnostic traces are strictly sent to `stderr`:
 
 ```bash
-cargo build --release --features antigravity
-# or: cargo install --features antigravity ...
+OUTPUT=$(nitpicker pr https://github.com/org/repo/pull/42 --no-comment --json)
+STATUS=$(echo "$OUTPUT" | jq -r '.status')
+DEGRADED=$(echo "$OUTPUT" | jq -r '.degraded')
 ```
 
-Without the feature, `auth = "agy-keyring"` is rejected at config validation with a build hint, and `nitpicker init` won't offer the keyring reviewer.
-
-Tested AG2 models (current author config): `gemini-3.1-pro-low`, `gemini-3.5-flash-low`. Other IDs returned by `fetchAvailableModels` (e.g. `gemini-3-flash-agent`) likely work but have not been exercised.
-
-```toml
-[aggregator]
-model = "gemini-3.5-flash-low"
-provider = "gemini"
-auth = "agy-keyring"
-
-[[reviewer]]
-name = "gemini"
-model = "gemini-3.1-pro-low"
-provider = "gemini"
-auth = "agy-keyring"
-```
-
-### ChatGPT/Codex subscription (research only)
-
-> [!CAUTION]
-> **Research only.** This reuses the OpenAI Codex CLI's public OAuth client to call OpenAI through your ChatGPT Plus/Pro subscription. Third-party use of that client is arguably outside OpenAI's terms — same posture as the Antigravity path above. Use a paid `OPENAI_API_KEY` for anything you care about.
-
-`auth = "codex"` (on an `openai` reviewer/aggregator) reuses the OAuth token the [Codex CLI](https://developers.openai.com/codex) stores in `~/.codex/auth.json`. Log in once with `codex login` (choosing your ChatGPT account, not an API key); nitpicker reads the token **read-only** and refreshes the short-lived access token in-memory via the refresh token — it never writes back to `auth.json`. Set `CODEX_HOME` to override the token directory.
-
-Under the hood this talks to the Codex subscription endpoint (`chatgpt.com/backend-api/codex/responses`), which speaks the OpenAI Responses API with subscription-specific quirks (a required top-level system prompt, mandatory streaming, `store: false`, no `max_output_tokens`, and encrypted reasoning items round-tripped across turns since nothing is server-side persisted); nitpicker handles all of that transparently. Requests also carry an opaque, deterministic `prompt_cache_key` derived from the model/system/tool prefix so successive turns route consistently without putting prompt text in the key. No API-key env var is needed.
-
-Models are your subscription's Codex models (e.g. `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`):
-
-```toml
-[aggregator]
-model = "gpt-5.4"
-provider = "openai"
-auth = "codex"
-
-[[reviewer]]
-name = "codex"
-model = "gpt-5.4"
-provider = "openai"
-auth = "codex"
-```
-
-### Azure AD (Azure AI Foundry)
-
-Call OpenAI and Anthropic models hosted on [Azure AI Foundry](https://ai.azure.com) using a short-lived Azure AD (Entra ID) token instead of a static key. nitpicker acquires the token via the Azure SDK and transparently refreshes it (rebuilding the client before the token expires), so long reviews and debates don't die mid-run — the equivalent of the Python SDK's `azure_ad_token_provider`.
-
-This path requires a build with the `azure` feature (off by default, since it pulls in the Azure SDK and needs Rust 1.88+):
+### OpenTelemetry Tracing
+Export every run as an [OpenTelemetry](https://opentelemetry.io) trace (requires `--features otel`):
 
 ```bash
-cargo build --release --features azure
-# or: cargo install --features azure ...
-```
+cargo install nitpicker --features otel
 
-Set `auth = "azure-ad"` on an `openai` or `anthropic` reviewer/aggregator and point `base_url` at your Foundry endpoint:
-
-```toml
-[[reviewer]]
-name = "gpt"
-provider = "openai"                                                  # OpenAI models → /openai/v1
-base_url = "https://<resource>.services.ai.azure.com/openai/v1"
-model = "gpt-4o"                                                     # your Foundry deployment / model
-auth = "azure-ad"
-
-[[reviewer]]
-name = "claude"
-provider = "anthropic"                                               # Anthropic models → /anthropic
-base_url = "https://<resource>.services.ai.azure.com/anthropic"
-model = "claude-sonnet-4-5"
-auth = "azure-ad"
-azure_credentials = "dev"                                            # optional, see below
-```
-
-Optional per-reviewer/aggregator fields:
-
-- `azure_scope` — AAD token scope. Defaults to `https://cognitiveservices.azure.com/.default`.
-- `azure_credentials` — selects the credential chain, mirroring the Azure SDK's `AZURE_TOKEN_CREDENTIALS`:
-  - `"dev"` — developer tools only (`az login`, Azure Developer CLI), excluding managed identity. Use on a VM where you want `az login` instead of a system-assigned managed identity.
-  - `"prod"` — env service principal (`AZURE_TENANT_ID`/`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET`), then managed identity.
-  - unset / `"auto"` — env service principal → managed identity → developer tools, in that order.
-
-  If unset, the `AZURE_TOKEN_CREDENTIALS` env var is honored as a fallback.
-
-### OpenTelemetry
-
-Each run can be exported as one [OpenTelemetry](https://opentelemetry.io) trace: the run, its
-review jobs or debate lanes and turns, every agent and subagent, every LLM call (with token usage,
-the model that actually answered, retries and failovers as child spans) and every tool call, using
-the OpenTelemetry GenAI semantic-convention attribute names (`gen_ai.*`) plus `nitpicker.*` for
-harness-specific ones. Only identifiers, counts and timings are recorded — prompts, tool arguments,
-tool output and provider error text never leave the process.
-
-This path requires a build with the `otel` feature (off by default, since it pulls in the
-OpenTelemetry SDK and protobuf codec):
-
-```bash
-cargo build --release --features otel
-# or: cargo install --features otel ...
-```
-
-Export is configured through the standard `OTEL_*` environment variables only — never through
-`nitpicker.toml` (in `pr` mode that file comes from the target repository). Setting an endpoint
-turns it on:
-
-```bash
-export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318      # any OTLP/HTTP collector or backend
-export OTEL_EXPORTER_OTLP_HEADERS="x-honeycomb-team=..."       # optional: backend auth
-export OTEL_SERVICE_NAME=nitpicker                             # optional: the default
+export OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4318"
+export OTEL_SERVICE_NAME="nitpicker"
 nitpicker pr https://github.com/owner/repo/pull/42
 ```
 
-Supported: `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `_HEADERS`,
-`_TIMEOUT`, `_COMPRESSION`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_TRACES_SAMPLER`,
-`OTEL_SDK_DISABLED`. The wire protocol is OTLP over HTTP/protobuf; a request for `grpc` or
-`http/json` logs a warning and disables export. Traces only — no metrics or log signals; a backend
-can derive token and latency metrics from the `chat` spans. Without the feature, a set endpoint
-logs one warning naming `--features otel` and the run proceeds unchanged. The `nitpicker.session.id`
-attribute on the `review`/`debate` span is the session directory name under `~/.nitpicker/sessions`,
-so a trace can be matched to its trajectory files.
+Traces adhere to standard GenAI semantic conventions (`gen_ai.*`), recording token usage, model failovers, tool latencies, and retry attempts. Sensitive prompt text and proprietary repository source code are never exported.
 
-## CLI reference
+---
 
-```
-nitpicker [OPTIONS]
-nitpicker ask [--no-debate] [--rounds N] [--max-turns N] [OPTIONS] <topic>
-nitpicker pr [URL] [--no-comment] [--no-debate] [--rounds N] [--max-turns N] [OPTIONS]
-nitpicker reflect [--sessions-dir DIR] [--n N] [OPTIONS]
-nitpicker init [--global] [--free] [--repo <DIR>]
-```
+## Advanced Features
 
-### Review (default)
-
-```
---repo <PATH>          git repository to review [default: .]
---config <PATH>        config file [default: <repo>/nitpicker.toml, then ~/.nitpicker/config.toml]
---prompt <TEXT>        review instructions (optional, has a sensible default)
---preset <NAME>        review angle(s) to run; repeatable, comma-separated, replaces the configured default list
---context-file <PATH>  inject a file's contents into the prompt; repeatable
---analyze [PATH]       analyze existing code instead of reviewing changes
---no-debate            use parallel aggregation instead of actor-critic debate
---fallback             try subsequent configured reviewers when a model fails
---rounds <N>           maximum debate rounds [default: 5]
---max-turns <N>        maximum tool-use turns per agent or debate turn [default: 100 via config]
--v, --verbose          show info-level logs (hidden by default)
-```
-
-#### `--context-file`
-
-The agents' own tools are sandboxed to the repository, so they cannot open a design doc that lives
-outside it. `--context-file` reads such a file directly into the prompt:
+### External Design Docs (`--context-file`)
+Reviewers are sandboxed inside the git repository. If your review needs external context (e.g. an RFC, architecture doc, or migration plan located elsewhere on disk), inject it safely:
 
 ```bash
-nitpicker --context-file ~/notes/migration-plan.md --context-file /tmp/rfc.md
+nitpicker --context-file ~/docs/rfc-42.md --context-file /tmp/spec.md
 ```
 
-Available on the default review mode, `ask`, and `pr`; the flag may be given before or after the
-subcommand. Files are injected verbatim, in the order given, after the task and any `--prompt`
-text. Total injected size — contents plus each block's wrapper — is capped at 256 KiB; a missing,
-non-regular (FIFO, device node), binary, or non-UTF-8 file is an error, raised before any model is
-called. Because the contents are placed in the task prompt rather than the system prompt, spawned
-subagents do not inherit them.
+### Automatic Fallback Rings (`--fallback`)
+Avoid losing 10 minutes of deep review to transient 429 rate-limits. When `--fallback` is enabled, any reviewer that exhausts retries automatically hands its history and completed tool outputs to the next configured model in the ring.
 
-### PR subcommand
+### Self-Reflection (`nitpicker reflect`)
+Analyze past review sessions to diagnose recurring false positives, agent friction, and tool loops:
 
-```
-nitpicker pr [URL] [--no-comment] [--no-debate] [--rounds N] [--max-turns N] [--prompt TEXT] [--preset NAME] [--context-file PATH] [--repo .] [--config PATH] [--json] [-v]
-```
+```bash
+# Enable trajectory logging in your config:
+# [defaults]
+# log_trajectories = true
 
-Reviews a GitHub PR using its title, description, and diff. Requires the `gh` CLI (`gh auth login` to authenticate).
-
-- Without `URL`: reviews the current branch's open PR (must be run inside the repo)
-- With `URL` (`https://github.com/owner/repo/pull/N`): clones the repo into a temp dir, checks out the PR branch, reviews it, then cleans up
-- By default, posts the review as a PR comment. Pass `--no-comment` to skip posting.
-- `--no-debate`, `--rounds`, and `--max-turns` work the same as in the default review mode
-- `--json` emits a single machine-readable JSON object on stdout (status, PR metadata, models, resolved `presets`, `report_markdown`, `usage`, …) instead of the human report, with all logs/progress on stderr — handy for calling nitpicker as a subprocess. Exits non-zero on failure, with a `status: "error"` object on stdout; a degraded run (some job or debate turn failed — `degraded: true`) exits 3 after emitting the envelope. The `coverage` key reports each preset's `attempted`/`succeeded` job or lane counts; entries with `succeeded > 0` identify the angles that produced evidence, while the counts distinguish partial coverage such as 1 of N jobs. The `usage` block reports aggregate `input_tokens`/`output_tokens`/`total_tokens`, `cached_input_tokens`/`cache_creation_input_tokens`, and `subagents_spawned` for the run (best-effort: successful completions only). The cache fields are a breakdown of `input_tokens`, not an extra charge — a healthy multi-turn run shows most of its input served from cache. Cost formulas must discount them: `input_tokens` now counts cache reads on every provider (before 0.8.3 the Anthropic path omitted them), so a naive `input_tokens * input_price` over-states a cache-heavy run.
-
-### Ask subcommand
-
-```
-nitpicker ask [--no-debate] [--rounds N] [--max-turns N] [--context-file PATH] [--repo .] [--config PATH] [-v] <topic>
+nitpicker reflect          # inspect recent sessions
+nitpicker reflect --n 10   # inspect last 10 runs
 ```
 
- Runs agents on a free-form question instead of a code diff. By default, two agents take turns as Actor/Critic before a meta-reviewer concludes. Pass `--no-debate` to switch to the parallel reviewer plus aggregator flow.
-
-### Reflect subcommand
-
-```
-nitpicker reflect [--sessions-dir DIR] [--n N] [--repo .] [--config PATH]
-```
-
-Analyzes the most recent recorded sessions (20 by default) and reports recurring execution
-friction. Reflection first computes deterministic trace metrics, then analyzes each session with
-the first reviewer and uses the second reviewer (the critic) for calibrated cross-session
-synthesis, falling back to the first reviewer when only one is configured. The ordinary aggregator
-is intentionally not used because reflection reduction is a tool-using investigation, not report
-formatting. Pattern claims include exact session support, representative trace evidence, confidence,
-and a small measurable experiment. New session records also preserve staged reviewer/debate
-verdicts so reflection can compare execution with the outcome, plus an `attribution.json` sidecar
-with the nitpicker version, build revision when available, and protocol-prompt SHA-256 so prompt
-experiments can be compared by cohort. Set
-`[defaults].log_trajectories = true` beforehand. Sessions recorded before staged verdicts became
-part of the aggregation schema are rejected, and `reflect` does not write extra trace copies.
-
-### Debate mode (default)
-
-Two LLM agents take turns exploring the codebase with file/git tools and submitting verdicts. The Critic can signal agreement (`agree=true`) to end early. A meta-reviewer synthesizes the dialogue.
-
-In review mode every Reviewer verdict ends with a Coverage block — what was inspected, which risk classes of the lane's angle were checked, what was skipped. The Validator checks it against the review snapshot and rejects gaps that could change the finding set (not wording), so a review with no findings still gets a bounded coverage check rather than a rubber stamp. Rejecting every finding is `agree=false` with the critique, so the reasons survive in the transcript. Follow-up rounds address only the disputed points.
-
-- `reviewer[0]` in config → Actor (review: Reviewer)
-- `reviewer[1]` in config → Critic (review: Validator)
-- `aggregator` → Meta-reviewer
-
-Interactive text runs show a compact cast/progress view while debating, then print the final synthesized result. While a review or debate is active, the terminal tab/window title also shows nitpicker's fixed-outline target activity glyph plus the repository name (for example, `⊙ reviewer`); it is TTY-only and cleared when the run ends, so redirected and JSON output stay unchanged. In a terminal, `--verbose` also shows intermediate debate output and the saved transcript path; redirected stdout stays final-report-only.
-
-With `--verbose`, the transcript is saved to `{tempdir}/debate-{timestamp}.md` (`ask`) or `review-debate-{timestamp}-{preset-slugs}.md` (review; one section per preset lane). Non-verbose runs skip the write.
-
-### Exit codes (default review, `ask`, and `pr`)
-
-| code | meaning |
-|------|---------|
-| 0 | clean verdict |
-| 1 | hard failure — no verdict (bad config, missing key, every reviewer/turn failed) |
-| 2 | CLI usage error (clap's exit code for bad arguments) |
-| 3 | degraded verdict — report printed, but a reviewer or debate turn failed |
-
-Non-interactive, non-verbose stdout carries exactly the final report, so the binary can be driven as a subprocess: read stdout for the verdict, branch on the exit code. `pr` follows the same codes; in `--json` mode the envelope (`status: ok|error`, with `degraded: true` on an exit-3 run) is emitted and flushed before the exit. Telemetry export (see [OpenTelemetry](#opentelemetry)) is flushed after the run and never changes the exit code.
-
-## Using the agent as a library
-
-The agentic core — the loop, the file/git tools, and the provider-agnostic LLM clients — lives in a separate crate, [`nitpicker-agent`](crates/nitpicker-agent), with none of the CLI/review/PR machinery. Use it to drive your own file-reading agent with subagents:
+### Rust Library (`nitpicker-agent`)
+The underlying agentic loop and file/git tools are published as a standalone crate [`nitpicker-agent`](crates/nitpicker-agent):
 
 ```rust
 use nitpicker_agent::prelude::*;
 use std::path::Path;
 
-let client = client_from_env(LLMProvider::Anthropic { base_url: None, api_key_env: None })?;
-let result = AgentBuilder::new("explorer", "claude-sonnet-5", "You explore codebases.", client)
-    .subagent_system_prompt("You are a focused file-reading worker. Report findings concisely.")
-    .run("Map the module layout of this repo.", &file_agent_tools(), Path::new("."))
-    .await?;
-println!("{}", result.text);
+#[tokio::main]
+async fn main() -> eyre::Result<()> {
+    let client = client_from_env(LLMProvider::Anthropic { base_url: None, api_key_env: None })?;
+    let result = AgentBuilder::new("explorer", "claude-sonnet-5", "You explore codebases.", client)
+        .run("Map the module layout of this repo.", &file_agent_tools(), Path::new("."))
+        .await?;
+
+    println!("{}", result.text);
+    Ok(())
+}
 ```
 
-`file_agent_tools()` is the read-only file/git toolset plus `spawn_subagent`. You control the top-level prompt, the subagent prompt, the toolset, and the client; config-file-driven client construction is available via the `config`/`provider` modules. See `crates/nitpicker-agent/examples/file_agent.rs`.
+<details>
+<summary>Experimental: Antigravity Keyring Auth (Research Only)</summary>
+
+> [!CAUTION]
+> Research only. AG2 is Google's internal agentic IDE backend. `auth = "agy-keyring"` reads the `agy` CLI OAuth token from the system keyring to evaluate `gemini-3.x` models. Google actively monitors and suspends accounts using third-party OAuth bridges. For standard Gemini access, use `GEMINI_API_KEY`.
+</details>
+
+---
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md) for release history.
+See [CHANGELOG.md](CHANGELOG.md) for version release notes.
