@@ -119,6 +119,7 @@ nitpicker --preset security                  # focus strictly on vulnerabilities
 nitpicker --preset security,performance      # run both security and performance lanes
 nitpicker --preset ai-systems                # audit agent prompts, tools, and context boundaries
 nitpicker --preset ml-rigor                  # audit ML pipelines, data leakage, and eval hygiene
+nitpicker --no-debate --review-timeout-seconds 600 # cap each reviewer/preset job at 10 minutes
 ```
 
 ### Built-in Presets
@@ -193,6 +194,11 @@ provider = "openrouter"
 ```
 
 > **Tip:** Pair different model families to avoid shared blind spots.
+
+In parallel aggregation mode, `--review-timeout-seconds <N>` places an independent wall-clock
+deadline on every reviewer/preset job. A timed-out job is marked failed and excluded from the
+synthesis; surviving jobs still produce a degraded report (exit 3). If every job times out or
+fails, nitpicker refuses to synthesize a verdict and exits 1.
 
 ---
 

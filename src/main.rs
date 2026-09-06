@@ -40,6 +40,10 @@ struct CommonArgs {
     /// Try the next configured reviewer when the selected model fails
     #[arg(long, global = true)]
     fallback: bool,
+
+    /// Maximum wall-clock seconds for each parallel review job
+    #[arg(long, global = true, value_parser = parse_positive_u64)]
+    review_timeout_seconds: Option<u64>,
 }
 
 /// `--context-file`, kept out of the global `CommonArgs` deliberately: clap propagates a global
@@ -388,6 +392,7 @@ async fn dispatch(args: Args) -> Result<Exit> {
                 &config,
                 review::ReviewOptions {
                     max_turns,
+                    timeout_seconds: args.common.review_timeout_seconds,
                     verbose: args.common.verbose,
                     task: prompts::RunTask::Ask,
                     fallback: use_fallback,
@@ -498,6 +503,7 @@ async fn dispatch(args: Args) -> Result<Exit> {
             &config,
             review::ReviewOptions {
                 max_turns,
+                timeout_seconds: args.common.review_timeout_seconds,
                 verbose: args.common.verbose,
                 task: prompts::RunTask::Review {
                     scope,
@@ -868,6 +874,18 @@ fn init_config_path(global: bool, repo: &Path) -> Result<PathBuf> {
 pub(crate) fn parse_positive_usize(value: &str) -> Result<usize, String> {
     let parsed = value
         .parse::<usize>()
+        .map_err(|_| format!("invalid positive integer: {value}"))?;
+
+    if parsed == 0 {
+        return Err("value must be greater than 0".to_string());
+    }
+
+    Ok(parsed)
+}
+
+fn parse_positive_u64(value: &str) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
         .map_err(|_| format!("invalid positive integer: {value}"))?;
 
     if parsed == 0 {
@@ -1284,6 +1302,20 @@ mod tests {
         assert!(args.common.fallback);
         let args = parse(&["nitpicker", "pr", "--fallback"]);
         assert!(args.common.fallback);
+
+        let args = parse(&["nitpicker", "--review-timeout-seconds", "420", "pr"]);
+        assert_eq!(args.common.review_timeout_seconds, Some(420));
+        let args = parse(&["nitpicker", "pr", "--review-timeout-seconds", "420"]);
+        assert_eq!(args.common.review_timeout_seconds, Some(420));
+    }
+
+    #[test]
+    fn review_timeout_must_be_positive() {
+        let error =
+            Args::try_parse_from(["nitpicker", "--no-debate", "--review-timeout-seconds", "0"])
+                .unwrap_err();
+
+        assert!(error.to_string().contains("value must be greater than 0"));
     }
 
     #[test]
