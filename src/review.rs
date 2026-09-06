@@ -260,6 +260,8 @@ pub(crate) fn synthesis_model(response: &CompletionResponse, configured_model: &
 /// under clippy's argument limit, symmetric with the debate entry point.
 pub struct ReviewOptions<'a> {
     pub max_turns: usize,
+    /// Optional wall-clock deadline for each independently spawned parallel review job.
+    pub timeout_seconds: Option<u64>,
     pub verbose: bool,
     pub task: RunTask<'a>,
     pub fallback: bool,
@@ -289,6 +291,7 @@ async fn run_review_inner(
 ) -> Result<ReviewOutcome> {
     let ReviewOptions {
         max_turns,
+        timeout_seconds,
         verbose,
         task,
         fallback,
@@ -431,6 +434,8 @@ async fn run_review_inner(
             nitpicker.job = %bounded(&label),
             nitpicker.reviewer = %bounded(&reviewer.name),
             nitpicker.preset = preset_name,
+            nitpicker.job.timeout_seconds = timeout_seconds,
+            nitpicker.job.timed_out = Empty,
             gen_ai.request.model = %bounded(&reviewer.model),
         );
         let handle: JoinHandle<Result<AgentResult>> = tokio::spawn(
@@ -467,7 +472,11 @@ async fn run_review_inner(
                     }));
                 }
                 let start = Instant::now();
-                let result = run_agent(config, &initial_message, &tools_map, &repo).await;
+                let result = run_job_with_timeout(
+                    run_agent(config, &initial_message, &tools_map, &repo),
+                    timeout_seconds.map(Duration::from_secs),
+                )
+                .await;
                 let elapsed = start.elapsed().as_secs();
                 sub_pb.finish_and_clear();
                 pb.set_style(done);
@@ -843,6 +852,22 @@ fn rendered_section(
     }
 }
 
+async fn run_job_with_timeout<T>(
+    future: impl std::future::Future<Output = Result<T>>,
+    timeout: Option<Duration>,
+) -> Result<T> {
+    match timeout {
+        Some(limit) => match tokio::time::timeout(limit, future).await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::Span::current().record("nitpicker.job.timed_out", true);
+                eyre::bail!("review job exceeded its {limit:?} wall-clock deadline")
+            }
+        },
+        None => future.await,
+    }
+}
+
 /// Trajectory identity for one reviewer: the file stem and every record's `agent` field. The
 /// config index keeps it unique even when reviewer names collide or sanitize to the same stem —
 /// `reflect` merges all of a session's files by timestamp, so the label is the only separator.
@@ -930,6 +955,33 @@ mod tests {
             usage: TokenUsage::default(),
             selected_model: Some("fallback-model".to_string()),
         }
+    }
+
+    #[tokio::test]
+    async fn a_hung_review_job_becomes_a_bounded_failure() {
+        let err = run_job_with_timeout(
+            std::future::pending::<Result<()>>(),
+            Some(Duration::from_millis(1)),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            format!("{err:#}"),
+            "review job exceeded its 1ms wall-clock deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_review_job_keeps_its_result_with_a_deadline() {
+        let result = run_job_with_timeout(
+            async { Ok::<_, eyre::Report>("review") },
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "review");
     }
 
     #[test]

@@ -6,6 +6,12 @@ Notable user-visible changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Parallel aggregation accepts `--review-timeout-seconds` to bound each independent
+  reviewer/preset job. Timed-out jobs degrade the run while completed jobs still reach final
+  synthesis; an all-timeout run continues to refuse a fabricated verdict.
+
 ## [0.10.1] - 2026-09-05
 
 `nitpicker-agent` 0.5.4

@@ -634,6 +634,7 @@ async fn run_pr_inner(
         verbose: common.verbose,
         alloy,
         fallback,
+        review_timeout_seconds: common.review_timeout_seconds,
     };
     crate::finalize_routing_config(&mut config, fallback).await?;
     let config = config;
@@ -658,6 +659,7 @@ struct PrReviewExecution {
     verbose: bool,
     alloy: bool,
     fallback: bool,
+    review_timeout_seconds: Option<u64>,
 }
 
 /// `pr` mode never reads `nitpicker.toml` from the working tree: the tree holds the PR
@@ -1013,6 +1015,7 @@ async fn run_review_inner(
         verbose,
         alloy: use_alloy,
         fallback: use_fallback,
+        review_timeout_seconds,
     } = execution;
 
     const FOOTER: &str =
@@ -1063,6 +1066,7 @@ async fn run_review_inner(
             config,
             review::ReviewOptions {
                 max_turns,
+                timeout_seconds: review_timeout_seconds,
                 verbose,
                 task: RunTask::Review {
                     scope: ReviewScope::Diff,
