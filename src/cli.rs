@@ -159,7 +159,6 @@ pub(crate) fn parse_positive_usize(value: &str) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{fallback_allowed, presets_allowed};
     use clap::CommandFactory;
 
     #[test]
@@ -309,47 +308,19 @@ mod tests {
         }
     }
 
-    /// Root-position `--preset` parses before any subcommand, so the non-review arms must
-    /// reject it explicitly instead of silently discarding it.
-    #[test]
-    fn root_position_presets_are_rejected_for_non_review_subcommands() {
-        let cases: [&[&str]; 3] = [
-            &["nitpicker", "--preset", "security", "ask", "topic"],
-            &["nitpicker", "--preset", "security", "init"],
-            &["nitpicker", "--preset", "security", "reflect"],
-        ];
-        for argv in cases {
-            let args = parse(argv);
-            assert!(!presets_allowed(&args.command), "argv: {argv:?}");
-        }
-
-        let args = parse(&["nitpicker", "--preset", "security", "pr"]);
-        assert!(presets_allowed(&args.command));
-        let args = parse(&["nitpicker", "--preset", "security"]);
-        assert!(presets_allowed(&args.command));
-    }
-
-    #[test]
-    fn fallback_is_scoped_to_review_and_ask_commands() {
-        for argv in [
-            &["nitpicker", "--fallback"][..],
-            &["nitpicker", "--fallback", "ask", "topic"][..],
-            &["nitpicker", "pr", "--fallback"][..],
-        ] {
-            let args = parse(argv);
-            assert!(fallback_allowed(&args.command), "argv: {argv:?}");
-        }
-        for argv in [
-            &["nitpicker", "init", "--fallback"][..],
-            &["nitpicker", "reflect", "--fallback"][..],
-        ] {
-            let args = parse(argv);
-            assert!(!fallback_allowed(&args.command), "argv: {argv:?}");
-        }
-    }
-
     #[test]
     fn execution_flags_keep_root_and_subcommand_namespaces() {
+        let flags = |command| match command {
+            Command::Ask {
+                no_debate,
+                alloy,
+                rounds,
+                max_turns,
+                ..
+            } => (no_debate, alloy, rounds, max_turns),
+            Command::Pr(pr) => (pr.no_debate, pr.alloy, pr.rounds, pr.max_turns),
+            _ => unreachable!(),
+        };
         for subcommand in [vec!["ask", "topic"], vec!["pr"]] {
             let mut argv = vec![
                 "nitpicker",
@@ -364,17 +335,7 @@ mod tests {
             let args = parse(&argv);
             assert!(args.no_debate && args.alloy);
             assert_eq!((args.rounds, args.max_turns), (9, Some(7)));
-            let (no_debate, alloy, rounds, turns) = match args.command.unwrap() {
-                Command::Ask {
-                    no_debate,
-                    alloy,
-                    rounds,
-                    max_turns,
-                    ..
-                } => (no_debate, alloy, rounds, max_turns),
-                Command::Pr(pr) => (pr.no_debate, pr.alloy, pr.rounds, pr.max_turns),
-                _ => unreachable!(),
-            };
+            let (no_debate, alloy, rounds, turns) = flags(args.command.unwrap());
             assert_eq!((no_debate, alloy, rounds, turns), (false, false, 5, None));
 
             let mut argv = vec!["nitpicker"];
@@ -392,17 +353,7 @@ mod tests {
                 (args.no_debate, args.alloy, args.rounds, args.max_turns),
                 (false, false, 5, None)
             );
-            let values = match args.command.unwrap() {
-                Command::Ask {
-                    no_debate,
-                    alloy,
-                    rounds,
-                    max_turns,
-                    ..
-                } => (no_debate, alloy, rounds, max_turns),
-                Command::Pr(pr) => (pr.no_debate, pr.alloy, pr.rounds, pr.max_turns),
-                _ => unreachable!(),
-            };
+            let values = flags(args.command.unwrap());
             assert_eq!(values, (true, true, 3, Some(2)));
         }
         for prefix in [

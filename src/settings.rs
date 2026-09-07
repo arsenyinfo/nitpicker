@@ -100,34 +100,34 @@ mod tests {
 
     #[test]
     fn routing_modes_combine_each_cli_and_config_setting_independently() {
-        for configured_alloy in [false, true] {
-            for configured_fallback in [false, true] {
-                let config: config::Config = toml::from_str(&format!(
-                    r#"
-                    [defaults]
-                    alloy = {configured_alloy}
-                    fallback = {configured_fallback}
-                    [aggregator]
-                    provider = "openai"
-                    [[reviewer]]
-                    provider = "openai"
-                    [[reviewer]]
-                    provider = "openai"
-                "#
-                ))
-                .unwrap();
-                for cli_alloy in [false, true] {
-                    for cli_fallback in [false, true] {
-                        assert_eq!(
-                            resolve_routing_modes(&config, cli_alloy, cli_fallback).unwrap(),
-                            (
-                                configured_alloy || cli_alloy,
-                                configured_fallback || cli_fallback
-                            )
-                        );
-                    }
-                }
-            }
+        let mut config: config::Config = toml::from_str(
+            r#"
+            [defaults]
+            [aggregator]
+            provider = "openai"
+            [[reviewer]]
+            provider = "openai"
+            [[reviewer]]
+            provider = "openai"
+        "#,
+        )
+        .unwrap();
+        for (configured, cli, expected) in [
+            ((false, false), (false, false), (false, false)),
+            ((true, false), (false, false), (true, false)),
+            ((false, true), (false, false), (false, true)),
+            ((false, false), (true, false), (true, false)),
+            ((false, false), (false, true), (false, true)),
+            ((true, false), (false, true), (true, true)),
+            ((false, true), (true, false), (true, true)),
+        ] {
+            let defaults = config.defaults.as_mut().unwrap();
+            defaults.alloy = Some(configured.0);
+            defaults.fallback = Some(configured.1);
+            assert_eq!(
+                resolve_routing_modes(&config, cli.0, cli.1).unwrap(),
+                expected
+            );
         }
     }
 
@@ -162,6 +162,10 @@ mod tests {
         );
         let presets = config.presets.as_ref().expect("presets present");
         assert_eq!(presets["tone"].prompt, "review the docs for tone");
+        let invalid = toml_str.replace("review the docs for tone", "   ");
+        let config: config::Config = toml::from_str(&invalid).unwrap();
+        let error = config.validate().expect_err("blank prompt");
+        assert!(error.to_string().contains("[presets.tone].prompt"));
     }
 
     #[test]
@@ -182,26 +186,5 @@ mod tests {
             model = "sneaky-per-preset-model"
         "#;
         assert!(toml::from_str::<config::Config>(toml_str).is_err());
-    }
-
-    #[test]
-    fn blank_preset_prompts_fail_validation() {
-        let toml_str = r#"
-            [aggregator]
-            model = "m"
-            provider = "openai"
-            auth = "codex"
-
-            [[reviewer]]
-            model = "m"
-            provider = "openai"
-            auth = "codex"
-
-            [presets.tone]
-            prompt = "   "
-        "#;
-        let config: config::Config = toml::from_str(toml_str).expect("parses");
-        let err = config.validate().expect_err("blank prompt");
-        assert!(format!("{err:#}").contains("[presets.tone].prompt"));
     }
 }

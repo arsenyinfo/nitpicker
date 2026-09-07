@@ -162,3 +162,72 @@ fn every_config_source_checks_structure_before_presets_and_credentials() {
         fs::remove_file(path).unwrap();
     }
 }
+
+#[test]
+fn commands_reject_inapplicable_flags_before_loading_config() {
+    let fixture = Fixture::new();
+    fs::write(fixture.repo.join("nitpicker.toml"), "[malformed").unwrap();
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["--preset", "security", "ask", "topic"],
+            "--preset applies to review modes only",
+        ),
+        (
+            &["--preset", "security", "init"],
+            "--preset applies to review modes only",
+        ),
+        (
+            &["--preset", "security", "reflect"],
+            "--preset applies to review modes only",
+        ),
+        (
+            &["init", "--fallback"],
+            "--fallback applies to review and ask modes only",
+        ),
+        (
+            &["reflect", "--fallback"],
+            "--fallback applies to review and ask modes only",
+        ),
+        (
+            &["init", "--config", "missing.toml"],
+            "--config has no effect on init",
+        ),
+    ];
+    for (args, expected) in cases {
+        let output = fixture
+            .command(env!("CARGO_BIN_EXE_nitpicker"))
+            .args(*args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{args:?}: {output:?}");
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains(expected), "{args:?}: {error}");
+    }
+}
+
+#[test]
+fn init_uses_the_repo_flag_before_or_after_the_subcommand() {
+    let fixture = Fixture::new();
+    fs::write(fixture.repo.join("nitpicker.toml"), "existing config").unwrap();
+    for before in [true, false] {
+        let mut command = fixture.command(env!("CARGO_BIN_EXE_nitpicker"));
+        command.current_dir(&fixture.home);
+        if before {
+            command.arg("--repo").arg(&fixture.repo).arg("init");
+        } else {
+            command.arg("init").arg("--repo").arg(&fixture.repo);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            error.contains(&format!(
+                "{} already exists",
+                fixture.repo.join("nitpicker.toml").display()
+            )),
+            "{error}"
+        );
+        assert!(!fixture.home.join("nitpicker.toml").exists());
+    }
+}
