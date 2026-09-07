@@ -1,0 +1,21 @@
+[defaults]
+debate = false
+fallback = false
+max_turns = 100
+compact_threshold = 100000
+log_trajectories = false
+
+[aggregator]
+model = "local-model"
+provider = "openai"
+base_url = "http://localhost:1234/v1"
+api_key_env = "LOCAL_KEY"
+auth = "example-auth"
+
+[[reviewer]]
+name = "local"
+model = "local-model"
+provider = "openai"
+base_url = "http://localhost:1234/v1"
+api_key_env = "LOCAL_KEY"
+auth = "example-auth"

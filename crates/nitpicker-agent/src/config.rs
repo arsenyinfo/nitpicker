@@ -183,14 +183,7 @@ impl Config {
         // Validate `auth` before the env-var check (matching the reviewer loop below): an unknown
         // auth value like the typo `azure_ad` should surface its own clear error rather than being
         // masked by a missing-API-key error when the provider key happens to be unset.
-        validate_auth(
-            "[aggregator]",
-            &self.aggregator.provider,
-            &self.aggregator.auth,
-            self.aggregator.base_url.as_deref(),
-            self.aggregator.api_key_env.as_deref(),
-            self.aggregator.azure_credentials.as_deref(),
-        )?;
+        validate_auth("[aggregator]", ClientSettings::from(&self.aggregator))?;
 
         for reviewer in &self.reviewer {
             let reviewer_label = match reviewer.name.is_empty() {
@@ -198,14 +191,7 @@ impl Config {
                 false => format!("reviewer {}", reviewer.name),
             };
             validate_free_model(&reviewer_label, &reviewer.provider, &reviewer.model)?;
-            validate_auth(
-                &reviewer_label,
-                &reviewer.provider,
-                &reviewer.auth,
-                reviewer.base_url.as_deref(),
-                reviewer.api_key_env.as_deref(),
-                reviewer.azure_credentials.as_deref(),
-            )?;
+            validate_auth(&reviewer_label, ClientSettings::from(reviewer))?;
             if reviewer.compact_threshold == Some(0) {
                 eyre::bail!(
                     "reviewer {}: compact_threshold must be greater than 0",
@@ -370,15 +356,8 @@ fn validate_free_model(label: &str, provider: &ProviderType, model: &str) -> Res
     Ok(())
 }
 
-fn validate_auth(
-    label: &str,
-    provider: &ProviderType,
-    auth: &Option<String>,
-    base_url: Option<&str>,
-    api_key_env: Option<&str>,
-    azure_credentials: Option<&str>,
-) -> Result<()> {
-    match (provider, auth.as_deref()) {
+fn validate_auth(label: &str, settings: ClientSettings<'_>) -> Result<()> {
+    match (settings.provider, settings.auth) {
         // Unset auth is always fine — providers fall back to their default env-var key.
         (_, None) => Ok(()),
         (ProviderType::Gemini, Some("oauth")) => {
@@ -409,7 +388,7 @@ fn validate_auth(
                     "{label}: auth = \"azure-ad\" requires building nitpicker with `--features azure`"
                 );
             }
-            validate_azure_fields(label, base_url, azure_credentials)
+            validate_azure_fields(label, settings.base_url, settings.azure_credentials)
         }
         (_, Some("azure-ad")) => {
             eyre::bail!(
@@ -421,12 +400,12 @@ fn validate_auth(
         // Client construction returns the fixed shared CodexClient and ignores base_url/api_key_env,
         // so reject them rather than silently dropping a configured endpoint or key.
         (ProviderType::OpenAi, Some("codex")) => {
-            if base_url.is_some() {
+            if settings.base_url.is_some() {
                 eyre::bail!(
                     "{label}: auth = \"codex\" ignores `base_url` (requests always go to the Codex endpoint) — remove it"
                 );
             }
-            if api_key_env.is_some() {
+            if settings.api_key_env.is_some() {
                 eyre::bail!(
                     "{label}: auth = \"codex\" ignores `api_key_env` (the token comes from ~/.codex/auth.json) — remove it"
                 );
@@ -562,8 +541,34 @@ mod tests {
     #[test]
     fn validate_auth_rejects_azure_ad_on_unsupported_providers() {
         let auth = Some("azure-ad".to_string());
-        assert!(validate_auth("[t]", &ProviderType::Gemini, &auth, None, None, None).is_err());
-        assert!(validate_auth("[t]", &ProviderType::OpenRouter, &auth, None, None, None).is_err());
+        assert!(
+            validate_auth(
+                "[t]",
+                ClientSettings {
+                    provider: &ProviderType::Gemini,
+                    auth: auth.as_deref(),
+                    base_url: None,
+                    api_key_env: None,
+                    azure_scope: None,
+                    azure_credentials: None,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            validate_auth(
+                "[t]",
+                ClientSettings {
+                    provider: &ProviderType::OpenRouter,
+                    auth: auth.as_deref(),
+                    base_url: None,
+                    api_key_env: None,
+                    azure_scope: None,
+                    azure_credentials: None,
+                },
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -574,19 +579,25 @@ mod tests {
         let creds = Some("auto");
         let openai = validate_auth(
             "[t]",
-            &ProviderType::OpenAi,
-            &auth,
-            Some(FOUNDRY_URL),
-            None,
-            creds,
+            ClientSettings {
+                provider: &ProviderType::OpenAi,
+                auth: auth.as_deref(),
+                base_url: Some(FOUNDRY_URL),
+                api_key_env: None,
+                azure_scope: None,
+                azure_credentials: creds,
+            },
         );
         let anthropic = validate_auth(
             "[t]",
-            &ProviderType::Anthropic,
-            &auth,
-            Some(FOUNDRY_URL),
-            None,
-            creds,
+            ClientSettings {
+                provider: &ProviderType::Anthropic,
+                auth: auth.as_deref(),
+                base_url: Some(FOUNDRY_URL),
+                api_key_env: None,
+                azure_scope: None,
+                azure_credentials: creds,
+            },
         );
         // Accepted only when compiled with the `azure` feature; otherwise validation fails fast
         // with a build hint.
@@ -601,16 +612,32 @@ mod tests {
 
     #[test]
     fn validate_auth_allows_unset_and_known_values() {
-        assert!(validate_auth("[t]", &ProviderType::OpenAi, &None, None, None, None).is_ok());
+        assert!(
+            validate_auth(
+                "[t]",
+                ClientSettings {
+                    provider: &ProviderType::OpenAi,
+                    auth: None,
+                    base_url: None,
+                    api_key_env: None,
+                    azure_scope: None,
+                    azure_credentials: None,
+                },
+            )
+            .is_ok()
+        );
         // agy-keyring is accepted only when compiled with the `antigravity` feature; otherwise
         // validation fails fast with a build hint (mirrors the azure gate).
         let agy = validate_auth(
             "[t]",
-            &ProviderType::Gemini,
-            &Some("agy-keyring".to_string()),
-            None,
-            None,
-            None,
+            ClientSettings {
+                provider: &ProviderType::Gemini,
+                auth: Some("agy-keyring"),
+                base_url: None,
+                api_key_env: None,
+                azure_scope: None,
+                azure_credentials: None,
+            },
         );
         if cfg!(feature = "antigravity") {
             assert!(agy.is_ok());
@@ -623,27 +650,46 @@ mod tests {
     fn validate_auth_codex_rejects_ignored_fields() {
         let auth = Some("codex".to_string());
         // bare codex auth is fine
-        assert!(validate_auth("[t]", &ProviderType::OpenAi, &auth, None, None, None).is_ok());
+        assert!(
+            validate_auth(
+                "[t]",
+                ClientSettings {
+                    provider: &ProviderType::OpenAi,
+                    auth: auth.as_deref(),
+                    base_url: None,
+                    api_key_env: None,
+                    azure_scope: None,
+                    azure_credentials: None,
+                },
+            )
+            .is_ok()
+        );
         // base_url / api_key_env would be silently dropped, so they must be rejected
         assert!(
             validate_auth(
                 "[t]",
-                &ProviderType::OpenAi,
-                &auth,
-                Some("https://example.com"),
-                None,
-                None,
+                ClientSettings {
+                    provider: &ProviderType::OpenAi,
+                    auth: auth.as_deref(),
+                    base_url: Some("https://example.com"),
+                    api_key_env: None,
+                    azure_scope: None,
+                    azure_credentials: None,
+                },
             )
             .is_err()
         );
         assert!(
             validate_auth(
                 "[t]",
-                &ProviderType::OpenAi,
-                &auth,
-                None,
-                Some("MY_KEY"),
-                None,
+                ClientSettings {
+                    provider: &ProviderType::OpenAi,
+                    auth: auth.as_deref(),
+                    base_url: None,
+                    api_key_env: Some("MY_KEY"),
+                    azure_scope: None,
+                    azure_credentials: None,
+                },
             )
             .is_err()
         );
@@ -659,10 +705,62 @@ mod tests {
     #[test]
     fn validate_auth_codex_only_on_openai() {
         let auth = Some("codex".to_string());
-        assert!(validate_auth("[t]", &ProviderType::OpenAi, &auth, None, None, None).is_ok());
-        assert!(validate_auth("[t]", &ProviderType::Anthropic, &auth, None, None, None).is_err());
-        assert!(validate_auth("[t]", &ProviderType::Gemini, &auth, None, None, None).is_err());
-        assert!(validate_auth("[t]", &ProviderType::OpenRouter, &auth, None, None, None).is_err());
+        assert!(
+            validate_auth(
+                "[t]",
+                ClientSettings {
+                    provider: &ProviderType::OpenAi,
+                    auth: auth.as_deref(),
+                    base_url: None,
+                    api_key_env: None,
+                    azure_scope: None,
+                    azure_credentials: None,
+                },
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_auth(
+                "[t]",
+                ClientSettings {
+                    provider: &ProviderType::Anthropic,
+                    auth: auth.as_deref(),
+                    base_url: None,
+                    api_key_env: None,
+                    azure_scope: None,
+                    azure_credentials: None,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            validate_auth(
+                "[t]",
+                ClientSettings {
+                    provider: &ProviderType::Gemini,
+                    auth: auth.as_deref(),
+                    base_url: None,
+                    api_key_env: None,
+                    azure_scope: None,
+                    azure_credentials: None,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            validate_auth(
+                "[t]",
+                ClientSettings {
+                    provider: &ProviderType::OpenRouter,
+                    auth: auth.as_deref(),
+                    base_url: None,
+                    api_key_env: None,
+                    azure_scope: None,
+                    azure_credentials: None,
+                },
+            )
+            .is_err()
+        );
     }
 
     /// Codex auth needs no env var, so this validates the same wherever it runs.
@@ -693,6 +791,39 @@ mod tests {
             }],
             presets: None,
         }
+    }
+
+    #[test]
+    fn structural_validation_reports_first_error_in_role_order() {
+        let mut config = config_with(Some(0), Some(0));
+        config.aggregator.model = "free".to_string();
+        config.aggregator.auth = Some("aggregator-typo".to_string());
+        config.reviewer[0].model = "free".to_string();
+        config.reviewer[0].auth = Some("reviewer-typo".to_string());
+        config.reviewer[0].compact_threshold = Some(0);
+
+        let error = config.validate_structure().unwrap_err().to_string();
+        assert!(error.contains("[aggregator]") && error.contains("free"));
+        config.aggregator.model = "gpt-5.4".to_string();
+        let error = config.validate_structure().unwrap_err().to_string();
+        assert!(error.contains("[aggregator]") && error.contains("aggregator-typo"));
+        config.aggregator.auth = Some("codex".to_string());
+        let error = config.validate_structure().unwrap_err().to_string();
+        assert!(error.contains("reviewer r") && error.contains("free"));
+        config.reviewer[0].model = "gpt-5.4".to_string();
+        let error = config.validate_structure().unwrap_err().to_string();
+        assert!(error.contains("reviewer r") && error.contains("reviewer-typo"));
+        config.reviewer[0].auth = Some("codex".to_string());
+        let error = config.validate_structure().unwrap_err().to_string();
+        assert!(error.contains("reviewer r") && error.contains("compact_threshold"));
+        config.reviewer[0].compact_threshold = None;
+        let error = config.validate_structure().unwrap_err().to_string();
+        assert!(error.contains("reviewer r") && error.contains("max_tokens"));
+        config.reviewer[0].max_tokens = None;
+        let error = config.validate_structure().unwrap_err().to_string();
+        assert!(error.contains("[aggregator]") && error.contains("max_tokens"));
+        config.aggregator.max_tokens = None;
+        assert!(config.validate_structure().is_ok());
     }
 
     /// Zero is not "no cap" — the provider answers it with nothing. Unset is how no cap is spelled.
@@ -854,15 +985,31 @@ mod tests {
         assert!(
             validate_auth(
                 "[t]",
-                &ProviderType::OpenAi,
-                &typo,
-                Some(FOUNDRY_URL),
-                None,
-                None
+                ClientSettings {
+                    provider: &ProviderType::OpenAi,
+                    auth: typo.as_deref(),
+                    base_url: Some(FOUNDRY_URL),
+                    api_key_env: None,
+                    azure_scope: None,
+                    azure_credentials: None,
+                },
             )
             .is_err()
         );
-        assert!(validate_auth("[t]", &ProviderType::Anthropic, &typo, None, None, None).is_err());
+        assert!(
+            validate_auth(
+                "[t]",
+                ClientSettings {
+                    provider: &ProviderType::Anthropic,
+                    auth: typo.as_deref(),
+                    base_url: None,
+                    api_key_env: None,
+                    azure_scope: None,
+                    azure_credentials: None,
+                },
+            )
+            .is_err()
+        );
     }
 
     #[cfg(feature = "azure")]
@@ -872,16 +1019,45 @@ mod tests {
         // The two error cases bail on `base_url` before any credential check, so they're already
         // env-independent; the ok case passes an explicit mode so it doesn't read the ambient
         // `AZURE_TOKEN_CREDENTIALS` (which a `None` here would).
-        assert!(validate_auth("[t]", &ProviderType::OpenAi, &auth, None, None, None).is_err());
-        assert!(validate_auth("[t]", &ProviderType::OpenAi, &auth, Some(""), None, None).is_err());
         assert!(
             validate_auth(
                 "[t]",
-                &ProviderType::OpenAi,
-                &auth,
-                Some(FOUNDRY_URL),
-                None,
-                Some("auto")
+                ClientSettings {
+                    provider: &ProviderType::OpenAi,
+                    auth: auth.as_deref(),
+                    base_url: None,
+                    api_key_env: None,
+                    azure_scope: None,
+                    azure_credentials: None,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            validate_auth(
+                "[t]",
+                ClientSettings {
+                    provider: &ProviderType::OpenAi,
+                    auth: auth.as_deref(),
+                    base_url: Some(""),
+                    api_key_env: None,
+                    azure_scope: None,
+                    azure_credentials: None,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            validate_auth(
+                "[t]",
+                ClientSettings {
+                    provider: &ProviderType::OpenAi,
+                    auth: auth.as_deref(),
+                    base_url: Some(FOUNDRY_URL),
+                    api_key_env: None,
+                    azure_scope: None,
+                    azure_credentials: Some("auto"),
+                },
             )
             .is_ok()
         );
@@ -912,11 +1088,14 @@ mod tests {
         let ok = |creds| {
             validate_auth(
                 "[t]",
-                &ProviderType::OpenAi,
-                &auth,
-                Some(FOUNDRY_URL),
-                None,
-                creds,
+                ClientSettings {
+                    provider: &ProviderType::OpenAi,
+                    auth: auth.as_deref(),
+                    base_url: Some(FOUNDRY_URL),
+                    api_key_env: None,
+                    azure_scope: None,
+                    azure_credentials: creds,
+                },
             )
             .is_ok()
         };
@@ -931,11 +1110,14 @@ mod tests {
         assert!(
             validate_auth(
                 "[t]",
-                &ProviderType::OpenAi,
-                &auth,
-                Some(FOUNDRY_URL),
-                None,
-                Some("deve")
+                ClientSettings {
+                    provider: &ProviderType::OpenAi,
+                    auth: auth.as_deref(),
+                    base_url: Some(FOUNDRY_URL),
+                    api_key_env: None,
+                    azure_scope: None,
+                    azure_credentials: Some("deve"),
+                },
             )
             .is_err()
         );

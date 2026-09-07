@@ -86,7 +86,10 @@ crates/nitpicker-agent/  — published library crate `nitpicker-agent`
                   and the fallback subagent protocol
 
 src/  — `nitpicker` binary (CLI)
-  main.rs         CLI, config loading, wires everything together; sync `main` → runtime → `run` → `finish` (exit contract)
+  main.rs         command dispatch and git/diff context; sync `main` → runtime → `run` → `finish` (exit contract)
+  cli.rs          clap declarations, repeatable flag merges, positive-integer parsing
+  init.rs         config template generation, provider selection, and init output
+  settings.rs     binary config file loading, CLI/config routing resolution, and deferred model resolution
   telemetry.rs    stderr log subscriber + optional OTLP span exporter (feature `otel`, off by default)
   review.rs       orchestrates parallel reviewers → aggregation
   debate.rs       sequential actor/critic debate loop → meta-review
