@@ -1,0 +1,7 @@
+# [[reviewer]]
+# name = "local"
+# model = "local-model"
+# provider = "openai"
+# base_url = "http://localhost:1234/v1"
+# api_key_env = "LOCAL_KEY"  # set to any non-empty value
+# auth = "example-auth"

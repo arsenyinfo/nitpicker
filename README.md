@@ -331,6 +331,11 @@ async fn main() -> eyre::Result<()> {
 
 ---
 
+For contributors, the binary keeps argument parsing in `src/cli.rs`, config loading and
+routing settings in `src/settings.rs`, and config generation in `src/init.rs`.
+Command dispatch remains in `src/main.rs`; PR-specific config trust and output handling
+live in `src/pr.rs`. See [CLAUDE.md](CLAUDE.md) for the full architecture.
+
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) for version release notes.

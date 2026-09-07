@@ -115,9 +115,9 @@ pub struct PrArgs {
     /// Full GitHub PR URL (https://github.com/owner/repo/pull/N)
     pub url: Option<String>,
     #[command(flatten)]
-    pub context: crate::ContextFileArgs,
+    pub context: crate::cli::ContextFileArgs,
     #[command(flatten)]
-    pub presets: crate::PresetArgs,
+    pub presets: crate::cli::PresetArgs,
     #[arg(long)]
     pub prompt: Option<String>,
     #[arg(long)]
@@ -126,7 +126,7 @@ pub struct PrArgs {
     pub alloy: bool,
     #[arg(long, default_value = "5")]
     pub rounds: usize,
-    #[arg(long, value_parser = crate::parse_positive_usize)]
+    #[arg(long, value_parser = crate::cli::parse_positive_usize)]
     pub max_turns: Option<usize>,
     /// Skip posting review as a PR comment
     #[arg(long)]
@@ -571,7 +571,7 @@ impl PrFlow {
 /// returns, so the checkout-restore/lock guards inside have already dropped.
 pub async fn run_pr(
     args: PrArgs,
-    common: crate::CommonArgs,
+    common: crate::cli::CommonArgs,
     context_files: Vec<PathBuf>,
     preset_names: Vec<String>,
 ) -> Result<crate::Exit> {
@@ -610,7 +610,7 @@ fn pr_failure_exit(
 
 async fn run_pr_inner(
     args: PrArgs,
-    common: crate::CommonArgs,
+    common: crate::cli::CommonArgs,
     context_files: Vec<PathBuf>,
     preset_names: Vec<String>,
     start: std::time::Instant,
@@ -629,13 +629,14 @@ async fn run_pr_inner(
     // Resolve presets and CLI-only routing validation before free-model resolution: pure usage
     // errors must fail before its smoke calls, and stay inside run_pr_inner for the JSON contract.
     let presets = crate::presets::resolve(&preset_names, &config)?;
-    let (alloy, fallback) = crate::resolve_routing_modes(&config, args.alloy, common.fallback)?;
+    let (alloy, fallback) =
+        crate::settings::resolve_routing_modes(&config, args.alloy, common.fallback)?;
     let execution = PrReviewExecution {
         verbose: common.verbose,
         alloy,
         fallback,
     };
-    crate::finalize_routing_config(&mut config, fallback).await?;
+    crate::settings::finalize_routing_config(&mut config, fallback).await?;
     let config = config;
 
     // `prepared` drops at the end of this scope, after the review completes: HEAD is restored
@@ -667,7 +668,7 @@ struct PrReviewExecution {
 /// an explicit `--config` path stays trusted and unchanged.
 fn load_pr_config(explicit: Option<&Path>, prepared: &PreparedPr) -> Result<Config> {
     if explicit.is_some() {
-        return crate::load_config(explicit, &prepared.repo);
+        return crate::settings::load_config(explicit, &prepared.repo);
     }
     // `origin/<base>` is only a trust anchor if `origin` is the GitHub repo the PR metadata
     // came from. The in-place flow selects on the owner/repo slug alone, so an unrelated
@@ -697,7 +698,7 @@ fn load_pr_config(explicit: Option<&Path>, prepared: &PreparedPr) -> Result<Conf
             config.validate_structure()?;
             Ok(config)
         }
-        None => crate::load_global_config(),
+        None => crate::settings::load_global_config(),
     }
 }
 

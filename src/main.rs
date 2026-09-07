@@ -1,17 +1,20 @@
-use clap::{Args as ClapArgs, Parser, Subcommand};
+use clap::Parser;
+use cli::{Args, Command, merged_context_files, merged_presets};
 use eyre::{Result, WrapErr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tracing::field::Empty;
 use tracing::{Instrument, info_span};
 
-use nitpicker_agent::{config, openrouter, tools::floor_char_boundary};
+use nitpicker_agent::tools::floor_char_boundary;
 
+mod cli;
 mod context;
 mod debate;
 mod detect;
 #[cfg(feature = "antigravity")]
 mod gemini_proxy;
+mod init;
 mod output;
 mod pr;
 mod presets;
@@ -20,63 +23,8 @@ mod prompts;
 mod proxy;
 mod reflect;
 mod review;
+mod settings;
 mod telemetry;
-
-/// Flags shared across the default review mode and the subcommands. Declared once here and
-/// marked `global`, so they are accepted before or after a subcommand and always land in
-/// `Args.common` — per-subcommand copies would be independent namespaces, and a flag parsed
-/// into the copy an arm doesn't read would be silently dropped.
-#[derive(Debug, ClapArgs)]
-struct CommonArgs {
-    #[arg(long, global = true, default_value = ".")]
-    repo: PathBuf,
-
-    #[arg(long, global = true)]
-    config: Option<PathBuf>,
-
-    #[arg(long, short, global = true)]
-    verbose: bool,
-
-    /// Try the next configured reviewer when the selected model fails
-    #[arg(long, global = true)]
-    fallback: bool,
-}
-
-/// `--context-file`, kept out of the global `CommonArgs` deliberately: clap propagates a global
-/// arg by keeping one winning occurrence list (the subcommand's), so a repeatable flag split
-/// around the subcommand would silently drop the root's values. Instead this struct is flattened
-/// at the root and into `ask`/`pr`, and the two vectors are concatenated root-first (= the
-/// command-line order) at each use site.
-#[derive(Debug, ClapArgs)]
-struct ContextFileArgs {
-    /// Read a file into the prompt verbatim; repeatable. Unlike the agents' own tools, this is not
-    /// confined to the repo, so it can carry design notes or working docs that live outside it.
-    #[arg(long = "context-file", value_name = "PATH")]
-    context_file: Vec<PathBuf>,
-}
-
-fn merged_context_files(root: &ContextFileArgs, sub: &ContextFileArgs) -> Vec<PathBuf> {
-    root.context_file
-        .iter()
-        .chain(&sub.context_file)
-        .cloned()
-        .collect()
-}
-
-/// `--preset`, shaped exactly like `ContextFileArgs` and for the same reason: a repeatable
-/// flag must not be `global` (clap would keep only the subcommand's occurrence list), so it
-/// is flattened at the root and into `pr`, and merged root-first at each use site.
-#[derive(Debug, ClapArgs)]
-struct PresetArgs {
-    /// Review preset(s) to run — repeatable and comma-separated (e.g. --preset security,ml-rigor).
-    /// Replaces the configured `[defaults].presets` list for this run.
-    #[arg(long = "preset", value_name = "NAME", value_delimiter = ',')]
-    preset: Vec<String>,
-}
-
-fn merged_presets(root: &PresetArgs, sub: &PresetArgs) -> Vec<String> {
-    root.preset.iter().chain(&sub.preset).cloned().collect()
-}
 
 /// Presets pick review rubrics; `ask`/`init`/`reflect` have none. Root-position `--preset`
 /// parses fine before any subcommand, so without an explicit rejection it would be silently
@@ -90,104 +38,6 @@ fn presets_allowed(command: &Option<Command>) -> bool {
 
 fn fallback_allowed(command: &Option<Command>) -> bool {
     matches!(command, None | Some(Command::Ask { .. } | Command::Pr(_)))
-}
-
-pub(crate) fn resolve_routing_modes(
-    config: &config::Config,
-    cli_alloy: bool,
-    cli_fallback: bool,
-) -> Result<(bool, bool)> {
-    let alloy = cli_alloy || config.default_alloy();
-    config.validate_alloy(alloy)?;
-    let fallback = cli_fallback || config.default_fallback();
-    config.validate_fallback(fallback)?;
-    Ok((alloy, fallback))
-}
-
-#[derive(Debug, Parser)]
-#[command(name = "nitpicker")]
-struct Args {
-    #[command(subcommand)]
-    command: Option<Command>,
-
-    #[command(flatten)]
-    common: CommonArgs,
-
-    #[command(flatten)]
-    context: ContextFileArgs,
-
-    #[command(flatten)]
-    presets: PresetArgs,
-
-    #[arg(
-        long,
-        help = "Additional review instructions appended to the diff context (use `ask` for fully custom prompts)"
-    )]
-    prompt: Option<String>,
-
-    /// Analyze existing code instead of reviewing changes
-    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
-    analyze: Option<PathBuf>,
-
-    /// Disable actor-critic debate and use parallel aggregation instead
-    #[arg(long)]
-    no_debate: bool,
-
-    /// Mix all reviewer models into a shared pool; each LLM call picks one at random
-    #[arg(long)]
-    alloy: bool,
-
-    /// Maximum debate rounds
-    #[arg(long, default_value = "5")]
-    rounds: usize,
-
-    /// Maximum tool-use turns per agent or debate turn
-    #[arg(long, value_parser = parse_positive_usize)]
-    max_turns: Option<usize>,
-}
-
-#[derive(Debug, Subcommand)]
-enum Command {
-    /// Generate a nitpicker config template
-    Init {
-        /// Write to ~/.nitpicker/config.toml instead of <repo>/nitpicker.toml
-        #[arg(long)]
-        global: bool,
-
-        /// Prefer OpenRouter experimental free models in the generated config
-        #[arg(long)]
-        free: bool,
-    },
-    /// Ask multiple LLM agents a free-form question about the codebase
-    Ask {
-        #[command(flatten)]
-        context: ContextFileArgs,
-        /// Question or topic to discuss
-        topic: String,
-        /// Disable actor-critic debate and use parallel aggregation instead
-        #[arg(long)]
-        no_debate: bool,
-        /// Mix all reviewer models into a shared pool; each LLM call picks one at random
-        #[arg(long)]
-        alloy: bool,
-        /// Maximum debate rounds
-        #[arg(long, default_value = "5")]
-        rounds: usize,
-        /// Maximum tool-use turns per agent or debate turn
-        #[arg(long, value_parser = parse_positive_usize)]
-        max_turns: Option<usize>,
-    },
-    /// Review a GitHub PR (current branch's PR or a remote PR by URL)
-    Pr(pr::PrArgs),
-    /// Reflect on past nitpicker sessions to identify patterns and friction points
-    Reflect {
-        /// Directory containing sessions (default: ~/.nitpicker/sessions)
-        #[arg(long)]
-        sessions_dir: Option<PathBuf>,
-        /// Number of most recent sessions to analyze
-        #[arg(long, default_value = "20")]
-        n: usize,
-    },
 }
 
 /// Outcome of a run, mapped to the exit-code contract by [`finish`]: 0 = clean verdict,
@@ -318,11 +168,11 @@ async fn dispatch(args: Args) -> Result<Exit> {
             if args.common.config.is_some() {
                 eyre::bail!("--config has no effect on init, which generates a config file");
             }
-            let path = init_config_path(global, &args.common.repo)?;
+            let path = init::init_config_path(global, &args.common.repo)?;
             if path.exists() {
                 eyre::bail!("{} already exists", path.display());
             }
-            run_init(path, free).await?;
+            init::run_init(path, free).await?;
             return Ok(Exit::Clean);
         }
         Some(Command::Ask {
@@ -334,11 +184,11 @@ async fn dispatch(args: Args) -> Result<Exit> {
             max_turns,
         }) => {
             let repo = resolve_repo_root(&args.common.repo)?;
-            let mut config = load_config(args.common.config.as_deref(), &repo)?;
+            let mut config = settings::load_config(args.common.config.as_deref(), &repo)?;
             // CLI-only routing validation must precede free-model smoke completions.
             let (use_alloy, use_fallback) =
-                resolve_routing_modes(&config, alloy, args.common.fallback)?;
-            finalize_routing_config(&mut config, use_fallback).await?;
+                settings::resolve_routing_modes(&config, alloy, args.common.fallback)?;
+            settings::finalize_routing_config(&mut config, use_fallback).await?;
             let config = config;
             let topic = context::append_to_prompt(
                 topic,
@@ -406,7 +256,8 @@ async fn dispatch(args: Args) -> Result<Exit> {
         }
         Some(Command::Reflect { sessions_dir, n }) => {
             let repo = resolve_repo_root(&args.common.repo)?;
-            let config = load_resolved_config(args.common.config.as_deref(), &repo).await?;
+            let config =
+                settings::load_resolved_config(args.common.config.as_deref(), &repo).await?;
             reflect::run_reflect(reflect::ReflectArgs {
                 sessions_dir,
                 n,
@@ -421,13 +272,13 @@ async fn dispatch(args: Args) -> Result<Exit> {
 
     let repo = resolve_repo_root(&args.common.repo)?;
 
-    let mut config = load_config(args.common.config.as_deref(), &repo)?;
+    let mut config = settings::load_config(args.common.config.as_deref(), &repo)?;
     // Resolve presets and CLI-only routing validation before free-model resolution: pure usage
     // errors must fail before any network call (the resolver can run live smoke completions).
     let presets = presets::resolve(&args.presets.preset, &config)?;
     let (use_alloy, use_fallback) =
-        resolve_routing_modes(&config, args.alloy, args.common.fallback)?;
-    finalize_routing_config(&mut config, use_fallback).await?;
+        settings::resolve_routing_modes(&config, args.alloy, args.common.fallback)?;
+    settings::finalize_routing_config(&mut config, use_fallback).await?;
     let config = config;
     let max_turns = config.max_turns(args.max_turns)?;
 
@@ -513,23 +364,6 @@ async fn dispatch(args: Args) -> Result<Exit> {
     }
 }
 
-pub(crate) fn load_config(explicit_path: Option<&Path>, repo: &Path) -> Result<config::Config> {
-    let config: config::Config = if let Some(path) = explicit_path {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| eyre::eyre!("failed to read config {:?}: {e}", path))?;
-        toml::from_str(&content).map_err(|e| eyre::eyre!("invalid config: {e}"))?
-    } else if repo.join("nitpicker.toml").exists() {
-        let path = repo.join("nitpicker.toml");
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| eyre::eyre!("failed to read config {:?}: {e}", path))?;
-        toml::from_str(&content).map_err(|e| eyre::eyre!("invalid config: {e}"))?
-    } else {
-        return load_global_config();
-    };
-    config.validate_structure()?;
-    Ok(config)
-}
-
 /// Resolve the worktree containing `path` through Git itself. Linked worktrees and checked-out
 /// submodules represent `.git` as a file, so its filesystem shape is not a repository invariant.
 pub(crate) fn git_worktree_root(path: &Path) -> Option<PathBuf> {
@@ -552,329 +386,6 @@ fn resolve_repo_root(path: &Path) -> Result<PathBuf> {
         .wrap_err("failed to canonicalize --repo path")?;
     git_worktree_root(&canonical)
         .ok_or_else(|| eyre::eyre!("--repo must point inside a Git worktree"))
-}
-
-/// The `~/.nitpicker/config.toml` fallback alone — `pr` mode reaches for this directly,
-/// since its repo-level config comes from the PR base branch blob, never the working tree.
-pub(crate) fn load_global_config() -> Result<config::Config> {
-    let path = dirs::home_dir()
-        .map(|home| home.join(".nitpicker").join("config.toml"))
-        .filter(|path| path.exists())
-        .ok_or_else(|| {
-            eyre::eyre!("no config found — run `nitpicker init [--global]` to generate one")
-        })?;
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| eyre::eyre!("failed to read config {:?}: {e}", path))?;
-    let config: config::Config =
-        toml::from_str(&content).map_err(|e| eyre::eyre!("invalid config: {e}"))?;
-    config.validate_structure()?;
-    Ok(config)
-}
-
-pub(crate) async fn load_resolved_config(
-    explicit_path: Option<&Path>,
-    repo: &Path,
-) -> Result<config::Config> {
-    let mut config = load_config(explicit_path, repo)?;
-    finalize_routing_config(&mut config, false).await?;
-    Ok(config)
-}
-
-/// Finish config validation and experimental route resolution after the caller has resolved the
-/// effective CLI/config fallback mode. Strict execution requires every credential up front;
-/// fallback execution lets route construction skip unusable entries.
-pub(crate) async fn finalize_routing_config(
-    config: &mut config::Config,
-    fallback: bool,
-) -> Result<()> {
-    if !fallback {
-        config.validate_credentials()?;
-    }
-    openrouter::resolve_free_models_with_fallback(config, fallback).await
-}
-
-async fn run_init(path: PathBuf, prefer_free: bool) -> eyre::Result<()> {
-    println!("Detecting available providers...\n");
-    let detected = detect::detect_all().await;
-
-    if detected.is_empty() {
-        eyre::bail!(
-            "no providers detected — set at least one of: \
-             ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, \
-             OPENROUTER_API_KEY, KIMI_API_KEY, ZAI_API_KEY, MINIMAX_API_KEY, MISTRAL_API_KEY, \
-             DATABRICKS_TOKEN (with DATABRICKS_HOST or ~/.databrickscfg)"
-        );
-    }
-
-    println!("Detected providers:");
-    for d in &detected {
-        let key_info = match d.api_key_env {
-            Some(env) => env.to_string(),
-            None => d.auth.unwrap_or("api_key").to_string(),
-        };
-        println!("  ✓ {} ({}) via {}", d.name, key_info, d.source);
-    }
-
-    let use_openrouter_free = should_prefer_openrouter_free(&detected, prefer_free);
-    if prefer_free && !use_openrouter_free {
-        println!(
-            "\nWarning: `--free` prefers OpenRouter free models, but OPENROUTER_API_KEY is not set; using the normal provider order."
-        );
-    }
-
-    let prioritized = prioritize_init_detected(&detected, use_openrouter_free);
-    let config = build_init_config(&prioritized, use_openrouter_free);
-    let mut toml_str = toml::to_string_pretty(&config)
-        .map_err(|e| eyre::eyre!("failed to serialize config: {e}"))?;
-
-    let active_names: std::collections::HashSet<&str> = config
-        .reviewer
-        .iter()
-        .map(|r| r.name.as_str())
-        .chain(std::iter::once(prioritized[0].name))
-        .collect();
-    let extras: Vec<&detect::Detected> = detected
-        .iter()
-        .filter(|d| !active_names.contains(d.name))
-        .collect();
-    if !extras.is_empty() {
-        toml_str.push_str("\n# Other detected providers — uncomment to add as a reviewer:\n");
-        for d in extras {
-            toml_str.push('\n');
-            toml_str.push_str(&format_commented_reviewer(d));
-            toml_str.push('\n');
-        }
-    }
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, &toml_str)?;
-    println!("\nCreated {}", path.display());
-
-    print_init_hints(&detected);
-    Ok(())
-}
-
-fn format_commented_reviewer(d: &detect::Detected) -> String {
-    let mut lines = vec![
-        "# [[reviewer]]".to_string(),
-        format!("# name = \"{}\"", d.name),
-        format!("# model = \"{}\"", d.model),
-        format!("# provider = \"{}\"", d.provider),
-    ];
-    if let Some(url) = &d.base_url {
-        lines.push(format!("# base_url = \"{url}\""));
-    }
-    if let Some(env) = d.api_key_env {
-        if d.local_server {
-            lines.push(format!(
-                "# api_key_env = \"{env}\"  # set to any non-empty value"
-            ));
-        } else {
-            lines.push(format!("# api_key_env = \"{env}\""));
-        }
-    }
-    if let Some(auth) = d.auth {
-        lines.push(format!("# auth = \"{auth}\""));
-    }
-    lines.join("\n")
-}
-
-fn build_init_config(
-    detected: &[&detect::Detected],
-    prefer_openrouter_free: bool,
-) -> config::Config {
-    let non_local_count = detected.iter().filter(|d| !d.local_server).count();
-    let debate = non_local_count >= 2;
-
-    // aggregator: highest priority (list is already sorted)
-    let agg = detected[0];
-    let aggregator = config::AggregatorConfig {
-        model: init_model_for_detected(agg, prefer_openrouter_free),
-        provider: parse_provider_type(agg.provider),
-        base_url: agg.base_url.clone(),
-        api_key_env: agg.api_key_env.map(str::to_string),
-        max_tokens: None,
-        auth: agg.auth.map(str::to_string),
-        azure_scope: None,
-        azure_credentials: None,
-    };
-
-    // Fallback needs a second route even when debate is disabled. OpenRouter free selection can
-    // produce two distinct model routes from its one detected credential.
-    let reviewer_slots = if detected.len() >= 2 || prefer_openrouter_free {
-        2
-    } else {
-        1
-    };
-    let reviewers = pick_reviewers(detected, reviewer_slots, prefer_openrouter_free);
-    let fallback = reviewers.len() >= 2;
-
-    config::Config {
-        defaults: Some(config::DefaultsConfig {
-            debate: Some(debate),
-            alloy: None,
-            fallback: Some(fallback),
-            max_turns: Some(config::DEFAULT_MAX_TURNS),
-            compact_threshold: Some(100_000),
-            log_trajectories: Some(false),
-            presets: None,
-        }),
-        aggregator,
-        reviewer: reviewers,
-        presets: None,
-    }
-}
-
-fn pick_reviewers(
-    detected: &[&detect::Detected],
-    count: usize,
-    prefer_openrouter_free: bool,
-) -> Vec<config::ReviewerConfig> {
-    if prefer_openrouter_free {
-        return detected
-            .first()
-            .into_iter()
-            .cycle()
-            .take(count)
-            .map(|d| make_reviewer(d, prefer_openrouter_free))
-            .collect();
-    }
-
-    let mut result = Vec::new();
-    let mut seen_names: std::collections::HashSet<&str> = Default::default();
-
-    // first pass: diverse provider names
-    for d in detected {
-        if result.len() >= count {
-            break;
-        }
-        if seen_names.insert(d.name) {
-            result.push(make_reviewer(d, prefer_openrouter_free));
-        }
-    }
-
-    // second pass: fill remaining slots with any provider
-    for d in detected {
-        if result.len() >= count {
-            break;
-        }
-        if result
-            .iter()
-            .all(|r: &config::ReviewerConfig| r.name != d.name)
-        {
-            result.push(make_reviewer(d, prefer_openrouter_free));
-        }
-    }
-
-    result
-}
-
-fn make_reviewer(d: &detect::Detected, prefer_openrouter_free: bool) -> config::ReviewerConfig {
-    config::ReviewerConfig {
-        name: d.name.to_string(),
-        model: init_model_for_detected(d, prefer_openrouter_free),
-        provider: parse_provider_type(d.provider),
-        base_url: d.base_url.clone(),
-        api_key_env: d.api_key_env.map(str::to_string),
-        max_tokens: None,
-        compact_threshold: None,
-        auth: d.auth.map(str::to_string),
-        azure_scope: None,
-        azure_credentials: None,
-    }
-}
-
-fn should_prefer_openrouter_free(detected: &[detect::Detected], prefer_free: bool) -> bool {
-    if !prefer_free {
-        return false;
-    }
-
-    let has_openrouter = detected.iter().any(|d| d.name == "openrouter");
-    has_openrouter && std::env::var("OPENROUTER_API_KEY").is_ok()
-}
-
-fn prioritize_init_detected(
-    detected: &[detect::Detected],
-    prefer_openrouter_free: bool,
-) -> Vec<&detect::Detected> {
-    let mut prioritized: Vec<&detect::Detected> = detected.iter().collect();
-    if prefer_openrouter_free {
-        prioritized.sort_by_key(|d| if d.name == "openrouter" { 0 } else { 1 });
-    }
-    prioritized
-}
-
-fn init_model_for_detected(d: &detect::Detected, prefer_openrouter_free: bool) -> String {
-    if prefer_openrouter_free && d.name == "openrouter" {
-        return "free".to_string();
-    }
-
-    d.model.clone()
-}
-
-fn parse_provider_type(s: &str) -> config::ProviderType {
-    match s {
-        "anthropic" => config::ProviderType::Anthropic,
-        "gemini" => config::ProviderType::Gemini,
-        "openrouter" => config::ProviderType::OpenRouter,
-        _ => config::ProviderType::OpenAi,
-    }
-}
-
-fn print_init_hints(detected: &[detect::Detected]) {
-    let unset: Vec<&detect::Detected> = detected
-        .iter()
-        .filter(|d| {
-            !d.local_server
-                && d.api_key_env
-                    .map(|env| std::env::var(env).is_err())
-                    .unwrap_or(false)
-        })
-        .collect();
-
-    if !unset.is_empty() {
-        println!("\nProviders detected but env vars not yet set:");
-        for d in unset {
-            println!(
-                "  export {}=...  # found via {}",
-                d.api_key_env.unwrap(),
-                d.source
-            );
-        }
-    }
-
-    let has_google_ai_key =
-        std::env::var("GOOGLE_AI_API_KEY").is_ok() && std::env::var("GEMINI_API_KEY").is_err();
-    if has_google_ai_key {
-        println!("\n  Note: found GOOGLE_AI_API_KEY — the gemini client reads GEMINI_API_KEY;");
-        println!("  add `export GEMINI_API_KEY=$GOOGLE_AI_API_KEY` to your shell profile.");
-    }
-}
-
-fn init_config_path(global: bool, repo: &Path) -> Result<PathBuf> {
-    if global {
-        let home =
-            dirs::home_dir().ok_or_else(|| eyre::eyre!("failed to resolve home directory"))?;
-        Ok(home.join(".nitpicker").join("config.toml"))
-    } else {
-        // --repo is a global flag, so `init --repo <dir>` must target that repo's root
-        // rather than silently writing into the cwd
-        Ok(repo.join("nitpicker.toml"))
-    }
-}
-
-pub(crate) fn parse_positive_usize(value: &str) -> Result<usize, String> {
-    let parsed = value
-        .parse::<usize>()
-        .map_err(|_| format!("invalid positive integer: {value}"))?;
-
-    if parsed == 0 {
-        return Err("value must be greater than 0".to_string());
-    }
-
-    Ok(parsed)
 }
 
 // Describes only the target and optional user instructions — the investigation angles come
@@ -1175,7 +686,6 @@ fn run_git_optional(repo: &Path, args: &[&str]) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
 
     struct FailingFlush;
 
@@ -1198,150 +708,6 @@ mod tests {
         assert_eq!(finish(Err(eyre::eyre!("boom")), &mut Vec::new()), 1);
         assert_eq!(finish(Ok(Exit::Degraded), &mut FailingFlush), 1);
         assert_eq!(finish(Ok(Exit::Clean), &mut FailingFlush), 0);
-    }
-
-    #[test]
-    fn cli_definition_is_valid() {
-        Args::command().debug_assert();
-    }
-
-    fn parse(argv: &[&str]) -> Args {
-        Args::try_parse_from(argv).expect("argv parses")
-    }
-
-    fn ask_context(args: &Args) -> Vec<PathBuf> {
-        match &args.command {
-            Some(Command::Ask { context, .. }) => merged_context_files(&args.context, context),
-            _ => panic!("expected ask subcommand"),
-        }
-    }
-
-    fn pr_context(args: &Args) -> Vec<PathBuf> {
-        match &args.command {
-            Some(Command::Pr(pr_args)) => merged_context_files(&args.context, &pr_args.context),
-            _ => panic!("expected pr subcommand"),
-        }
-    }
-
-    #[test]
-    fn context_file_before_the_subcommand_reaches_ask() {
-        let args = parse(&["nitpicker", "--context-file", "/a", "ask", "topic"]);
-        assert_eq!(ask_context(&args), [PathBuf::from("/a")]);
-    }
-
-    #[test]
-    fn context_file_after_the_subcommand_reaches_ask() {
-        let args = parse(&["nitpicker", "ask", "--context-file", "/a", "topic"]);
-        assert_eq!(ask_context(&args), [PathBuf::from("/a")]);
-    }
-
-    #[test]
-    fn context_files_split_around_the_subcommand_merge_in_cli_order() {
-        let args = parse(&[
-            "nitpicker",
-            "--context-file",
-            "/a",
-            "ask",
-            "--context-file",
-            "/b",
-            "topic",
-        ]);
-        assert_eq!(
-            ask_context(&args),
-            [PathBuf::from("/a"), PathBuf::from("/b")]
-        );
-
-        let args = parse(&[
-            "nitpicker",
-            "--context-file",
-            "/a",
-            "pr",
-            "--context-file",
-            "/b",
-        ]);
-        assert_eq!(
-            pr_context(&args),
-            [PathBuf::from("/a"), PathBuf::from("/b")]
-        );
-    }
-
-    #[test]
-    fn global_scalars_land_in_common_from_either_side_of_the_subcommand() {
-        let args = parse(&["nitpicker", "-v", "--repo", "/x", "ask", "topic"]);
-        assert!(args.common.verbose);
-        assert_eq!(args.common.repo, PathBuf::from("/x"));
-
-        let args = parse(&["nitpicker", "ask", "topic", "--repo", "/x", "-v"]);
-        assert!(args.common.verbose);
-        assert_eq!(args.common.repo, PathBuf::from("/x"));
-
-        let args = parse(&["nitpicker", "pr", "--repo", "/x", "--config", "/c.toml"]);
-        assert!(!args.common.verbose);
-        assert_eq!(args.common.repo, PathBuf::from("/x"));
-        assert_eq!(args.common.config, Some(PathBuf::from("/c.toml")));
-
-        let args = parse(&["nitpicker", "--fallback", "ask", "topic"]);
-        assert!(args.common.fallback);
-        let args = parse(&["nitpicker", "pr", "--fallback"]);
-        assert!(args.common.fallback);
-    }
-
-    #[test]
-    fn init_writes_into_the_repo_named_by_the_global_repo_flag() {
-        let path = init_config_path(false, Path::new("/some/repo")).unwrap();
-        assert_eq!(path, PathBuf::from("/some/repo/nitpicker.toml"));
-    }
-
-    fn detected_provider(name: &'static str, provider: &'static str) -> detect::Detected {
-        detect::Detected {
-            name,
-            provider,
-            model: format!("{name}-model"),
-            base_url: None,
-            api_key_env: None,
-            auth: None,
-            source: "test",
-            local_server: false,
-        }
-    }
-
-    #[test]
-    fn init_enables_fallback_when_it_can_generate_two_routes() {
-        let first = detected_provider("first", "openai");
-        let second = detected_provider("second", "anthropic");
-        let config = build_init_config(&[&first, &second], false);
-
-        assert_eq!(config.reviewer.len(), 2);
-        assert!(config.default_fallback());
-        assert!(
-            toml::to_string_pretty(&config)
-                .unwrap()
-                .contains("fallback = true")
-        );
-    }
-
-    #[test]
-    fn free_init_generates_two_fallback_routes_from_openrouter() {
-        let openrouter = detected_provider("openrouter", "openrouter");
-        let config = build_init_config(&[&openrouter], true);
-
-        assert_eq!(config.reviewer.len(), 2);
-        assert!(config.reviewer.iter().all(|route| route.model == "free"));
-        assert!(config.default_fallback());
-        assert!(
-            toml::to_string_pretty(&config)
-                .unwrap()
-                .contains("fallback = true")
-        );
-    }
-
-    #[test]
-    fn init_does_not_enable_impossible_single_route_fallback() {
-        let only = detected_provider("only", "openai");
-        let config = build_init_config(&[&only], false);
-
-        assert_eq!(config.reviewer.len(), 1);
-        assert!(!config.default_fallback());
     }
 
     #[test]
@@ -1577,206 +943,5 @@ mod tests {
         let mut snapshot = String::new();
         append_snapshot_file_sections(&mut snapshot, Some(&files), &files);
         assert!(snapshot.len() <= MAX_SNAPSHOT_BYTES);
-    }
-
-    #[test]
-    fn subcommands_without_context_files_reject_the_flag() {
-        for argv in [
-            ["nitpicker", "reflect", "--context-file", "/a"],
-            ["nitpicker", "init", "--context-file", "/a"],
-        ] {
-            assert!(Args::try_parse_from(argv).is_err());
-        }
-    }
-
-    fn pr_presets(args: &Args) -> Vec<String> {
-        match &args.command {
-            Some(Command::Pr(pr_args)) => merged_presets(&args.presets, &pr_args.presets),
-            _ => panic!("expected pr subcommand"),
-        }
-    }
-
-    #[test]
-    fn preset_reaches_pr_from_either_side_of_the_subcommand() {
-        let args = parse(&["nitpicker", "--preset", "security", "pr"]);
-        assert_eq!(pr_presets(&args), ["security"]);
-
-        let args = parse(&["nitpicker", "pr", "--preset", "security"]);
-        assert_eq!(pr_presets(&args), ["security"]);
-    }
-
-    /// Repeated flags append, commas split within one occurrence, and values split around
-    /// the subcommand merge root-first (= command-line order) — same contract as
-    /// `--context-file`, and the reason `--preset` is not a clap `global`.
-    #[test]
-    fn presets_split_around_the_subcommand_merge_in_cli_order_with_commas_expanded() {
-        let args = parse(&[
-            "nitpicker",
-            "--preset",
-            "security,ml-rigor",
-            "pr",
-            "--preset",
-            "tone",
-        ]);
-        assert_eq!(pr_presets(&args), ["security", "ml-rigor", "tone"]);
-    }
-
-    #[test]
-    fn repeated_preset_flags_append_on_the_root_review_path() {
-        let args = parse(&["nitpicker", "--preset", "security", "--preset", "tone"]);
-        assert!(args.command.is_none());
-        assert_eq!(args.presets.preset, ["security", "tone"]);
-    }
-
-    #[test]
-    fn subcommands_without_presets_reject_the_flag() {
-        let cases: [&[&str]; 3] = [
-            &["nitpicker", "ask", "topic", "--preset", "security"],
-            &["nitpicker", "reflect", "--preset", "security"],
-            &["nitpicker", "init", "--preset", "security"],
-        ];
-        for argv in cases {
-            assert!(Args::try_parse_from(argv).is_err(), "argv: {argv:?}");
-        }
-    }
-
-    /// Root-position `--preset` parses before any subcommand, so the non-review arms must
-    /// reject it explicitly instead of silently discarding it.
-    #[test]
-    fn root_position_presets_are_rejected_for_non_review_subcommands() {
-        let cases: [&[&str]; 3] = [
-            &["nitpicker", "--preset", "security", "ask", "topic"],
-            &["nitpicker", "--preset", "security", "init"],
-            &["nitpicker", "--preset", "security", "reflect"],
-        ];
-        for argv in cases {
-            let args = parse(argv);
-            assert!(!presets_allowed(&args.command), "argv: {argv:?}");
-        }
-
-        let args = parse(&["nitpicker", "--preset", "security", "pr"]);
-        assert!(presets_allowed(&args.command));
-        let args = parse(&["nitpicker", "--preset", "security"]);
-        assert!(presets_allowed(&args.command));
-    }
-
-    #[test]
-    fn fallback_is_scoped_to_review_and_ask_commands() {
-        for argv in [
-            &["nitpicker", "--fallback"][..],
-            &["nitpicker", "--fallback", "ask", "topic"][..],
-            &["nitpicker", "pr", "--fallback"][..],
-        ] {
-            let args = parse(argv);
-            assert!(fallback_allowed(&args.command), "argv: {argv:?}");
-        }
-        for argv in [
-            &["nitpicker", "init", "--fallback"][..],
-            &["nitpicker", "reflect", "--fallback"][..],
-        ] {
-            let args = parse(argv);
-            assert!(!fallback_allowed(&args.command), "argv: {argv:?}");
-        }
-    }
-
-    #[test]
-    fn routing_modes_reject_cli_pooling_with_one_reviewer() {
-        let config: config::Config = toml::from_str(
-            r#"
-                [aggregator]
-                model = "m"
-                provider = "openai"
-                auth = "codex"
-
-                [[reviewer]]
-                model = "m"
-                provider = "openai"
-                auth = "codex"
-            "#,
-        )
-        .unwrap();
-
-        let err = resolve_routing_modes(&config, false, true).unwrap_err();
-        assert!(format!("{err:#}").contains("requires at least 2 reviewers"));
-        let err = resolve_routing_modes(&config, true, false).unwrap_err();
-        assert!(format!("{err:#}").contains("--alloy requires at least 2 reviewers"));
-        assert_eq!(
-            resolve_routing_modes(&config, false, false).unwrap(),
-            (false, false)
-        );
-    }
-
-    /// The config file shape for presets: `[presets.<name>]` tables and the
-    /// `[defaults].presets` selection list round-trip through the library's Config.
-    #[test]
-    fn preset_config_tables_parse_and_validate() {
-        let toml_str = r#"
-            [defaults]
-            presets = ["tone", "security"]
-
-            [aggregator]
-            model = "m"
-            provider = "openai"
-            auth = "codex"
-
-            [[reviewer]]
-            name = "r"
-            model = "m"
-            provider = "openai"
-            auth = "codex"
-
-            [presets.tone]
-            prompt = "review the docs for tone"
-        "#;
-        let config: config::Config = toml::from_str(toml_str).expect("parses");
-        config.validate().expect("validates");
-        let defaults = config.defaults.as_ref().expect("defaults present");
-        assert_eq!(
-            defaults.presets.as_deref(),
-            Some(&["tone".to_string(), "security".to_string()][..])
-        );
-        let presets = config.presets.as_ref().expect("presets present");
-        assert_eq!(presets["tone"].prompt, "review the docs for tone");
-    }
-
-    #[test]
-    fn unknown_fields_inside_a_preset_table_are_rejected() {
-        let toml_str = r#"
-            [aggregator]
-            model = "m"
-            provider = "openai"
-            auth = "codex"
-
-            [[reviewer]]
-            model = "m"
-            provider = "openai"
-            auth = "codex"
-
-            [presets.tone]
-            prompt = "p"
-            model = "sneaky-per-preset-model"
-        "#;
-        assert!(toml::from_str::<config::Config>(toml_str).is_err());
-    }
-
-    #[test]
-    fn blank_preset_prompts_fail_validation() {
-        let toml_str = r#"
-            [aggregator]
-            model = "m"
-            provider = "openai"
-            auth = "codex"
-
-            [[reviewer]]
-            model = "m"
-            provider = "openai"
-            auth = "codex"
-
-            [presets.tone]
-            prompt = "   "
-        "#;
-        let config: config::Config = toml::from_str(toml_str).expect("parses");
-        let err = config.validate().expect_err("blank prompt");
-        assert!(format!("{err:#}").contains("[presets.tone].prompt"));
     }
 }
