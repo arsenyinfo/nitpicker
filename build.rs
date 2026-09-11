@@ -25,16 +25,27 @@ fn main() {
     // moves on commit or checkout: HEAD, the branch it points at (a commit on a branch never
     // touches HEAD itself), packed-refs, and the index. Paths are resolved through git so linked
     // worktrees get real files; a missing rerun path would make cargo rerun on every build.
-    for dir in ["Cargo.toml", "Cargo.lock", "build.rs", "src", "prompts", "crates"] {
+    for dir in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "build.rs",
+        "src",
+        "prompts",
+        "crates",
+    ] {
         println!("cargo:rerun-if-changed={manifest_dir}/{dir}");
     }
-    let mut git_paths = vec!["HEAD".to_string(), "packed-refs".to_string(), "index".to_string()];
+    let mut git_paths = vec![
+        "HEAD".to_string(),
+        "packed-refs".to_string(),
+        "index".to_string(),
+    ];
     if let Some(branch_ref) = git_stdout(&manifest_dir, &["symbolic-ref", "-q", "HEAD"]) {
         git_paths.push(branch_ref);
     }
     for git_path in git_paths {
-        let resolved = git_stdout(&manifest_dir, &["rev-parse", "--git-path", &git_path])
-            .map(|path| {
+        let resolved =
+            git_stdout(&manifest_dir, &["rev-parse", "--git-path", &git_path]).map(|path| {
                 let path = PathBuf::from(path);
                 if path.is_absolute() {
                     path

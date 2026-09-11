@@ -399,9 +399,47 @@ pub(crate) fn review_reduce_prompt(
     task: &str,
     combined: &str,
     presets: &[crate::presets::ReviewPreset],
+    coverage: &[crate::output::PresetCoverage],
 ) -> String {
-    let roster = format!("{}\n\n", preset_roster(presets));
+    let gaps = coverage_gaps(coverage, "jobs")
+        .map(|gaps| format!("{gaps}\n\n"))
+        .unwrap_or_default();
+    let roster = format!("{}\n\n{gaps}", preset_roster(presets));
     reduce_prompt(task, combined, "Individual reviews to synthesize", &roster)
+}
+
+/// Execution-coverage gaps for the synthesizer, `None` when every job (or lane) completed.
+/// A failed job's stub is excluded from the synthesis input (execution noise, not evidence)
+/// and an unreviewed preset is dropped from the roster — but silent absence reads as
+/// "reviewed clean", so the gap is stated explicitly instead.
+pub(crate) fn coverage_gaps(
+    coverage: &[crate::output::PresetCoverage],
+    unit: &str,
+) -> Option<String> {
+    let lines: Vec<String> = coverage
+        .iter()
+        .filter(|c| c.succeeded < c.attempted)
+        .map(|c| {
+            let status = match c.succeeded {
+                0 => " (not reviewed)",
+                _ => "",
+            };
+            format!(
+                "- {}: {} of {} {unit} completed{status}",
+                c.preset, c.succeeded, c.attempted
+            )
+        })
+        .collect();
+    match lines.is_empty() {
+        true => None,
+        false => Some(format!(
+            "Execution coverage gaps — a failed {unit_singular} produced no evidence. An angle with \
+             none completed was not reviewed at all and is absent from the roster above: never \
+             describe it as reviewed or clean, and never attribute a finding to it.\n{}",
+            lines.join("\n"),
+            unit_singular = unit.trim_end_matches('s'),
+        )),
+    }
 }
 
 pub(crate) fn ask_reduce_prompt(task: &str, combined: &str) -> String {
@@ -549,13 +587,47 @@ mod tests {
         );
     }
 
+    /// The gap block exists only when a preset lost jobs, and it names the lossy presets —
+    /// a fully covered run must keep the synthesis prompt byte-identical to before.
+    #[test]
+    fn coverage_gaps_appear_only_for_lossy_presets() {
+        let cov = |name: &str, attempted, succeeded| crate::output::PresetCoverage {
+            preset: name.to_string(),
+            attempted,
+            succeeded,
+        };
+        assert_eq!(coverage_gaps(&[cov("angle-a", 2, 2)], "jobs"), None);
+        let gaps = coverage_gaps(
+            &[
+                cov("angle-a", 2, 2),
+                cov("angle-b", 2, 1),
+                cov("angle-c", 1, 0),
+            ],
+            "jobs",
+        )
+        .expect("lossy presets produce a gap block");
+        let lines: Vec<&str> = gaps.lines().filter(|l| l.starts_with("- ")).collect();
+        assert_eq!(
+            lines,
+            [
+                "- angle-b: 1 of 2 jobs completed",
+                "- angle-c: 0 of 1 jobs completed (not reviewed)",
+            ]
+        );
+        let full =
+            review_reduce_prompt("t", "r", &[preset("angle-a", "R")], &[cov("angle-a", 2, 2)]);
+        let lossy =
+            review_reduce_prompt("t", "r", &[preset("angle-a", "R")], &[cov("angle-a", 2, 1)]);
+        assert_ne!(full, lossy);
+    }
+
     #[test]
     fn reduce_prompt_carries_every_active_preset_rubric() {
         let presets = [
             preset("angle-a", "RUBRIC-MARKER-A"),
             preset("angle-b", "RUBRIC-MARKER-B"),
         ];
-        let out = review_reduce_prompt("the task", "the reviews", &presets);
+        let out = review_reduce_prompt("the task", "the reviews", &presets, &[]);
         for needle in [
             "angle-a",
             "RUBRIC-MARKER-A",

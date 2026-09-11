@@ -884,6 +884,8 @@ async fn run_debate_inner(
         return Err(err);
     }
 
+    let coverage = presets.map(|ps| lane_coverage(ps, &lanes));
+
     // meta-review: non-agentic single completion over the surviving lanes' dialogue
     let survivors = surviving(&lanes);
     let meta_prompt = match presets {
@@ -914,9 +916,13 @@ async fn run_debate_inner(
                 })
                 .cloned()
                 .collect();
+            let gaps =
+                crate::prompts::coverage_gaps(coverage.as_deref().unwrap_or_default(), "lanes")
+                    .map(|gaps| format!("{gaps}\n\n"))
+                    .unwrap_or_default();
             format!(
                 "The following are independent review debates about the same target, one per review angle.\n\
-                 Target: {prompt}\n\n{roster}\n\n{sections}\n\n---\n\
+                 Target: {prompt}\n\n{roster}\n\n{gaps}{sections}\n\n---\n\
                  Notes:\n\
                  - \"*Agent failed: …*\" markers are execution errors kept for chronology; they are \
                  not review evidence and not agreement.\n\
@@ -1105,27 +1111,44 @@ async fn run_debate_inner(
         PathBuf::new()
     };
 
+    let report = match &coverage {
+        Some(coverage) => crate::output::with_partial_review_note(
+            meta_text,
+            lanes.iter().filter(|lane| lane.degraded).count(),
+            lanes.len(),
+            "debate lanes",
+            coverage,
+        ),
+        None => meta_text,
+    };
     Ok(DebateOutcome {
-        report: meta_text,
+        report,
         transcript_path,
         usage,
         degraded,
-        coverage: presets.map(|ps| {
-            ps.iter()
-                .map(|p| {
-                    let survived = lanes.iter().any(|lane| {
-                        lane.preset_name.as_deref() == Some(p.name.as_str())
-                            && lane.any_turn_succeeded
-                    });
-                    crate::output::PresetCoverage {
-                        preset: p.name.clone(),
-                        attempted: 1,
-                        succeeded: usize::from(survived),
-                    }
-                })
-                .collect()
-        }),
+        coverage,
     })
+}
+
+/// Per-preset lane coverage: attempted is always 1 (one lane per preset); a lane survived
+/// iff at least one of its turns really ran.
+fn lane_coverage(
+    presets: &[crate::presets::ReviewPreset],
+    lanes: &[DebateLaneOutcome],
+) -> Vec<crate::output::PresetCoverage> {
+    presets
+        .iter()
+        .map(|p| {
+            let survived = lanes.iter().any(|lane| {
+                lane.preset_name.as_deref() == Some(p.name.as_str()) && lane.any_turn_succeeded
+            });
+            crate::output::PresetCoverage {
+                preset: p.name.clone(),
+                attempted: 1,
+                succeeded: usize::from(survived),
+            }
+        })
+        .collect()
 }
 
 /// Trajectory stems for one lane's two sides. Topic keeps the pre-preset stems; preset

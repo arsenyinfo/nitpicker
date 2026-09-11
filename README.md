@@ -255,6 +255,8 @@ nitpicker uses standard exit codes designed for automated pipelines and scripts:
 | `2` | CLI usage error (invalid flags) | Fix CI script |
 | `3` | Degraded verdict (report printed, but a reviewer/turn failed) | Warning / Soft alert |
 
+A degraded preset review also starts with a one-line `⚠️ Partial review` note naming the angles that were not reviewed, so a PR comment reading "No findings" is never mistaken for full coverage.
+
 ### Headless JSON Output
 With `nitpicker pr <url> --json`, nitpicker emits exactly one JSON object on `stdout` with structured findings, token metrics, and coverage data. All progress bars, logs, and diagnostic traces are strictly sent to `stderr`:
 
