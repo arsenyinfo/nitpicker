@@ -290,7 +290,9 @@ impl Tool for ReadFileTool {
                 .to_string();
             let mut output = format!("File: {relative}\nLines: {start}-{end} of {total}\n");
             if swapped {
-                output.push_str("Note: start_line and end_line were given in reverse order and swapped\n");
+                output.push_str(
+                    "Note: start_line and end_line were given in reverse order and swapped\n",
+                );
             }
             output.push('\n');
             for (idx, line) in lines.iter().enumerate() {

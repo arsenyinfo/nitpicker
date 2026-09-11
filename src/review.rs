@@ -608,9 +608,12 @@ async fn run_review_inner(
         .unwrap_or_default();
     let reduce_prompt = match task {
         RunTask::Ask => crate::prompts::ask_reduce_prompt(user_prompt, &combined),
-        RunTask::Review { .. } => {
-            crate::prompts::review_reduce_prompt(user_prompt, &combined, &surviving_presets)
-        }
+        RunTask::Review { .. } => crate::prompts::review_reduce_prompt(
+            user_prompt,
+            &combined,
+            &surviving_presets,
+            coverage.as_deref().unwrap_or_default(),
+        ),
     };
 
     let pb_agg = mp.add(ProgressBar::new_spinner());
@@ -719,8 +722,18 @@ async fn run_review_inner(
             })
             .await?;
     }
+    let report = match &coverage {
+        Some(coverage) => crate::output::with_partial_review_note(
+            text,
+            job_count - success_count,
+            job_count,
+            "review jobs",
+            coverage,
+        ),
+        None => text,
+    };
     Ok(ReviewOutcome {
-        report: text,
+        report,
         usage,
         degraded: success_count < job_count,
         coverage,
@@ -825,8 +838,10 @@ fn plan_jobs(
 
 /// One finished job's contribution to the synthesis input. Successes always render;
 /// failure stubs render only outside preset runs — for Review fan-out an error note is
-/// execution noise, not review evidence (degraded accounting and the logs carry it), while
-/// the Ask path keeps its pre-fan-out stubs byte-for-byte.
+/// execution noise, not review evidence (degraded accounting and the logs carry it; the
+/// synthesizer learns of the gap through `prompts::coverage_gaps`, and the report through
+/// `output::with_partial_review_note`), while the Ask path keeps its pre-fan-out stubs
+/// byte-for-byte.
 fn rendered_section(
     label: &str,
     outcome: std::result::Result<&str, &str>,

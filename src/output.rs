@@ -165,6 +165,34 @@ pub struct PresetCoverage {
     pub succeeded: usize,
 }
 
+/// Prepend a one-line partial-review caveat to a degraded preset report. The synthesis text
+/// is left untouched: an aggregator told to output exactly the no-findings line says so even
+/// when an angle never ran, and `pr` posts the report verbatim, so the caveat comes from the
+/// harness, which knows exactly what failed. `failed == 0` returns the report unchanged.
+pub(crate) fn with_partial_review_note(
+    report: String,
+    failed: usize,
+    total: usize,
+    unit: &str,
+    coverage: &[PresetCoverage],
+) -> String {
+    match failed {
+        0 => report,
+        _ => {
+            let not_reviewed: Vec<&str> = coverage
+                .iter()
+                .filter(|c| c.succeeded == 0)
+                .map(|c| c.preset.as_str())
+                .collect();
+            let gaps = match not_reviewed.is_empty() {
+                true => String::new(),
+                false => format!(" Not reviewed: {}.", not_reviewed.join(", ")),
+            };
+            format!("> ⚠️ Partial review: {failed} of {total} {unit} failed.{gaps}\n\n{report}")
+        }
+    }
+}
+
 /// serialize `value` as one line on stdout, flushed before returning so the envelope has
 /// landed whatever exit path follows.
 pub fn emit_json<T: Serialize>(value: &T) -> Result<()> {
@@ -182,6 +210,54 @@ pub fn write_json<T: Serialize>(out: &mut impl Write, value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn coverage(preset: &str, attempted: usize, succeeded: usize) -> PresetCoverage {
+        PresetCoverage {
+            preset: preset.to_string(),
+            attempted,
+            succeeded,
+        }
+    }
+
+    #[test]
+    fn partial_review_note_is_absent_when_nothing_failed() {
+        let report = "No findings. Great job! 🎉".to_string();
+        assert_eq!(
+            with_partial_review_note(
+                report.clone(),
+                0,
+                4,
+                "review jobs",
+                &[coverage("security", 1, 1)]
+            ),
+            report
+        );
+    }
+
+    #[test]
+    fn partial_review_note_names_unreviewed_presets_only() {
+        let report = "No findings. Great job! 🎉".to_string();
+        let cov = [
+            coverage("correctness", 2, 1),
+            coverage("security", 1, 0),
+            coverage("tone", 1, 0),
+        ];
+        assert_eq!(
+            with_partial_review_note(report.clone(), 3, 4, "review jobs", &cov),
+            "> ⚠️ Partial review: 3 of 4 review jobs failed. Not reviewed: security, tone.\n\n\
+             No findings. Great job! 🎉"
+        );
+        assert_eq!(
+            with_partial_review_note(
+                report,
+                1,
+                4,
+                "debate lanes",
+                &[coverage("correctness", 2, 1)]
+            ),
+            "> ⚠️ Partial review: 1 of 4 debate lanes failed.\n\nNo findings. Great job! 🎉"
+        );
+    }
 
     fn usage_of(input: u64, output: u64, cached: u64, cache_creation: u64) -> TokenUsage {
         TokenUsage {
