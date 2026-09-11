@@ -6,6 +6,14 @@ Notable user-visible changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- A degraded preset review (a job or debate lane failed, no surviving findings) no longer
+  synthesizes and posts a clean `No findings. Great job! 🎉` comment. The synthesizer is told
+  which presets lost jobs or lanes, and the report starts with a one-line
+  `⚠️ Partial review` note naming the angles that were not reviewed. The synthesis text itself,
+  `aggregation.json`, and `ask` runs are unchanged.
+
 ## [0.10.1] - 2026-09-05
 
 `nitpicker-agent` 0.5.4
