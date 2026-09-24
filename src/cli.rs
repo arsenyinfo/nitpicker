@@ -2,10 +2,10 @@ use crate::pr;
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use std::path::PathBuf;
 
-/// Flags shared across the default review mode and the subcommands. Declared once here and
-/// marked `global`, so they are accepted before or after a subcommand and always land in
-/// `Args.common` — per-subcommand copies would be independent namespaces, and a flag parsed
-/// into the copy an arm doesn't read would be silently dropped.
+// Flags shared across the default review mode and the subcommands. Declared once here and
+// marked `global`, so they are accepted before or after a subcommand and always land in
+// `Args.common` — per-subcommand copies would be independent namespaces, and a flag parsed
+// into the copy an arm doesn't read would be silently dropped.
 #[derive(Debug, ClapArgs)]
 pub(crate) struct CommonArgs {
     #[arg(long, global = true, default_value = ".")]
@@ -22,11 +22,11 @@ pub(crate) struct CommonArgs {
     pub(crate) fallback: bool,
 }
 
-/// `--context-file`, kept out of the global `CommonArgs` deliberately: clap propagates a global
-/// arg by keeping one winning occurrence list (the subcommand's), so a repeatable flag split
-/// around the subcommand would silently drop the root's values. Instead this struct is flattened
-/// at the root and into `ask`/`pr`, and the two vectors are concatenated root-first (= the
-/// command-line order) at each use site.
+// `--context-file`, kept out of the global `CommonArgs` deliberately: clap propagates a global
+// arg by keeping one winning occurrence list (the subcommand's), so a repeatable flag split
+// around the subcommand would silently drop the root's values. Instead this struct is flattened
+// at the root and into `ask`/`pr`, and the two vectors are concatenated root-first (= the
+// command-line order) at each use site.
 #[derive(Debug, ClapArgs)]
 pub(crate) struct ContextFileArgs {
     /// Read a file into the prompt verbatim; repeatable. Unlike the agents' own tools, this is not
@@ -43,9 +43,9 @@ pub(crate) fn merged_context_files(root: &ContextFileArgs, sub: &ContextFileArgs
         .collect()
 }
 
-/// `--preset`, shaped exactly like `ContextFileArgs` and for the same reason: a repeatable
-/// flag must not be `global` (clap would keep only the subcommand's occurrence list), so it
-/// is flattened at the root and into `pr`, and merged root-first at each use site.
+// `--preset`, shaped exactly like `ContextFileArgs` and for the same reason: a repeatable
+// flag must not be `global` (clap would keep only the subcommand's occurrence list), so it
+// is flattened at the root and into `pr`, and merged root-first at each use site.
 #[derive(Debug, ClapArgs)]
 pub(crate) struct PresetArgs {
     /// Review preset(s) to run — repeatable and comma-separated (e.g. --preset security,ml-rigor).
