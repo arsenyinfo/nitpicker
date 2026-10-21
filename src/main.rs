@@ -254,7 +254,19 @@ async fn dispatch(args: Args) -> Result<Exit> {
             // config loading happens inside run_pr so its failures honor --format json too
             return pr::run_pr(pr_args, args.common, context_files, preset_names).await;
         }
-        Some(Command::Reflect { sessions_dir, n }) => {
+        Some(Command::Reflect {
+            sessions_dir,
+            n,
+            dump: Some(out_dir),
+        }) => {
+            reflect::dump_sessions(sessions_dir, n, &out_dir)?;
+            return Ok(Exit::Clean);
+        }
+        Some(Command::Reflect {
+            sessions_dir,
+            n,
+            dump: None,
+        }) => {
             let repo = resolve_repo_root(&args.common.repo)?;
             let config =
                 settings::load_resolved_config(args.common.config.as_deref(), &repo).await?;
@@ -450,7 +462,16 @@ pub fn detect_diff_context(repo: &Path) -> Result<String> {
                     "--",
                 ],
             )?;
-            Some((base, base_sha, merge_base, nonempty_lines(&committed)))
+            let numstat = run_git(
+                repo,
+                &["diff", "--numstat", "-M", comparison_base, &head_sha, "--"],
+            )?;
+            Some((
+                base,
+                base_sha,
+                merge_base,
+                with_line_counts(nonempty_lines(&committed), &numstat),
+            ))
         }
         None => None,
     };
@@ -529,6 +550,27 @@ fn nonempty_lines(output: &str) -> Vec<String> {
         .collect()
 }
 
+/// Appends `+added -deleted` to each name-status entry. Both listings come from the same pinned
+/// comparison with identical rename detection, so git emits them in the same order; on any
+/// count mismatch the plain name-status entries are kept rather than risk misattributed counts.
+fn with_line_counts(name_status: Vec<String>, numstat: &str) -> Vec<String> {
+    let counts = nonempty_lines(numstat);
+    match counts.len() == name_status.len() {
+        true => name_status
+            .into_iter()
+            .zip(counts)
+            .map(
+                |(entry, count)| match count.split('\t').collect::<Vec<_>>()[..] {
+                    ["-", "-", ..] => format!("{entry}\tbinary"),
+                    [added, deleted, ..] => format!("{entry}\t+{added} -{deleted}"),
+                    _ => entry,
+                },
+            )
+            .collect(),
+        false => name_status,
+    }
+}
+
 fn render_snapshot_files(files: &[String], budget: usize) -> String {
     if files.is_empty() {
         return "(none)\n".to_string();
@@ -570,7 +612,8 @@ fn append_snapshot_file_sections(
     committed_files: Option<&[String]>,
     working_tree_files: &[String],
 ) {
-    const COMMITTED_HEADING: &str = "\n### Committed changed files (name-status)\n";
+    const COMMITTED_HEADING: &str =
+        "\n### Committed changed files (name-status, +added -deleted lines)\n";
     const WORKING_TREE_HEADING: &str = "\n### Uncommitted changed files (`git status --short`)\n";
     const NO_BASE: &str = "(comparison unavailable: no base detected)\n";
 
@@ -866,7 +909,7 @@ mod tests {
             format!("- Merge base: `{base_sha}`"),
             format!("git diff {base_sha} {head_sha} --"),
             "- Working tree: dirty".to_string(),
-            "- `A\tcommitted.txt`".to_string(),
+            "- `A\tcommitted.txt\t+1 -0`".to_string(),
             "- ` M committed.txt`".to_string(),
             "- `?? untracked.txt`".to_string(),
         ] {
@@ -918,6 +961,16 @@ mod tests {
         assert!(run_git(repo, &["merge-base", "main", "HEAD"]).is_err());
         let context = detect_diff_context(repo).unwrap();
         assert!(context.len() <= MAX_SNAPSHOT_BYTES);
+    }
+
+    #[test]
+    fn line_counts_annotate_in_order_and_fall_back_on_mismatch() {
+        let entries = vec!["M\ta.rs".to_string(), "A\tlogo.png".to_string()];
+        assert_eq!(
+            with_line_counts(entries.clone(), "3\t1\ta.rs\n-\t-\tlogo.png\n"),
+            vec!["M\ta.rs\t+3 -1", "A\tlogo.png\tbinary"]
+        );
+        assert_eq!(with_line_counts(entries.clone(), "3\t1\ta.rs\n"), entries);
     }
 
     #[test]

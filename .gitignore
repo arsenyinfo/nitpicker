@@ -1,6 +1,7 @@
 /target
 .env
-.claude/
+.claude/*
+!.claude/workflows/
 .nitpicker-sessions/
 sessions/   # for debugging 3rd party sessions
 nitpicker.toml

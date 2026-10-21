@@ -141,6 +141,10 @@ pub(crate) enum Command {
         /// Number of most recent sessions to analyze
         #[arg(long, default_value = "20")]
         n: usize,
+        /// Write formatted session dossiers to this directory and print their paths, skipping
+        /// the LLM stages (no config needed)
+        #[arg(long, value_name = "DIR")]
+        dump: Option<PathBuf>,
     },
 }
 

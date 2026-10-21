@@ -19,59 +19,9 @@ const MAX_FORMATTED_SESSION_BYTES: usize = 200_000;
 const MAX_STAGED_VERDICTS_BYTES: usize = 40_000;
 const MAX_TOOL_TRACE_BYTES: usize = 120_000;
 
-const MAP_PROMPT: &str = "\
-You are analyzing one recorded nitpicker session. The input contains deterministic metrics,
-staged verdicts, the final outcome, and the tool trace.
+const MAP_PROMPT: &str = include_str!("../prompts/reflect/map.md");
 
-Assess whether the execution produced a useful outcome and identify avoidable friction in agent
-behavior, tool usage, delegation, or coordination. Repetition is not automatically waste:
-independent reviewers may intentionally verify the same evidence. Distinguish useful replication
-from redundant rediscovery, and distinguish observations from hypotheses.
-
-For every claimed friction point include:
-- Evidence: cite concrete records as `[agent turn N: tool]` and relevant deterministic counts.
-- Outcome effect: explain whether it affected correctness, convergence, cost, or only presentation.
-- Confidence: high, medium, or low.
-- Smallest experiment: the least invasive change that could test the hypothesis.
-
-Do not infer a code-level root cause from the trace alone; the cross-session synthesizer can inspect
-the implementation. Ignore provider outages, rate limits, and timeouts except when agent behavior
-made them worse. Do not use words such as dominant, systemic, nearly all, or widespread in this
-single-session report. Include a short `No material friction observed` conclusion when warranted.
-Keep the report under 700 words.
----
-";
-
-const REDUCE_PROMPT: &str = "\
-You are synthesizing evidence from multiple recorded nitpicker sessions. The user will use this
-report to decide what to change, so calibration matters more than producing many recommendations.
-
-Use repository tools to verify proposed code-level causes against the current implementation.
-Do not convert repeated behavior into an architectural prescription without considering deliberate
-reviewer independence, cache behavior, context cost, and false-negative risk. Prefer the smallest
-reversible experiment over a broad redesign.
-
-Output these sections:
-
-## Overall synthesis
-A short, calibrated assessment.
-
-## Measured patterns
-A table with Pattern, Support (exact `N/M sessions`), Representative evidence (session names plus
-agent/tool references), Outcome effect, and Confidence. Never say dominant, systemic, nearly all,
-or widespread without the corresponding count. Do not combine unlike observations to inflate N.
-
-## Recommended experiments
-For each recommendation give: observed behavior and support; current-code cause (`Verified` with
-paths/symbols, or `Unverified`); smallest change; tradeoff or regression risk; and a metric that
-would show whether it helped. Rank by evidence strength and expected value.
-
-Infrastructure failures are out of scope unless nitpicker behavior amplified them. Separate
-correctness problems from token/latency inefficiency and editorial friction. Be concise.
-Use uncertain or rejected hypotheses only to calibrate the synthesis internally. Do not print them
-or recommendations that lack enough support to act on.
----
-";
+const REDUCE_PROMPT: &str = include_str!("../prompts/reflect/reduce.md");
 
 struct SessionData {
     name: String,
@@ -247,7 +197,12 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..floor_char_boundary(s, max)])
+        let cut = floor_char_boundary(s, max);
+        format!(
+            "{}… [reflect-truncated: {cut} of {} bytes]",
+            &s[..cut],
+            s.len()
+        )
     }
 }
 
@@ -707,8 +662,8 @@ pub struct ReflectArgs {
     pub config: Config,
 }
 
-pub async fn run_reflect(args: ReflectArgs) -> Result<()> {
-    let dir = match args.sessions_dir {
+fn load_recent_sessions(sessions_dir: Option<PathBuf>, n: usize) -> Result<Vec<SessionData>> {
+    let dir = match sessions_dir {
         Some(d) => d,
         None => {
             let home =
@@ -716,7 +671,7 @@ pub async fn run_reflect(args: ReflectArgs) -> Result<()> {
             home.join(".nitpicker").join("sessions")
         }
     };
-    let session_paths: Vec<PathBuf> = discover_sessions(&dir, args.n)?;
+    let session_paths: Vec<PathBuf> = discover_sessions(&dir, n)?;
 
     if session_paths.is_empty() {
         eyre::bail!("no sessions found");
@@ -745,6 +700,24 @@ pub async fn run_reflect(args: ReflectArgs) -> Result<()> {
         sessions.len(),
         sessions.len() - complete
     );
+    Ok(sessions)
+}
+
+/// Writes each session's formatted dossier to `<out_dir>/<session>.md` and prints the paths, one
+/// per line, so external orchestrators can run the LLM stages over the same deterministic input.
+pub fn dump_sessions(sessions_dir: Option<PathBuf>, n: usize, out_dir: &Path) -> Result<()> {
+    let sessions = load_recent_sessions(sessions_dir, n)?;
+    std::fs::create_dir_all(out_dir)?;
+    for session in &sessions {
+        let path = out_dir.join(format!("{}.md", session.name));
+        std::fs::write(&path, format_session(session))?;
+        println!("{}", path.display());
+    }
+    Ok(())
+}
+
+pub async fn run_reflect(args: ReflectArgs) -> Result<()> {
+    let sessions = load_recent_sessions(args.sessions_dir, args.n)?;
 
     let cfg = &args.config;
 

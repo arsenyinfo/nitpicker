@@ -909,7 +909,7 @@ impl Tool for SpawnSubagentTool {
                 "properties": {
                     "task": {
                         "type": "string",
-                        "description": "A compact self-contained task. The subagent starts from an empty conversation: it sees none of your messages, plan labels, prior tool results, or the original question and review snapshot. Restate verbatim the revision ids, paths, and claims it needs."
+                        "description": "A compact self-contained task. The subagent starts from an empty conversation: it sees none of your messages, plan labels, prior tool results, or the original question and review snapshot. Restate verbatim the revision ids, paths, claims, and any proposal, plan, or option text it needs."
                     }
                 },
                 "required": ["task"],
