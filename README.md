@@ -108,6 +108,9 @@ nitpicker --analyze src/auth/                # audit a specific directory
 nitpicker --analyze                          # audit the entire repository
 ```
 
+### 5. Second Opinion from Your Coding Agent
+The [`second-opinion`](https://github.com/arsenyinfo/skills/tree/main/skills/second-opinion) skill lets Claude Code (and other skill-aware agents) hand a diff, PR, plan, or contested claim to nitpicker for an independent review. If nitpicker isn't installed, it falls back to codex or opencode.
+
 ---
 
 ## Review Lenses (Presets)
@@ -303,7 +306,10 @@ Analyze past review sessions to diagnose recurring false positives, agent fricti
 
 nitpicker reflect          # inspect recent sessions
 nitpicker reflect --n 10   # inspect last 10 runs
+nitpicker reflect --dump out/   # write formatted session dossiers only, no LLM calls
 ```
+
+From Claude Code, the `reflect` workflow (`.claude/workflows/reflect.js`) runs the same pipeline on a Claude subscription: it builds dossiers with `--dump`, analyzes each session, and then writes a synthesis that has been checked against the repo. It reads the same `prompts/reflect/` instructions as the CLI.
 
 ### Rust Library (`nitpicker-agent`)
 The underlying agentic loop and file/git tools are published as a standalone crate [`nitpicker-agent`](crates/nitpicker-agent):

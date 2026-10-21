@@ -162,7 +162,8 @@ overflow; Ask/Topic failures propagate untouched.
 
 0. Diff review entrypoints call `detect_diff_context` once before fan-out. It resolves full HEAD,
    base, and merge-base object ids; records the exact two-endpoint committed comparison; and embeds
-   bounded committed `git diff --name-status -M` plus working-tree `git status --short` maps (the
+   bounded committed `git diff --name-status -M` (each entry annotated with `--numstat` `+added -deleted`
+   line counts, or `binary`; dropped if the two listings disagree) plus working-tree `git status --short` maps (the
    latter includes untracked files). The resulting frozen orientation is part of the user topic, so
    parallel jobs and every later debate turn receive identical revisions and paths without an
    LLM-generated summary. Agents still inspect hunks and code normally. Static `--analyze` and
@@ -198,7 +199,7 @@ overflow; Ask/Topic failures propagate untouched.
 - Review prompts encourage a quick local map, a short working plan, and fanning out **all** disjoint threads as one broad parallel wave of subagents, re-spawning only when a finding demands a follow-up (each extra serial wave adds wall-clock latency)
 - Within a single turn, all tool calls run **concurrently** (`join_all`): a wave of `spawn_subagent` calls overlaps instead of running one-at-a-time, so subagent breadth no longer scales wall-clock. The turn is processed in three phases — ordered cycle/terminal bookkeeping (no awaits), concurrent execution, then results folded back in original index order (provider requires tool-result ordering)
 - Concurrent in-flight LLM calls are bounded by a shared `llm_semaphore` (`MAX_CONCURRENT_LLM_CALLS`, default 16), acquired only around each `completion()` call — never held across a subagent spawn, so a blocking acquire bounds account-wide provider concurrency without deadlock. One per run in both `review.rs` (all jobs + subagents) and `debate.rs` (all lanes + subagents — hoisted out of the per-turn scope when lanes became concurrent)
-- Reviewers can delegate deeper investigations via `spawn_subagent`. A subagent starts from an empty conversation — system prompt, project context, and the `task` string only, no topic, snapshot, or parent tool results — so the `task` schema says so and tells the parent to restate revision ids, paths, and claims verbatim; `subagent.md` tells depth-1 subagents to do the work themselves rather than re-delegating
+- Reviewers can delegate deeper investigations via `spawn_subagent`. A subagent starts from an empty conversation — system prompt, project context, and the `task` string only, no topic, snapshot, or parent tool results — so the `task` schema says so and tells the parent to restate revision ids, paths, claims, and any proposal/plan/option text verbatim; `subagent.md` tells depth-1 subagents to do the work themselves rather than re-delegating
 - Subagent depth is capped at 2 to bound recursion and cost
 - Subagents never inherit the parent's terminal tools (e.g. debate's `submit_verdict`, which writes into parent-owned verdict state and could falsely converge a debate) — they terminate via their own per-run `finish` tool
 - Project context (`CLAUDE.md`/`AGENTS.md`) is appended to the system prompt wrapped in a `<context-only>` tag that marks it as repository-authored reference material, not instructions — it is target-controlled content in `pr` mode
@@ -318,6 +319,10 @@ path surfaces after the clone/checkout but still before the first model call.
    sessions, verified/unverified code causes, regression risks, and measurable experiments; weak
    hypotheses calibrate the synthesis internally and are omitted from the user-facing report
 6. Print the report only. `reflect` does not copy formatted traces into a shared temp directory
+7. `reflect --dump <dir>` stops after step 3: it writes each session's formatted dossier to
+   `<dir>/<session>.md`, prints the paths, and needs no config. `.claude/workflows/reflect.js` runs
+   the map/reduce stages on top of it inside Claude Code, reading the same `prompts/reflect/{map,reduce}.md`
+   that `reflect.rs` `include_str!`s, so the CLI and the workflow share one prompt source
 
 ### LLM abstraction (`llm.rs`)
 
