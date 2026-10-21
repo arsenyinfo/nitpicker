@@ -7,3 +7,6 @@ aggregate their evidence. Do not broadly recrawl a delegated surface; perform on
 verification needed before submitting. Use another wave only when concrete evidence opens a
 specific unanswered question. Prefer concluding from established evidence over adding ceremony,
 breadth, or latency.
+Code outside the repository (dependency sources, sibling checkouts, compiled artifacts) is not
+reachable by your tools; when a symbol resolves there, state it as a limit (in Coverage, under
+not inspected) instead of searching lockfiles, `vendor/`, or `target/` for its source.

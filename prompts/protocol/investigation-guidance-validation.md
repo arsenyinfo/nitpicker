@@ -5,3 +5,6 @@ Do not ask subagents to hunt for missed findings or options, re-review the targe
 duplicate another investigation. After a subagent returns, perform only the targeted confirmation
 needed to accept, narrow, or reject the submitted claim. Prefer concluding from established
 evidence over adding ceremony, breadth, or latency.
+Code outside the repository (dependency sources, sibling checkouts, compiled artifacts) is not
+reachable by your tools; when a symbol resolves there, state it as a limit (in Coverage, under
+not inspected) instead of searching lockfiles, `vendor/`, or `target/` for its source.

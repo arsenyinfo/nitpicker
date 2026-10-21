@@ -16,6 +16,8 @@ Do not infer a code-level root cause from the trace alone; the cross-session syn
 the implementation. Ignore provider outages, rate limits, and timeouts except when agent behavior
 made them worse. Do not use words such as dominant, systemic, nearly all, or widespread in this
 single-session report. Include a short `No material friction observed` conclusion when warranted.
+The opening reviewer/actor always submits `agree=false` by contract; only the validator/critic's
+`agree` ends a lane, so never report the opening `agree=false` as friction or an open question.
 `[reflect-truncated: …]` and `… middle omitted …` markers are cuts made when rendering this
 input, not agent behavior; never report them as friction.
 Keep the report under 700 words.
