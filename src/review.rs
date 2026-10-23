@@ -1,23 +1,23 @@
 use crate::output::{OutputFormat, PresetCoverage, UsageReport};
 use crate::prompts::RunTask;
+use crate::routing::{
+    aggregator_client, build_reviewer_pool, independent_agent_client, reviewer_client,
+    reviewer_pool_compact_threshold,
+};
 use crate::telemetry::{self, RunMode};
 use eyre::Result;
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle};
 use nitpicker_agent::agent::{
     AgentConfig, AgentDepth, AgentProgress, AgentResult, MAX_CONCURRENT_LLM_CALLS,
     add_spawn_subagent_tool, run_agent,
 };
 use nitpicker_agent::config::{Config, ReviewerConfig};
-use nitpicker_agent::llm::{
-    AlloyClient, AlloySlot, Completion, CompletionResponse, FallbackSlot, FinishReason,
-    LLMClientDyn, PriorityClient, throttled_completion,
-};
-use nitpicker_agent::provider::{build_aggregator_client, build_reviewer_client};
+use nitpicker_agent::llm::Completion;
 use nitpicker_agent::session::{
-    AggregationRecord, JobRecord, SessionLogger, VerdictRecord, sanitize_path_component,
+    AggregationRecord, JobRecord, VerdictRecord, sanitize_path_component,
 };
 use nitpicker_agent::telemetry::bounded;
-use nitpicker_agent::tools::{all_tools, floor_char_boundary};
+use nitpicker_agent::tools::all_tools;
 use rig_core::completion::Message;
 use std::path::Path;
 use std::sync::Arc;
@@ -40,220 +40,6 @@ pub struct ReviewOutcome {
     pub degraded: bool,
     /// Per-preset attempted/succeeded job counts in resolution order. `None` on the Ask path.
     pub coverage: Option<Vec<PresetCoverage>>,
-}
-
-pub(crate) type ReviewerClientPool = Vec<std::result::Result<FallbackSlot, String>>;
-
-pub(crate) fn build_reviewer_pool(
-    config: &Config,
-    gemini_proxy: &crate::proxy::GeminiProxy,
-    proxy_url: Option<&str>,
-) -> ReviewerClientPool {
-    config
-        .reviewer
-        .iter()
-        .map(|reviewer| {
-            if nitpicker_agent::openrouter::is_unresolved_free_route(
-                &reviewer.provider,
-                &reviewer.model,
-            ) {
-                return Err("experimental OpenRouter free route could not be resolved".to_string());
-            }
-            gemini_proxy
-                .annotate(build_reviewer_client(reviewer, proxy_url))
-                .map(|client| {
-                    FallbackSlot::new(client, reviewer.model.clone(), reviewer.max_tokens)
-                })
-                .map_err(|err| format!("{err:#}"))
-        })
-        .collect()
-}
-
-/// A fallback/alloy agent may run on any healthy reviewer route, while compaction happens before
-/// route selection. Use the smallest configured threshold that any usable route needs.
-pub(crate) fn reviewer_pool_compact_threshold(
-    config: &Config,
-    pool: &[std::result::Result<FallbackSlot, String>],
-) -> Option<u64> {
-    config
-        .reviewer
-        .iter()
-        .zip(pool)
-        .filter(|(_, route)| route.is_ok())
-        .filter_map(|(reviewer, _)| config.reviewer_compact_threshold(reviewer))
-        .min()
-}
-
-/// Resolve one logical reviewer to either its own client or an ordered priority ring. The ring
-/// starts at that reviewer and wraps through the declaration order, so every role keeps its normal
-/// primary while sharing the same simple fallback policy.
-pub(crate) fn reviewer_client(
-    pool: &ReviewerClientPool,
-    primary_index: usize,
-    fallback: bool,
-) -> Result<Arc<dyn nitpicker_agent::llm::LLMClientDyn>> {
-    reviewer_client_with_deferred_route(pool, primary_index, None, fallback)
-}
-
-/// Give an independently progressing agent its own mutable routing state. Priority clients fork
-/// their sticky index while retaining the shared route availability carried by `FallbackSlot`;
-/// stateless provider and Alloy clients are safe to share directly.
-pub(crate) fn independent_agent_client(template: &Arc<dyn LLMClientDyn>) -> Arc<dyn LLMClientDyn> {
-    template
-        .fork_for_agent()
-        .unwrap_or_else(|| Arc::clone(template))
-}
-
-/// Build one side of a debate while preserving model diversity for as long as possible. The
-/// counterpart's configured primary is still a valid last resort, but spare reviewers are tried
-/// first so one failed side does not immediately collapse both roles onto the same model.
-pub(crate) fn debate_reviewer_client(
-    pool: &ReviewerClientPool,
-    primary_index: usize,
-    counterpart_primary_index: usize,
-) -> Result<Arc<dyn nitpicker_agent::llm::LLMClientDyn>> {
-    reviewer_client_with_deferred_route(pool, primary_index, Some(counterpart_primary_index), true)
-}
-
-fn reviewer_client_with_deferred_route(
-    pool: &ReviewerClientPool,
-    primary_index: usize,
-    deferred_index: Option<usize>,
-    fallback: bool,
-) -> Result<Arc<dyn nitpicker_agent::llm::LLMClientDyn>> {
-    if !fallback {
-        return match &pool[primary_index] {
-            Ok(slot) => Ok(slot.client()),
-            Err(message) => Err(eyre::eyre!(message.clone())),
-        };
-    }
-
-    let mut slots = Vec::with_capacity(pool.len());
-    let mut build_errors = Vec::new();
-    for index in reviewer_route_order(pool.len(), primary_index, deferred_index) {
-        match &pool[index] {
-            Ok(slot) => slots.push(slot.clone()),
-            Err(message) => {
-                warn!(
-                    reviewer_index = index,
-                    error = %message,
-                    "reviewer route unavailable; trying next configured reviewer"
-                );
-                build_errors.push(message.as_str());
-            }
-        }
-    }
-    if slots.is_empty() {
-        eyre::bail!(
-            "no reviewer client could be built: {}",
-            build_errors.join("; ")
-        );
-    }
-    Ok(Arc::new(PriorityClient::new(slots)?))
-}
-
-fn reviewer_route_order(
-    reviewer_count: usize,
-    primary_index: usize,
-    deferred_index: Option<usize>,
-) -> Vec<usize> {
-    let mut order = (0..reviewer_count)
-        .map(|offset| (primary_index + offset) % reviewer_count)
-        .collect::<Vec<_>>();
-    if let Some(deferred_index) = deferred_index
-        && deferred_index != primary_index
-        && let Some(position) = order.iter().position(|&index| index == deferred_index)
-    {
-        order.remove(position);
-        order.push(deferred_index);
-    }
-    order
-}
-
-pub(crate) fn alloy_client(
-    pool: &ReviewerClientPool,
-    fallback: bool,
-) -> Result<Arc<dyn nitpicker_agent::llm::LLMClientDyn>> {
-    let mut slots = Vec::with_capacity(pool.len());
-    for route in pool {
-        match route {
-            Ok(slot) => slots.push(slot.clone()),
-            Err(message) if fallback => {
-                warn!(error = %message, "alloy route unavailable; continuing with healthy reviewers")
-            }
-            Err(message) => return Err(eyre::eyre!(message.clone())),
-        }
-    }
-    let client = match fallback {
-        true => AlloyClient::new_with_fallback_routes(slots)?,
-        false => AlloyClient::new(slots.iter().map(AlloySlot::from).collect())?,
-    };
-    Ok(Arc::new(client))
-}
-
-pub(crate) fn aggregator_client(
-    config: &Config,
-    gemini_proxy: &crate::proxy::GeminiProxy,
-    proxy_url: Option<&str>,
-    reviewer_pool: &ReviewerClientPool,
-    fallback: bool,
-) -> Result<Arc<dyn nitpicker_agent::llm::LLMClientDyn>> {
-    let primary = if nitpicker_agent::openrouter::is_unresolved_free_route(
-        &config.aggregator.provider,
-        &config.aggregator.model,
-    ) {
-        Err(eyre::eyre!(
-            "experimental OpenRouter free aggregator could not be resolved"
-        ))
-    } else {
-        gemini_proxy.annotate(build_aggregator_client(&config.aggregator, proxy_url))
-    };
-    if !fallback {
-        return primary;
-    }
-
-    let mut slots = Vec::with_capacity(1 + reviewer_pool.len());
-    match primary {
-        Ok(client) => slots.push(FallbackSlot::new(
-            client,
-            config.aggregator.model.clone(),
-            Some(config.aggregator_max_tokens()),
-        )),
-        Err(err) => warn!(error = %err, "aggregator route unavailable; trying reviewer pool"),
-    }
-    for route in reviewer_pool {
-        match route {
-            Ok(slot) => slots.push(slot.clone()),
-            Err(message) => warn!(
-                error = %message,
-                "reviewer route unavailable for aggregator fallback"
-            ),
-        }
-    }
-    if slots.is_empty() {
-        eyre::bail!("no aggregator or reviewer fallback client could be built");
-    }
-    Ok(Arc::new(PriorityClient::new(slots)?))
-}
-
-pub(crate) fn validate_synthesis_response(response: &CompletionResponse, role: &str) -> Result<()> {
-    match &response.finish_reason {
-        FinishReason::ToolUse => eyre::bail!("{role} returned tool calls unexpectedly"),
-        FinishReason::MaxTokens => {
-            let model = response.selected_model.as_deref().unwrap_or("unknown");
-            eyre::bail!(
-                "{role} model '{model}' reached its output token limit and returned a truncated verdict"
-            )
-        }
-        FinishReason::None | FinishReason::Stop | FinishReason::Other(_) => Ok(()),
-    }
-}
-
-pub(crate) fn synthesis_model(response: &CompletionResponse, configured_model: &str) -> String {
-    response
-        .selected_model
-        .clone()
-        .unwrap_or_else(|| configured_model.to_string())
 }
 
 /// Mirrors `DebateOptions`: the trailing run-control params bundled so `run_review` stays
@@ -294,20 +80,12 @@ async fn run_review_inner(
         fallback,
         format,
     } = opts;
-    let session_attribution = crate::prompts::session_attribution();
     let _terminal_title = crate::progress::start_terminal_title(repo, format);
     let presets = task.presets();
     let lanes = task.lanes();
     let mut tools = all_tools();
     add_spawn_subagent_tool(&mut tools);
-    let session_logger = SessionLogger::maybe_new(config.log_trajectories())?;
-    if let Some(logger) = &session_logger {
-        info!(path = %logger.root().display(), "trajectory logging enabled");
-        tracing::Span::current().record("nitpicker.session.id", logger.id());
-        if let Err(err) = logger.write_attribution(&session_attribution).await {
-            warn!(error = ?err, "failed to persist session attribution");
-        }
-    }
+    let session_logger = crate::run::open_session(config).await?;
     let context = crate::context::build_context(repo).await;
     let initial_message = task.initial_message(user_prompt);
     let reviewer_names: Vec<&str> = config.reviewer.iter().map(|r| r.name.as_str()).collect();
@@ -327,12 +105,7 @@ async fn run_review_inner(
     };
     let llm_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_LLM_CALLS));
 
-    let mp = Arc::new(MultiProgress::new());
-    if verbose {
-        mp.set_draw_target(ProgressDrawTarget::hidden());
-    }
-    let _progress_guard = (!verbose && crate::progress::stderr_is_terminal())
-        .then(|| crate::progress::set_active_progress(&mp));
+    let (mp, _progress_guard) = crate::run::progress_display(verbose);
     let prefix_width = jobs
         .iter()
         .map(|job| job.label.chars().count())
@@ -498,68 +271,30 @@ async fn run_review_inner(
     }
 
     let job_count = handles.len();
-    let preset_run = presets.is_some();
-    let mut usage = UsageReport::default();
-    let mut rendered = Vec::new();
-    let mut success_count = 0usize;
-    let mut surviving_preset_indices = std::collections::HashSet::new();
-    let mut job_records: Vec<JobRecord> = Vec::new();
-    let mut verdict_records: Vec<VerdictRecord> = Vec::new();
-    for (label, preset_index, handle) in handles {
-        let preset_name = match (presets, preset_index) {
-            (Some(ps), Some(j)) => Some(ps[j].name.clone()),
-            _ => None,
-        };
-        let ok = match handle.await {
-            Ok(Ok(result)) => {
-                usage.add(result.usage, result.subagents_spawned);
-                rendered.extend(rendered_section(&label, Ok(&result.text), preset_run));
-                verdict_records.push(VerdictRecord {
-                    lens: preset_name.clone(),
-                    stage: label.clone(),
-                    text: result.text,
-                    ok: true,
-                });
-                success_count += 1;
-                if let Some(j) = preset_index {
-                    surviving_preset_indices.insert(j);
-                }
-                info!(job = %label, "review completed");
-                true
-            }
-            Ok(Err(err)) => {
-                let stub = format!("*Failed: {err:#}*");
-                rendered.extend(rendered_section(&label, Err(&stub), preset_run));
-                verdict_records.push(VerdictRecord {
-                    lens: preset_name.clone(),
-                    stage: label.clone(),
-                    text: stub,
-                    ok: false,
-                });
-                warn!(job = %label, error = ?err, "review failed");
-                false
-            }
-            Err(err) => {
-                let stub = format!("*Failed (task panicked): {err:#}*");
-                rendered.extend(rendered_section(&label, Err(&stub), preset_run));
-                verdict_records.push(VerdictRecord {
-                    lens: preset_name.clone(),
-                    stage: label.clone(),
-                    text: stub,
-                    ok: false,
-                });
-                error!(job = %label, error = ?err, "review task panicked");
-                false
-            }
-        };
-        job_records.push(JobRecord {
-            label,
-            preset: preset_name,
-            ok,
-        });
-    }
-
+    let CollectedJobs {
+        mut usage,
+        rendered,
+        job_records,
+        verdict_records,
+    } = collect_jobs(handles, presets).await;
+    let success_count = job_records.iter().filter(|job| job.ok).count();
     let coverage = presets.map(|ps| preset_coverage(ps, &job_records));
+
+    let record = crate::run::RunRecord {
+        logger: session_logger.as_ref(),
+        base: AggregationRecord {
+            kind: "aggregation".to_string(),
+            model: config.aggregator.model.clone(),
+            text: String::new(),
+            error: None,
+            rounds: None,
+            converged: None,
+            presets: presets.map(|ps| ps.iter().map(|p| p.name.clone()).collect()),
+            lanes: None,
+            verdicts: verdict_records,
+            jobs: Some(job_records),
+        },
+    };
 
     // Refuse to synthesize a verdict out of nothing but failures: the aggregator would hallucinate
     // a confident review from error notes, and `pr` would post it. A total failure is an error, not
@@ -569,52 +304,22 @@ async fn run_review_inner(
     if success_count == 0 {
         let err =
             eyre::eyre!("all {job_count} review job(s) failed; refusing to synthesize a verdict");
-        if let Some(logger) = &session_logger {
-            let record = AggregationRecord {
-                kind: "aggregation".to_string(),
-                model: config.aggregator.model.clone(),
-                text: String::new(),
-                error: Some(bounded_error_string(&err)),
-                rounds: None,
-                converged: None,
-                presets: presets.map(|ps| ps.iter().map(|p| p.name.clone()).collect()),
-                lanes: None,
-                verdicts: verdict_records,
-                jobs: Some(job_records),
-            };
-            match logger.write_aggregation(&record).await {
-                Ok(()) => {}
-                Err(write_err) => {
-                    warn!(error = ?write_err, "failed to persist all-jobs-failed record");
-                }
-            }
-        }
+        record.persist_failure(&err, "all-jobs-failed").await;
         return Err(err);
     }
 
-    let combined = rendered.join("\n\n---\n\n");
     // The synthesis roster covers only presets with at least one surviving job — a rubric
     // with no matching report would read as an angle that was reviewed and found clean.
     // (The session record and `pr --json` keep the FULL resolved list: they document the
     // run's resolution, not its coverage.)
-    let surviving_presets: Vec<crate::presets::ReviewPreset> = presets
-        .map(|ps| {
-            ps.iter()
-                .enumerate()
-                .filter(|(j, _)| surviving_preset_indices.contains(j))
-                .map(|(_, p)| p.clone())
-                .collect()
-        })
-        .unwrap_or_default();
-    let reduce_prompt = match task {
-        RunTask::Ask => crate::prompts::ask_reduce_prompt(user_prompt, &combined),
-        RunTask::Review { .. } => crate::prompts::review_reduce_prompt(
-            user_prompt,
-            &combined,
-            &surviving_presets,
-            coverage.as_deref().unwrap_or_default(),
-        ),
-    };
+    let surviving_presets = surviving_presets(presets, coverage.as_deref());
+    let reduce_prompt = reduce_prompt(
+        task,
+        user_prompt,
+        &rendered,
+        &surviving_presets,
+        coverage.as_deref(),
+    );
 
     let pb_agg = mp.add(ProgressBar::new_spinner());
     pb_agg.set_style(spinner_style);
@@ -622,106 +327,43 @@ async fn run_review_inner(
     pb_agg.set_message(crate::progress::bar_message("synthesizing…"));
     pb_agg.enable_steady_tick(Duration::from_millis(80));
 
-    let agg = &config.aggregator;
-    let synthesis_span = telemetry::synthesis_span(&agg.model);
-    let synthesis: Result<(String, String)> = async {
-        let client = aggregator_client(
-            config,
-            &gemini_proxy,
-            proxy_url.as_deref(),
-            &reviewer_clients,
-            fallback,
-        )?;
-        let completion = Completion {
-            model: agg.model.clone(),
-            prompt: Message::user(reduce_prompt),
-            preamble: Some(task.aggregator_preamble()),
-            history: Vec::new(),
-            tools: Vec::new(),
-            tool_choice: None,
-            max_tokens: Some(config.aggregator_max_tokens()),
-            additional_params: None,
-        };
-        // preset runs get the count/context wrapping; the Ask path propagates the provider
-        // error untouched, as it did before the fan-out
-        // every job has finished, so the permit is free; routing through the chokepoint keeps
-        // "every completion is a chat span" true for the synthesis too
-        let response = throttled_completion(&llm_semaphore, &client, completion)
-            .await
-            .and_then(|response| {
-                validate_synthesis_response(&response, "aggregator")?;
-                Ok(response)
-            })
-            .map_err(|err| match presets {
-                Some(presets) => crate::presets::synthesis_failure(
-                    err,
-                    format!(
-                        "final aggregation failed over {success_count} surviving review job(s) across {} preset(s)",
-                        presets.len()
-                    ),
-                ),
-                None => err,
-            })?;
-        usage.add(response.usage, 0);
-        let model = synthesis_model(&response, &agg.model);
-        Ok((response.text(), model))
-    }
-    .instrument(synthesis_span.clone())
-    .await;
-    if synthesis.is_err() {
-        synthesis_span.record("otel.status_code", "ERROR");
-    }
-    pb_agg.set_style(done_style);
-    // A post-collection synthesis failure still persists the per-job outcomes: the jobs
-    // list is the durable record of what ran, and losing it because the aggregator died
-    // is exactly when a post-mortem needs it. The record carries `error` and an empty
-    // `text` so consumers (reflect) don't render it as a verdict.
-    let (text, aggregation_model) = match synthesis {
-        Ok(result) => {
-            pb_agg.finish_with_message("✓ done");
-            result
-        }
-        Err(err) => {
-            pb_agg.finish_with_message(crate::progress::bar_message("✗ synthesis failed"));
-            if let Some(logger) = &session_logger {
-                let record = AggregationRecord {
-                    kind: "aggregation".to_string(),
-                    model: agg.model.clone(),
-                    text: String::new(),
-                    error: Some(bounded_error_string(&err)),
-                    rounds: None,
-                    converged: None,
-                    presets: presets.map(|ps| ps.iter().map(|p| p.name.clone()).collect()),
-                    lanes: None,
-                    verdicts: verdict_records,
-                    jobs: Some(job_records),
-                };
-                match logger.write_aggregation(&record).await {
-                    Ok(()) => {}
-                    Err(write_err) => {
-                        warn!(error = ?write_err, "failed to persist synthesis-failure record");
-                    }
-                }
-            }
-            return Err(err);
-        }
-    };
-    if let Some(logger) = &session_logger {
-        logger
-            .write_aggregation(&AggregationRecord {
-                kind: "aggregation".to_string(),
-                model: aggregation_model,
-                text: text.clone(),
-                error: None,
-                rounds: None,
-                converged: None,
-                presets: presets.map(|ps| ps.iter().map(|p| p.name.clone()).collect()),
-                lanes: None,
-                verdicts: verdict_records,
-                jobs: Some(job_records),
-            })
-            .await?;
-    }
+    let synthesis = crate::run::synthesize(
+        crate::run::Synthesis {
+            // built only now, after every job: a build failure is reported (and recorded) as the
+            // synthesis failure, unwrapped
+            client: aggregator_client(
+                config,
+                &gemini_proxy,
+                proxy_url.as_deref(),
+                &reviewer_clients,
+                fallback,
+            ),
+            completion: Completion {
+                model: config.aggregator.model.clone(),
+                prompt: Message::user(reduce_prompt),
+                preamble: Some(task.aggregator_preamble()),
+                history: Vec::new(),
+                tools: Vec::new(),
+                tool_choice: None,
+                max_tokens: Some(config.aggregator_max_tokens()),
+                additional_params: None,
+            },
+            role: "aggregator",
+            failure_context: presets.map(|presets| {
+                format!(
+                    "final aggregation failed over {success_count} surviving review job(s) across {} preset(s)",
+                    presets.len()
+                )
+            }),
+            progress: pb_agg,
+            done_style,
+            llm_semaphore: &llm_semaphore,
+        },
+        record,
+    )
+    .await?;
+    usage.add(synthesis.usage, 0);
+    let text = synthesis.text;
     let report = match &coverage {
         Some(coverage) => crate::output::with_partial_review_note(
             text,
@@ -740,6 +382,25 @@ async fn run_review_inner(
     })
 }
 
+fn reduce_prompt(
+    task: RunTask<'_>,
+    user_prompt: &str,
+    rendered: &[String],
+    surviving_presets: &[crate::presets::ReviewPreset],
+    coverage: Option<&[PresetCoverage]>,
+) -> String {
+    let combined = rendered.join("\n\n---\n\n");
+    match task {
+        RunTask::Ask => crate::prompts::ask_reduce_prompt(user_prompt, &combined),
+        RunTask::Review { .. } => crate::prompts::review_reduce_prompt(
+            user_prompt,
+            &combined,
+            surviving_presets,
+            coverage.unwrap_or_default(),
+        ),
+    }
+}
+
 /// One spawned review job. `reviewer_index` picks the client/config slot; `preset_index`
 /// (preset runs only) picks the rubric. `label` heads the rendered report section and the
 /// progress bar; `session_agent` names the trajectory file and every record in it.
@@ -750,10 +411,84 @@ struct ReviewJob {
     session_agent: String,
 }
 
-/// Plan the job matrix: one job per reviewer for `ask` (`presets: None`), reviewers ×
-/// presets for review runs. Labels must be unique — the aggregator attributes reports by
-/// them: duplicate reviewer names get an ` #<index>` suffix, and any residual collision
-/// (a crafted name that embeds the suffix) falls back to the globally-unique job ordinal.
+type JobHandle = (String, Option<usize>, JoinHandle<Result<AgentResult>>);
+
+/// Every job's contribution to the synthesis input and the session record, in spawn order.
+struct CollectedJobs {
+    usage: UsageReport,
+    rendered: Vec<String>,
+    job_records: Vec<JobRecord>,
+    verdict_records: Vec<VerdictRecord>,
+}
+
+async fn collect_jobs(
+    handles: Vec<JobHandle>,
+    presets: Option<&[crate::presets::ReviewPreset]>,
+) -> CollectedJobs {
+    let mut collected = CollectedJobs {
+        usage: UsageReport::default(),
+        rendered: Vec::new(),
+        job_records: Vec::new(),
+        verdict_records: Vec::new(),
+    };
+    for (label, preset_index, handle) in handles {
+        let preset_name = match (presets, preset_index) {
+            (Some(ps), Some(j)) => Some(ps[j].name.clone()),
+            _ => None,
+        };
+        let outcome = match handle.await {
+            Ok(Ok(result)) => {
+                collected.usage.add(result.usage, result.subagents_spawned);
+                info!(job = %label, "review completed");
+                Ok(result.text)
+            }
+            Ok(Err(err)) => {
+                warn!(job = %label, error = ?err, "review failed");
+                Err(format!("*Failed: {err:#}*"))
+            }
+            Err(err) => {
+                error!(job = %label, error = ?err, "review task panicked");
+                Err(format!("*Failed (task panicked): {err:#}*"))
+            }
+        };
+        collected.rendered.extend(rendered_section(
+            &label,
+            outcome.as_deref().map_err(String::as_str),
+            presets.is_some(),
+        ));
+        let ok = outcome.is_ok();
+        collected.verdict_records.push(VerdictRecord {
+            lens: preset_name.clone(),
+            stage: label.clone(),
+            text: outcome.unwrap_or_else(|stub| stub),
+            ok,
+        });
+        collected.job_records.push(JobRecord {
+            label,
+            preset: preset_name,
+            ok,
+        });
+    }
+    collected
+}
+
+/// The synthesis roster: presets with at least one surviving job, in resolution order. A
+/// rubric with no matching report would read as an angle that was reviewed and found clean.
+fn surviving_presets(
+    presets: Option<&[crate::presets::ReviewPreset]>,
+    coverage: Option<&[PresetCoverage]>,
+) -> Vec<crate::presets::ReviewPreset> {
+    match (presets, coverage) {
+        (Some(presets), Some(coverage)) => presets
+            .iter()
+            .zip(coverage)
+            .filter(|(_, c)| c.succeeded > 0)
+            .map(|(p, _)| p.clone())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Per-preset attempted/succeeded counts in resolution order, from the drained job list.
 fn preset_coverage(
     presets: &[crate::presets::ReviewPreset],
@@ -775,17 +510,10 @@ fn preset_coverage(
         .collect()
 }
 
-/// Bounded `{err:#}` chain for persistence — a provider error body can be huge, and the
-/// session record is not the place to store it whole.
-pub(crate) fn bounded_error_string(err: &eyre::Report) -> String {
-    const MAX: usize = 4000;
-    let full = format!("{err:#}");
-    match full.len() <= MAX {
-        true => full,
-        false => format!("{}…", &full[..floor_char_boundary(&full, MAX)]),
-    }
-}
-
+/// Plan the job matrix: one job per reviewer for `ask` (`presets: None`), reviewers ×
+/// presets for review runs. Labels must be unique — the aggregator attributes reports by
+/// them: duplicate reviewer names get an ` #<index>` suffix, and any residual collision
+/// (a crafted name that embeds the suffix) falls back to the globally-unique job ordinal.
 fn plan_jobs(
     reviewer_names: &[&str],
     presets: Option<&[crate::presets::ReviewPreset]>,
@@ -922,142 +650,6 @@ fn build_agent_config(
 mod tests {
     use super::*;
     use crate::presets::ReviewPreset;
-    use nitpicker_agent::llm::{LLMClient, TokenUsage};
-    use rig_core::OneOrMany;
-    use rig_core::completion::AssistantContent;
-
-    struct UnusedClient;
-
-    impl LLMClient for UnusedClient {
-        async fn completion(&self, _completion: Completion) -> Result<CompletionResponse> {
-            unreachable!("threshold tests never call the model")
-        }
-    }
-
-    fn usable_slot(model: &str) -> std::result::Result<FallbackSlot, String> {
-        Ok(FallbackSlot::new(Arc::new(UnusedClient), model, None))
-    }
-
-    fn synthesis_response(finish_reason: FinishReason) -> CompletionResponse {
-        CompletionResponse {
-            choice: OneOrMany::one(AssistantContent::text("partial verdict")),
-            finish_reason,
-            usage: TokenUsage::default(),
-            selected_model: Some("fallback-model".to_string()),
-        }
-    }
-
-    #[test]
-    fn fallback_compaction_uses_smallest_usable_route_threshold() {
-        let config: Config = toml::from_str(
-            r#"
-                [aggregator]
-                provider = "openai"
-
-                [[reviewer]]
-                model = "large"
-                provider = "openai"
-                compact_threshold = 120000
-
-                [[reviewer]]
-                model = "small"
-                provider = "openai"
-                compact_threshold = 24000
-
-                [[reviewer]]
-                model = "unset"
-                provider = "openai"
-            "#,
-        )
-        .unwrap();
-
-        let all_usable = vec![
-            usable_slot("large"),
-            usable_slot("small"),
-            usable_slot("unset"),
-        ];
-        assert_eq!(
-            reviewer_pool_compact_threshold(&config, &all_usable),
-            Some(24_000)
-        );
-
-        let small_failed = vec![
-            usable_slot("large"),
-            Err("small failed to build".to_string()),
-            usable_slot("unset"),
-        ];
-        assert_eq!(
-            reviewer_pool_compact_threshold(&config, &small_failed),
-            Some(120_000)
-        );
-
-        let only_unset_usable = vec![
-            Err("large failed to build".to_string()),
-            Err("small failed to build".to_string()),
-            usable_slot("unset"),
-        ];
-        assert_eq!(
-            reviewer_pool_compact_threshold(&config, &only_unset_usable),
-            None
-        );
-
-        let defaulted: Config = toml::from_str(
-            r#"
-                [defaults]
-                compact_threshold = 50000
-
-                [aggregator]
-                provider = "openai"
-
-                [[reviewer]]
-                model = "defaulted"
-                provider = "openai"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(
-            reviewer_pool_compact_threshold(&defaulted, &[usable_slot("defaulted")]),
-            Some(50_000)
-        );
-    }
-
-    #[test]
-    fn debate_fallback_defers_the_counterpart_primary() {
-        assert_eq!(reviewer_route_order(4, 0, Some(1)), vec![0, 2, 3, 1]);
-        assert_eq!(reviewer_route_order(4, 1, Some(0)), vec![1, 2, 3, 0]);
-
-        // With no spare route, using the counterpart is still preferable to aborting the run.
-        assert_eq!(reviewer_route_order(2, 0, Some(1)), vec![0, 1]);
-        assert_eq!(reviewer_route_order(2, 1, Some(0)), vec![1, 0]);
-    }
-
-    #[test]
-    fn ordinary_review_fallback_keeps_declaration_order() {
-        assert_eq!(reviewer_route_order(4, 0, None), vec![0, 1, 2, 3]);
-        assert_eq!(reviewer_route_order(4, 2, None), vec![2, 3, 0, 1]);
-    }
-
-    #[test]
-    fn synthesis_rejects_truncated_or_tool_call_responses() {
-        let truncated = synthesis_response(FinishReason::MaxTokens);
-        let err = validate_synthesis_response(&truncated, "aggregator").unwrap_err();
-        assert!(format!("{err:#}").contains("truncated verdict"));
-        assert!(format!("{err:#}").contains("fallback-model"));
-
-        let tool_call = synthesis_response(FinishReason::ToolUse);
-        assert!(validate_synthesis_response(&tool_call, "aggregator").is_err());
-
-        let complete = synthesis_response(FinishReason::Stop);
-        assert!(validate_synthesis_response(&complete, "aggregator").is_ok());
-        assert_eq!(synthesis_model(&complete, "configured"), "fallback-model");
-
-        let mut without_selected_model = complete;
-        without_selected_model.selected_model = None;
-        assert_eq!(
-            synthesis_model(&without_selected_model, "configured"),
-            "configured"
-        );
-    }
 
     /// Two unnamed (or same-named) reviewers must still get distinct trajectory identities —
     /// before the index they shared one file stem AND one record label, interleaving
@@ -1197,5 +789,70 @@ mod tests {
             rendered_section("claude", Err("*Failed: x*"), false),
             Some("## claude review\n\n*Failed: x*".to_string())
         );
+    }
+
+    fn spawned(
+        label: &str,
+        preset_index: Option<usize>,
+        outcome: Option<Result<&'static str>>,
+    ) -> JobHandle {
+        let handle = tokio::spawn(async move {
+            match outcome {
+                Some(Ok(text)) => Ok(AgentResult {
+                    text: text.to_string(),
+                    turns: 1,
+                    tool_calls: 0,
+                    subagents_spawned: 2,
+                    usage: nitpicker_agent::llm::TokenUsage::default(),
+                }),
+                Some(Err(err)) => Err(err),
+                None => panic!("job panicked"),
+            }
+        });
+        (label.to_string(), preset_index, handle)
+    }
+
+    #[tokio::test]
+    async fn collected_jobs_drive_success_count_and_surviving_roster() {
+        let presets = presets(&["security", "tone", "simplicity"]);
+        let collected = collect_jobs(
+            vec![
+                spawned("security · a", Some(0), Some(Ok("finding"))),
+                spawned("security · b", Some(0), Some(Err(eyre::eyre!("boom")))),
+                spawned("tone · a", Some(1), None),
+                spawned("simplicity · a", Some(2), Some(Ok("clean"))),
+            ],
+            Some(&presets),
+        )
+        .await;
+        let oks: Vec<bool> = collected.job_records.iter().map(|j| j.ok).collect();
+        assert_eq!(oks, [true, false, false, true]);
+        let verdict_oks: Vec<bool> = collected.verdict_records.iter().map(|v| v.ok).collect();
+        assert_eq!(verdict_oks, oks);
+        assert_eq!(collected.rendered.len(), 2);
+        assert_eq!(collected.usage.subagents_spawned, 4);
+
+        let coverage = preset_coverage(&presets, &collected.job_records);
+        let roster: Vec<String> = surviving_presets(Some(&presets), Some(&coverage))
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(roster, ["security", "simplicity"]);
+    }
+
+    #[tokio::test]
+    async fn ask_jobs_keep_failure_stubs_in_the_synthesis_input() {
+        let collected = collect_jobs(
+            vec![
+                spawned("a", None, Some(Ok("answer"))),
+                spawned("b", None, Some(Err(eyre::eyre!("boom")))),
+            ],
+            None,
+        )
+        .await;
+        let oks: Vec<bool> = collected.job_records.iter().map(|j| j.ok).collect();
+        assert_eq!(oks, [true, false]);
+        assert_eq!(collected.rendered.len(), 2);
+        assert!(surviving_presets(None, None).is_empty());
     }
 }
