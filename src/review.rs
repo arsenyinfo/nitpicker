@@ -271,67 +271,13 @@ async fn run_review_inner(
     }
 
     let job_count = handles.len();
-    let preset_run = presets.is_some();
-    let mut usage = UsageReport::default();
-    let mut rendered = Vec::new();
-    let mut success_count = 0usize;
-    let mut surviving_preset_indices = std::collections::HashSet::new();
-    let mut job_records: Vec<JobRecord> = Vec::new();
-    let mut verdict_records: Vec<VerdictRecord> = Vec::new();
-    for (label, preset_index, handle) in handles {
-        let preset_name = match (presets, preset_index) {
-            (Some(ps), Some(j)) => Some(ps[j].name.clone()),
-            _ => None,
-        };
-        let ok = match handle.await {
-            Ok(Ok(result)) => {
-                usage.add(result.usage, result.subagents_spawned);
-                rendered.extend(rendered_section(&label, Ok(&result.text), preset_run));
-                verdict_records.push(VerdictRecord {
-                    lens: preset_name.clone(),
-                    stage: label.clone(),
-                    text: result.text,
-                    ok: true,
-                });
-                success_count += 1;
-                if let Some(j) = preset_index {
-                    surviving_preset_indices.insert(j);
-                }
-                info!(job = %label, "review completed");
-                true
-            }
-            Ok(Err(err)) => {
-                let stub = format!("*Failed: {err:#}*");
-                rendered.extend(rendered_section(&label, Err(&stub), preset_run));
-                verdict_records.push(VerdictRecord {
-                    lens: preset_name.clone(),
-                    stage: label.clone(),
-                    text: stub,
-                    ok: false,
-                });
-                warn!(job = %label, error = ?err, "review failed");
-                false
-            }
-            Err(err) => {
-                let stub = format!("*Failed (task panicked): {err:#}*");
-                rendered.extend(rendered_section(&label, Err(&stub), preset_run));
-                verdict_records.push(VerdictRecord {
-                    lens: preset_name.clone(),
-                    stage: label.clone(),
-                    text: stub,
-                    ok: false,
-                });
-                error!(job = %label, error = ?err, "review task panicked");
-                false
-            }
-        };
-        job_records.push(JobRecord {
-            label,
-            preset: preset_name,
-            ok,
-        });
-    }
-
+    let CollectedJobs {
+        mut usage,
+        rendered,
+        job_records,
+        verdict_records,
+    } = collect_jobs(handles, presets).await;
+    let success_count = job_records.iter().filter(|job| job.ok).count();
     let coverage = presets.map(|ps| preset_coverage(ps, &job_records));
 
     let record = crate::run::RunRecord {
@@ -366,15 +312,7 @@ async fn run_review_inner(
     // with no matching report would read as an angle that was reviewed and found clean.
     // (The session record and `pr --json` keep the FULL resolved list: they document the
     // run's resolution, not its coverage.)
-    let surviving_presets: Vec<crate::presets::ReviewPreset> = presets
-        .map(|ps| {
-            ps.iter()
-                .enumerate()
-                .filter(|(j, _)| surviving_preset_indices.contains(j))
-                .map(|(_, p)| p.clone())
-                .collect()
-        })
-        .unwrap_or_default();
+    let surviving_presets = surviving_presets(presets, coverage.as_deref());
     let reduce_prompt = reduce_prompt(
         task,
         user_prompt,
@@ -473,10 +411,84 @@ struct ReviewJob {
     session_agent: String,
 }
 
-/// Plan the job matrix: one job per reviewer for `ask` (`presets: None`), reviewers ×
-/// presets for review runs. Labels must be unique — the aggregator attributes reports by
-/// them: duplicate reviewer names get an ` #<index>` suffix, and any residual collision
-/// (a crafted name that embeds the suffix) falls back to the globally-unique job ordinal.
+type JobHandle = (String, Option<usize>, JoinHandle<Result<AgentResult>>);
+
+/// Every job's contribution to the synthesis input and the session record, in spawn order.
+struct CollectedJobs {
+    usage: UsageReport,
+    rendered: Vec<String>,
+    job_records: Vec<JobRecord>,
+    verdict_records: Vec<VerdictRecord>,
+}
+
+async fn collect_jobs(
+    handles: Vec<JobHandle>,
+    presets: Option<&[crate::presets::ReviewPreset]>,
+) -> CollectedJobs {
+    let mut collected = CollectedJobs {
+        usage: UsageReport::default(),
+        rendered: Vec::new(),
+        job_records: Vec::new(),
+        verdict_records: Vec::new(),
+    };
+    for (label, preset_index, handle) in handles {
+        let preset_name = match (presets, preset_index) {
+            (Some(ps), Some(j)) => Some(ps[j].name.clone()),
+            _ => None,
+        };
+        let outcome = match handle.await {
+            Ok(Ok(result)) => {
+                collected.usage.add(result.usage, result.subagents_spawned);
+                info!(job = %label, "review completed");
+                Ok(result.text)
+            }
+            Ok(Err(err)) => {
+                warn!(job = %label, error = ?err, "review failed");
+                Err(format!("*Failed: {err:#}*"))
+            }
+            Err(err) => {
+                error!(job = %label, error = ?err, "review task panicked");
+                Err(format!("*Failed (task panicked): {err:#}*"))
+            }
+        };
+        collected.rendered.extend(rendered_section(
+            &label,
+            outcome.as_deref().map_err(String::as_str),
+            presets.is_some(),
+        ));
+        let ok = outcome.is_ok();
+        collected.verdict_records.push(VerdictRecord {
+            lens: preset_name.clone(),
+            stage: label.clone(),
+            text: outcome.unwrap_or_else(|stub| stub),
+            ok,
+        });
+        collected.job_records.push(JobRecord {
+            label,
+            preset: preset_name,
+            ok,
+        });
+    }
+    collected
+}
+
+/// The synthesis roster: presets with at least one surviving job, in resolution order. A
+/// rubric with no matching report would read as an angle that was reviewed and found clean.
+fn surviving_presets(
+    presets: Option<&[crate::presets::ReviewPreset]>,
+    coverage: Option<&[PresetCoverage]>,
+) -> Vec<crate::presets::ReviewPreset> {
+    match (presets, coverage) {
+        (Some(presets), Some(coverage)) => presets
+            .iter()
+            .zip(coverage)
+            .filter(|(_, c)| c.succeeded > 0)
+            .map(|(p, _)| p.clone())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Per-preset attempted/succeeded counts in resolution order, from the drained job list.
 fn preset_coverage(
     presets: &[crate::presets::ReviewPreset],
@@ -498,6 +510,10 @@ fn preset_coverage(
         .collect()
 }
 
+/// Plan the job matrix: one job per reviewer for `ask` (`presets: None`), reviewers ×
+/// presets for review runs. Labels must be unique — the aggregator attributes reports by
+/// them: duplicate reviewer names get an ` #<index>` suffix, and any residual collision
+/// (a crafted name that embeds the suffix) falls back to the globally-unique job ordinal.
 fn plan_jobs(
     reviewer_names: &[&str],
     presets: Option<&[crate::presets::ReviewPreset]>,
@@ -773,5 +789,70 @@ mod tests {
             rendered_section("claude", Err("*Failed: x*"), false),
             Some("## claude review\n\n*Failed: x*".to_string())
         );
+    }
+
+    fn spawned(
+        label: &str,
+        preset_index: Option<usize>,
+        outcome: Option<Result<&'static str>>,
+    ) -> JobHandle {
+        let handle = tokio::spawn(async move {
+            match outcome {
+                Some(Ok(text)) => Ok(AgentResult {
+                    text: text.to_string(),
+                    turns: 1,
+                    tool_calls: 0,
+                    subagents_spawned: 2,
+                    usage: nitpicker_agent::llm::TokenUsage::default(),
+                }),
+                Some(Err(err)) => Err(err),
+                None => panic!("job panicked"),
+            }
+        });
+        (label.to_string(), preset_index, handle)
+    }
+
+    #[tokio::test]
+    async fn collected_jobs_drive_success_count_and_surviving_roster() {
+        let presets = presets(&["security", "tone", "simplicity"]);
+        let collected = collect_jobs(
+            vec![
+                spawned("security · a", Some(0), Some(Ok("finding"))),
+                spawned("security · b", Some(0), Some(Err(eyre::eyre!("boom")))),
+                spawned("tone · a", Some(1), None),
+                spawned("simplicity · a", Some(2), Some(Ok("clean"))),
+            ],
+            Some(&presets),
+        )
+        .await;
+        let oks: Vec<bool> = collected.job_records.iter().map(|j| j.ok).collect();
+        assert_eq!(oks, [true, false, false, true]);
+        let verdict_oks: Vec<bool> = collected.verdict_records.iter().map(|v| v.ok).collect();
+        assert_eq!(verdict_oks, oks);
+        assert_eq!(collected.rendered.len(), 2);
+        assert_eq!(collected.usage.subagents_spawned, 4);
+
+        let coverage = preset_coverage(&presets, &collected.job_records);
+        let roster: Vec<String> = surviving_presets(Some(&presets), Some(&coverage))
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(roster, ["security", "simplicity"]);
+    }
+
+    #[tokio::test]
+    async fn ask_jobs_keep_failure_stubs_in_the_synthesis_input() {
+        let collected = collect_jobs(
+            vec![
+                spawned("a", None, Some(Ok("answer"))),
+                spawned("b", None, Some(Err(eyre::eyre!("boom")))),
+            ],
+            None,
+        )
+        .await;
+        let oks: Vec<bool> = collected.job_records.iter().map(|j| j.ok).collect();
+        assert_eq!(oks, [true, false]);
+        assert_eq!(collected.rendered.len(), 2);
+        assert!(surviving_presets(None, None).is_empty());
     }
 }

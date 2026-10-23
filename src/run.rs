@@ -53,29 +53,21 @@ impl RunRecord<'_> {
     /// Best-effort: a run that failed is the one most in need of a durable record, but a
     /// failed write must not replace the error that ended the run.
     pub(crate) async fn persist_failure(self, err: &eyre::Report, what: &str) {
-        let written = match self.logger {
-            Some(logger) => {
-                logger
-                    .write_aggregation(&failure_record(self.base, err))
-                    .await
-            }
-            None => Ok(()),
-        };
-        match written {
+        match write(self.logger, failure_record(self.base, err)).await {
             Ok(()) => {}
             Err(write_err) => warn!(error = ?write_err, "failed to persist {what} record"),
         }
     }
 
     pub(crate) async fn persist_success(self, model: String, text: String) -> Result<()> {
-        match self.logger {
-            Some(logger) => {
-                logger
-                    .write_aggregation(&success_record(self.base, model, text))
-                    .await
-            }
-            None => Ok(()),
-        }
+        write(self.logger, success_record(self.base, model, text)).await
+    }
+}
+
+async fn write(logger: Option<&SessionLogger>, record: AggregationRecord) -> Result<()> {
+    match logger {
+        Some(logger) => logger.write_aggregation(&record).await,
+        None => Ok(()),
     }
 }
 
