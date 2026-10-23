@@ -149,7 +149,8 @@ impl Tool for SubmitVerdictTool {
             let text = args
                 .get("verdict")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| eyre::eyre!("missing verdict"))?
+                .filter(|v| !v.trim().is_empty())
+                .ok_or_else(|| eyre::eyre!("missing or blank verdict"))?
                 .to_string();
             // accept both bool true and string "true" in case the model serializes it as a string
             let agree = match args.get("agree") {
@@ -1314,6 +1315,23 @@ mod tests {
             definition.parameters["properties"]["agree"]["description"],
             "True only for literal, unchanged agreement; any correction or unresolved point requires false"
         );
+    }
+
+    #[tokio::test]
+    async fn blank_verdict_is_rejected_without_populating_the_store() {
+        let store = Arc::new(Mutex::new(None));
+        let tool = SubmitVerdictTool {
+            verdict: Arc::clone(&store),
+        };
+        for blank in ["", "  \n\t"] {
+            let args = json!({ "verdict": blank, "agree": true });
+            assert!(tool.call(args, PathBuf::new()).await.is_err());
+            assert!(store.lock().unwrap().is_none());
+        }
+        let args = json!({ "verdict": "No findings.", "agree": true });
+        tool.call(args, PathBuf::new()).await.unwrap();
+        let stored = store.lock().unwrap().take().unwrap();
+        assert_eq!((stored.text.as_str(), stored.agree), ("No findings.", true));
     }
 
     #[test]
