@@ -888,54 +888,7 @@ async fn run_debate_inner(
 
     // meta-review: non-agentic single completion over the surviving lanes' dialogue
     let survivors = surviving(&lanes);
-    let meta_prompt = match presets {
-        // Topic (`ask`): single lane, prompt shape unchanged
-        None => {
-            let note = match lane_pruned_to_final_round(survivors[0]) {
-                true => {
-                    "The debate converged; only the final round is shown — it supersedes the \
-                     earlier dialogue.\n\n"
-                }
-                false => "",
-            };
-            format!(
-                "The following is a debate about: {prompt}\n\n{note}{dialogue}\n\n---\n{instruction}",
-                dialogue = lane_dialogue(survivors[0]),
-                instruction = task.meta_instruction(),
-            )
-        }
-        Some(presets) => {
-            // roster covers surviving lanes only — a dead lane's rubric with no matching
-            // section would read as an angle that was reviewed and found clean
-            let surviving_presets: Vec<crate::presets::ReviewPreset> = presets
-                .iter()
-                .filter(|p| {
-                    survivors
-                        .iter()
-                        .any(|lane| lane.preset_name.as_deref() == Some(p.name.as_str()))
-                })
-                .cloned()
-                .collect();
-            let gaps =
-                crate::prompts::coverage_gaps(coverage.as_deref().unwrap_or_default(), "lanes")
-                    .map(|gaps| format!("{gaps}\n\n"))
-                    .unwrap_or_default();
-            format!(
-                "The following are independent review debates about the same target, one per review angle.\n\
-                 Target: {prompt}\n\n{roster}\n\n{gaps}{sections}\n\n---\n\
-                 Notes:\n\
-                 - \"*Agent failed: …*\" markers are execution errors kept for chronology; they are \
-                 not review evidence and not agreement.\n\
-                 - A lane that ended without convergence carries unresolved disagreement — weigh it \
-                 by the evidence, do not read it as agreement.\n\
-                 - A lane marked degraded had a turn fail; its dialogue is partial.\n\
-                 {instruction}",
-                roster = crate::prompts::preset_roster(&surviving_presets),
-                sections = lane_sections(&survivors),
-                instruction = task.meta_instruction(),
-            )
-        }
-    };
+    let meta_prompt = meta_prompt(task, prompt, &survivors, coverage.as_deref());
     let meta_completion = Completion {
         model: agg_cfg.model.clone(),
         prompt: Message::user(meta_prompt),
@@ -1050,60 +1003,15 @@ async fn run_debate_inner(
             .unwrap_or(0);
         let transcript_path =
             std::env::temp_dir().join(transcript_filename(task.label(), ts, presets));
-        let now = chrono::Local::now();
-        let label = task.label();
-        let mut transcript = match presets {
-            // Ask: single lane, transcript shape unchanged
-            None => {
-                let lane = &lanes[0];
-                let convergence_status = match lane.converged {
-                    true => format!("converged at round {}", lane.final_round),
-                    false => format!("max rounds ({max_rounds}) reached without convergence"),
-                };
-                let mut transcript = format!(
-                    "# Debate Transcript ({label})\n\n\
-                    **Topic:** {prompt}\n\
-                    **{actor_role} model:** {}\n\
-                    **{critic_role} model:** {}\n\
-                    **Meta-reviewer:** {}\n\
-                    **Date:** {}\n\
-                    **Convergence:** {convergence_status}\n\
-                    **Rounds:** {}\n\n---\n\n",
-                    actor_label.full,
-                    critic_label.full,
-                    meta_model,
-                    now.format("%Y-%m-%d %H:%M:%S"),
-                    lane.final_round,
-                );
-                for verdict in &lane.verdicts {
-                    transcript.push_str(&format!(
-                        "## {} — Round {}\n\n{}\n\n",
-                        verdict.role, verdict.round, verdict.text
-                    ));
-                }
-                transcript
-            }
-            Some(_) => {
-                let mut transcript = format!(
-                    "# Debate Transcript ({label})\n\n\
-                    **Topic:** {prompt}\n\
-                    **{actor_role} model:** {}\n\
-                    **{critic_role} model:** {}\n\
-                    **Meta-reviewer:** {}\n\
-                    **Date:** {}\n\
-                    **Lanes:** {}\n\n---\n\n",
-                    actor_label.full,
-                    critic_label.full,
-                    meta_model,
-                    now.format("%Y-%m-%d %H:%M:%S"),
-                    lanes.len(),
-                );
-                for lane in &lanes {
-                    transcript.push_str(&render_lane_transcript_section(lane, max_rounds));
-                }
-                transcript
-            }
-        };
+        let mut transcript = render_transcript(
+            task,
+            prompt,
+            &actor_label.full,
+            &critic_label.full,
+            &meta_model,
+            &lanes,
+            max_rounds,
+        );
         transcript.push_str(&format!("---\n\n## Meta-review\n\n{meta_text}\n"));
         tokio::fs::write(&transcript_path, &transcript).await?;
         transcript_path
@@ -1128,6 +1036,132 @@ async fn run_debate_inner(
         degraded,
         coverage,
     })
+}
+
+/// The meta-review's user message: Topic keeps its single-lane shape; preset runs list the
+/// surviving lanes only, with the roster and coverage gaps stated up front.
+fn meta_prompt(
+    task: RunTask<'_>,
+    prompt: &str,
+    survivors: &[&DebateLaneOutcome],
+    coverage: Option<&[crate::output::PresetCoverage]>,
+) -> String {
+    match task.presets() {
+        // Topic (`ask`): single lane, prompt shape unchanged
+        None => {
+            let note = match lane_pruned_to_final_round(survivors[0]) {
+                true => {
+                    "The debate converged; only the final round is shown — it supersedes the \
+                 earlier dialogue.\n\n"
+                }
+                false => "",
+            };
+            format!(
+                "The following is a debate about: {prompt}\n\n{note}{dialogue}\n\n---\n{instruction}",
+                dialogue = lane_dialogue(survivors[0]),
+                instruction = task.meta_instruction(),
+            )
+        }
+        Some(presets) => {
+            // roster covers surviving lanes only — a dead lane's rubric with no matching
+            // section would read as an angle that was reviewed and found clean
+            let surviving_presets: Vec<crate::presets::ReviewPreset> = presets
+                .iter()
+                .filter(|p| {
+                    survivors
+                        .iter()
+                        .any(|lane| lane.preset_name.as_deref() == Some(p.name.as_str()))
+                })
+                .cloned()
+                .collect();
+            let gaps = crate::prompts::coverage_gaps(coverage.unwrap_or_default(), "lanes")
+                .map(|gaps| format!("{gaps}\n\n"))
+                .unwrap_or_default();
+            format!(
+                "The following are independent review debates about the same target, one per review angle.\n\
+             Target: {prompt}\n\n{roster}\n\n{gaps}{sections}\n\n---\n\
+             Notes:\n\
+             - \"*Agent failed: …*\" markers are execution errors kept for chronology; they are \
+             not review evidence and not agreement.\n\
+             - A lane that ended without convergence carries unresolved disagreement — weigh it \
+             by the evidence, do not read it as agreement.\n\
+             - A lane marked degraded had a turn fail; its dialogue is partial.\n\
+             {instruction}",
+                roster = crate::prompts::preset_roster(&surviving_presets),
+                sections = lane_sections(survivors),
+                instruction = task.meta_instruction(),
+            )
+        }
+    }
+}
+
+/// The verbose transcript up to (not including) the meta-review section.
+fn render_transcript(
+    task: RunTask<'_>,
+    prompt: &str,
+    actor_model: &str,
+    critic_model: &str,
+    meta_model: &str,
+    lanes: &[DebateLaneOutcome],
+    max_rounds: usize,
+) -> String {
+    let now = chrono::Local::now();
+    let label = task.label();
+    let actor_role = task.actor_role();
+    let critic_role = task.critic_role();
+    let presets = task.presets();
+    match presets {
+        // Ask: single lane, transcript shape unchanged
+        None => {
+            let lane = &lanes[0];
+            let convergence_status = match lane.converged {
+                true => format!("converged at round {}", lane.final_round),
+                false => format!("max rounds ({max_rounds}) reached without convergence"),
+            };
+            let mut transcript = format!(
+                "# Debate Transcript ({label})\n\n\
+                    **Topic:** {prompt}\n\
+                    **{actor_role} model:** {}\n\
+                    **{critic_role} model:** {}\n\
+                    **Meta-reviewer:** {}\n\
+                    **Date:** {}\n\
+                    **Convergence:** {convergence_status}\n\
+                    **Rounds:** {}\n\n---\n\n",
+                actor_model,
+                critic_model,
+                meta_model,
+                now.format("%Y-%m-%d %H:%M:%S"),
+                lane.final_round,
+            );
+            for verdict in &lane.verdicts {
+                transcript.push_str(&format!(
+                    "## {} — Round {}\n\n{}\n\n",
+                    verdict.role, verdict.round, verdict.text
+                ));
+            }
+            transcript
+        }
+        Some(_) => {
+            let mut transcript = format!(
+                "# Debate Transcript ({label})\n\n\
+                    **Topic:** {prompt}\n\
+                    **{actor_role} model:** {}\n\
+                    **{critic_role} model:** {}\n\
+                    **Meta-reviewer:** {}\n\
+                    **Date:** {}\n\
+                    **Lanes:** {}\n\n---\n\n",
+                actor_model,
+                critic_model,
+                meta_model,
+                now.format("%Y-%m-%d %H:%M:%S"),
+                lanes.len(),
+            );
+            for lane in lanes {
+                transcript.push_str(&render_lane_transcript_section(lane, max_rounds));
+            }
+            transcript
+        }
+    }
 }
 
 /// Per-preset lane coverage: attempted is always 1 (one lane per preset); a lane survived

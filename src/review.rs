@@ -592,7 +592,6 @@ async fn run_review_inner(
         return Err(err);
     }
 
-    let combined = rendered.join("\n\n---\n\n");
     // The synthesis roster covers only presets with at least one surviving job — a rubric
     // with no matching report would read as an angle that was reviewed and found clean.
     // (The session record and `pr --json` keep the FULL resolved list: they document the
@@ -606,15 +605,13 @@ async fn run_review_inner(
                 .collect()
         })
         .unwrap_or_default();
-    let reduce_prompt = match task {
-        RunTask::Ask => crate::prompts::ask_reduce_prompt(user_prompt, &combined),
-        RunTask::Review { .. } => crate::prompts::review_reduce_prompt(
-            user_prompt,
-            &combined,
-            &surviving_presets,
-            coverage.as_deref().unwrap_or_default(),
-        ),
-    };
+    let reduce_prompt = reduce_prompt(
+        task,
+        user_prompt,
+        &rendered,
+        &surviving_presets,
+        coverage.as_deref(),
+    );
 
     let pb_agg = mp.add(ProgressBar::new_spinner());
     pb_agg.set_style(spinner_style);
@@ -738,6 +735,25 @@ async fn run_review_inner(
         degraded: success_count < job_count,
         coverage,
     })
+}
+
+fn reduce_prompt(
+    task: RunTask<'_>,
+    user_prompt: &str,
+    rendered: &[String],
+    surviving_presets: &[crate::presets::ReviewPreset],
+    coverage: Option<&[PresetCoverage]>,
+) -> String {
+    let combined = rendered.join("\n\n---\n\n");
+    match task {
+        RunTask::Ask => crate::prompts::ask_reduce_prompt(user_prompt, &combined),
+        RunTask::Review { .. } => crate::prompts::review_reduce_prompt(
+            user_prompt,
+            &combined,
+            surviving_presets,
+            coverage.unwrap_or_default(),
+        ),
+    }
 }
 
 /// One spawned review job. `reviewer_index` picks the client/config slot; `preset_index`
