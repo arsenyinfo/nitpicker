@@ -164,7 +164,7 @@ impl Tool for SubmitVerdictTool {
     }
 }
 
-async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnResult> {
+async fn run_debate_turn(request: DebateTurnRequest<'_>) -> DebateTurnResult {
     let verdict_store: Arc<Mutex<Option<DebateVerdict>>> = Arc::new(Mutex::new(None));
     let submit_tool = Arc::new(SubmitVerdictTool {
         verdict: Arc::clone(&verdict_store),
@@ -198,21 +198,38 @@ async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnRes
         session_writer: request.session_writer,
     };
 
-    let result = match run_agent(
+    let outcome = run_agent(
         config,
         request.initial_message,
         &tools_map,
         request.work_dir,
     )
     .await
-    {
-        Ok(r) => r,
+    .and_then(|result| {
+        let stored = verdict_store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let verdict = stored.ok_or_else(|| {
+            eyre::eyre!("debate agent completed without calling required submit_verdict tool")
+        })?;
+        Ok((result, verdict))
+    });
+    match outcome {
+        Ok((result, verdict)) => DebateTurnResult {
+            verdict,
+            turns: result.turns,
+            tool_calls: result.tool_calls,
+            subagents_spawned: result.subagents_spawned,
+            usage: result.usage,
+            agent_failed: false,
+        },
         Err(err) => {
             tracing::debug!(model = request.model, error = ?err, "debate agent failed");
             if claim_failure_warning(&request.failure_warning_emitted) {
                 warn!("{}", debate_failure_warning(&err));
             }
-            return Ok(DebateTurnResult {
+            DebateTurnResult {
                 verdict: DebateVerdict {
                     text: format!("*Agent failed: {err:#}*"),
                     agree: false,
@@ -222,25 +239,9 @@ async fn run_debate_turn(request: DebateTurnRequest<'_>) -> Result<DebateTurnRes
                 subagents_spawned: 0,
                 usage: TokenUsage::default(),
                 agent_failed: true,
-            });
+            }
         }
-    };
-    let usage = result.usage;
-    let stored = verdict_store
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take();
-    let verdict = stored.ok_or_else(|| {
-        eyre::eyre!("debate agent completed without calling required submit_verdict tool")
-    })?;
-    Ok(DebateTurnResult {
-        verdict,
-        turns: result.turns,
-        tool_calls: result.tool_calls,
-        subagents_spawned: result.subagents_spawned,
-        usage,
-        agent_failed: false,
-    })
+    }
 }
 
 fn debate_failure_warning(err: &eyre::Report) -> &'static str {
@@ -258,14 +259,14 @@ fn claim_failure_warning(emitted: &AtomicBool) -> bool {
 /// One debater's fixed identity for the whole debate — the per-side inputs that would
 /// otherwise be spelled out twice per round.
 struct DebateSide<'a> {
-    role: &'a str,
+    role: &'static str,
     client: Arc<dyn LLMClientDyn>,
     compact_threshold: Option<u64>,
     max_tokens: Option<u64>,
     model: &'a str,
-    system_prompt: &'a str,
+    system_prompt: String,
     /// Trajectory filename stem; the round number is appended.
-    session_stem: &'a str,
+    session_stem: String,
 }
 
 /// Everything a lane's turns need that is identical for both sides. One instance per lane;
@@ -281,7 +282,7 @@ struct RoundEnv<'a> {
     stdout_ok: bool,
     llm_semaphore: &'a Arc<tokio::sync::Semaphore>,
     failure_warning_emitted: &'a Arc<AtomicBool>,
-    subagent_system_prompt: Option<&'a str>,
+    subagent_system_prompt: Option<String>,
     /// Print verdicts as turns finish (single lane only) — concurrent lanes buffer instead,
     /// since their interleaved output would be unattributable.
     live_output: bool,
@@ -296,7 +297,7 @@ async fn run_debate_side(
     env: &RoundEnv<'_>,
     verdicts: &[LaneVerdict],
     round: usize,
-) -> Result<DebateTurnResult> {
+) -> DebateTurnResult {
     let pb = env.lane_progress.clone();
     let role = colored_role_stderr(side.role);
     pb.set_message(crate::progress::bar_message(format!(
@@ -327,8 +328,8 @@ async fn run_debate_side(
         compact_threshold: side.compact_threshold,
         max_tokens: side.max_tokens,
         model: side.model,
-        system_prompt: side.system_prompt,
-        subagent_system_prompt: env.subagent_system_prompt.map(str::to_string),
+        system_prompt: &side.system_prompt,
+        subagent_system_prompt: env.subagent_system_prompt.clone(),
         initial_message: &msg,
         max_turns: env.max_turns,
         work_dir: env.repo,
@@ -342,7 +343,7 @@ async fn run_debate_side(
         session_agent,
     })
     .instrument(turn_span.clone())
-    .await?;
+    .await;
     turn_span.record("nitpicker.agree", result.verdict.agree);
     if result.agent_failed {
         turn_span.record("otel.status_code", "ERROR");
@@ -365,7 +366,7 @@ async fn run_debate_side(
         env.skin.print_text(&result.verdict.text);
         println!();
     }
-    Ok(result)
+    result
 }
 
 fn build_turn_message(topic: &str, verdicts: &[LaneVerdict], round: usize, role: &str) -> String {
@@ -436,14 +437,14 @@ fn print_cast_line(role: &str, info: &str) {
     println!("  {}{pad} {info}", colored_role(role));
 }
 
-fn make_spinner(mp: &MultiProgress) -> (ProgressBar, ProgressStyle) {
+fn make_spinner(mp: &MultiProgress) -> ProgressBar {
     let spinner_style = ProgressStyle::with_template("{spinner:.cyan} {prefix:<12} {msg}")
         .unwrap()
         .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", ""]);
     let pb = mp.add(ProgressBar::new_spinner());
-    pb.set_style(spinner_style.clone());
+    pb.set_style(spinner_style);
     pb.enable_steady_tick(Duration::from_millis(80));
-    (pb, spinner_style)
+    pb
 }
 
 pub struct DebateOptions<'a> {
@@ -521,8 +522,6 @@ async fn run_debate_inner(
         );
     }
 
-    let actor_cfg = &config.reviewer[0];
-    let critic_cfg = &config.reviewer[1];
     let agg_cfg = &config.aggregator;
 
     // proxy handle stays bound for the function so its local server outlives the debate;
@@ -530,55 +529,16 @@ async fn run_debate_inner(
     let gemini_proxy = crate::proxy::GeminiProxy::maybe_start(config).await;
     let proxy_url = gemini_proxy.url();
 
-    let actor_client: Arc<dyn LLMClientDyn>;
-    let critic_client: Arc<dyn LLMClientDyn>;
-    let actor_label: ModelLabel;
-    let critic_label: ModelLabel;
-    let actor_compact_threshold: Option<u64>;
-    let critic_compact_threshold: Option<u64>;
-    // Output caps stay bound to the two logical roles; the routing clients replace them with the
-    // selected route's cap at the completion boundary.
-    let actor_max_tokens = actor_cfg.max_tokens;
-    let critic_max_tokens = critic_cfg.max_tokens;
-
     let reviewer_pool = (alloy || fallback)
         .then(|| crate::routing::build_reviewer_pool(config, &gemini_proxy, proxy_url.as_deref()));
-
-    if alloy {
-        let pool = reviewer_pool.as_ref().expect("alloy builds reviewer pool");
-        let shared = crate::routing::alloy_client(pool, fallback)?;
-        actor_client = Arc::clone(&shared);
-        critic_client = shared;
-        let label = ModelLabel::alloy(config.reviewer.iter().map(|r| r.model.as_str()));
-        actor_label = ModelLabel {
-            alias: label.alias.clone(),
-            full: label.full.clone(),
-        };
-        critic_label = label;
-        let threshold = crate::routing::reviewer_pool_compact_threshold(config, pool);
-        actor_compact_threshold = threshold;
-        critic_compact_threshold = threshold;
-    } else if fallback {
-        let pool = reviewer_pool
-            .as_ref()
-            .expect("fallback builds reviewer pool");
-        actor_client = crate::routing::debate_reviewer_client(pool, 0, 1)?;
-        critic_client = crate::routing::debate_reviewer_client(pool, 1, 0)?;
-        actor_label = ModelLabel::plain(&actor_cfg.model);
-        critic_label = ModelLabel::plain(&critic_cfg.model);
-        let threshold = crate::routing::reviewer_pool_compact_threshold(config, pool);
-        actor_compact_threshold = threshold;
-        critic_compact_threshold = threshold;
-    } else {
-        actor_client =
-            gemini_proxy.annotate(build_reviewer_client(actor_cfg, proxy_url.as_deref()))?;
-        critic_client =
-            gemini_proxy.annotate(build_reviewer_client(critic_cfg, proxy_url.as_deref()))?;
-        actor_label = ModelLabel::plain(&actor_cfg.model);
-        critic_label = ModelLabel::plain(&critic_cfg.model);
-        actor_compact_threshold = config.reviewer_compact_threshold(actor_cfg);
-        critic_compact_threshold = config.reviewer_compact_threshold(critic_cfg);
-    }
+    let (actor, critic) = resolve_roles(
+        config,
+        &gemini_proxy,
+        proxy_url.as_deref(),
+        reviewer_pool.as_ref(),
+        alloy,
+        fallback,
+    )?;
     let session_logger = crate::run::open_session(config).await?;
 
     let project_context = crate::context::build_context(repo).await;
@@ -593,22 +553,6 @@ async fn run_debate_inner(
         )?,
         _ => gemini_proxy.annotate(build_aggregator_client(agg_cfg, proxy_url.as_deref()))?,
     };
-
-    // Sticky failover belongs to one logical agent. Treat actor/critic clients as pristine role
-    // templates and fork each preset lane before any of them starts; forks keep independent active
-    // indices while their cloned FallbackSlots share run-wide route availability.
-    let lane_role_clients = (0..lane_tasks.len())
-        .map(|_| {
-            if fallback && !alloy {
-                (
-                    crate::routing::independent_agent_client(&actor_client),
-                    crate::routing::independent_agent_client(&critic_client),
-                )
-            } else {
-                (Arc::clone(&actor_client), Arc::clone(&critic_client))
-            }
-        })
-        .collect::<Vec<_>>();
 
     let actor_role = task.actor_role();
     let critic_role = task.critic_role();
@@ -625,25 +569,7 @@ async fn run_debate_inner(
     // cast lines show which models are participating in interactive text mode, but piped/json
     // stdout stays machine-readable/final-report-only.
     if stdout_ok && stdout_is_terminal() {
-        if alloy {
-            print_cast_line(actor_role, &actor_label.full);
-            print_cast_line(critic_role, &critic_label.full);
-        } else {
-            print_cast_line(
-                actor_role,
-                &format!("{} · {}", actor_cfg.name, actor_label.full),
-            );
-            print_cast_line(
-                critic_role,
-                &format!("{} · {}", critic_cfg.name, critic_label.full),
-            );
-        }
-        print_cast_line("Meta-review", &agg_cfg.model);
-        if let Some(presets) = presets {
-            let names: Vec<&str> = presets.iter().map(|p| p.name.as_str()).collect();
-            print_cast_line("Presets", &names.join(", "));
-        }
-        println!();
+        print_cast(task, config, &actor, &critic, alloy);
     }
 
     // One lane per preset for Review; Ask is the degenerate single unscoped lane and
@@ -654,154 +580,70 @@ async fn run_debate_inner(
         .iter()
         .enumerate()
         .map(|(lane_index, lane_task)| {
-            let actor_client = Arc::clone(&lane_role_clients[lane_index].0);
-            let critic_client = Arc::clone(&lane_role_clients[lane_index].1);
-            let llm_semaphore = &llm_semaphore;
-            let failure_warning_emitted = &failure_warning_emitted;
-            let mp = &mp;
-            let done_style = &done_style;
-            let skin = &skin;
-            let project_context = &project_context;
-            let session_logger = session_logger.as_ref();
-            let actor_alias = &actor_label.alias;
-            let critic_alias = &critic_label.alias;
+            let preset = lane_task.preset();
+            // Sticky failover belongs to one logical agent: each lane forks the role templates, so
+            // forks keep independent active indices while their cloned FallbackSlots share
+            // run-wide route availability.
+            let lane_client = |role: &DebateRole| match fallback && !alloy {
+                true => crate::routing::independent_agent_client(&role.client),
+                false => Arc::clone(&role.client),
+            };
+            let (actor_stem, critic_stem) = lane_session_stems(lane_index, preset);
+            let actor_side = DebateSide {
+                role: actor_role,
+                client: lane_client(&actor),
+                compact_threshold: actor.compact_threshold,
+                max_tokens: actor.max_tokens,
+                model: &actor.label.alias,
+                system_prompt: lane_task.actor_system(),
+                session_stem: actor_stem,
+            };
+            let critic_side = DebateSide {
+                role: critic_role,
+                client: lane_client(&critic),
+                compact_threshold: critic.compact_threshold,
+                max_tokens: critic.max_tokens,
+                model: &critic.label.alias,
+                system_prompt: lane_task.critic_system(),
+                session_stem: critic_stem,
+            };
+            let lane_progress = make_spinner(&mp);
+            lane_progress.set_prefix(preset.map_or("debate", |p| p.name.as_str()).to_string());
+            lane_progress.set_message(crate::progress::bar_message("waiting…"));
+            let env = RoundEnv {
+                skin: &skin,
+                repo,
+                topic: prompt,
+                project_context: &project_context,
+                session_logger: session_logger.as_ref(),
+                max_turns,
+                verbose,
+                stdout_ok,
+                llm_semaphore: &llm_semaphore,
+                failure_warning_emitted: &failure_warning_emitted,
+                subagent_system_prompt: lane_task.subagent_prompt(),
+                live_output,
+                lane_progress,
+            };
             let lane_span = info_span!(
                 "debate.lane",
                 nitpicker.lane = lane_index as u64,
-                nitpicker.preset = lane_task.preset().map_or("", |p| bounded(&p.name)),
+                nitpicker.preset = preset.map_or("", |p| bounded(&p.name)),
                 nitpicker.rounds = Empty,
                 nitpicker.converged = Empty,
                 nitpicker.degraded = Empty,
             );
-            async move {
-                let preset = lane_task.preset();
-                let (lane_progress, _) = make_spinner(mp);
-                lane_progress.set_prefix(preset.map_or("debate", |p| p.name.as_str()).to_string());
-                lane_progress.set_message(crate::progress::bar_message("waiting…"));
-                let actor_system = lane_task.actor_system();
-                let critic_system = lane_task.critic_system();
-                let subagent_prompt = lane_task.subagent_prompt();
-                let (actor_stem, critic_stem) = lane_session_stems(lane_index, preset);
-                let actor = DebateSide {
-                    role: actor_role,
-                    client: actor_client,
-                    compact_threshold: actor_compact_threshold,
-                    max_tokens: actor_max_tokens,
-                    model: actor_alias,
-                    system_prompt: &actor_system,
-                    session_stem: &actor_stem,
-                };
-                let critic = DebateSide {
-                    role: critic_role,
-                    client: critic_client,
-                    compact_threshold: critic_compact_threshold,
-                    max_tokens: critic_max_tokens,
-                    model: critic_alias,
-                    system_prompt: &critic_system,
-                    session_stem: &critic_stem,
-                };
-                let env = RoundEnv {
-                    skin,
-                    repo,
-                    topic: prompt,
-                    project_context,
-                    session_logger,
-                    max_turns,
-                    verbose,
-                    stdout_ok,
-                    llm_semaphore,
-                    failure_warning_emitted,
-                    subagent_system_prompt: subagent_prompt.as_deref(),
-                    live_output,
-                    lane_progress,
-                };
-
-                let started = std::time::Instant::now();
-                let mut lane = DebateLaneOutcome {
-                    preset_name: preset.map(|p| p.name.clone()),
-                    verdicts: Vec::new(),
-                    converged: false,
-                    final_round: 0,
-                    any_turn_succeeded: false,
-                    degraded: false,
-                    usage: UsageReport::default(),
-                };
-
-                'debate: for round in 1..=max_rounds {
-                    lane.final_round = round;
-
-                    let actor_turn = run_debate_side(&actor, &env, &lane.verdicts, round).await?;
-                    lane.usage
-                        .add(actor_turn.usage, actor_turn.subagents_spawned);
-                    lane.any_turn_succeeded |= !actor_turn.agent_failed;
-                    lane.degraded |= actor_turn.agent_failed;
-                    lane.verdicts.push(LaneVerdict {
-                        role: actor_role.to_string(),
-                        round,
-                        text: actor_turn.verdict.text,
-                        agent_failed: actor_turn.agent_failed,
-                    });
-
-                    let critic_turn = run_debate_side(&critic, &env, &lane.verdicts, round).await?;
-                    lane.usage
-                        .add(critic_turn.usage, critic_turn.subagents_spawned);
-                    lane.any_turn_succeeded |= !critic_turn.agent_failed;
-                    lane.degraded |= critic_turn.agent_failed;
-                    // Convergence requires a real agreement: a critic that agrees with a failed
-                    // actor's `*Agent failed*` stub (or a failed critic, whose verdict defaults to
-                    // agree=false) must not end the debate early.
-                    let agreed = critic_turn.verdict.agree
-                        && !actor_turn.agent_failed
-                        && !critic_turn.agent_failed;
-                    lane.verdicts.push(LaneVerdict {
-                        role: critic_role.to_string(),
-                        round,
-                        text: critic_turn.verdict.text,
-                        agent_failed: critic_turn.agent_failed,
-                    });
-
-                    if agreed {
-                        lane.converged = true;
-                        break 'debate;
-                    }
-                }
-
-                env.lane_progress.set_style(done_style.clone());
-                env.lane_progress
-                    .finish_with_message(crate::progress::bar_message(lane_progress_summary(
-                        &lane,
-                        started.elapsed().as_secs(),
-                    )));
-                let span = tracing::Span::current();
-                span.record("nitpicker.rounds", lane.final_round as u64);
-                span.record("nitpicker.converged", lane.converged);
-                span.record("nitpicker.degraded", lane.degraded);
-                Ok::<DebateLaneOutcome, eyre::Report>(lane)
-            }
+            run_lane(
+                preset.map(|p| p.name.clone()),
+                actor_side,
+                critic_side,
+                env,
+                max_rounds,
+                &done_style,
+            )
             .instrument(lane_span)
         });
-    let lane_results = futures::future::join_all(lane_futures).await;
-
-    let mut lanes: Vec<DebateLaneOutcome> = Vec::new();
-    for (lane_index, result) in lane_results.into_iter().enumerate() {
-        match result {
-            Ok(lane) => lanes.push(lane),
-            // a lane-level error (nothing inside the loop should produce one — turn failures
-            // fold into stubs) counts as a dead, degraded lane rather than aborting siblings
-            Err(err) => {
-                warn!(lane = lane_index, error = ?err, "debate lane failed");
-                lanes.push(DebateLaneOutcome {
-                    preset_name: lane_tasks[lane_index].preset().map(|p| p.name.clone()),
-                    verdicts: Vec::new(),
-                    converged: false,
-                    final_round: 0,
-                    any_turn_succeeded: false,
-                    degraded: true,
-                    usage: UsageReport::default(),
-                });
-            }
-        }
-    }
+    let lanes: Vec<DebateLaneOutcome> = futures::future::join_all(lane_futures).await;
 
     let mut usage = UsageReport::default();
     let mut degraded = false;
@@ -872,7 +714,7 @@ async fn run_debate_inner(
         max_tokens: Some(config.aggregator_max_tokens()),
         additional_params: None,
     };
-    let (pb, _) = make_spinner(&mp);
+    let pb = make_spinner(&mp);
     pb.set_prefix(colored_role_stderr("Meta-review"));
     pb.set_message(crate::progress::bar_message("synthesizing…"));
     let synthesis = crate::run::synthesize(
@@ -909,8 +751,8 @@ async fn run_debate_inner(
         let mut transcript = render_transcript(
             task,
             prompt,
-            &actor_label.full,
-            &critic_label.full,
+            &actor.label.full,
+            &critic.label.full,
             &meta_model,
             &lanes,
             max_rounds,
@@ -939,6 +781,155 @@ async fn run_debate_inner(
         degraded,
         coverage,
     })
+}
+
+/// One debate role's client and run-level settings, fixed for the whole run.
+struct DebateRole {
+    client: Arc<dyn LLMClientDyn>,
+    label: ModelLabel,
+    compact_threshold: Option<u64>,
+    /// Output caps stay bound to the logical role; the routing clients replace them with the
+    /// selected route's cap at the completion boundary.
+    max_tokens: Option<u64>,
+}
+
+/// Actor (`reviewer[0]`) and critic (`reviewer[1]`) for the run's routing mode: a shared Alloy
+/// pool, fallback priority rings, or each reviewer's own client.
+fn resolve_roles(
+    config: &Config,
+    gemini_proxy: &crate::proxy::GeminiProxy,
+    proxy_url: Option<&str>,
+    reviewer_pool: Option<&crate::routing::ReviewerClientPool>,
+    alloy: bool,
+    fallback: bool,
+) -> Result<(DebateRole, DebateRole)> {
+    let shared = match alloy {
+        true => Some(crate::routing::alloy_client(
+            reviewer_pool.expect("alloy builds reviewer pool"),
+            fallback,
+        )?),
+        false => None,
+    };
+    let pool_threshold =
+        reviewer_pool.map(|pool| crate::routing::reviewer_pool_compact_threshold(config, pool));
+    let role = |index: usize| -> Result<DebateRole> {
+        let cfg = &config.reviewer[index];
+        let client = match (&shared, reviewer_pool) {
+            (Some(shared), _) => Arc::clone(shared),
+            (None, Some(pool)) => crate::routing::debate_reviewer_client(pool, index, 1 - index)?,
+            (None, None) => gemini_proxy.annotate(build_reviewer_client(cfg, proxy_url))?,
+        };
+        Ok(DebateRole {
+            client,
+            label: match alloy {
+                true => ModelLabel::alloy(config.reviewer.iter().map(|r| r.model.as_str())),
+                false => ModelLabel::plain(&cfg.model),
+            },
+            compact_threshold: match pool_threshold {
+                Some(threshold) => threshold,
+                None => config.reviewer_compact_threshold(cfg),
+            },
+            max_tokens: cfg.max_tokens,
+        })
+    };
+    Ok((role(0)?, role(1)?))
+}
+
+fn print_cast(
+    task: RunTask<'_>,
+    config: &Config,
+    actor: &DebateRole,
+    critic: &DebateRole,
+    alloy: bool,
+) {
+    let cast = [
+        (task.actor_role(), &config.reviewer[0], actor),
+        (task.critic_role(), &config.reviewer[1], critic),
+    ];
+    for (role, cfg, debate_role) in cast {
+        match alloy {
+            true => print_cast_line(role, &debate_role.label.full),
+            false => print_cast_line(role, &format!("{} · {}", cfg.name, debate_role.label.full)),
+        }
+    }
+    print_cast_line("Meta-review", &config.aggregator.model);
+    if let Some(presets) = task.presets() {
+        let names: Vec<&str> = presets.iter().map(|p| p.name.as_str()).collect();
+        print_cast_line("Presets", &names.join(", "));
+    }
+    println!();
+}
+
+/// One lane's actor/critic rounds until the critic literally agrees or `max_rounds` runs out.
+/// Turn failures fold into stubs, so a lane always produces an outcome.
+async fn run_lane(
+    preset_name: Option<String>,
+    actor: DebateSide<'_>,
+    critic: DebateSide<'_>,
+    env: RoundEnv<'_>,
+    max_rounds: usize,
+    done_style: &ProgressStyle,
+) -> DebateLaneOutcome {
+    let started = std::time::Instant::now();
+    let mut lane = DebateLaneOutcome {
+        preset_name,
+        verdicts: Vec::new(),
+        converged: false,
+        final_round: 0,
+        any_turn_succeeded: false,
+        degraded: false,
+        usage: UsageReport::default(),
+    };
+
+    'debate: for round in 1..=max_rounds {
+        lane.final_round = round;
+
+        let actor_turn = run_debate_side(&actor, &env, &lane.verdicts, round).await;
+        lane.usage
+            .add(actor_turn.usage, actor_turn.subagents_spawned);
+        lane.any_turn_succeeded |= !actor_turn.agent_failed;
+        lane.degraded |= actor_turn.agent_failed;
+        lane.verdicts.push(LaneVerdict {
+            role: actor.role.to_string(),
+            round,
+            text: actor_turn.verdict.text,
+            agent_failed: actor_turn.agent_failed,
+        });
+
+        let critic_turn = run_debate_side(&critic, &env, &lane.verdicts, round).await;
+        lane.usage
+            .add(critic_turn.usage, critic_turn.subagents_spawned);
+        lane.any_turn_succeeded |= !critic_turn.agent_failed;
+        lane.degraded |= critic_turn.agent_failed;
+        // Convergence requires a real agreement: a critic that agrees with a failed
+        // actor's `*Agent failed*` stub (or a failed critic, whose verdict defaults to
+        // agree=false) must not end the debate early.
+        let agreed =
+            critic_turn.verdict.agree && !actor_turn.agent_failed && !critic_turn.agent_failed;
+        lane.verdicts.push(LaneVerdict {
+            role: critic.role.to_string(),
+            round,
+            text: critic_turn.verdict.text,
+            agent_failed: critic_turn.agent_failed,
+        });
+
+        if agreed {
+            lane.converged = true;
+            break 'debate;
+        }
+    }
+
+    env.lane_progress.set_style(done_style.clone());
+    env.lane_progress
+        .finish_with_message(crate::progress::bar_message(lane_progress_summary(
+            &lane,
+            started.elapsed().as_secs(),
+        )));
+    let span = tracing::Span::current();
+    span.record("nitpicker.rounds", lane.final_round as u64);
+    span.record("nitpicker.converged", lane.converged);
+    span.record("nitpicker.degraded", lane.degraded);
+    lane
 }
 
 /// The meta-review's user message: Topic keeps its single-lane shape; preset runs list the
