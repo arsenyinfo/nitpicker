@@ -37,7 +37,16 @@ pub(crate) async fn build_context(repo: &std::path::Path) -> String {
     };
 
     for filename in ["CLAUDE.md", "AGENTS.md"] {
-        let path = repo_canonical.join(filename);
+        // resolved before the containment check: in `pr` mode the tree is target-controlled,
+        // and a symlinked CLAUDE.md would otherwise inject any host file into the prompt
+        let path = match tokio::fs::canonicalize(repo_canonical.join(filename)).await {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                tracing::warn!("Cannot access context file {}: {}", filename, e);
+                continue;
+            }
+        };
 
         if !path.starts_with(&repo_canonical) {
             tracing::warn!("Context file path escapes repo root: {}", filename);
@@ -212,6 +221,22 @@ mod tests {
         let path = dir.path().join(name);
         std::fs::write(&path, bytes).unwrap();
         path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_context_follows_only_in_repo_symlinks() {
+        let outside = tempfile::tempdir().unwrap();
+        let secret = write(&outside, "secret.txt", b"HOST-SECRET-SENTINEL");
+        let repo = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(&secret, repo.path().join("CLAUDE.md")).unwrap();
+        assert_eq!(build_context(repo.path()).await, "");
+
+        let notes = write(&repo, "NOTES.md", b"in-repo guidance");
+        std::os::unix::fs::symlink(&notes, repo.path().join("AGENTS.md")).unwrap();
+        let context = build_context(repo.path()).await;
+        assert!(!context.contains("HOST-SECRET-SENTINEL"));
+        assert!(context.ends_with("in-repo guidance"));
     }
 
     #[test]
