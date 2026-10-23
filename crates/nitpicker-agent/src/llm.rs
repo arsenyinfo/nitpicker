@@ -1286,10 +1286,10 @@ fn is_foreign_thought_signature_rejection(err: &CompletionError) -> bool {
 }
 
 /// The request with every reasoning block dropped from its history; an assistant message left
-/// with no content is dropped whole.
+/// with no content is dropped whole. `None` when nothing but reasoning was sent.
 fn without_reasoning(
     mut request: rig_core::completion::CompletionRequest,
-) -> rig_core::completion::CompletionRequest {
+) -> Option<rig_core::completion::CompletionRequest> {
     let history = request
         .chat_history
         .into_iter()
@@ -1304,9 +1304,8 @@ fn without_reasoning(
             }
             other => Some(other),
         });
-    request.chat_history =
-        OneOrMany::many(history).expect("the prompt is a user message and is always kept");
-    request
+    request.chat_history = OneOrMany::many(history).ok()?;
+    Some(request)
 }
 
 fn is_local_base_url(base_url: Option<&str>) -> bool {
@@ -1442,11 +1441,16 @@ impl LLMClient for openrouter::Client {
         let model = self.completion_model(&model_name);
         let response = match model.completion(request.clone()).await {
             Err(err) if is_foreign_thought_signature_rejection(&err) => {
-                warn!(
-                    model = %model_name,
-                    "upstream rejected a replayed thought signature; retrying without reasoning history"
-                );
-                model.completion(without_reasoning(request)).await
+                match without_reasoning(request) {
+                    Some(stripped) => {
+                        warn!(
+                            model = %model_name,
+                            "upstream rejected a replayed thought signature; retrying without reasoning history"
+                        );
+                        model.completion(stripped).await
+                    }
+                    None => Err(err),
+                }
             }
             other => other,
         };
@@ -2609,6 +2613,27 @@ mod tests {
     }
 
     #[test]
+    fn without_reasoning_declines_a_reasoning_only_request() {
+        let request: rig_core::completion::CompletionRequest = Completion {
+            model: "gemini".to_string(),
+            prompt: Message::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::Reasoning(
+                    rig_core::completion::message::Reasoning::new("think"),
+                )),
+            },
+            preamble: None,
+            history: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            max_tokens: None,
+            additional_params: None,
+        }
+        .into();
+        assert!(without_reasoning(request).is_none());
+    }
+
+    #[test]
     fn without_reasoning_drops_reasoning_and_reasoning_only_turns() {
         let reasoning =
             || AssistantContent::Reasoning(rig_core::completion::message::Reasoning::new("think"));
@@ -2635,6 +2660,7 @@ mod tests {
         }
         .into();
         let kept: Vec<Message> = without_reasoning(request)
+            .unwrap()
             .chat_history
             .into_iter()
             .collect();
