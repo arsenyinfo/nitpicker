@@ -23,6 +23,7 @@ mod prompts;
 mod proxy;
 mod reflect;
 mod review;
+mod routing;
 mod settings;
 mod telemetry;
 

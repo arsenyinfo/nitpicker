@@ -545,11 +545,11 @@ async fn run_debate_inner(
     let critic_max_tokens = critic_cfg.max_tokens;
 
     let reviewer_pool = (alloy || fallback)
-        .then(|| crate::review::build_reviewer_pool(config, &gemini_proxy, proxy_url.as_deref()));
+        .then(|| crate::routing::build_reviewer_pool(config, &gemini_proxy, proxy_url.as_deref()));
 
     if alloy {
         let pool = reviewer_pool.as_ref().expect("alloy builds reviewer pool");
-        let shared = crate::review::alloy_client(pool, fallback)?;
+        let shared = crate::routing::alloy_client(pool, fallback)?;
         actor_client = Arc::clone(&shared);
         critic_client = shared;
         let label = ModelLabel::alloy(config.reviewer.iter().map(|r| r.model.as_str()));
@@ -558,18 +558,18 @@ async fn run_debate_inner(
             full: label.full.clone(),
         };
         critic_label = label;
-        let threshold = crate::review::reviewer_pool_compact_threshold(config, pool);
+        let threshold = crate::routing::reviewer_pool_compact_threshold(config, pool);
         actor_compact_threshold = threshold;
         critic_compact_threshold = threshold;
     } else if fallback {
         let pool = reviewer_pool
             .as_ref()
             .expect("fallback builds reviewer pool");
-        actor_client = crate::review::debate_reviewer_client(pool, 0, 1)?;
-        critic_client = crate::review::debate_reviewer_client(pool, 1, 0)?;
+        actor_client = crate::routing::debate_reviewer_client(pool, 0, 1)?;
+        critic_client = crate::routing::debate_reviewer_client(pool, 1, 0)?;
         actor_label = ModelLabel::plain(&actor_cfg.model);
         critic_label = ModelLabel::plain(&critic_cfg.model);
-        let threshold = crate::review::reviewer_pool_compact_threshold(config, pool);
+        let threshold = crate::routing::reviewer_pool_compact_threshold(config, pool);
         actor_compact_threshold = threshold;
         critic_compact_threshold = threshold;
     } else {
@@ -594,7 +594,7 @@ async fn run_debate_inner(
     let project_context = crate::context::build_context(repo).await;
 
     let agg_client: Arc<dyn LLMClientDyn> = match &reviewer_pool {
-        Some(pool) if fallback => crate::review::aggregator_client(
+        Some(pool) if fallback => crate::routing::aggregator_client(
             config,
             &gemini_proxy,
             proxy_url.as_deref(),
@@ -611,8 +611,8 @@ async fn run_debate_inner(
         .map(|_| {
             if fallback && !alloy {
                 (
-                    crate::review::independent_agent_client(&actor_client),
-                    crate::review::independent_agent_client(&critic_client),
+                    crate::routing::independent_agent_client(&actor_client),
+                    crate::routing::independent_agent_client(&critic_client),
                 )
             } else {
                 (Arc::clone(&actor_client), Arc::clone(&critic_client))
