@@ -2,15 +2,13 @@ use crate::output::UsageReport;
 use crate::prompts::RunTask;
 use crate::telemetry::{self, RunMode};
 use eyre::Result;
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use nitpicker_agent::agent::{
     AgentConfig, AgentDepth, AgentProgress, MAX_CONCURRENT_LLM_CALLS, add_spawn_subagent_tool,
     run_agent,
 };
 use nitpicker_agent::config::Config;
-use nitpicker_agent::llm::{
-    Completion, LLMClientDyn, TokenUsage, is_operational_limit_error, throttled_completion,
-};
+use nitpicker_agent::llm::{Completion, LLMClientDyn, TokenUsage, is_operational_limit_error};
 use nitpicker_agent::provider::{build_aggregator_client, build_reviewer_client};
 use nitpicker_agent::session::{
     AggregationRecord, LaneRecord, SessionLogger, SessionWriter, VerdictRecord,
@@ -28,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use termimad::MadSkin;
 use tracing::field::Empty;
-use tracing::{Instrument, info, info_span, warn};
+use tracing::{Instrument, info_span, warn};
 
 struct ModelLabel {
     alias: String, // short name used in agent name / logs
@@ -511,7 +509,6 @@ async fn run_debate_inner(
         fallback,
         format,
     } = opts;
-    let session_attribution = crate::prompts::session_attribution();
     let presets = task.presets();
     let lane_tasks = task.lanes();
     // in json mode stdout is reserved for the final envelope; the cast lines and
@@ -582,14 +579,7 @@ async fn run_debate_inner(
         actor_compact_threshold = config.reviewer_compact_threshold(actor_cfg);
         critic_compact_threshold = config.reviewer_compact_threshold(critic_cfg);
     }
-    let session_logger = SessionLogger::maybe_new(config.log_trajectories())?;
-    if let Some(logger) = &session_logger {
-        info!(path = %logger.root().display(), "trajectory logging enabled");
-        tracing::Span::current().record("nitpicker.session.id", logger.id());
-        if let Err(err) = logger.write_attribution(&session_attribution).await {
-            warn!(error = ?err, "failed to persist session attribution");
-        }
-    }
+    let session_logger = crate::run::open_session(config).await?;
 
     let project_context = crate::context::build_context(repo).await;
 
@@ -630,12 +620,7 @@ async fn run_debate_inner(
     let done_style = ProgressStyle::with_template("  {prefix:<12} {msg}").unwrap();
     let skin = MadSkin::default();
 
-    let mp = Arc::new(MultiProgress::new());
-    if verbose {
-        mp.set_draw_target(ProgressDrawTarget::hidden());
-    }
-    let _progress_guard = (!verbose && crate::progress::stderr_is_terminal())
-        .then(|| crate::progress::set_active_progress(&mp));
+    let (mp, _progress_guard) = crate::run::progress_display(verbose);
 
     // cast lines show which models are participating in interactive text mode, but piped/json
     // stdout stays machine-readable/final-report-only.
@@ -839,48 +824,36 @@ async fn run_debate_inner(
         }
     }
 
+    // Lane metadata travels on every outcome: the scalars follow the single-lane derivation
+    // whether the run fails or succeeds, so a failed `ask` run's record isn't shaped differently
+    // from a successful one.
+    let (rounds, converged) = single_lane_scalars(&lanes);
+    let record = crate::run::RunRecord {
+        logger: session_logger.as_ref(),
+        base: AggregationRecord {
+            kind: "aggregation".to_string(),
+            model: agg_cfg.model.clone(),
+            text: String::new(),
+            error: None,
+            rounds,
+            converged,
+            presets: presets.map(|ps| ps.iter().map(|p| p.name.clone()).collect()),
+            lanes: presets.map(|_| lane_records(&lanes)),
+            verdicts: debate_verdict_records(&lanes),
+            jobs: None,
+        },
+    };
+
     // Every turn failed everywhere (provider down, bad config): the dialogue is nothing but
     // failure stubs, so synthesizing a meta-verdict would fabricate a confident review from
     // errors. Surface the failure instead — `run_pr` maps this to a `status: "error"`
     // envelope and posts no comment. A lane with no successful turn is likewise omitted from
-    // synthesis below: its stubs are execution noise, not review evidence.
+    // synthesis below: its stubs are execution noise, not review evidence. The lane outcomes
+    // are persisted first: a run where every turn failed is the one that most needs a durable
+    // record of what was attempted.
     if surviving(&lanes).is_empty() {
         let err = eyre::eyre!("all debate turns failed; refusing to synthesize a verdict");
-        // persist the lane outcomes before bailing: a run where every turn failed is the one
-        // that most needs a durable record of what was attempted. The scalars follow the
-        // same single-lane derivation as the success and meta-failure paths, so a failed
-        // `ask` run's record isn't shaped differently from a successful one.
-        if let Some(logger) = &session_logger {
-            let (rounds, converged) = single_lane_scalars(&lanes);
-            let record = AggregationRecord {
-                kind: "aggregation".to_string(),
-                model: agg_cfg.model.clone(),
-                text: String::new(),
-                error: Some(crate::review::bounded_error_string(&err)),
-                rounds,
-                converged,
-                presets: presets.map(|ps| ps.iter().map(|p| p.name.clone()).collect()),
-                lanes: presets.map(|_| {
-                    lanes
-                        .iter()
-                        .map(|lane| LaneRecord {
-                            preset: lane.preset_name.clone().unwrap_or_default(),
-                            rounds: lane.final_round,
-                            converged: lane.converged,
-                            degraded: lane.degraded,
-                        })
-                        .collect()
-                }),
-                verdicts: debate_verdict_records(&lanes),
-                jobs: None,
-            };
-            match logger.write_aggregation(&record).await {
-                Ok(()) => {}
-                Err(write_err) => {
-                    warn!(error = ?write_err, "failed to persist all-turns-failed record");
-                }
-            }
-        }
+        record.persist_failure(&err, "all-turns-failed").await;
         return Err(err);
     }
 
@@ -902,98 +875,28 @@ async fn run_debate_inner(
     let (pb, _) = make_spinner(&mp);
     pb.set_prefix(colored_role_stderr("Meta-review"));
     pb.set_message(crate::progress::bar_message("synthesizing…"));
-    // preset runs get the count/context wrapping; Topic propagates the provider error
-    // untouched, as it did before lanes existed
-    let synthesis_span = telemetry::synthesis_span(&agg_cfg.model);
-    // all lanes have finished, so the permit is free; the chokepoint gives this call its chat span
-    let meta_result: eyre::Result<nitpicker_agent::llm::CompletionResponse> =
-        throttled_completion(&llm_semaphore, &agg_client, meta_completion)
-            .instrument(synthesis_span.clone())
-            .await
-            .and_then(|response| {
-                crate::review::validate_synthesis_response(&response, "meta-review")?;
-                Ok(response)
-            })
-            .map_err(|err| match presets {
-                Some(presets) => crate::presets::synthesis_failure(
-                    err,
-                    format!(
-                        "meta-review failed over {} surviving lane(s) across {} preset(s)",
-                        survivors.len(),
-                        presets.len()
-                    ),
-                ),
-                None => err,
-            });
-    if meta_result.is_err() {
-        synthesis_span.record("otel.status_code", "ERROR");
-    }
-    pb.set_style(done_style);
-    // Lane metadata travels on both outcomes: a meta failure still persists the per-lane
-    // record (the durable trace of what ran), flagged with `error` and an empty `text` so
-    // consumers (reflect) don't render it as a verdict.
-    let (rounds, converged) = single_lane_scalars(&lanes);
-    let preset_names: Option<Vec<String>> =
-        presets.map(|ps| ps.iter().map(|p| p.name.clone()).collect());
-    let lane_records: Option<Vec<LaneRecord>> = presets.map(|_| {
-        lanes
-            .iter()
-            .map(|lane| LaneRecord {
-                preset: lane.preset_name.clone().unwrap_or_default(),
-                rounds: lane.final_round,
-                converged: lane.converged,
-                degraded: lane.degraded,
-            })
-            .collect()
-    });
-    let meta_response = match meta_result {
-        Ok(response) => {
-            pb.finish_with_message("✓ done");
-            response
-        }
-        Err(err) => {
-            pb.finish_with_message(crate::progress::bar_message("✗ synthesis failed"));
-            if let Some(logger) = &session_logger {
-                let record = AggregationRecord {
-                    kind: "aggregation".to_string(),
-                    model: agg_cfg.model.clone(),
-                    text: String::new(),
-                    error: Some(crate::review::bounded_error_string(&err)),
-                    rounds,
-                    converged,
-                    presets: preset_names,
-                    lanes: lane_records,
-                    verdicts: debate_verdict_records(&lanes),
-                    jobs: None,
-                };
-                match logger.write_aggregation(&record).await {
-                    Ok(()) => {}
-                    Err(write_err) => {
-                        warn!(error = ?write_err, "failed to persist synthesis-failure record");
-                    }
-                }
-            }
-            return Err(err);
-        }
-    };
-    usage.add(meta_response.usage, 0);
-    let meta_text = meta_response.text();
-    let meta_model = crate::review::synthesis_model(&meta_response, &agg_cfg.model);
-    if let Some(logger) = &session_logger {
-        let record = AggregationRecord {
-            kind: "aggregation".to_string(),
-            model: meta_model.clone(),
-            text: meta_text.clone(),
-            error: None,
-            rounds,
-            converged,
-            presets: preset_names,
-            lanes: lane_records,
-            verdicts: debate_verdict_records(&lanes),
-            jobs: None,
-        };
-        logger.write_aggregation(&record).await?;
-    }
+    let synthesis = crate::run::synthesize(
+        crate::run::Synthesis {
+            client: Ok(agg_client),
+            completion: meta_completion,
+            role: "meta-review",
+            failure_context: presets.map(|presets| {
+                format!(
+                    "meta-review failed over {} surviving lane(s) across {} preset(s)",
+                    survivors.len(),
+                    presets.len()
+                )
+            }),
+            progress: pb,
+            done_style,
+            llm_semaphore: &llm_semaphore,
+        },
+        record,
+    )
+    .await?;
+    usage.add(synthesis.usage, 0);
+    let meta_text = synthesis.text;
+    let meta_model = synthesis.model;
     // The transcript is a verbose-only debugging artifact. Keep both rendering and writing
     // behind the flag: multi-lane verdicts can be large, and non-verbose callers ignore the path.
     let transcript_path = if verbose {
@@ -1214,6 +1117,18 @@ fn single_lane_scalars(lanes: &[DebateLaneOutcome]) -> (Option<usize>, Option<bo
         [lane] => (Some(lane.final_round), Some(lane.converged)),
         _ => (None, None),
     }
+}
+
+fn lane_records(lanes: &[DebateLaneOutcome]) -> Vec<LaneRecord> {
+    lanes
+        .iter()
+        .map(|lane| LaneRecord {
+            preset: lane.preset_name.clone().unwrap_or_default(),
+            rounds: lane.final_round,
+            converged: lane.converged,
+            degraded: lane.degraded,
+        })
+        .collect()
 }
 
 fn debate_verdict_records(lanes: &[DebateLaneOutcome]) -> Vec<VerdictRecord> {

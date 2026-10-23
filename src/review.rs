@@ -6,18 +6,18 @@ use crate::routing::{
 };
 use crate::telemetry::{self, RunMode};
 use eyre::Result;
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle};
 use nitpicker_agent::agent::{
     AgentConfig, AgentDepth, AgentProgress, AgentResult, MAX_CONCURRENT_LLM_CALLS,
     add_spawn_subagent_tool, run_agent,
 };
 use nitpicker_agent::config::{Config, ReviewerConfig};
-use nitpicker_agent::llm::{Completion, CompletionResponse, FinishReason, throttled_completion};
+use nitpicker_agent::llm::Completion;
 use nitpicker_agent::session::{
-    AggregationRecord, JobRecord, SessionLogger, VerdictRecord, sanitize_path_component,
+    AggregationRecord, JobRecord, VerdictRecord, sanitize_path_component,
 };
 use nitpicker_agent::telemetry::bounded;
-use nitpicker_agent::tools::{all_tools, floor_char_boundary};
+use nitpicker_agent::tools::all_tools;
 use rig_core::completion::Message;
 use std::path::Path;
 use std::sync::Arc;
@@ -40,26 +40,6 @@ pub struct ReviewOutcome {
     pub degraded: bool,
     /// Per-preset attempted/succeeded job counts in resolution order. `None` on the Ask path.
     pub coverage: Option<Vec<PresetCoverage>>,
-}
-
-pub(crate) fn validate_synthesis_response(response: &CompletionResponse, role: &str) -> Result<()> {
-    match &response.finish_reason {
-        FinishReason::ToolUse => eyre::bail!("{role} returned tool calls unexpectedly"),
-        FinishReason::MaxTokens => {
-            let model = response.selected_model.as_deref().unwrap_or("unknown");
-            eyre::bail!(
-                "{role} model '{model}' reached its output token limit and returned a truncated verdict"
-            )
-        }
-        FinishReason::None | FinishReason::Stop | FinishReason::Other(_) => Ok(()),
-    }
-}
-
-pub(crate) fn synthesis_model(response: &CompletionResponse, configured_model: &str) -> String {
-    response
-        .selected_model
-        .clone()
-        .unwrap_or_else(|| configured_model.to_string())
 }
 
 /// Mirrors `DebateOptions`: the trailing run-control params bundled so `run_review` stays
@@ -100,20 +80,12 @@ async fn run_review_inner(
         fallback,
         format,
     } = opts;
-    let session_attribution = crate::prompts::session_attribution();
     let _terminal_title = crate::progress::start_terminal_title(repo, format);
     let presets = task.presets();
     let lanes = task.lanes();
     let mut tools = all_tools();
     add_spawn_subagent_tool(&mut tools);
-    let session_logger = SessionLogger::maybe_new(config.log_trajectories())?;
-    if let Some(logger) = &session_logger {
-        info!(path = %logger.root().display(), "trajectory logging enabled");
-        tracing::Span::current().record("nitpicker.session.id", logger.id());
-        if let Err(err) = logger.write_attribution(&session_attribution).await {
-            warn!(error = ?err, "failed to persist session attribution");
-        }
-    }
+    let session_logger = crate::run::open_session(config).await?;
     let context = crate::context::build_context(repo).await;
     let initial_message = task.initial_message(user_prompt);
     let reviewer_names: Vec<&str> = config.reviewer.iter().map(|r| r.name.as_str()).collect();
@@ -133,12 +105,7 @@ async fn run_review_inner(
     };
     let llm_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_LLM_CALLS));
 
-    let mp = Arc::new(MultiProgress::new());
-    if verbose {
-        mp.set_draw_target(ProgressDrawTarget::hidden());
-    }
-    let _progress_guard = (!verbose && crate::progress::stderr_is_terminal())
-        .then(|| crate::progress::set_active_progress(&mp));
+    let (mp, _progress_guard) = crate::run::progress_display(verbose);
     let prefix_width = jobs
         .iter()
         .map(|job| job.label.chars().count())
@@ -367,6 +334,22 @@ async fn run_review_inner(
 
     let coverage = presets.map(|ps| preset_coverage(ps, &job_records));
 
+    let record = crate::run::RunRecord {
+        logger: session_logger.as_ref(),
+        base: AggregationRecord {
+            kind: "aggregation".to_string(),
+            model: config.aggregator.model.clone(),
+            text: String::new(),
+            error: None,
+            rounds: None,
+            converged: None,
+            presets: presets.map(|ps| ps.iter().map(|p| p.name.clone()).collect()),
+            lanes: None,
+            verdicts: verdict_records,
+            jobs: Some(job_records),
+        },
+    };
+
     // Refuse to synthesize a verdict out of nothing but failures: the aggregator would hallucinate
     // a confident review from error notes, and `pr` would post it. A total failure is an error, not
     // an "ok" report with empty findings. The job outcomes are persisted first — a run where
@@ -375,26 +358,7 @@ async fn run_review_inner(
     if success_count == 0 {
         let err =
             eyre::eyre!("all {job_count} review job(s) failed; refusing to synthesize a verdict");
-        if let Some(logger) = &session_logger {
-            let record = AggregationRecord {
-                kind: "aggregation".to_string(),
-                model: config.aggregator.model.clone(),
-                text: String::new(),
-                error: Some(bounded_error_string(&err)),
-                rounds: None,
-                converged: None,
-                presets: presets.map(|ps| ps.iter().map(|p| p.name.clone()).collect()),
-                lanes: None,
-                verdicts: verdict_records,
-                jobs: Some(job_records),
-            };
-            match logger.write_aggregation(&record).await {
-                Ok(()) => {}
-                Err(write_err) => {
-                    warn!(error = ?write_err, "failed to persist all-jobs-failed record");
-                }
-            }
-        }
+        record.persist_failure(&err, "all-jobs-failed").await;
         return Err(err);
     }
 
@@ -425,106 +389,43 @@ async fn run_review_inner(
     pb_agg.set_message(crate::progress::bar_message("synthesizing…"));
     pb_agg.enable_steady_tick(Duration::from_millis(80));
 
-    let agg = &config.aggregator;
-    let synthesis_span = telemetry::synthesis_span(&agg.model);
-    let synthesis: Result<(String, String)> = async {
-        let client = aggregator_client(
-            config,
-            &gemini_proxy,
-            proxy_url.as_deref(),
-            &reviewer_clients,
-            fallback,
-        )?;
-        let completion = Completion {
-            model: agg.model.clone(),
-            prompt: Message::user(reduce_prompt),
-            preamble: Some(task.aggregator_preamble()),
-            history: Vec::new(),
-            tools: Vec::new(),
-            tool_choice: None,
-            max_tokens: Some(config.aggregator_max_tokens()),
-            additional_params: None,
-        };
-        // preset runs get the count/context wrapping; the Ask path propagates the provider
-        // error untouched, as it did before the fan-out
-        // every job has finished, so the permit is free; routing through the chokepoint keeps
-        // "every completion is a chat span" true for the synthesis too
-        let response = throttled_completion(&llm_semaphore, &client, completion)
-            .await
-            .and_then(|response| {
-                validate_synthesis_response(&response, "aggregator")?;
-                Ok(response)
-            })
-            .map_err(|err| match presets {
-                Some(presets) => crate::presets::synthesis_failure(
-                    err,
-                    format!(
-                        "final aggregation failed over {success_count} surviving review job(s) across {} preset(s)",
-                        presets.len()
-                    ),
-                ),
-                None => err,
-            })?;
-        usage.add(response.usage, 0);
-        let model = synthesis_model(&response, &agg.model);
-        Ok((response.text(), model))
-    }
-    .instrument(synthesis_span.clone())
-    .await;
-    if synthesis.is_err() {
-        synthesis_span.record("otel.status_code", "ERROR");
-    }
-    pb_agg.set_style(done_style);
-    // A post-collection synthesis failure still persists the per-job outcomes: the jobs
-    // list is the durable record of what ran, and losing it because the aggregator died
-    // is exactly when a post-mortem needs it. The record carries `error` and an empty
-    // `text` so consumers (reflect) don't render it as a verdict.
-    let (text, aggregation_model) = match synthesis {
-        Ok(result) => {
-            pb_agg.finish_with_message("✓ done");
-            result
-        }
-        Err(err) => {
-            pb_agg.finish_with_message(crate::progress::bar_message("✗ synthesis failed"));
-            if let Some(logger) = &session_logger {
-                let record = AggregationRecord {
-                    kind: "aggregation".to_string(),
-                    model: agg.model.clone(),
-                    text: String::new(),
-                    error: Some(bounded_error_string(&err)),
-                    rounds: None,
-                    converged: None,
-                    presets: presets.map(|ps| ps.iter().map(|p| p.name.clone()).collect()),
-                    lanes: None,
-                    verdicts: verdict_records,
-                    jobs: Some(job_records),
-                };
-                match logger.write_aggregation(&record).await {
-                    Ok(()) => {}
-                    Err(write_err) => {
-                        warn!(error = ?write_err, "failed to persist synthesis-failure record");
-                    }
-                }
-            }
-            return Err(err);
-        }
-    };
-    if let Some(logger) = &session_logger {
-        logger
-            .write_aggregation(&AggregationRecord {
-                kind: "aggregation".to_string(),
-                model: aggregation_model,
-                text: text.clone(),
-                error: None,
-                rounds: None,
-                converged: None,
-                presets: presets.map(|ps| ps.iter().map(|p| p.name.clone()).collect()),
-                lanes: None,
-                verdicts: verdict_records,
-                jobs: Some(job_records),
-            })
-            .await?;
-    }
+    let synthesis = crate::run::synthesize(
+        crate::run::Synthesis {
+            // built only now, after every job: a build failure is reported (and recorded) as the
+            // synthesis failure, unwrapped
+            client: aggregator_client(
+                config,
+                &gemini_proxy,
+                proxy_url.as_deref(),
+                &reviewer_clients,
+                fallback,
+            ),
+            completion: Completion {
+                model: config.aggregator.model.clone(),
+                prompt: Message::user(reduce_prompt),
+                preamble: Some(task.aggregator_preamble()),
+                history: Vec::new(),
+                tools: Vec::new(),
+                tool_choice: None,
+                max_tokens: Some(config.aggregator_max_tokens()),
+                additional_params: None,
+            },
+            role: "aggregator",
+            failure_context: presets.map(|presets| {
+                format!(
+                    "final aggregation failed over {success_count} surviving review job(s) across {} preset(s)",
+                    presets.len()
+                )
+            }),
+            progress: pb_agg,
+            done_style,
+            llm_semaphore: &llm_semaphore,
+        },
+        record,
+    )
+    .await?;
+    usage.add(synthesis.usage, 0);
+    let text = synthesis.text;
     let report = match &coverage {
         Some(coverage) => crate::output::with_partial_review_note(
             text,
@@ -595,17 +496,6 @@ fn preset_coverage(
             }
         })
         .collect()
-}
-
-/// Bounded `{err:#}` chain for persistence — a provider error body can be huge, and the
-/// session record is not the place to store it whole.
-pub(crate) fn bounded_error_string(err: &eyre::Report) -> String {
-    const MAX: usize = 4000;
-    let full = format!("{err:#}");
-    match full.len() <= MAX {
-        true => full,
-        false => format!("{}…", &full[..floor_char_boundary(&full, MAX)]),
-    }
 }
 
 fn plan_jobs(
@@ -744,40 +634,6 @@ fn build_agent_config(
 mod tests {
     use super::*;
     use crate::presets::ReviewPreset;
-    use nitpicker_agent::llm::TokenUsage;
-    use rig_core::OneOrMany;
-    use rig_core::completion::AssistantContent;
-
-    fn synthesis_response(finish_reason: FinishReason) -> CompletionResponse {
-        CompletionResponse {
-            choice: OneOrMany::one(AssistantContent::text("partial verdict")),
-            finish_reason,
-            usage: TokenUsage::default(),
-            selected_model: Some("fallback-model".to_string()),
-        }
-    }
-
-    #[test]
-    fn synthesis_rejects_truncated_or_tool_call_responses() {
-        let truncated = synthesis_response(FinishReason::MaxTokens);
-        let err = validate_synthesis_response(&truncated, "aggregator").unwrap_err();
-        assert!(format!("{err:#}").contains("truncated verdict"));
-        assert!(format!("{err:#}").contains("fallback-model"));
-
-        let tool_call = synthesis_response(FinishReason::ToolUse);
-        assert!(validate_synthesis_response(&tool_call, "aggregator").is_err());
-
-        let complete = synthesis_response(FinishReason::Stop);
-        assert!(validate_synthesis_response(&complete, "aggregator").is_ok());
-        assert_eq!(synthesis_model(&complete, "configured"), "fallback-model");
-
-        let mut without_selected_model = complete;
-        without_selected_model.selected_model = None;
-        assert_eq!(
-            synthesis_model(&without_selected_model, "configured"),
-            "configured"
-        );
-    }
 
     /// Two unnamed (or same-named) reviewers must still get distinct trajectory identities —
     /// before the index they shared one file stem AND one record label, interleaving
