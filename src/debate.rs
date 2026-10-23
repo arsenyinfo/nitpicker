@@ -747,8 +747,6 @@ async fn run_debate_inner(
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let transcript_path =
-            std::env::temp_dir().join(transcript_filename(task.label(), ts, presets));
         let mut transcript = render_transcript(
             task,
             prompt,
@@ -759,8 +757,7 @@ async fn run_debate_inner(
             max_rounds,
         );
         transcript.push_str(&format!("---\n\n## Meta-review\n\n{meta_text}\n"));
-        tokio::fs::write(&transcript_path, &transcript).await?;
-        transcript_path
+        write_transcript(&transcript_stem(task.label(), ts, presets), &transcript)?
     } else {
         PathBuf::new()
     };
@@ -1224,13 +1221,13 @@ fn lane_sections(survivors: &[&DebateLaneOutcome]) -> String {
 
 /// `debate-{ts}.md` for Topic (unchanged); review runs append bounded sanitized preset
 /// slugs so concurrent artifacts are attributable at a glance.
-fn transcript_filename(
+fn transcript_stem(
     label: &str,
     ts: u64,
     presets: Option<&[crate::presets::ReviewPreset]>,
 ) -> String {
     match presets {
-        None => format!("{label}-{ts}.md"),
+        None => format!("{label}-{ts}"),
         Some(presets) => {
             let mut slugs = presets
                 .iter()
@@ -1240,9 +1237,21 @@ fn transcript_filename(
             // sanitize output is ASCII, so a byte truncate cannot split a char
             const MAX_SLUG_LEN: usize = 80;
             slugs.truncate(MAX_SLUG_LEN);
-            format!("{label}-{ts}-{slugs}.md")
+            format!("{label}-{ts}-{slugs}")
         }
     }
+}
+
+/// The temp dir is shared and the stem predictable, so the file gets a random suffix and is
+/// created exclusively, owner-only: a pre-planted symlink or file is never written through.
+fn write_transcript(stem: &str, transcript: &str) -> Result<PathBuf> {
+    let file = tempfile::Builder::new()
+        .prefix(&format!("{stem}-"))
+        .suffix(".md")
+        .tempfile()?;
+    std::io::Write::write_all(&mut file.as_file(), transcript.as_bytes())?;
+    let (_, path) = file.keep()?;
+    Ok(path)
 }
 
 /// Human transcript section for one lane — every lane appears (dead ones flagged), unlike
@@ -1478,17 +1487,35 @@ mod tests {
 
     /// Topic filenames are unchanged; preset filenames append bounded sanitized slugs.
     #[test]
-    fn transcript_filenames_are_mode_appropriate_and_bounded() {
-        assert_eq!(transcript_filename("debate", 42, None), "debate-42.md");
+    fn transcript_stems_are_mode_appropriate_and_bounded() {
+        assert_eq!(transcript_stem("debate", 42, None), "debate-42");
 
         let ps = vec![preset("security"), preset("ml-rigor")];
         assert_eq!(
-            transcript_filename("review-debate", 42, Some(&ps)),
-            "review-debate-42-security-ml-rigor.md"
+            transcript_stem("review-debate", 42, Some(&ps)),
+            "review-debate-42-security-ml-rigor"
         );
 
         let long: Vec<ReviewPreset> = (0..30).map(|i| preset(&format!("angle-{i}"))).collect();
-        let name = transcript_filename("review-debate", 42, Some(&long));
+        let name = transcript_stem("review-debate", 42, Some(&long));
         assert!(name.len() < 120, "unbounded filename: {name}");
+    }
+
+    #[test]
+    fn transcripts_with_the_same_stem_never_share_a_file() {
+        let stem = format!("nitpicker-transcript-test-{}", std::process::id());
+        let first = write_transcript(&stem, "first").unwrap();
+        let second = write_transcript(&stem, "second").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "first");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&first).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        std::fs::remove_file(first).unwrap();
+        std::fs::remove_file(second).unwrap();
     }
 }
