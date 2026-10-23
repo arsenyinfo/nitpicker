@@ -1258,6 +1258,57 @@ fn normalize_openrouter_completion_error(err: CompletionError) -> eyre::Report {
     }
 }
 
+/// OpenRouter fails a Gemini turn over between upstreams (Vertex, AI Studio), and each rejects
+/// a thought signature the other minted with a 400 that names it only in the gateway's `raw`
+/// upstream text. History without signatures is accepted.
+fn is_foreign_thought_signature_rejection(err: &CompletionError) -> bool {
+    fn raw_mentions_signature(value: &Value) -> bool {
+        match value {
+            Value::Object(object) => {
+                object
+                    .iter()
+                    .any(|(key, value)| match (key.as_str(), value) {
+                        ("raw", Value::String(raw)) => {
+                            raw.to_ascii_lowercase().contains("thought signature")
+                        }
+                        _ => raw_mentions_signature(value),
+                    })
+            }
+            Value::Array(values) => values.iter().any(raw_mentions_signature),
+            _ => false,
+        }
+    }
+    let status = err.provider_response_status().map(|status| status.as_u16());
+    match (status, err.provider_response_json()) {
+        (Some(400), Ok(Some(body))) => raw_mentions_signature(&body),
+        _ => false,
+    }
+}
+
+/// The request with every reasoning block dropped from its history; an assistant message left
+/// with no content is dropped whole.
+fn without_reasoning(
+    mut request: rig_core::completion::CompletionRequest,
+) -> rig_core::completion::CompletionRequest {
+    let history = request
+        .chat_history
+        .into_iter()
+        .filter_map(|message| match message {
+            Message::Assistant { id, content } => {
+                let kept = content
+                    .into_iter()
+                    .filter(|item| !matches!(item, AssistantContent::Reasoning(_)));
+                OneOrMany::many(kept)
+                    .ok()
+                    .map(|content| Message::Assistant { id, content })
+            }
+            other => Some(other),
+        });
+    request.chat_history =
+        OneOrMany::many(history).expect("the prompt is a user message and is always kept");
+    request
+}
+
 fn is_local_base_url(base_url: Option<&str>) -> bool {
     base_url
         .map(|u| u.starts_with("http://localhost") || u.starts_with("http://127.0.0.1"))
@@ -1389,9 +1440,17 @@ impl LLMClient for openrouter::Client {
         let mut request: rig_core::completion::CompletionRequest = completion.into();
         request.model = Some(model_name.clone());
         let model = self.completion_model(&model_name);
-        let response = model
-            .completion(request)
-            .await
+        let response = match model.completion(request.clone()).await {
+            Err(err) if is_foreign_thought_signature_rejection(&err) => {
+                warn!(
+                    model = %model_name,
+                    "upstream rejected a replayed thought signature; retrying without reasoning history"
+                );
+                model.completion(without_reasoning(request)).await
+            }
+            other => other,
+        };
+        let response = response
             .map_err(normalize_openrouter_completion_error)
             .wrap_err_with(|| format!("OpenRouter completion failed for model '{model_name}'"))?;
         let finish_reason = response
@@ -2532,6 +2591,64 @@ mod tests {
             None => CompletionError::from_provider_body(body),
         };
         eyre::Report::new(error).wrap_err("completion failed for model 'test'")
+    }
+
+    #[test]
+    fn foreign_thought_signature_is_recognized_only_as_a_gateway_400() {
+        let body = r#"{"error":{"message":"Provider returned error","code":400,"metadata":{"raw":"Upstream error: {\"error\":{\"code\":400,\"message\":\"Corrupted thought signature.\"}}","provider_name":"Google AI Studio"}}}"#;
+        let status = |code: u16| {
+            CompletionError::from_http_response(reqwest::StatusCode::from_u16(code).unwrap(), body)
+        };
+        assert!(is_foreign_thought_signature_rejection(&status(400)));
+        assert!(!is_foreign_thought_signature_rejection(&status(502)));
+        let other = CompletionError::from_http_response(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"Provider returned error","code":400,"metadata":{"raw":"invalid tool schema"}}}"#,
+        );
+        assert!(!is_foreign_thought_signature_rejection(&other));
+    }
+
+    #[test]
+    fn without_reasoning_drops_reasoning_and_reasoning_only_turns() {
+        let reasoning =
+            || AssistantContent::Reasoning(rig_core::completion::message::Reasoning::new("think"));
+        let request: rig_core::completion::CompletionRequest = Completion {
+            model: "gemini".to_string(),
+            prompt: Message::user("follow-up"),
+            preamble: None,
+            history: vec![
+                Message::user("task"),
+                Message::Assistant {
+                    id: None,
+                    content: OneOrMany::many([reasoning(), AssistantContent::text("answer")])
+                        .unwrap(),
+                },
+                Message::Assistant {
+                    id: None,
+                    content: OneOrMany::one(reasoning()),
+                },
+            ],
+            tools: Vec::new(),
+            tool_choice: None,
+            max_tokens: None,
+            additional_params: None,
+        }
+        .into();
+        let kept: Vec<Message> = without_reasoning(request)
+            .chat_history
+            .into_iter()
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                Message::user("task"),
+                Message::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::text("answer")),
+                },
+                Message::user("follow-up"),
+            ]
+        );
     }
 
     fn gemini_completion(max_tokens: Option<u64>, additional_params: Option<Value>) -> Completion {
