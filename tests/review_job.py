@@ -35,6 +35,9 @@ class ReviewJobTest(unittest.TestCase):
         self.request = self.root / "request.json"
         self.request.write_text(json.dumps({"schema_version": 1, "repository": "example/repo", "base_sha": self.base, "head_sha": self.head}))
         self.calls = []
+        self.mcp_calls = []
+        self.recover_block = False
+        self.missing_policy_tools = False
         self.result = {"summary": "Reviewed", "findings": [], "previous": [], "reviewed": ["src/lib.rs"], "limitations": "Synthetic transport"}
         test = self
 
@@ -44,6 +47,28 @@ class ReviewJobTest(unittest.TestCase):
 
             def do_POST(self):
                 data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if self.path == "/mcp":
+                    test.mcp_calls.append((data, dict(self.headers)))
+                    method = data["method"]
+                    if method == "notifications/initialized":
+                        self.send_response(202)
+                        self.end_headers()
+                        return
+                    if method == "initialize":
+                        result = {"protocolVersion": "2025-03-26", "capabilities": {"tools": {}}, "serverInfo": {"name": "fixture", "version": "1"}}
+                    elif method == "tools/list":
+                        result = {"tools": [] if test.missing_policy_tools else [{"name": name, "description": "Policy fixture", "inputSchema": {"type": "object", "properties": {}}} for name in ["archestra__get_remedy_plans", "archestra__execute_remedy_plan"]]}
+                    elif method == "tools/call":
+                        result = {"content": [{"type": "text", "text": "Fixture policy observation; retry the read_file call"}]}
+                    else:
+                        raise AssertionError(method)
+                    body = json.dumps({"jsonrpc": "2.0", "id": data["id"], "result": result}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 test.calls.append((data, dict(self.headers)))
                 if self.path.endswith("/responses"):
                     if not data.get("tools"):
@@ -69,7 +94,10 @@ class ReviewJobTest(unittest.TestCase):
                 if not tools:
                     message = {"role": "assistant", "content": json.dumps(test.result)}
                     finish = "stop"
-                elif not any(m["role"] == "tool" for m in data["messages"]):
+                elif test.recover_block and not any(m["role"] == "tool" for m in data["messages"]):
+                    message = {"role": "assistant", "content": None, "tool_calls": [{"id": "policy-1", "type": "function", "function": {"name": "archestra__get_remedy_plans", "arguments": "{}"}}]}
+                    finish = "tool_calls"
+                elif not any(m["role"] == "tool" and m.get("tool_call_id") == "read-1" for m in data["messages"]):
                     message = {"role": "assistant", "content": None, "tool_calls": [{"id": "read-1", "type": "function", "function": {"name": "read_file", "arguments": json.dumps({"path": "src/lib.rs"})}}]}
                     finish = "tool_calls"
                 elif "submit_verdict" in tools:
@@ -124,8 +152,31 @@ provider = "openai"
 base_url = "{self.url}"
 api_key_env = "NITPICKER_TEST_KEY"
 ''')
-        env = {**os.environ, "NITPICKER_TEST_KEY": "synthetic", "OTEL_SDK_DISABLED": "true", "ARCHESTRA_LLM_PROXY_URL": self.url + "/v1/openai/fixture", "ARCHESTRA_AGENT_RUNTIME_BINDING": "synthetic-binding", "ARCHESTRA_AGENT_RUNTIME_TASK_ID": "fixture-task", "ARCHESTRA_AGENT_RUNTIME_WORKSPACE_ID": "fixture-session"}
+        env = {**os.environ, "NITPICKER_TEST_KEY": "synthetic", "OTEL_SDK_DISABLED": "true", "ARCHESTRA_MCP_GATEWAY_URL": self.url + "/mcp", "ARCHESTRA_MCP_GATEWAY_TOKEN": "mcp-synthetic", "ARCHESTRA_LLM_PROXY_URL": self.url + "/v1/openai/fixture", "ARCHESTRA_AGENT_RUNTIME_BINDING": "synthetic-binding", "ARCHESTRA_AGENT_RUNTIME_TASK_ID": "fixture-task", "ARCHESTRA_AGENT_RUNTIME_WORKSPACE_ID": "fixture-session"}
         return subprocess.run([BINARY, "--repo", str(self.repo), "--config", str(config), "--request", str(self.request), "--rounds", "1", "--max-turns", "4"], env=env, capture_output=True, text=True, timeout=20)
+
+    def test_runtime_policy_notice_is_dispatched_before_source_read(self):
+        self.recover_block = True
+        process = self.invoke(debate=True)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertFalse(json.loads(process.stdout)["_nitpicker"]["degraded"])
+        controls = [(body, headers) for body, headers in self.mcp_calls if body["method"] == "tools/call"]
+        self.assertTrue(controls)
+        for _, headers in self.mcp_calls:
+            headers = {key.lower(): value for key, value in headers.items()}
+            self.assertEqual(headers["authorization"], "Bearer mcp-synthetic")
+            self.assertEqual(headers["x-appa-session-id"], "fixture-session")
+            self.assertEqual(headers["x-archestra-runtime-binding"], "synthetic-binding")
+        wire = json.dumps(self.calls)
+        self.assertIn("pub fn value()", wire)
+        self.assertNotIn("mcp-synthetic", wire)
+
+    def test_missing_runtime_policy_tools_fails_before_model_calls(self):
+        self.missing_policy_tools = True
+        process = self.invoke()
+        self.assertNotEqual(process.returncode, 0)
+        self.assertFalse(self.calls)
+        self.assertIn("required runtime MCP policy tool unavailable", process.stderr)
 
     def test_parallel_json_uses_real_file_tools_and_pinned_base_instructions(self):
         process = self.invoke()

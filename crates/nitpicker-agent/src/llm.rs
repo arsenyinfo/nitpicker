@@ -1607,8 +1607,27 @@ pub(crate) fn merge_json(base: Value, extra: Value) -> Value {
     }
 }
 
+// Kimi's always-thinking models reject a named tool choice. Requiring a call
+// from the requested subset preserves the terminal contract without disabling thinking.
+fn normalize_kimi_tool_choice(completion: &mut Completion) {
+    let model = completion.model.to_ascii_lowercase();
+    if !(model.starts_with("kimi-code:")
+        || model.starts_with("kimi-")
+        || model.starts_with("moonshot:kimi-"))
+    {
+        return;
+    }
+    if let Some(ToolChoice::Specific { function_names }) = &completion.tool_choice {
+        completion.tools.retain(|tool| {
+            function_names.contains(&tool.name) || crate::runtime_mcp::is_policy_tool(&tool.name)
+        });
+        completion.tool_choice = Some(ToolChoice::Required);
+    }
+}
+
 impl LLMClient for openai::CompletionsClient {
     async fn completion(&self, mut completion: Completion) -> Result<CompletionResponse> {
+        normalize_kimi_tool_choice(&mut completion);
         // Newer OpenAI models (o1, o3, o4-mini, gpt-4o, gpt-5, etc.) reject the legacy
         // `max_tokens` param and require `max_completion_tokens` instead. Since rig always
         // serializes `max_tokens`, we move the value into `additional_params` and clear it.
@@ -2106,6 +2125,40 @@ mod tests {
         assert_eq!(response.selected_model.as_deref(), Some("tool-use"));
         assert_eq!(tool_use_calls.load(Ordering::Relaxed), 1);
         assert!(unused_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn kimi_named_terminal_choice_requires_only_the_permitted_subset() {
+        for model in ["kimi-code:k3.1-pro", "kimi-k3.1-pro"] {
+            let mut completion = test_completion();
+            completion.model = model.into();
+            completion.tools = ["git", "submit_verdict"]
+                .into_iter()
+                .map(|name| rig_core::completion::ToolDefinition {
+                    name: name.into(),
+                    description: name.into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                })
+                .collect();
+            completion.tool_choice = Some(ToolChoice::Specific {
+                function_names: vec!["submit_verdict".into()],
+            });
+            normalize_kimi_tool_choice(&mut completion);
+            assert!(matches!(completion.tool_choice, Some(ToolChoice::Required)));
+            assert_eq!(completion.tools.len(), 1);
+            assert_eq!(completion.tools[0].name, "submit_verdict");
+            assert!(completion.additional_params.is_none());
+        }
+        let mut completion = test_completion();
+        completion.model = "gpt-6.1-sol".into();
+        completion.tool_choice = Some(ToolChoice::Specific {
+            function_names: vec!["submit".into()],
+        });
+        normalize_kimi_tool_choice(&mut completion);
+        assert!(matches!(
+            completion.tool_choice,
+            Some(ToolChoice::Specific { .. })
+        ));
     }
 
     #[tokio::test]

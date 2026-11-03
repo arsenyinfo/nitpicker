@@ -418,6 +418,7 @@ async fn run_agent_inner(
 ) -> Result<AgentResult> {
     let finish_store = Arc::new(Mutex::new(None));
     let mut runtime_tools = tools_map.clone();
+    crate::runtime_mcp::add_runtime_tools(&mut runtime_tools).await?;
     if config.depth.is_subagent() {
         let finish_tool = Arc::new(FinishTool {
             result: Arc::clone(&finish_store),
@@ -448,13 +449,20 @@ async fn run_agent_inner(
     // but cannot require one of several named tools. Preserve the stable schema prefix whenever
     // the choice itself is sufficient; for multiple terminal tools, retain the old structural
     // guarantee that no non-terminal schema is callable on the terminal request.
-    let multiple_terminal_tool_definitions = (terminal_tools.len() > 1).then(|| {
-        advertised_tool_definitions
-            .iter()
-            .filter(|tool| terminal_tools.iter().any(|name| name == &tool.name))
-            .cloned()
-            .collect::<Vec<_>>()
-    });
+    let has_policy_tools = runtime_tools
+        .keys()
+        .any(|name| crate::runtime_mcp::is_policy_tool(name));
+    let multiple_terminal_tool_definitions =
+        (terminal_tools.len() > 1 || has_policy_tools).then(|| {
+            advertised_tool_definitions
+                .iter()
+                .filter(|tool| {
+                    terminal_tools.iter().any(|name| name == &tool.name)
+                        || crate::runtime_mcp::is_policy_tool(&tool.name)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        });
 
     let mut effective_system_prompt = config.system_prompt.clone();
     match &config.project_context {
@@ -519,7 +527,10 @@ async fn run_agent_inner(
         }
 
         if terminal_phase {
-            executable_tools.retain(|name| terminal_tools.iter().any(|tool| tool == name));
+            executable_tools.retain(|name| {
+                terminal_tools.iter().any(|tool| tool == name)
+                    || crate::runtime_mcp::is_policy_tool(name)
+            });
         }
 
         if is_final_turn {
@@ -539,7 +550,7 @@ async fn run_agent_inner(
         let tool_choice = if terminal_phase {
             match terminal_tools.as_slice() {
                 [] => Some(ToolChoice::None),
-                [name] => Some(ToolChoice::Specific {
+                [name] if !has_policy_tools => Some(ToolChoice::Specific {
                     function_names: vec![name.clone()],
                 }),
                 _ => Some(ToolChoice::Required),

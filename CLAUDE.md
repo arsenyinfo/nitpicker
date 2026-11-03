@@ -77,6 +77,23 @@ the injected Archestra proxy origin, including model-router paths on that origin
 Managed transport permits in-cluster HTTP only on that exact injected origin;
 unrelated HTTP hosts remain rejected.
 
+In an Archestra runtime, Nitpicker initializes the injected MCP gateway before
+agent turns and exposes only `archestra__get_remedy_plans` and
+`archestra__execute_remedy_plan`. Both channels use the same runtime/session
+identity and binding. Discovery failure aborts the agent; policy refusals and
+approval requirements remain tool observations. The bridge neither grants consent
+nor imports general gateway tools. It uses bounded Streamable HTTP JSON/SSE,
+disables redirects and does not retry remedy calls. Concurrent reviewers share the
+runtime policy session, just as their LLM requests do; no synthetic child identities
+or policy resets are created. The isolated live test currently exercises one
+sequential debate lane; concurrent policy recovery still needs live validation.
+
+Kimi named terminal calls use `required` with the permitted tool subset because
+K3.1 thinking rejects a specific function choice. The harness still requires the
+terminal tool to run successfully; plain text cannot substitute for a verdict.
+Runtime terminal turns keep the policy controls available for proxy recovery.
+
+
 This is a two-crate Cargo workspace: a publishable library crate `nitpicker-agent`
 (`crates/nitpicker-agent/`) holds the reusable agentic core, and the `nitpicker` binary at
 the repo root (`src/`) holds the CLI/review/debate/PR layer and depends on the library via

@@ -27,6 +27,7 @@ pub mod llm;
 pub mod openrouter;
 pub mod prompts;
 pub mod provider;
+mod runtime_mcp;
 pub mod session;
 pub mod telemetry;
 pub mod tools;

@@ -99,3 +99,21 @@ cargo test --workspace
 cargo build
 NITPICKER_TEST_BIN="$PWD/target/debug/nitpicker" python3 tests/review_job.py -v
 ```
+
+## Runtime policy channel and Kimi terminal calls
+
+In an Archestra runtime, Nitpicker initializes the injected MCP gateway before
+agent turns and exposes only `archestra__get_remedy_plans` and
+`archestra__execute_remedy_plan`. Both channels use the same runtime/session
+identity and binding. Discovery failure aborts the agent; policy refusals and
+approval requirements remain tool observations. The bridge neither grants consent
+nor imports general gateway tools. It uses bounded Streamable HTTP JSON/SSE,
+disables redirects and does not retry remedy calls. Concurrent reviewers share the
+runtime policy session, just as their LLM requests do; no synthetic child identities
+or policy resets are created. The isolated live test currently exercises one
+sequential debate lane; concurrent policy recovery still needs live validation.
+
+Kimi named terminal calls use `required` with the permitted tool subset because
+K3.1 thinking rejects a specific function choice. The harness still requires the
+terminal tool to run successfully; plain text cannot substitute for a verdict.
+Runtime terminal turns keep the policy controls available for proxy recovery.

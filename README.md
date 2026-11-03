@@ -355,3 +355,8 @@ and Codex Responses access through a managed proxy without a coding CLI.
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) for version release notes.
+
+Archestra runtime jobs also initialize the injected MCP policy gateway before
+reviewing. Only remedy controls are exposed; policy and approval remain enforced
+by Archestra. Kimi terminal calls preserve thinking using a required tool subset.
+See [review job runtime details](docs/review-jobs.md#runtime-policy-channel-and-kimi-terminal-calls).
