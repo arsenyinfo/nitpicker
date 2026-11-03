@@ -81,7 +81,9 @@ api_key_env = "ARCHESTRA_VIRTUAL_KEY"
 This path never reads or refreshes local OAuth credentials. The gateway owns
 account selection and refresh. It uses the existing Responses SSE/tool-history
 handling, `store: false`, and encrypted reasoning replay. The endpoint must use
-HTTPS or loopback HTTP. A partial endpoint/key configuration is rejected.
+HTTPS, loopback HTTP, or the exact origin injected in `ARCHESTRA_LLM_PROXY_URL`
+(which can be HTTP inside a cluster). Other HTTP endpoints are rejected. A
+partial endpoint/key configuration is rejected.
 
 When running inside Archestra, the OpenAI, Anthropic, Gemini, and managed Codex
 clients forward injected run/session/binding headers only to the same parsed

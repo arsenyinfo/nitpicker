@@ -74,6 +74,8 @@ For managed Codex access, `auth = "codex"` accepts an explicit `base_url` plus
 Codex Responses wire and leaves OAuth/account refresh to the proxy. Bare Codex
 auth retains the local OAuth store. Runtime identity headers are sent only to
 the injected Archestra proxy origin, including model-router paths on that origin.
+Managed transport permits in-cluster HTTP only on that exact injected origin;
+unrelated HTTP hosts remain rejected.
 
 This is a two-crate Cargo workspace: a publishable library crate `nitpicker-agent`
 (`crates/nitpicker-agent/`) holds the reusable agentic core, and the `nitpicker` binary at

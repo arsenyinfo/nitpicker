@@ -430,11 +430,10 @@ pub fn shared_client() -> Result<Arc<dyn LLMClientDyn>> {
 /// selection; this client never opens or refreshes a local subscription credential.
 pub fn managed_client(base_url: &str, api_key_env: &str) -> Result<Arc<dyn LLMClientDyn>> {
     let base = reqwest::Url::parse(base_url).wrap_err("invalid managed Codex base_url")?;
+    let runtime_proxy = std::env::var("ARCHESTRA_LLM_PROXY_URL").ok();
     eyre::ensure!(
-        base.scheme() == "https"
-            || (base.scheme() == "http"
-                && matches!(base.host_str(), Some("localhost" | "127.0.0.1" | "::1"))),
-        "managed Codex endpoint must use HTTPS or loopback HTTP"
+        managed_endpoint_allowed(&base, runtime_proxy.as_deref()),
+        "managed Codex endpoint must use HTTPS, loopback HTTP, or the injected runtime proxy origin"
     );
     let api_key =
         std::env::var(api_key_env).wrap_err_with(|| format!("missing env var {api_key_env}"))?;
@@ -445,6 +444,26 @@ pub fn managed_client(base_url: &str, api_key_env: &str) -> Result<Arc<dyn LLMCl
     }
     .with_retry()
     .into_arc())
+}
+
+fn managed_endpoint_allowed(base: &reqwest::Url, runtime_proxy: Option<&str>) -> bool {
+    if base.scheme() == "https" {
+        return true;
+    }
+    if base.scheme() != "http" {
+        return false;
+    }
+    if matches!(
+        base.host_str(),
+        Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
+    ) {
+        return true;
+    }
+    // An in-cluster Archestra proxy may use HTTP. Trust only the launcher's
+    // explicit origin, never arbitrary private hosts or hostname suffixes.
+    runtime_proxy
+        .and_then(|url| reqwest::Url::parse(url).ok())
+        .is_some_and(|proxy| proxy.origin() == base.origin())
 }
 
 struct ManagedCodexClient {
@@ -757,6 +776,46 @@ fn is_rotation_4xx(err: &eyre::Report) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_http_is_limited_to_loopback_or_the_injected_origin() {
+        let injected = Some("http://gateway.internal:9000/v1/model-router/agent");
+        for (url, proxy, expected) in [
+            ("https://provider.example/v1", None, true),
+            ("http://localhost:8000/v1", None, true),
+            ("http://127.0.0.1:8000/v1", None, true),
+            ("http://[::1]:8000/v1", None, true),
+            (
+                "http://gateway.internal:9000/v1/model-router/agent",
+                None,
+                false,
+            ),
+            (
+                "http://gateway.internal:9000/v1/model-router/agent",
+                injected,
+                true,
+            ),
+            (
+                "http://gateway.internal:9000/v1/model-router",
+                injected,
+                true,
+            ),
+            ("http://gateway.internal:9001/v1", injected, false),
+            (
+                "http://gateway.internal.attacker.invalid:9000/v1",
+                injected,
+                false,
+            ),
+            ("http://unrelated.internal:9000/v1", injected, false),
+            ("ftp://gateway.internal:9000/v1", injected, false),
+        ] {
+            assert_eq!(
+                managed_endpoint_allowed(&reqwest::Url::parse(url).unwrap(), proxy),
+                expected,
+                "{url}"
+            );
+        }
+    }
     use rig_core::OneOrMany;
     use rig_core::completion::message::{
         Message, ToolCall, ToolFunction, ToolResult, ToolResultContent,
