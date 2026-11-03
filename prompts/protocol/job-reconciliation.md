@@ -1,0 +1,4 @@
+
+Automation finding lifecycle: when the task supplies previous_findings, append a separate `## Previous findings` section to your report, including when there are no new findings. This section is required bookkeeping, not a new finding or narration of landed improvements. It overrides an otherwise exact no-findings-only response.
+
+For every supplied ID, inspect the current code and report `fixed`, `still_present`, or `regressed`, with concrete file/line evidence and the current location. Preserve that ID on any corresponding active finding. An absent finding, a moved line, or somebody's claim that it is fixed is not evidence of a fix. State missing evidence rather than fabricating a disposition. Validators must check this section too; agreeing means it can be forwarded unchanged. The final synthesizer relies on this evidence to update existing GitHub threads.

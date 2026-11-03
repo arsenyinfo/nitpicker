@@ -46,6 +46,8 @@ fn protocol_prompt_sha256() -> String {
     };
     let presets = [preset.clone()];
     let mut prompts = vec![
+        include_str!("../prompts/protocol/job-synthesis.md").to_string(),
+        include_str!("../prompts/protocol/job-reconciliation.md").to_string(),
         LaneTask::Ask.reviewer_system(),
         LaneTask::Ask.actor_system(),
         LaneTask::Ask.critic_system(),

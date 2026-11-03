@@ -100,6 +100,9 @@ fn build_client_from_settings(
     }
 
     if is_codex_auth(settings.auth) {
+        if let (Some(base), Some(key)) = (settings.base_url, settings.api_key_env) {
+            return crate::codex::managed_client(base, key);
+        }
         return crate::codex::shared_client();
     }
 

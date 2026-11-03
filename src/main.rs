@@ -15,6 +15,7 @@ mod detect;
 #[cfg(feature = "antigravity")]
 mod gemini_proxy;
 mod init;
+mod job;
 mod output;
 mod pr;
 mod presets;
@@ -149,6 +150,12 @@ async fn run(args: Args) -> Result<Exit> {
 }
 
 async fn dispatch(args: Args) -> Result<Exit> {
+    if let Some(request) = &args.request {
+        if args.command.is_some() {
+            eyre::bail!("--request applies to the default review mode only");
+        }
+        return job::run(request, &args).await;
+    }
     if !presets_allowed(&args.command) && !args.presets.preset.is_empty() {
         eyre::bail!("--preset applies to review modes only (default review, --analyze, pr)");
     }

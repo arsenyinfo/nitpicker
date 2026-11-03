@@ -591,7 +591,11 @@ async fn run_debate_inner(
         }
     }
 
-    let project_context = crate::context::build_context(repo).await;
+    let project_context = if format == crate::output::OutputFormat::ReviewJson {
+        String::new()
+    } else {
+        crate::context::build_context(repo).await
+    };
 
     let agg_client: Arc<dyn LLMClientDyn> = match &reviewer_pool {
         Some(pool) if fallback => crate::review::aggregator_client(
@@ -693,8 +697,8 @@ async fn run_debate_inner(
                 let (lane_progress, _) = make_spinner(mp);
                 lane_progress.set_prefix(preset.map_or("debate", |p| p.name.as_str()).to_string());
                 lane_progress.set_message(crate::progress::bar_message("waiting…"));
-                let actor_system = lane_task.actor_system();
-                let critic_system = lane_task.critic_system();
+                let actor_system = crate::job::worker_prompt(lane_task.actor_system(), format);
+                let critic_system = crate::job::worker_prompt(lane_task.critic_system(), format);
                 let subagent_prompt = lane_task.subagent_prompt();
                 let (actor_stem, critic_stem) = lane_session_stems(lane_index, preset);
                 let actor = DebateSide {
@@ -939,7 +943,11 @@ async fn run_debate_inner(
     let meta_completion = Completion {
         model: agg_cfg.model.clone(),
         prompt: Message::user(meta_prompt),
-        preamble: Some(task.meta_preamble()),
+        preamble: Some(if format == crate::output::OutputFormat::ReviewJson {
+            crate::job::synthesis_prompt().to_string()
+        } else {
+            task.meta_preamble()
+        }),
         history: Vec::new(),
         tools: Vec::new(),
         tool_choice: None,
@@ -1112,14 +1120,16 @@ async fn run_debate_inner(
     };
 
     let report = match &coverage {
-        Some(coverage) => crate::output::with_partial_review_note(
-            meta_text,
-            lanes.iter().filter(|lane| lane.degraded).count(),
-            lanes.len(),
-            "debate lanes",
-            coverage,
-        ),
-        None => meta_text,
+        Some(coverage) if format != crate::output::OutputFormat::ReviewJson => {
+            crate::output::with_partial_review_note(
+                meta_text,
+                lanes.iter().filter(|lane| lane.degraded).count(),
+                lanes.len(),
+                "debate lanes",
+                coverage,
+            )
+        }
+        _ => meta_text,
     };
     Ok(DebateOutcome {
         report,

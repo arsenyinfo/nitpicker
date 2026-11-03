@@ -308,12 +308,19 @@ async fn run_review_inner(
             warn!(error = ?err, "failed to persist session attribution");
         }
     }
-    let context = crate::context::build_context(repo).await;
+    let context = if format == OutputFormat::ReviewJson {
+        String::new() // The job supplies repository instructions from the pinned base commit.
+    } else {
+        crate::context::build_context(repo).await
+    };
     let initial_message = task.initial_message(user_prompt);
     let reviewer_names: Vec<&str> = config.reviewer.iter().map(|r| r.name.as_str()).collect();
     let jobs = plan_jobs(&reviewer_names, presets);
     // per-preset prompts are identical across reviewers — compose each once, not per job
-    let system_prompts: Vec<String> = lanes.iter().map(|lane| lane.reviewer_system()).collect();
+    let system_prompts: Vec<String> = lanes
+        .iter()
+        .map(|lane| crate::job::worker_prompt(lane.reviewer_system(), format))
+        .collect();
     let subagent_prompts: Vec<Option<String>> =
         lanes.iter().map(|lane| lane.subagent_prompt()).collect();
     let mut handles = Vec::new();
@@ -635,7 +642,11 @@ async fn run_review_inner(
         let completion = Completion {
             model: agg.model.clone(),
             prompt: Message::user(reduce_prompt),
-            preamble: Some(task.aggregator_preamble()),
+            preamble: Some(if format == OutputFormat::ReviewJson {
+                crate::job::synthesis_prompt().to_string()
+            } else {
+                task.aggregator_preamble()
+            }),
             history: Vec::new(),
             tools: Vec::new(),
             tool_choice: None,
@@ -723,14 +734,16 @@ async fn run_review_inner(
             .await?;
     }
     let report = match &coverage {
-        Some(coverage) => crate::output::with_partial_review_note(
-            text,
-            job_count - success_count,
-            job_count,
-            "review jobs",
-            coverage,
-        ),
-        None => text,
+        Some(coverage) if format != OutputFormat::ReviewJson => {
+            crate::output::with_partial_review_note(
+                text,
+                job_count - success_count,
+                job_count,
+                "review jobs",
+                coverage,
+            )
+        }
+        _ => text,
     };
     Ok(ReviewOutcome {
         report,

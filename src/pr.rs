@@ -599,7 +599,7 @@ fn pr_failure_exit(
 ) -> Result<crate::Exit> {
     match format {
         crate::output::OutputFormat::Text => Err(err),
-        crate::output::OutputFormat::Json => {
+        crate::output::OutputFormat::Json | crate::output::OutputFormat::ReviewJson => {
             let env = crate::output::PrReviewOutput::error(format!("{err:#}"), elapsed_ms);
             // a consumer that cannot read the envelope still gets the non-zero exit
             let _ = crate::output::write_json(stdout, &env);
@@ -1093,7 +1093,7 @@ async fn run_review_inner(
                 eprintln!("\nTranscript saved to: {}", transcript_path.display());
             }
         }
-        OutputFormat::Json => {
+        OutputFormat::Json | OutputFormat::ReviewJson => {
             // post the comment before emitting so its outcome is reflected in the
             // envelope rather than arriving after a success-looking object. a
             // posting failure is non-fatal here — the report itself succeeded.

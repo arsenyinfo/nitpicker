@@ -1306,7 +1306,9 @@ impl LLMProvider {
                 let key_env = api_key_env.as_deref().unwrap_or("ANTHROPIC_API_KEY");
                 let api_key = std::env::var(key_env)
                     .or_else(|_| missing_or_local(key_env, base_url.as_deref()))?;
-                let mut builder = anthropic::Client::builder().api_key(api_key);
+                let mut builder = anthropic::Client::builder()
+                    .api_key(api_key)
+                    .http_headers(runtime_proxy_headers(base_url.as_deref())?);
                 if let Some(url) = base_url {
                     builder = builder.base_url(url);
                 }
@@ -1334,7 +1336,9 @@ impl LLMProvider {
                             )
                         })?,
                 };
-                let mut builder = gemini::Client::builder().api_key(api_key);
+                let mut builder = gemini::Client::builder()
+                    .api_key(api_key)
+                    .http_headers(runtime_proxy_headers(base_url.as_deref())?);
                 if let Some(url) = base_url {
                     builder = builder.base_url(url);
                 }
@@ -1350,7 +1354,9 @@ impl LLMProvider {
                 let key_env = api_key_env.as_deref().unwrap_or("OPENAI_API_KEY");
                 let api_key = std::env::var(key_env)
                     .or_else(|_| missing_or_local(key_env, base_url.as_deref()))?;
-                let mut builder = openai::CompletionsClient::builder().api_key(&api_key);
+                let mut builder = openai::CompletionsClient::builder()
+                    .api_key(&api_key)
+                    .http_headers(runtime_proxy_headers(base_url.as_deref())?);
                 if let Some(url) = base_url {
                     builder = builder.base_url(url);
                 }
@@ -1367,6 +1373,52 @@ impl LLMProvider {
             }
         }
     }
+}
+
+/// Attach run identity only to the injected platform origin. Provider credentials and
+/// runtime binding must never travel to a third-party endpoint from a different config route.
+pub(crate) fn runtime_proxy_headers(base_url: Option<&str>) -> Result<reqwest::header::HeaderMap> {
+    let platform = std::env::var("ARCHESTRA_LLM_PROXY_URL").ok();
+    let values = [
+        ("X-Archestra-Run-Id", "ARCHESTRA_AGENT_RUNTIME_TASK_ID"),
+        (
+            "X-Archestra-Session-Id",
+            "ARCHESTRA_AGENT_RUNTIME_WORKSPACE_ID",
+        ),
+        ("X-Appa-Session-ID", "ARCHESTRA_AGENT_RUNTIME_WORKSPACE_ID"),
+        (
+            "X-Archestra-Runtime-Binding",
+            "ARCHESTRA_AGENT_RUNTIME_BINDING",
+        ),
+    ]
+    .map(|(header, env)| (header, std::env::var(env).ok()));
+    headers_for_runtime_origin(base_url, platform.as_deref(), &values)
+}
+
+fn headers_for_runtime_origin(
+    base_url: Option<&str>,
+    platform: Option<&str>,
+    values: &[(&str, Option<String>)],
+) -> Result<reqwest::header::HeaderMap> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    let (Some(base), Some(platform)) = (base_url, platform) else {
+        return Ok(headers);
+    };
+    // Use the URL type re-exported by reqwest; compare parsed origins, not string prefixes.
+    let base = reqwest::Url::parse(base)?;
+    let platform = reqwest::Url::parse(platform)?;
+    if base.origin() != platform.origin() {
+        return Ok(headers);
+    }
+    for (name, value) in values {
+        if let Some(value) = value.as_deref().filter(|v| !v.is_empty()) {
+            headers.insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes())?,
+                value.parse()?,
+            );
+        }
+    }
+    Ok(headers)
 }
 
 pub fn openrouter_headers() -> Result<reqwest::header::HeaderMap> {
@@ -3086,5 +3138,47 @@ mod tests {
             assert_eq!(attempts[0].field("error.type"), Some("empty_response"));
             assert_eq!(attempts[0].field("otel.status_code"), Some("ERROR"));
         }
+    }
+}
+
+#[cfg(test)]
+mod runtime_header_tests {
+    use super::headers_for_runtime_origin;
+
+    #[test]
+    fn runtime_credentials_stay_on_the_platform_origin() {
+        let values = [(
+            "X-Archestra-Runtime-Binding",
+            Some("fixture-binding".into()),
+        )];
+        let platform = Some("https://platform.example/v1/openai/agent");
+        let headers = headers_for_runtime_origin(
+            Some("https://platform.example/v1/model-router"),
+            platform,
+            &values,
+        )
+        .unwrap();
+        assert_eq!(headers["X-Archestra-Runtime-Binding"], "fixture-binding");
+        for other in [
+            "https://platform.example.attacker.invalid/v1",
+            "http://platform.example/v1",
+            "https://platform.example:444/v1",
+        ] {
+            assert!(
+                headers_for_runtime_origin(Some(other), platform, &values)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(
+            headers_for_runtime_origin(None, platform, &values)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            headers_for_runtime_origin(Some("https://platform.example"), None, &values)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

@@ -59,6 +59,22 @@ cargo run -- --fallback
 
 ## Architecture
 
+Pinned automation reviews use `--request PATH` on the default review command
+(`src/job.rs`, contract in `docs/review-jobs.md`). They require an explicit trusted
+config, verify a clean fixed HEAD, supply repository instructions from the base
+commit, and reuse parallel/debate with `OutputFormat::ReviewJson`. The existing
+final synthesis uses `prompts/protocol/job-synthesis.md` and returns typed Action
+JSON directly; normal text and `pr --json` behavior remain unchanged. The caller
+owns checkout and publication. `_nitpicker` carries revisions, coverage, usage,
+and degradation. Run subprocess tests with `NITPICKER_TEST_BIN=... python3
+tests/review_job.py -v`.
+
+For managed Codex access, `auth = "codex"` accepts an explicit `base_url` plus
+`api_key_env` pair; both are required together. `codex::managed_client` reuses the
+Codex Responses wire and leaves OAuth/account refresh to the proxy. Bare Codex
+auth retains the local OAuth store. Runtime identity headers are sent only to
+the injected Archestra proxy origin, including model-router paths on that origin.
+
 This is a two-crate Cargo workspace: a publishable library crate `nitpicker-agent`
 (`crates/nitpicker-agent/`) holds the reusable agentic core, and the `nitpicker` binary at
 the repo root (`src/`) holds the CLI/review/debate/PR layer and depends on the library via

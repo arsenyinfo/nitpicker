@@ -79,6 +79,10 @@ pub(crate) struct Args {
     )]
     pub(crate) prompt: Option<String>,
 
+    /// Review a pinned automation request; emit an Action-compatible JSON result without posting
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["analyze", "prompt"])]
+    pub(crate) request: Option<PathBuf>,
+
     /// Analyze existing code instead of reviewing changes
     #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
     pub(crate) analyze: Option<PathBuf>,

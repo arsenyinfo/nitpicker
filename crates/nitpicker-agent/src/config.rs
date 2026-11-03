@@ -395,20 +395,15 @@ fn validate_auth(label: &str, settings: ClientSettings<'_>) -> Result<()> {
                 "{label}: auth = \"azure-ad\" is only supported with provider \"openai\" or \"anthropic\""
             );
         }
-        // Codex/ChatGPT subscription auth reuses the OpenAI Responses endpoint, so it only makes
-        // sense for the OpenAI provider; the token comes from `~/.codex/auth.json`, not an env var.
-        // Client construction returns the fixed shared CodexClient and ignores base_url/api_key_env,
-        // so reject them rather than silently dropping a configured endpoint or key.
+        // Bare Codex uses the local OAuth store. An explicit endpoint/key pair uses the
+        // same Codex Responses wire through a managed proxy, which owns subscription refresh.
         (ProviderType::OpenAi, Some("codex")) => {
-            if settings.base_url.is_some() {
-                eyre::bail!(
-                    "{label}: auth = \"codex\" ignores `base_url` (requests always go to the Codex endpoint) — remove it"
-                );
-            }
-            if settings.api_key_env.is_some() {
-                eyre::bail!(
-                    "{label}: auth = \"codex\" ignores `api_key_env` (the token comes from ~/.codex/auth.json) — remove it"
-                );
+            match (settings.base_url, settings.api_key_env) {
+                (None, None) => {}
+                (Some(base), Some(key)) if !base.trim().is_empty() && !key.trim().is_empty() => {}
+                _ => eyre::bail!(
+                    "{label}: managed Codex auth requires both base_url and api_key_env; omit both for local OAuth"
+                ),
             }
             Ok(())
         }
@@ -490,7 +485,7 @@ fn required_env_var<'a>(settings: ClientSettings<'a>) -> Option<&'a str> {
         return None;
     }
     if is_codex_auth(settings.auth) {
-        return None;
+        return settings.base_url.and(settings.api_key_env);
     }
     if is_local_server(settings.base_url) {
         return None;
@@ -602,11 +597,11 @@ mod tests {
     }
 
     #[test]
-    fn validate_auth_codex_rejects_ignored_fields() {
+    fn validate_auth_codex_requires_a_complete_proxy_pair() {
         let auth = Some("codex");
         // bare codex auth is fine
         assert!(validate_auth("[t]", client_settings(&ProviderType::OpenAi, auth),).is_ok());
-        // base_url / api_key_env would be silently dropped, so they must be rejected
+        // Neither half of a managed proxy configuration may be silently ignored.
         assert!(
             validate_auth(
                 "[t]",
@@ -617,6 +612,13 @@ mod tests {
             )
             .is_err()
         );
+        let proxy = || ClientSettings {
+            base_url: Some("https://platform.example/v1/model-router"),
+            api_key_env: Some("ROUTER_KEY"),
+            ..client_settings(&ProviderType::OpenAi, auth)
+        };
+        assert!(validate_auth("[t]", proxy()).is_ok());
+        assert_eq!(required_env_var(proxy()), Some("ROUTER_KEY"));
         assert!(
             validate_auth(
                 "[t]",
@@ -780,6 +782,7 @@ mod tests {
             ("openai",     Some("azure-ad"),    Some("https://f.example/v1"),      Some("EXPLICIT"), None),
             ("openai",     Some("codex"),       None,                              None,             None),
             ("openai",     Some("codex"),       None,                              Some("EXPLICIT"), None),
+            ("openai",     Some("codex"),       Some("https://gw.example"),        Some("EXPLICIT"), Some("EXPLICIT")),
             ("openai",     None,                Some("http://localhost:1234/v1"),  Some("EXPLICIT"), None),
             ("openai",     None,                Some("http://127.0.0.1:1234/v1"),  None,             None),
             // a non-local base_url does not bypass the key; explicit env beats the default

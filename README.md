@@ -344,6 +344,14 @@ routing settings in `src/settings.rs`, and config generation in `src/init.rs`.
 Command dispatch remains in `src/main.rs`; PR-specific config trust and output handling
 live in `src/pr.rs`. See [CLAUDE.md](CLAUDE.md) for the full architecture.
 
+## Pinned review jobs
+
+Automation can use `nitpicker --repo CHECKOUT --config TRUSTED_CONFIG --request
+REQUEST_JSON` to review fixed revisions, reconcile previous findings, and emit
+the typed Archestra Action result directly. No GitHub comment is posted. See
+[pinned automation reviews](docs/review-jobs.md) for inputs, output, exit codes,
+and Codex Responses access through a managed proxy without a coding CLI.
+
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) for version release notes.

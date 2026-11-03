@@ -426,6 +426,63 @@ pub fn shared_client() -> Result<Arc<dyn LLMClientDyn>> {
     Ok(client)
 }
 
+/// Codex wire over an explicitly configured gateway. The gateway owns OAuth and account
+/// selection; this client never opens or refreshes a local subscription credential.
+pub fn managed_client(base_url: &str, api_key_env: &str) -> Result<Arc<dyn LLMClientDyn>> {
+    let base = reqwest::Url::parse(base_url).wrap_err("invalid managed Codex base_url")?;
+    eyre::ensure!(
+        base.scheme() == "https"
+            || (base.scheme() == "http"
+                && matches!(base.host_str(), Some("localhost" | "127.0.0.1" | "::1"))),
+        "managed Codex endpoint must use HTTPS or loopback HTTP"
+    );
+    let api_key =
+        std::env::var(api_key_env).wrap_err_with(|| format!("missing env var {api_key_env}"))?;
+    Ok(ManagedCodexClient {
+        http: build_http_client()?,
+        base_url: base_url.trim_end_matches('/').into(),
+        api_key,
+    }
+    .with_retry()
+    .into_arc())
+}
+
+struct ManagedCodexClient {
+    http: reqwest::Client,
+    base_url: String,
+    api_key: String,
+}
+
+impl LLMClient for ManagedCodexClient {
+    async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
+        let body = build_body_value(&completion)?;
+        let response = self
+            .http
+            .post(format!("{}/responses", self.base_url))
+            .bearer_auth(&self.api_key)
+            .headers(crate::llm::runtime_proxy_headers(Some(&self.base_url))?)
+            .header("originator", ORIGINATOR)
+            .header(reqwest::header::USER_AGENT, user_agent())
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .json(&body)
+            .send()
+            .await
+            .wrap_err("managed Codex request failed")?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .wrap_err("reading managed Codex response")?;
+        if !status.is_success() {
+            return Err(eyre::Report::new(CompletionError::from_http_response(
+                status,
+                compact_provider_error_body(&text, 1000),
+            )));
+        }
+        to_completion_response(parse_sse(&text)?, completion.model)
+    }
+}
+
 impl LLMClient for CodexClient {
     async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
         let (access, account_id) = self.current_access().await?;

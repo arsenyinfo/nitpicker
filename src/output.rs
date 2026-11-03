@@ -15,6 +15,8 @@ pub enum OutputFormat {
     #[default]
     Text,
     Json,
+    /// Direct typed synthesis for a pinned automation request, not the PR report envelope.
+    ReviewJson,
 }
 
 #[derive(Debug, Serialize)]
