@@ -113,8 +113,8 @@ pub fn extract_model_from_path(path: &str) -> String {
     path.split('/')
         .find(|s| s.starts_with("gemini-"))
         .map(|s| s.split(':').next().unwrap_or(s).to_string())
-        // default to gemini-2.5-flash when no model segment is present
-        .unwrap_or_else(|| "gemini-2.5-flash".to_string())
+        // Use the Antigravity default when no model segment is present.
+        .unwrap_or_else(|| "gemini-3.8-flash-tiered".to_string())
 }
 
 pub fn transform_request(

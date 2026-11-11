@@ -21,7 +21,7 @@ async fn main() -> eyre::Result<()> {
 
     let result = AgentBuilder::new(
         "explorer",
-        "claude-sonnet-5",
+        "claude-sonnet-5-5",
         "You explore codebases. Build a quick map, then delegate disjoint threads to subagents.",
         client,
     )

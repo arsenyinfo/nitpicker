@@ -53,15 +53,15 @@ fn priority_index(name: &str) -> usize {
 static ANTHROPIC: ProviderDef = ProviderDef {
     name: "anthropic",
     provider: "anthropic",
-    model: "claude-sonnet-5",
+    model: "claude-sonnet-5-5",
     base_url: None,
     api_key_env: "ANTHROPIC_API_KEY",
 };
 static OPENAI: ProviderDef = ProviderDef {
     name: "openai",
     provider: "openai",
-    // flagship tier; cheaper tiers: gpt-5.6-terra, gpt-5.6-luna
-    model: "gpt-5.6-sol",
+    // Balanced default; cheaper tiers: gpt-6.1-terra, gpt-6-luna
+    model: "gpt-6.1-sol",
     base_url: None,
     api_key_env: "OPENAI_API_KEY",
 };
@@ -75,14 +75,14 @@ static GEMINI_API: ProviderDef = ProviderDef {
 static MISTRAL: ProviderDef = ProviderDef {
     name: "mistral",
     provider: "openai",
-    model: "mistral-medium-3.5",
+    model: "mistral-large-4",
     base_url: Some("https://api.mistral.ai/v1"),
     api_key_env: "MISTRAL_API_KEY",
 };
 static OPENROUTER: ProviderDef = ProviderDef {
     name: "openrouter",
     provider: "openrouter",
-    model: "deepseek/deepseek-v4-pro",
+    model: "deepseek/deepseek-v4.1-flash-1017",
     base_url: None,
     api_key_env: "OPENROUTER_API_KEY",
 };
@@ -103,7 +103,7 @@ static ZAI: ProviderDef = ProviderDef {
 static MINIMAX: ProviderDef = ProviderDef {
     name: "minimax",
     provider: "anthropic",
-    model: "MiniMax-M3",
+    model: "MiniMax-M3.1-Flash",
     base_url: Some("https://api.minimax.io/anthropic"),
     api_key_env: "MINIMAX_API_KEY",
 };
@@ -235,7 +235,7 @@ fn detect_agy_keyring() -> Option<Detected> {
         Ok(_) => Some(Detected {
             name: "gemini",
             provider: "gemini",
-            model: "gemini-3.5-flash-low".to_string(),
+            model: "gemini-3.8-flash-tiered".to_string(),
             base_url: None,
             api_key_env: None,
             auth: Some(AGY_KEYRING_AUTH),
@@ -250,7 +250,7 @@ fn detect_codex() -> Option<Detected> {
     nitpicker_agent::codex::auth_available().then(|| Detected {
         name: "codex",
         provider: "openai",
-        model: "gpt-5.6-sol".to_string(),
+        model: "gpt-6.1-sol".to_string(),
         base_url: None,
         api_key_env: None,
         auth: Some("codex"),
@@ -323,7 +323,7 @@ async fn detect_ollama() -> Option<Detected> {
         .unwrap_or(false);
 
     if binary_found {
-        let model = find_ollama_installed_model().unwrap_or_else(|| "llama3.2".to_string());
+        let model = find_ollama_installed_model().unwrap_or_else(|| "qwen3.5:4b".to_string());
         return Some(ollama_detected(model, "ollama (installed, not running)"));
     }
 
@@ -432,7 +432,7 @@ fn detect_databricks() -> Option<Detected> {
     Some(Detected {
         name: "databricks",
         provider: "openai",
-        model: "databricks-claude-sonnet-4-6".to_string(),
+        model: "databricks-claude-sonnet-5-5".to_string(),
         base_url: Some(base_url),
         api_key_env: Some("DATABRICKS_TOKEN"),
         auth: None,

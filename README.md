@@ -172,26 +172,26 @@ max_turns = 100        # tool-use loop limit per agent
 
 # Model that synthesizes the final report from surviving debate findings
 [aggregator]
-model = "claude-sonnet-5"
+model = "claude-sonnet-5-5"
 provider = "anthropic"
 max_tokens = 16384
 
 # Reviewer 1 (Actor / Discovery)
 [[reviewer]]
 name = "claude"
-model = "claude-sonnet-5"
+model = "claude-sonnet-5-5"
 provider = "anthropic"
 
 # Reviewer 2 (Critic / Validator)
 [[reviewer]]
 name = "gpt"
-model = "gpt-5.6-sol"
+model = "gpt-6.1-sol"
 provider = "openai"
 
 # Reviewer 3 (Fast / Inexpensive via OpenRouter)
 [[reviewer]]
 name = "qwen"
-model = "qwen/qwen3-30b-a3b"
+model = "qwen/qwen3.5-35b-a3b"
 provider = "openrouter"
 ```
 
@@ -223,7 +223,7 @@ codex login
 ```toml
 [[reviewer]]
 name = "codex"
-model = "gpt-5.6-sol"
+model = "gpt-6.1-sol"
 provider = "openai"
 auth = "codex"
 ```
@@ -234,7 +234,7 @@ For high-volume reviews, OpenRouter gives you access to cost-effective models wi
 ```toml
 [[reviewer]]
 name = "deepseek"
-model = "deepseek/deepseek-v4-pro"
+model = "deepseek/deepseek-v4.1-flash-1017"
 provider = "openrouter"
 
 # Or experimental auto-selection of currently available free models:
@@ -321,7 +321,7 @@ use std::path::Path;
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     let client = client_from_env(LLMProvider::Anthropic { base_url: None, api_key_env: None })?;
-    let result = AgentBuilder::new("explorer", "claude-sonnet-5", "You explore codebases.", client)
+    let result = AgentBuilder::new("explorer", "claude-sonnet-5-5", "You explore codebases.", client)
         .run("Map the module layout of this repo.", &file_agent_tools(), Path::new("."))
         .await?;
 
@@ -335,6 +335,10 @@ async fn main() -> eyre::Result<()> {
 
 > [!CAUTION]
 > Research only. AG2 is Google's internal agentic IDE backend. `auth = "agy-keyring"` reads the `agy` CLI OAuth token from the system keyring to evaluate `gemini-3.x` models. Google actively monitors and suspends accounts using third-party OAuth bridges. For standard Gemini access, use `GEMINI_API_KEY`.
+
+Build with `--features antigravity`. The default model for this auth path is
+`gemini-3.8-flash-tiered`; use that exact backend ID rather than the `agy` CLI's
+`gemini-3.8-flash-low` alias.
 </details>
 
 ---
