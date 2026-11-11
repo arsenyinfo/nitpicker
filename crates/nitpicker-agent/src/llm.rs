@@ -1597,6 +1597,7 @@ fn model_needs_max_completion_tokens(model: &str) -> bool {
         || model.starts_with("gpt-4.1")
         || model.starts_with("gpt-4.5")
         || model.starts_with("gpt-5")
+        || model.starts_with("gpt-6")
 }
 
 /// Deep-merge `extra` over `base`: nested objects are merged recursively; on a scalar/type
@@ -1620,7 +1621,7 @@ pub(crate) fn merge_json(base: Value, extra: Value) -> Value {
 
 impl LLMClient for openai::CompletionsClient {
     async fn completion(&self, mut completion: Completion) -> Result<CompletionResponse> {
-        // Newer OpenAI models (o1, o3, o4-mini, gpt-4o, gpt-5, etc.) reject the legacy
+        // Newer OpenAI models (o1, o3, o4-mini, gpt-4o, gpt-5, gpt-6, etc.) reject the legacy
         // `max_tokens` param and require `max_completion_tokens` instead. Since rig always
         // serializes `max_tokens`, we move the value into `additional_params` and clear it.
         if let Some(max) = completion.max_tokens {
