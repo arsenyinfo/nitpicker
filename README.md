@@ -296,6 +296,9 @@ nitpicker --context-file ~/docs/rfc-42.md --context-file /tmp/spec.md
 ### Automatic Fallback Rings (`--fallback`)
 Avoid losing 10 minutes of deep review to transient 429 rate-limits. When `--fallback` is enabled, any reviewer that exhausts retries automatically hands its history and completed tool outputs to the next configured model in the ring.
 
+### Provider Circuit Breaker (`--features circuit-breaker`)
+When a provider keeps returning 5xx or connection errors, the debate lanes and subagents sharing that model stop retrying it and fail fast (straight to the next route with `--fallback`) instead of each spending its own retry budget. Build with `cargo install nitpicker --features circuit-breaker`.
+
 ### Self-Reflection (`nitpicker reflect`)
 Analyze past review sessions to diagnose recurring false positives, agent friction, and tool loops:
 

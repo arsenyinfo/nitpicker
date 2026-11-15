@@ -123,6 +123,8 @@ src/  — `nitpicker` binary (CLI)
   (`gemini_proxy/`) with its `axum`/`uuid`/`keyring` deps. The two must be enabled together
   (forwarding ensures this): enabling it binary-side without the library gate would accept the
   auth value while the client hook compiled out.
+- `circuit-breaker` (library): owns the optional `tokio-prompt-orchestrator` dep (MSRV 1.88) and
+  the `llm::circuit` module. The binary's `circuit-breaker` feature is a pure forward.
 
 ### Customizable prompts (library)
 
@@ -338,6 +340,7 @@ path surfaces after the clone/checkout but still before the first model call.
 - Anthropic is the one provider whose API **requires** `max_tokens`, so "no cap" can't be expressed there: `impl LLMClient for anthropic::Client` substitutes `ANTHROPIC_DEFAULT_MAX_TOKENS` (8192) when the caller sends none. Letting rig fill it instead would give 2048 for any model name rig doesn't recognize — every Anthropic-compatible gateway (z.ai, proxied models) — which is less than one review turn spends on reasoning alone
 - An empty response (no text, no tool calls) is reported with `empty_response_diagnosis`: `finish_reason` plus the output tokens spent. `MaxTokens` there means the budget was consumed before any content, which is a configuration problem that otherwise presents as a broken model. A response with *nothing* in it — no content, no reasoning, no tool call — never reaches this: rig rejects it as a `CompletionError` first, so the metadata is lost. The cap-exhaustion case does reach it, since rig folds provider reasoning into the choice
 - Always wrap clients with `.with_retry()` — the OAuth Gemini path is no exception
+- With the off-by-default `circuit-breaker` feature, `RetryingLLM` routes each attempt through a per-model `CircuitBreaker` (from `tokio-prompt-orchestrator`) owned by that client, so it is shared by every lane, reviewer and subagent holding the client. Only `Server`/`Unknown` failures count; any other provider answer (4xx, 429, quota) counts as the provider being up and keeps its normal policy. After `MAX_COMPLETION_ATTEMPTS + 1` consecutive counted failures the circuit opens for 30s (doubling per failed probe) and attempts return `CircuitOpen` immediately with no further retries, which `--fallback` treats like any other route failure. Feature off, `RetryingLLM` is unchanged.
 - `AzureAdClient` (in `azure.rs`, feature `azure`) is a refreshing decorator: it acquires an AAD bearer token via the Azure SDK and rebuilds the inner rig client just before the token expires. Built in `provider.rs` when `auth = "azure-ad"`, then wrapped with `.with_retry()` like every other client. Since 401 is non-retryable, it also force-refreshes once on a 401 (detected via the same chain-walk as the retry classifiers). `ensure_client` uses double-checked locking so concurrent callers (e.g. parallel subagents sharing the client) don't each refresh; the 401-refresh path dedups the same way but gates on **client identity** rather than expiry (the token was rejected despite not being clock-expired, so an expiry re-check would wrongly skip the refresh) — a burst of concurrent 401s triggers exactly one token fetch.
 
 ### Azure AD auth (`azure.rs`)

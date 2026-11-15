@@ -33,6 +33,8 @@ sha2 = "0.11"
 # Azure AD (Entra ID) auth for Foundry-hosted models — opt-in, see `azure` feature below.
 azure_identity = { version = "1", optional = true }
 azure_core = { version = "1", optional = true }
+# Shared per-model circuit breaker in `RetryingLLM` — opt-in, see `circuit-breaker` feature below.
+tokio-prompt-orchestrator = { version = "2.2", default-features = false, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -47,3 +49,7 @@ azure = ["dep:azure_identity", "dep:azure_core"]
 # proxy *server* and its heavy deps live in the `nitpicker` binary; this feature just compiles
 # in the config validation + proxy-URL client hook so the binary's feature can forward to it.
 antigravity = []
+# Shares one circuit breaker per model across every caller of a retry-wrapped client (parallel
+# lanes, subagents), so once a provider keeps returning 5xx/transport errors the other callers
+# fail fast instead of each burning their own retry budget. Raises MSRV to 1.88. Off by default.
+circuit-breaker = ["dep:tokio-prompt-orchestrator"]

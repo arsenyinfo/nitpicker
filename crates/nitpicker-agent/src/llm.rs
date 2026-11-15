@@ -430,15 +430,36 @@ fn empty_response_diagnosis(response: &CompletionResponse) -> String {
 
 pub struct RetryingLLM<C> {
     inner: C,
+    #[cfg(feature = "circuit-breaker")]
+    breakers: circuit::ModelBreakers,
 }
 
 pub trait WithRetryExt: Sized {
     fn with_retry(self) -> RetryingLLM<Self> {
-        RetryingLLM { inner: self }
+        RetryingLLM {
+            inner: self,
+            #[cfg(feature = "circuit-breaker")]
+            breakers: Default::default(),
+        }
     }
 }
 
 impl<T: LLMClient> WithRetryExt for T {}
+
+impl<C: LLMClient> RetryingLLM<C> {
+    /// One provider round-trip. With the `circuit-breaker` feature it goes through the model's
+    /// shared breaker, which rejects it up front while that model's circuit is open.
+    async fn attempt(&self, completion: Completion) -> Result<CompletionResponse> {
+        #[cfg(feature = "circuit-breaker")]
+        {
+            self.breakers.call(&self.inner, completion).await
+        }
+        #[cfg(not(feature = "circuit-breaker"))]
+        {
+            self.inner.completion(completion).await
+        }
+    }
+}
 
 impl<C: LLMClient> LLMClient for RetryingLLM<C> {
     async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
@@ -454,8 +475,7 @@ impl<C: LLMClient> LLMClient for RetryingLLM<C> {
                 nitpicker.attempt = attempt as u64,
             );
             match self
-                .inner
-                .completion(completion.clone())
+                .attempt(completion.clone())
                 .instrument(span.clone())
                 .await
             {
@@ -484,6 +504,13 @@ impl<C: LLMClient> LLMClient for RetryingLLM<C> {
                     return Ok(response);
                 }
                 Err(err) => {
+                    // the provider has been failing for every caller: fail fast, don't retry
+                    #[cfg(feature = "circuit-breaker")]
+                    if err.is::<circuit::CircuitOpen>() {
+                        span.record("otel.status_code", "ERROR");
+                        span.record("error.type", "circuit_open");
+                        return Err(err);
+                    }
                     let class = classify_provider_failure(&err);
                     span.record("otel.status_code", "ERROR");
                     span.record("error.type", class.as_str());
@@ -505,6 +532,94 @@ impl<C: LLMClient> LLMClient for RetryingLLM<C> {
                 }
             }
         }
+    }
+}
+
+/// Run-wide circuit breaking for [`RetryingLLM`] (feature `circuit-breaker`). A retry-wrapped
+/// client is shared by every debate lane and subagent that runs on it, so one breaker per model
+/// makes them stop hammering a provider that keeps failing: after `FAILURE_THRESHOLD`
+/// consecutive provider-side failures the remaining callers fail fast (straight to the next
+/// route under `--fallback`) until a probe succeeds.
+#[cfg(feature = "circuit-breaker")]
+mod circuit {
+    use super::{
+        Completion, CompletionResponse, LLMClient, MAX_COMPLETION_ATTEMPTS, ProviderFailureClass,
+        classify_provider_failure,
+    };
+    use eyre::Result;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, PoisonError};
+    use std::time::Duration;
+    use tokio_prompt_orchestrator::enhanced::CircuitBreaker;
+    use tokio_prompt_orchestrator::enhanced::circuit_breaker::CircuitBreakerError;
+
+    /// Consecutive provider-side failures that open a model's circuit. One above a single
+    /// caller's attempt budget, so one unlucky request exhausting its retries never trips it.
+    pub(super) const FAILURE_THRESHOLD: usize = MAX_COMPLETION_ATTEMPTS + 1;
+    /// How long an open circuit rejects calls before letting a probe through; the breaker doubles
+    /// it after each failed probe.
+    const OPEN_FOR: Duration = Duration::from_secs(30);
+
+    #[derive(Debug)]
+    pub(super) struct CircuitOpen {
+        model: String,
+    }
+
+    impl std::fmt::Display for CircuitOpen {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "circuit open for model '{}': the provider kept failing, so this call failed fast",
+                self.model
+            )
+        }
+    }
+
+    impl std::error::Error for CircuitOpen {}
+
+    #[derive(Default)]
+    pub(super) struct ModelBreakers(Mutex<HashMap<String, CircuitBreaker>>);
+
+    impl ModelBreakers {
+        fn for_model(&self, model: &str) -> CircuitBreaker {
+            let mut breakers = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            breakers
+                .entry(model.to_string())
+                .or_insert_with(|| CircuitBreaker::new(FAILURE_THRESHOLD, 0.5, OPEN_FOR))
+                .clone()
+        }
+
+        pub(super) async fn call<C: LLMClient>(
+            &self,
+            inner: &C,
+            completion: Completion,
+        ) -> Result<CompletionResponse> {
+            let model = completion.model.clone();
+            let outcome = self
+                .for_model(&model)
+                .call(|| async {
+                    match inner.completion(completion).await {
+                        Err(err) if counts_against_circuit(&err) => Err(err),
+                        // any answer from the provider (4xx, 429, quota) shows it is up; those
+                        // keep their own retry/fallback policies and close the circuit
+                        other => Ok(other),
+                    }
+                })
+                .await;
+            match outcome {
+                Ok(result) => result,
+                Err(CircuitBreakerError::Failed(err)) => Err(err),
+                Err(CircuitBreakerError::Open) => Err(eyre::Report::new(CircuitOpen { model })),
+            }
+        }
+    }
+
+    /// The failures that mean the provider itself is down: 5xx and transport/unclassified errors.
+    fn counts_against_circuit(err: &eyre::Report) -> bool {
+        matches!(
+            classify_provider_failure(err),
+            ProviderFailureClass::Server | ProviderFailureClass::Unknown
+        )
     }
 }
 
@@ -3058,6 +3173,102 @@ mod tests {
             FinishReason::Other("content_filter".to_string()),
         ] {
             assert_eq!(resolve_finish_reason(&choice, wire.clone()), wire);
+        }
+    }
+
+    #[cfg(feature = "circuit-breaker")]
+    mod circuit_breaker {
+        use super::*;
+        use crate::llm::circuit::{CircuitOpen, FAILURE_THRESHOLD};
+        use std::collections::HashMap;
+
+        /// Answers every call with the given HTTP status, counting calls per model.
+        struct StatusClient {
+            status: u16,
+            calls: Arc<StdMutex<HashMap<String, usize>>>,
+        }
+
+        impl LLMClient for StatusClient {
+            async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
+                *self
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .entry(completion.model)
+                    .or_default() += 1;
+                Err(provider_error(
+                    Some(self.status),
+                    r#"{"message":"unavailable"}"#,
+                ))
+            }
+        }
+
+        fn status_client(
+            status: u16,
+        ) -> (
+            RetryingLLM<StatusClient>,
+            Arc<StdMutex<HashMap<String, usize>>>,
+        ) {
+            let calls = Arc::new(StdMutex::new(HashMap::new()));
+            let client = StatusClient {
+                status,
+                calls: Arc::clone(&calls),
+            }
+            .with_retry();
+            (client, calls)
+        }
+
+        fn calls_for(calls: &StdMutex<HashMap<String, usize>>, model: &str) -> usize {
+            calls.lock().unwrap().get(model).copied().unwrap_or(0)
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn repeated_server_errors_open_the_circuit_for_every_caller() {
+            let (client, calls) = status_client(503);
+
+            // the first caller spends its whole retry budget; the circuit is still closed
+            let err = LLMClient::completion(&client, test_completion())
+                .await
+                .unwrap_err();
+            assert!(!err.is::<CircuitOpen>());
+            assert_eq!(
+                calls_for(&calls, "logical-primary"),
+                MAX_COMPLETION_ATTEMPTS
+            );
+
+            // the next caller's first failure crosses the threshold, so it stops retrying
+            let err = LLMClient::completion(&client, test_completion())
+                .await
+                .unwrap_err();
+            assert!(err.is::<CircuitOpen>());
+            assert_eq!(calls_for(&calls, "logical-primary"), FAILURE_THRESHOLD);
+
+            // later callers fail fast without reaching the provider
+            let err = LLMClient::completion(&client, test_completion())
+                .await
+                .unwrap_err();
+            assert!(err.is::<CircuitOpen>());
+            assert!(err.to_string().contains("logical-primary"));
+            assert_eq!(calls_for(&calls, "logical-primary"), FAILURE_THRESHOLD);
+
+            // the circuit belongs to the model, not the whole client
+            let mut other = test_completion();
+            other.model = "other-model".to_string();
+            let err = LLMClient::completion(&client, other).await.unwrap_err();
+            assert!(!err.is::<CircuitOpen>());
+            assert_eq!(calls_for(&calls, "other-model"), MAX_COMPLETION_ATTEMPTS);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn client_errors_never_open_the_circuit() {
+            let (client, calls) = status_client(400);
+            for _ in 0..FAILURE_THRESHOLD * 2 {
+                let err = LLMClient::completion(&client, test_completion())
+                    .await
+                    .unwrap_err();
+                assert!(!err.is::<CircuitOpen>());
+            }
+            assert_eq!(calls_for(&calls, "logical-primary"), FAILURE_THRESHOLD * 2);
         }
     }
 
