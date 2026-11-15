@@ -75,6 +75,9 @@ antigravity = ["nitpicker-agent/antigravity", "dep:axum", "dep:uuid", "dep:keyri
 # is set. Binary-only: the core crate emits plain `tracing` spans unconditionally. Off by
 # default: pulls in the OpenTelemetry SDK + protobuf codec. Build with `--features otel`.
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+# Fail fast across parallel debate lanes once a provider keeps erroring. Forwards to the core
+# crate's `circuit-breaker` feature (raises MSRV to 1.88). Build with `--features circuit-breaker`.
+circuit-breaker = ["nitpicker-agent/circuit-breaker"]
 
 # thin LTO + opt-level "z" trims the binary (~12M → ~8.7M) while keeping clean release
 # builds faster than the no-LTO default; codegen-units stays at the default 16 for build

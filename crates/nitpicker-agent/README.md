@@ -56,6 +56,9 @@ See `examples/file_agent.rs` for a runnable version.
 - `azure` — `auth = "azure-ad"` for Azure AI Foundry (pulls in the Azure SDK; raises MSRV to 1.88).
 - `antigravity` — compiles in the Gemini-proxy client hook + config validation (the proxy
   server itself lives in the `nitpicker` binary).
+- `circuit-breaker` — `.with_retry()` clients share one circuit breaker per model, so callers fail
+  fast once a provider keeps returning 5xx/transport errors (uses `tokio-prompt-orchestrator`;
+  raises MSRV to 1.88).
 
 ## Breaking changes
 
