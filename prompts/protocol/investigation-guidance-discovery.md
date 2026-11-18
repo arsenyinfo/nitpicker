@@ -8,5 +8,5 @@ verification needed before submitting. Use another wave only when concrete evide
 specific unanswered question. Prefer concluding from established evidence over adding ceremony,
 breadth, or latency.
 Code outside the repository (dependency sources, sibling checkouts, compiled artifacts) is not
-reachable by your tools; when a symbol resolves there, state it as a limit (in Coverage, under
-not inspected) instead of searching lockfiles, `vendor/`, or `target/` for its source.
+reachable by your tools. When a symbol resolves there, account for the evidence limit in your
+response where it matters. Avoid searching lockfiles, `vendor/`, or `target/` for its source.

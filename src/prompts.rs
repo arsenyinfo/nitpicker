@@ -549,9 +549,10 @@ mod tests {
             scope: ReviewScope::Diff,
             preset: &p,
         };
-        for prompt in [worker.reviewer_system(), worker.actor_system()] {
-            assert!(prompt.contains("- Uncertainty:"));
-        }
+        assert!(worker.reviewer_system().contains("- Uncertainty:"));
+        let actor = worker.actor_system();
+        assert!(actor.contains("The `Uncertainty` field is optional and allowed only in round 1."));
+        assert!(actor.contains("- Uncertainty:"));
         for prompt in [
             worker.critic_system(),
             RunTask::Review {
@@ -570,6 +571,24 @@ mod tests {
 
         let validator = worker.critic_system();
         assert!(validator.contains(NO_FINDINGS));
+    }
+
+    #[test]
+    fn shared_investigation_guidance_does_not_require_coverage() {
+        let p = preset("angle-a", "rubric");
+        let review = LaneTask::Review {
+            scope: ReviewScope::Diff,
+            preset: &p,
+        };
+        for prompt in [
+            review.reviewer_system(),
+            LaneTask::Ask.reviewer_system(),
+            LaneTask::Ask.actor_system(),
+            LaneTask::Ask.critic_system(),
+        ] {
+            assert!(!prompt.contains("Coverage"));
+        }
+        assert!(review.actor_system().contains("under Not inspected"));
     }
 
     #[test]

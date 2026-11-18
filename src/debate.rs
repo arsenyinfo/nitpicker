@@ -114,7 +114,8 @@ impl Tool for SubmitVerdictTool {
             name: "submit_verdict".to_string(),
             description: "Submit your final position for this round. \
                 Set agree=true only when the opponent's latest position can be forwarded \
-                unchanged: no corrections, caveats, unresolved blockers, or changed finding set. \
+                unchanged. A caveat already accounted for in that position can be forwarded as-is. \
+                If a correction, a new caveat, or resolution of a blocker is needed, set agree=false. \
                 An agreeing verdict is the forwardable position itself, not an audit narrative."
                 .to_string(),
             parameters: json!({
@@ -1320,6 +1321,7 @@ mod tests {
         };
         let definition = tool.definition();
         assert!(definition.description.contains("forwarded unchanged"));
+        assert!(definition.description.contains("already accounted for"));
         assert_eq!(
             definition.parameters["properties"]["agree"]["description"],
             "True only for literal, unchanged agreement; any correction or unresolved point requires false"
