@@ -74,6 +74,14 @@ pub fn provider_from_config(
         ProviderType::OpenRouter => Ok(LLMProvider::OpenRouter {
             api_key_env: api_key_env.unwrap_or("OPENROUTER_API_KEY").to_string(),
         }),
+        ProviderType::OpenCode | ProviderType::OpenCodeGo => Ok(LLMProvider::OpenCode {
+            service: match provider {
+                ProviderType::OpenCodeGo => crate::llm::OpenCodeService::Go,
+                _ => crate::llm::OpenCodeService::Console,
+            },
+            base_url: base_url.map(str::to_string),
+            api_key_env: api_key_env.map(str::to_string),
+        }),
     }
 }
 

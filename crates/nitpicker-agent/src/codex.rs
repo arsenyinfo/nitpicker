@@ -15,25 +15,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use eyre::{Result, WrapErr};
-use rig_core::completion::CompletionError;
-use rig_core::completion::message::{AssistantContent, UserContent};
-use rig_core::providers::openai::responses_api::{
-    CompletionRequest as ResponsesBody, CompletionResponse as ResponsesResp, Include,
-};
+use rig_core::ProviderError;
+use rig_core::completion::CompletionRequest;
+use rig_core::providers::openai::responses_api::wire::Responses;
+use rig_core::providers::openai::wire::CallerIdentity;
+use rig_core::providers::{chatgpt, openai};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::llm::{
-    CacheAccounting, Completion, CompletionResponse, FinishReason, LLMClient, LLMClientDyn,
-    TokenUsage, WithRetryExt, compact_provider_error_body, provider_http_status,
+    Completion, CompletionResponse, LLMClient, LLMClientDyn, WithRetryExt,
+    compact_provider_error_body, provider_http_status,
 };
 
 /// Codex CLI's public OAuth client id (PKCE, no secret) — shared with the official CLI.
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
-/// rig appends the `/responses` path; this is the Codex subscription base.
-const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const ORIGINATOR: &str = "nitpicker";
 /// Refresh this long before the token's stated expiry to avoid racing the deadline.
 const EXPIRY_SKEW: Duration = Duration::from_secs(60);
@@ -247,7 +245,7 @@ async fn refresh_tokens(
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(eyre::Report::new(CompletionError::from_http_response(
+        return Err(eyre::Report::new(ProviderError::from_http_response(
             status,
             compact_provider_error_body(&body, 1000),
         )))
@@ -360,49 +358,23 @@ impl CodexClient {
         Ok((guard.access_token.clone(), guard.account_id.clone()))
     }
 
-    /// Build the Responses body, POST it over SSE, and parse the result. Reuses rig's request
-    /// lowering and response parsing; the DIY HTTP exists only to satisfy the backend's quirks:
-    /// top-level `instructions` (required; rig hardcodes it to None), `stream: true` (required),
-    /// `store: false` + omitted `max_output_tokens` (required), and — because store:false is
-    /// stateless — output items arrive via `response.output_item.done` rather than in the terminal
-    /// `response.completed` event.
+    /// Use Rig's Codex dialect for stateless Responses framing and replay.
     async fn send(
         &self,
         completion: &Completion,
         access: &str,
         account_id: Option<&str>,
     ) -> Result<CompletionResponse> {
-        let body = build_body_value(completion)?;
-        let mut req = self
-            .http
-            .post(format!("{CODEX_BASE_URL}/responses"))
-            .bearer_auth(access)
-            .header("originator", ORIGINATOR)
-            .header(reqwest::header::USER_AGENT, user_agent())
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .json(&body);
-        if let Some(id) = account_id {
-            req = req.header("ChatGPT-Account-Id", id);
-        }
-        let resp = req
-            .send()
+        let wire = codex_wire(&completion.model, access, account_id);
+        let model = rig_core::Model::new(wire, rig_reqwest::ReqwestClient::from(self.http.clone()));
+        let response = model
+            .call(codex_request(completion)?)
             .await
-            .wrap_err("Codex completion request failed")?;
-        let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .wrap_err("reading Codex completion response")?;
-        if !status.is_success() {
-            return Err(eyre::Report::new(CompletionError::from_http_response(
-                status,
-                compact_provider_error_body(&text, 1000),
-            )))
-            .wrap_err("Codex completion failed");
-        }
-        let raw = parse_sse(&text)?;
-        let model = completion.model.clone();
-        to_completion_response(raw, model)
+            .wrap_err("Codex completion failed")?;
+        Ok(CompletionResponse::from_rig(
+            response,
+            completion.model.clone(),
+        ))
     }
 }
 
@@ -446,47 +418,29 @@ impl LLMClient for CodexClient {
 // Request/response mapping
 // ============================================================================
 
-/// Lower a nitpicker [`Completion`] to the Codex Responses body, applying the backend quirks.
-fn build_body(completion: &Completion) -> Result<ResponsesBody> {
-    let mut c = completion.clone();
-    normalize_codex_completion_history(&mut c);
-    let prompt_cache_key = codex_prompt_cache_key(&c)?;
-    // codex rejects max_output_tokens outright (matches the Codex CLI, which omits it).
-    c.max_tokens = None;
-    // the system prompt must be sent as top-level `instructions`, not an input item, so take it out
-    // of the rig request (None preamble => rig adds no system input item).
-    let instructions = c.preamble.take();
-    let instructions = match instructions {
-        Some(s) if !s.trim().is_empty() => s,
-        _ => eyre::bail!(
-            "Codex auth requires a system prompt: this completion had no `instructions`"
-        ),
-    };
-    let model = c.model.clone();
-    let rig_req: rig_core::completion::CompletionRequest = c.into();
-    let mut body = ResponsesBody::try_from((model, rig_req))
-        .map_err(|e| eyre::eyre!("lowering completion to Codex Responses body failed: {e}"))?;
-    body.instructions = Some(instructions);
-    body.stream = Some(true);
-    body.max_output_tokens = None;
-    // store:false is mandatory, but it makes the stream stateless: a reasoning item the model
-    // returns this turn would be echoed back next turn as a bare `rs_...` id the backend can no
-    // longer resolve ("Items are not persisted when `store` is set to false" → HTTP 404). Asking
-    // for `reasoning.encrypted_content` makes the backend return each reasoning item's opaque blob,
-    // which rig round-trips through the core Reasoning type, so the next turn replays it inline
-    // instead of by id. Set both on the lowered body (rig only auto-adds the include when a
-    // `reasoning` config is present, which we don't set) so any caller additional_params survive.
-    let params = &mut body.additional_parameters;
-    params.store = Some(false);
-    params.prompt_cache_key = Some(prompt_cache_key);
-    let include = params.include.get_or_insert_with(Vec::new);
-    if !include
-        .iter()
-        .any(|i| matches!(i, Include::ReasoningEncryptedContent))
-    {
-        include.push(Include::ReasoningEncryptedContent);
-    }
-    Ok(body)
+fn codex_wire(model: &str, access: &str, account_id: Option<&str>) -> Responses {
+    let mut config = openai::OpenAIConfig::with_key(&chatgpt::DIALECT, access);
+    config.instructions = None;
+    config.identity = Some(CallerIdentity {
+        originator: ORIGINATOR.into(),
+        user_agent: user_agent(),
+    });
+    config.account_id = account_id.map(str::to_owned);
+    Responses::new(config, model)
+}
+
+fn codex_request(completion: &Completion) -> Result<CompletionRequest> {
+    eyre::ensure!(
+        completion
+            .preamble
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty()),
+        "Codex auth requires a system prompt: this completion had no `instructions`"
+    );
+    let mut request = CompletionRequest::from(completion.clone());
+    request.max_tokens = None;
+    request.options.cache_key = Some(codex_prompt_cache_key(completion)?);
+    Ok(request)
 }
 
 /// Stable, opaque cache-routing key for the prefix that remains fixed during one conversation.
@@ -520,175 +474,6 @@ fn codex_prompt_cache_key(completion: &Completion) -> Result<String> {
     Ok(format!("nitpicker-{suffix}"))
 }
 
-// rig lowers assistant text into a valid Responses shape itself, and since 0.41 also drops
-// function-call item ids that aren't native `fc_...` ids, pairing by `call_id` alone. Both
-// rewrites nitpicker used to apply here are upstream now, so serialization needs no fixups.
-fn build_body_value(completion: &Completion) -> Result<Value> {
-    let body = build_body(completion)?;
-    serde_json::to_value(&body).wrap_err("serializing Codex Responses request")
-}
-
-fn normalize_codex_completion_history(completion: &mut Completion) {
-    for message in completion
-        .history
-        .iter_mut()
-        .chain(std::iter::once(&mut completion.prompt))
-    {
-        match message {
-            rig_core::completion::Message::Assistant { content, .. } => {
-                for item in content.iter_mut() {
-                    match item {
-                        AssistantContent::ToolCall(call) if call.call_id.is_none() => {
-                            call.call_id = Some(call.id.clone());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            rig_core::completion::Message::User { content } => {
-                for item in content.iter_mut() {
-                    match item {
-                        UserContent::ToolResult(result) if result.call_id.is_none() => {
-                            result.call_id = Some(result.id.clone());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            rig_core::completion::Message::System { .. } => {}
-        }
-    }
-}
-
-/// Split an SSE stream into per-event payloads. Events are separated by a blank line, and a single
-/// event may carry its payload across several `data:` fields that must be rejoined with `\n`
-/// (per the SSE spec). `str::lines()` strips a trailing `\r`, so this handles `\n` and `\r\n`.
-fn sse_event_payloads(text: &str) -> Vec<String> {
-    let mut events = vec![];
-    let mut current = String::new();
-    for line in text.lines() {
-        if line.is_empty() {
-            if !current.is_empty() {
-                events.push(std::mem::take(&mut current));
-            }
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("data:") {
-            if !current.is_empty() {
-                current.push('\n');
-            }
-            // an optional single leading space after the colon is part of the SSE framing, not data
-            current.push_str(rest.strip_prefix(' ').unwrap_or(rest));
-        }
-        // other field lines (`event:`, `id:`, comments) are not needed here
-    }
-    if !current.is_empty() {
-        events.push(current);
-    }
-    events
-}
-
-/// Parse the Codex SSE stream into rig's response type. The terminal event is `response.completed`
-/// or `response.incomplete` (the latter when the model stops early, e.g. hitting the output cap);
-/// both carry the full `response` object. With `store:false` that object's `output` is empty, so the
-/// real items are accumulated from the per-item `response.output_item.done` events and injected.
-fn parse_sse(text: &str) -> Result<ResponsesResp> {
-    let mut items: Vec<Value> = vec![];
-    let mut last_parse_err: Option<String> = None;
-    for data in sse_event_payloads(text) {
-        let data = data.trim();
-        if data.is_empty() || data == "[DONE]" {
-            continue;
-        }
-        let ev: Value = match serde_json::from_str(data) {
-            Ok(v) => v,
-            // keep going (most events are deltas we ignore), but remember the failure so a missing
-            // terminal event reports the real parse error instead of a generic "not found".
-            Err(e) => {
-                last_parse_err = Some(e.to_string());
-                continue;
-            }
-        };
-        match ev.get("type").and_then(Value::as_str) {
-            Some("response.output_item.done") => {
-                if let Some(item) = ev.get("item") {
-                    items.push(item.clone());
-                }
-            }
-            Some("response.completed") | Some("response.incomplete") => {
-                let mut response = ev
-                    .get("response")
-                    .cloned()
-                    .ok_or_else(|| eyre::eyre!("Codex terminal SSE event missing `response`"))?;
-                // only inject accumulated items when the event didn't echo its own output
-                // (store:false leaves it empty; a future stored mode might populate it).
-                let echoed_output = response
-                    .get("output")
-                    .and_then(Value::as_array)
-                    .is_some_and(|a| !a.is_empty());
-                if !echoed_output {
-                    response["output"] = Value::Array(std::mem::take(&mut items));
-                }
-                return serde_json::from_value::<ResponsesResp>(response)
-                    .wrap_err("parsing Codex terminal response payload");
-            }
-            Some("response.failed") | Some("error") => {
-                return Err(eyre::Report::new(CompletionError::from_provider_body(
-                    compact_provider_error_body(&ev.to_string(), 1000),
-                )))
-                .wrap_err("Codex stream error event");
-            }
-            _ => {}
-        }
-    }
-    match last_parse_err {
-        Some(e) => eyre::bail!("no terminal event in Codex SSE stream; last parse error: {e}"),
-        None => eyre::bail!(
-            "no terminal event in Codex SSE stream: {}",
-            truncate(text, 1000)
-        ),
-    }
-}
-
-fn to_completion_response(raw: ResponsesResp, model: String) -> Result<CompletionResponse> {
-    let incomplete_reason = raw.incomplete_details.as_ref().map(|d| d.reason.clone());
-    let parsed: rig_core::completion::CompletionResponse<ResponsesResp> = raw
-        .try_into()
-        .map_err(|e| eyre::eyre!("parsing Codex response into completion: {e}"))?;
-    let has_tool_call = parsed
-        .choice
-        .iter()
-        .any(|c| matches!(c, AssistantContent::ToolCall(_)));
-    let finish_reason = if has_tool_call {
-        FinishReason::ToolUse
-    } else {
-        match incomplete_reason.as_deref() {
-            Some("max_output_tokens") => FinishReason::MaxTokens,
-            Some(other) => FinishReason::Other(other.to_string()),
-            None => FinishReason::Stop,
-        }
-    };
-    Ok(CompletionResponse {
-        // rig's `TryFrom` above already errors on an empty response, so `choice` is non-empty here.
-        choice: parsed.choice,
-        finish_reason,
-        // the Responses API reports cache reads inside `input_tokens`
-        usage: TokenUsage::from_provider(&parsed.usage, CacheAccounting::InsidePrompt),
-        selected_model: Some(model),
-    })
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let end = (0..=max)
-        .rev()
-        .find(|&i| s.is_char_boundary(i))
-        .unwrap_or(0);
-    format!("{}…", &s[..end])
-}
-
 /// A 4xx-other-than-429 status anywhere in the error chain — used to decide whether a failed token
 /// refresh warrants reloading a rotated refresh token from disk. 429 is excluded: a rate-limited
 /// refresh is transient and reloading `auth.json` can't fix it, so it should bubble up to the outer
@@ -700,9 +485,9 @@ fn is_rotation_4xx(err: &eyre::Report) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rig_core::OneOrMany;
     use rig_core::completion::message::{
-        Message, ToolCall, ToolFunction, ToolResult, ToolResultContent,
+        AssistantContent, AssistantMessage, CallId, Message, ToolCall, ToolFunction, ToolName,
+        ToolResultContent, UserContent,
     };
     use serde_json::json;
 
@@ -806,6 +591,16 @@ mod tests {
         assert!(parse_tokens(&raw, "test").is_err());
     }
 
+    fn build_body_value(completion: &Completion) -> Result<Value> {
+        use rig_core::wire::{Body, Mode, Wire};
+        let wire = codex_wire(&completion.model, "unused", None);
+        let encoded = wire.encode(codex_request(completion)?, Mode::Unary)?;
+        let Body::Bytes(bytes) = encoded.request.into_body() else {
+            panic!("expected a JSON body")
+        };
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
     #[test]
     fn build_body_applies_codex_quirks() {
         let completion = Completion {
@@ -818,12 +613,10 @@ mod tests {
             max_tokens: Some(4096),
             additional_params: None,
         };
-        let body = build_body(&completion).unwrap();
-        assert_eq!(body.instructions.as_deref(), Some("You are a reviewer."));
-        assert_eq!(body.stream, Some(true));
-        assert_eq!(body.max_output_tokens, None);
-        // store:false ends up in the flattened additional parameters
-        let json = serde_json::to_value(&body).unwrap();
+        let json = build_body_value(&completion).unwrap();
+        assert_eq!(json["instructions"], "You are a reviewer.");
+        assert_eq!(json["stream"], true);
+        assert!(json.get("max_output_tokens").is_none());
         assert_eq!(json.get("store"), Some(&Value::Bool(false)));
         assert!(
             json.get("prompt_cache_key")
@@ -867,7 +660,7 @@ mod tests {
             max_tokens: None,
             additional_params: None,
         };
-        assert!(build_body(&completion).is_err());
+        assert!(build_body_value(&completion).is_err());
     }
 
     #[test]
@@ -878,7 +671,8 @@ mod tests {
             preamble: Some("stable reviewer and project context".to_string()),
             history: vec![],
             tools: vec![rig_core::completion::ToolDefinition {
-                name: "read_file".to_string(),
+                name: ToolName::new("read_file").unwrap(),
+                annotations: Default::default(),
                 description: "Read a file".to_string(),
                 parameters: json!({
                     "type": "object",
@@ -896,25 +690,13 @@ mod tests {
         ];
         later_turn.prompt = Message::user("continue");
 
-        let first_key = build_body(&first)
-            .unwrap()
-            .additional_parameters
-            .prompt_cache_key
-            .unwrap();
-        let later_key = build_body(&later_turn)
-            .unwrap()
-            .additional_parameters
-            .prompt_cache_key
-            .unwrap();
+        let first_key = codex_prompt_cache_key(&first).unwrap();
+        let later_key = codex_prompt_cache_key(&later_turn).unwrap();
         assert_eq!(first_key, later_key);
 
         let mut different_prefix = later_turn;
         different_prefix.preamble = Some("different reviewer or project context".to_string());
-        let different_key = build_body(&different_prefix)
-            .unwrap()
-            .additional_parameters
-            .prompt_cache_key
-            .unwrap();
+        let different_key = codex_prompt_cache_key(&different_prefix).unwrap();
         assert_ne!(first_key, different_key);
     }
 
@@ -930,66 +712,18 @@ mod tests {
             max_tokens: None,
             additional_params: Some(json!({ "reasoning": { "effort": "low" } })),
         };
-        let body = build_body(&completion).unwrap();
-        let json = serde_json::to_value(&body).unwrap();
+        let json = build_body_value(&completion).unwrap();
         assert_eq!(json.get("store"), Some(&Value::Bool(false)));
         assert!(json.get("reasoning").is_some());
     }
 
     #[test]
-    fn build_body_fills_missing_tool_call_ids_for_mixed_provider_history() {
-        let tool_id = "toolu_1".to_string();
-        let completion = Completion {
-            model: "gpt-5.5".to_string(),
-            prompt: Message::user("continue"),
-            preamble: Some("sys".to_string()),
-            history: vec![
-                Message::Assistant {
-                    id: None,
-                    content: OneOrMany::one(AssistantContent::ToolCall(ToolCall::new(
-                        tool_id.clone(),
-                        ToolFunction::new(
-                            "read_file".to_string(),
-                            json!({ "path": "src/main.rs" }),
-                        ),
-                    ))),
-                },
-                Message::User {
-                    content: OneOrMany::one(UserContent::ToolResult(ToolResult {
-                        id: tool_id.clone(),
-                        call_id: None,
-                        content: OneOrMany::one(ToolResultContent::text("ok")),
-                    })),
-                },
-            ],
-            tools: vec![],
-            tool_choice: None,
-            max_tokens: None,
-            additional_params: None,
-        };
-
-        let body = build_body(&completion).unwrap();
-        let json = serde_json::to_value(&body).unwrap();
-        assert!(
-            json.to_string()
-                .contains(&format!("\"call_id\":\"{tool_id}\""))
-        );
-    }
-
-    #[test]
     fn body_value_preserves_assistant_text_history() {
-        // An id-less assistant message (nitpicker's only shape — `.message()` sets `id: None`,
-        // including for Alloy histories from non-Responses providers) must survive lowering into a
-        // valid Codex Responses item. rig 0.39 emits the bare-string `AssistantInput` shape, so the
-        // text is carried verbatim as the item's `content`.
         let completion = Completion {
             model: "gpt-5.5".to_string(),
             prompt: Message::user("continue"),
             preamble: Some("sys".to_string()),
-            history: vec![Message::Assistant {
-                id: None,
-                content: OneOrMany::one(AssistantContent::text("previous answer")),
-            }],
+            history: vec![Message::assistant("previous answer")],
             tools: vec![],
             tool_choice: None,
             max_tokens: None,
@@ -1004,35 +738,32 @@ mod tests {
             .find(|item| item.get("role").and_then(Value::as_str) == Some("assistant"))
             .unwrap();
 
-        assert_eq!(assistant_message["content"], "previous answer");
+        assert_eq!(assistant_message["content"][0]["text"], "previous answer");
     }
 
     /// A tool id from another provider (an Alloy history replayed into Codex) is not a native
     /// `fc_...` id, so it must be absent from `function_call` and pair by `call_id` alone.
     #[test]
     fn body_value_omits_foreign_function_call_item_id() {
-        let tool_id = "tool_5Xt5WpWtZ6Whah4Z2uZcZO34".to_string();
+        let tool_id = "tool_5Xt5WpWtZ6Whah4Z2uZcZO34";
+        let call = ToolCall::new(
+            CallId::from_wire(tool_id),
+            ToolFunction::new(
+                ToolName::new("read_file").unwrap(),
+                json!({"path":"src/main.rs"}),
+            ),
+        );
+        let result = call.result(vec![ToolResultContent::text("ok")]);
         let completion = Completion {
             model: "gpt-5.5".to_string(),
             prompt: Message::user("continue"),
             preamble: Some("sys".to_string()),
             history: vec![
-                Message::Assistant {
-                    id: None,
-                    content: OneOrMany::one(AssistantContent::ToolCall(ToolCall::new(
-                        tool_id.clone(),
-                        ToolFunction::new(
-                            "read_file".to_string(),
-                            json!({ "path": "src/main.rs" }),
-                        ),
-                    ))),
-                },
+                Message::Assistant(AssistantMessage::new(vec![AssistantContent::ToolCall(
+                    call,
+                )])),
                 Message::User {
-                    content: OneOrMany::one(UserContent::ToolResult(ToolResult {
-                        id: tool_id.clone(),
-                        call_id: None,
-                        content: OneOrMany::one(ToolResultContent::text("ok")),
-                    })),
+                    content: vec![UserContent::ToolResult(result)],
                 },
             ],
             tools: vec![],
@@ -1079,20 +810,47 @@ mod tests {
         assert!(resolve_auth_path(None, None).is_err());
     }
 
-    #[test]
-    fn truncate_respects_char_boundaries() {
-        assert_eq!(truncate("hello", 10), "hello");
-        assert_eq!(truncate("hello", 3), "hel…");
-        // multibyte: "é" is 2 bytes; truncating at 1 byte must not split it
-        let s = "é".repeat(5); // 10 bytes
-        let out = truncate(&s, 3);
-        assert!(out.ends_with('…'));
-        // the kept prefix is valid UTF-8 (no panic) and has whole chars only
-        assert!(out.chars().filter(|&c| c == 'é').count() <= 1);
+    async fn codex_reply(sse: String) -> Result<CompletionResponse> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                assert_ne!(socket.read_buf(&mut request).await.unwrap(), 0);
+                if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                sse.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let mut wire = codex_wire("gpt-5.4", "unused", None);
+        wire.provider = wire.provider.with_base_url(base_url);
+        let model =
+            rig_core::Model::new(wire, rig_reqwest::ReqwestClient::from(build_http_client()?));
+        let response = model
+            .call(CompletionRequest::new("hello").preamble("sys"))
+            .await;
+        server.await?;
+        Ok(CompletionResponse::from_rig(response?, "gpt-5.4".into()))
     }
 
-    #[test]
-    fn parse_sse_accumulates_output_items_with_empty_completed() {
+    #[tokio::test]
+    async fn parse_sse_accumulates_output_items_with_empty_completed() {
         // mirrors the store:false stream: items arrive in output_item.done; completed has empty output
         let item = json!({
             "type": "message",
@@ -1121,29 +879,28 @@ mod tests {
             json!({ "type": "response.output_item.done", "item": item }),
             json!({ "type": "response.completed", "response": completed })
         );
-        let raw = parse_sse(&sse).unwrap();
-        let resp = to_completion_response(raw, "gpt-5.4".to_string()).unwrap();
+        let resp = codex_reply(sse).await.unwrap();
         assert_eq!(resp.text(), "pong");
-        assert_eq!(resp.finish_reason, FinishReason::Stop);
+        assert_eq!(resp.finish_reason, crate::llm::FinishReason::Stop);
         // cache reads are inside `input_tokens` here, so the prompt must not be inflated by them
         assert_eq!(resp.usage.input_tokens, 5000);
         assert_eq!(resp.usage.cached_input_tokens, 4800);
         assert_eq!(resp.usage.total_tokens, 5001);
     }
 
-    #[test]
-    fn parse_sse_surfaces_error_events() {
+    #[tokio::test]
+    async fn parse_sse_surfaces_error_events() {
         let sse = format!(
-            "data: {}\n",
+            "data: {}\n\n",
             json!({ "type": "response.failed", "error": { "message": "boom" } })
         );
-        assert!(parse_sse(&sse).is_err());
+        assert!(codex_reply(sse).await.is_err());
     }
 
-    #[test]
-    fn parse_sse_preserves_codes_from_large_error_events() {
+    #[tokio::test]
+    async fn parse_sse_preserves_codes_from_large_error_events() {
         let sse = format!(
-            "data: {}\n",
+            "data: {}\n\n",
             json!({
                 "type": "response.failed",
                 "error": {
@@ -1153,7 +910,7 @@ mod tests {
                 }
             })
         );
-        let err = parse_sse(&sse).unwrap_err();
+        let err = codex_reply(sse).await.unwrap_err();
         assert!(crate::llm::provider_error_has_code(
             &err,
             &["usage_limit_reached"]
@@ -1170,8 +927,8 @@ mod tests {
         })
     }
 
-    #[test]
-    fn parse_sse_handles_incomplete_as_max_tokens() {
+    #[tokio::test]
+    async fn parse_sse_handles_incomplete_as_max_tokens() {
         // model stopped early on the output cap: terminal event is `response.incomplete`
         let item = json!({
             "type": "message", "id": "m", "role": "assistant", "status": "incomplete",
@@ -1184,18 +941,17 @@ mod tests {
             "usage": usage_json()
         });
         let sse = format!(
-            "data: {}\n\ndata: {}\n",
+            "data: {}\n\ndata: {}\n\n",
             json!({ "type": "response.output_item.done", "item": item }),
             json!({ "type": "response.incomplete", "response": response })
         );
-        let raw = parse_sse(&sse).unwrap();
-        let resp = to_completion_response(raw, "gpt-5.4".to_string()).unwrap();
+        let resp = codex_reply(sse).await.unwrap();
         assert_eq!(resp.text(), "partial");
-        assert_eq!(resp.finish_reason, FinishReason::MaxTokens);
+        assert_eq!(resp.finish_reason, crate::llm::FinishReason::MaxTokens);
     }
 
-    #[test]
-    fn parse_sse_rejoins_multiline_data_fields() {
+    #[tokio::test]
+    async fn parse_sse_rejoins_multiline_data_fields() {
         // a single event whose JSON payload is split across two `data:` lines (valid SSE);
         // splitting after a `,` keeps each half from being valid alone but the `\n`-join valid.
         let completed = json!({
@@ -1214,15 +970,14 @@ mod tests {
         let comma = completed.find(',').unwrap();
         let (head, tail) = completed.split_at(comma);
         let sse = format!("data: {head}\ndata: {tail}\n\n");
-        let raw = parse_sse(&sse).unwrap();
-        let resp = to_completion_response(raw, "gpt-5.4".to_string()).unwrap();
+        let resp = codex_reply(sse).await.unwrap();
         assert_eq!(resp.text(), "hi");
     }
 
     #[test]
     fn is_rotation_4xx_excludes_429_and_5xx() {
         let mk = |status| {
-            eyre::Report::new(CompletionError::from_http_response(
+            eyre::Report::new(ProviderError::from_http_response(
                 reqwest::StatusCode::from_u16(status).unwrap(),
                 r#"{"error":"test"}"#,
             ))

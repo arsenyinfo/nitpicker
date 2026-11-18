@@ -327,14 +327,14 @@ fn render_history_as_text(history: &[Message]) -> String {
                                 })
                                 .collect::<Vec<_>>()
                                 .join("");
-                            parts.push(format!("[tool result {}]: {}", tr.id, result));
+                            parts.push(format!("[tool result {}]: {}", tr.call, result));
                         }
                         _ => {}
                     }
                 }
             }
-            Message::Assistant { content, .. } => {
-                for item in content.iter() {
+            Message::Assistant(turn) => {
+                for item in &turn.content {
                     match item {
                         AssistantContent::Text(t) if !t.text().is_empty() => {
                             parts.push(format!("[assistant]: {}", t.text()));
@@ -342,7 +342,8 @@ fn render_history_as_text(history: &[Message]) -> String {
                         AssistantContent::ToolCall(tc) => {
                             parts.push(format!(
                                 "[called: {}({})]",
-                                tc.function.name, tc.function.arguments
+                                tc.function.name,
+                                serde_json::Value::Object(tc.function.arguments.clone())
                             ));
                         }
                         _ => {}

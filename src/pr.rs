@@ -533,10 +533,10 @@ fn build_pr_prompt(
         parts.push(comments_section);
     }
     parts.push(diff_context.to_string());
-    if let Some(p) = extra {
-        if !p.trim().is_empty() {
-            parts.push(format!("Additional instructions: {p}"));
-        }
+    if let Some(p) = extra
+        && !p.trim().is_empty()
+    {
+        parts.push(format!("Additional instructions: {p}"));
     }
     parts.join("\n\n")
 }

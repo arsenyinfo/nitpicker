@@ -195,15 +195,14 @@ fn bounded_error_string(err: &eyre::Report) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nitpicker_agent::llm::LLMClient;
+    use nitpicker_agent::llm::{LLMClient, LLMProvider};
     use nitpicker_agent::session::{JobRecord, LaneRecord, VerdictRecord};
-    use rig_core::OneOrMany;
     use rig_core::completion::{AssistantContent, Message};
-    use rig_core::providers::openai;
 
     fn synthesis_response(finish_reason: FinishReason) -> CompletionResponse {
         CompletionResponse {
-            choice: OneOrMany::one(AssistantContent::text("partial verdict")),
+            choice: vec![AssistantContent::text("partial verdict")],
+            origin: None,
             finish_reason,
             usage: TokenUsage::default(),
             selected_model: Some("fallback-model".to_string()),
@@ -325,12 +324,13 @@ mod tests {
     }
 
     fn unreachable_client() -> Arc<dyn LLMClientDyn> {
-        openai::CompletionsClient::builder()
-            .api_key("unused")
-            .base_url("http://127.0.0.1:1/v1")
-            .build()
-            .unwrap()
-            .into_arc()
+        LLMProvider::OpenAi {
+            base_url: Some("http://127.0.0.1:1/v1".into()),
+            api_key_env: Some("NITPICKER_TEST_UNUSED_LOOPBACK_KEY".into()),
+        }
+        .client_from_env()
+        .unwrap()
+        .into_arc()
     }
 
     fn no_session() -> RunRecord<'static> {

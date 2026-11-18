@@ -1,11 +1,9 @@
 use crate::config::{Config, ProviderType};
-use crate::llm::{
-    Completion, LLMClient, openrouter_headers, provider_error_has_code, provider_http_status,
-};
+use crate::llm::{Completion, LLMClient, provider_error_has_code, provider_http_status};
 use chrono::{Duration, Utc};
 use eyre::Result;
 use rig_core::completion::{Message, ToolDefinition};
-use rig_core::providers::openrouter;
+use rig_core::message::ToolName;
 use serde::Deserialize;
 use serde_json::json;
 use std::future::Future;
@@ -260,7 +258,8 @@ async fn try_fetch_models(
 
 fn smoke_test_tool() -> ToolDefinition {
     ToolDefinition {
-        name: "smoke_test_tool".to_string(),
+        name: ToolName::new("smoke_test_tool").unwrap(),
+        annotations: Default::default(),
         description: "Sanity-check tool used to verify model tool calling.".to_string(),
         parameters: json!({
             "type": "object",
@@ -274,14 +273,6 @@ fn smoke_test_tool() -> ToolDefinition {
             "additionalProperties": false
         }),
     }
-}
-
-fn build_openrouter_client(api_key: &str) -> Result<openrouter::Client> {
-    openrouter::Client::builder()
-        .api_key(api_key)
-        .http_headers(openrouter_headers()?)
-        .build()
-        .map_err(|e| eyre::eyre!("failed to build openrouter client: {e}"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,7 +303,7 @@ async fn smoke_test_call(
     slot_label: &str,
     attempt: usize,
 ) -> SmokeTestOutcome {
-    let client = match build_openrouter_client(api_key) {
+    let client = match crate::llm::RigClient::openrouter(api_key) {
         Ok(client) => client,
         Err(err) => {
             tracing::warn!(slot = slot_label, %model, attempt, error = %err, "openrouter smoke test client init failed");
@@ -824,7 +815,7 @@ pub async fn resolve_free_models_with_fallback(config: &mut Config, fallback: bo
 mod tests {
     use super::*;
     use crate::config::{AggregatorConfig, ReviewerConfig};
-    use rig_core::completion::CompletionError;
+    use rig_core::ProviderError as CompletionError;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

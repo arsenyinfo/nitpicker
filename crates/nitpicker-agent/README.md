@@ -47,17 +47,26 @@ See `examples/file_agent.rs` for a runnable version.
   toolset plus `spawn_subagent`; `all_tools()` omits subagents; add your own `Tool` impls.
 - **Subagents:** `subagent_system_prompt(...)` overrides the prompt spawned subagents run with;
   the override propagates through nested spawns. Depth is capped at 2.
-- **Clients:** `client_from_env(LLMProvider::…)` for Anthropic / OpenAI / Gemini / OpenRouter
+- **Clients:** `client_from_env(LLMProvider::…)` for Anthropic / OpenAI / Gemini / OpenRouter / OpenCode
   via env-var API keys, or build any `Arc<dyn LLMClientDyn>` yourself. Config-file-driven
   construction is available via the `config` and `provider` modules.
 
 ## Features
 
-- `azure` — `auth = "azure-ad"` for Azure AI Foundry (pulls in the Azure SDK; raises MSRV to 1.88).
+- `azure` — `auth = "azure-ad"` for Azure AI Foundry (pulls in the Azure SDK).
 - `antigravity` — compiles in the Gemini-proxy client hook + config validation (the proxy
   server itself lives in the `nitpicker` binary).
 
 ## Breaking changes
+
+**0.6.0**
+- Requires Rust 1.97.1 and uses Rig 0.46 message and tool types. `CompletionResponse::choice`
+  is a `Vec<AssistantContent>` and struct literals must provide `origin` (use `None` for
+  hand-built replies). `TokenUsage::from_provider` takes Rig's already-normalized usage.
+  Raw Gemini `additional_params` use provider field names, e.g. `generationConfig`.
+- Rig provider clients no longer implement `LLMClient` directly. Use
+  `nitpicker_agent::client_from_env(LLMProvider::…)` for environment-based setup, or implement
+  `LLMClient` on a local wrapper around your Rig client if you need custom settings.
 
 `SessionAttribution` and `SessionLogger::write_attribution` are additive APIs for writing optional
 experiment metadata beside an aggregation record; they do not change `AggregationRecord` literals.

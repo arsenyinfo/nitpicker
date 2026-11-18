@@ -6,6 +6,20 @@ Notable user-visible changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-18
+
+`nitpicker-agent` 0.6.0
+
+### Added
+
+- OpenCode Console and Go as opt-in providers via `OPENCODE_API_KEY`.
+- `reflect --dump <dir>` exports session dossiers without making model calls.
+
+### Changed
+
+- Migrated to Rig 0.46 and raised the minimum Rust version to 1.97.1.
+  Codex subscription completions now use Rig's native Responses adapter.
+
 ### Fixed
 
 - A degraded preset review (a job or debate lane failed, no surviving findings) no longer
@@ -13,6 +27,10 @@ Notable user-visible changes are recorded here. The format follows
   which presets lost jobs or lanes, and the report starts with a one-line
   `⚠️ Partial review` note naming the angles that were not reviewed. The synthesis text itself,
   `aggregation.json`, and `ask` runs are unchanged.
+
+### Security
+
+- Updated the OpenSSL, TLS, certificate, and QUIC dependencies to resolve 21 RustSec vulnerabilities.
 
 ## [0.10.1] - 2026-09-05
 

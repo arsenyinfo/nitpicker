@@ -175,13 +175,13 @@ pub fn transform_response(code_assist_response: Value) -> Result<Value> {
     };
 
     // rig-core requires responseId to be present
-    if response.get("responseId").is_none() {
-        if let Some(obj) = response.as_object_mut() {
-            obj.insert(
-                "responseId".to_string(),
-                serde_json::json!(Uuid::new_v4().to_string()),
-            );
-        }
+    if response.get("responseId").is_none()
+        && let Some(obj) = response.as_object_mut()
+    {
+        obj.insert(
+            "responseId".to_string(),
+            serde_json::json!(Uuid::new_v4().to_string()),
+        );
     }
 
     Ok(response)
