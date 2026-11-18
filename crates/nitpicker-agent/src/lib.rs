@@ -55,7 +55,7 @@ pub mod prelude {
         AgentConfig, AgentDepth, AgentProgress, AgentResult, MAX_CONCURRENT_LLM_CALLS,
         add_spawn_subagent_tool, run_agent,
     };
-    pub use crate::llm::{LLMClientDyn, LLMProvider, WithRetryExt};
+    pub use crate::llm::{LLMClientDyn, LLMProvider, OpenCodeService, WithRetryExt};
     pub use crate::tools::{Tool, all_tools};
     pub use crate::{AgentBuilder, client_from_env, file_agent_tools};
 }

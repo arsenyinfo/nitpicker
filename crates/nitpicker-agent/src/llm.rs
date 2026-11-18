@@ -1,13 +1,12 @@
 use crate::tools::floor_char_boundary;
 use eyre::{Result, WrapErr};
-use rig_core::OneOrMany;
-use rig_core::client::CompletionClient;
-use rig_core::completion::CompletionError;
-use rig_core::completion::message::ReasoningContent;
+use rig_core::ProviderError;
 use rig_core::completion::message::ToolCall;
 use rig_core::completion::message::ToolChoice;
-use rig_core::completion::{AssistantContent, CompletionModel, Message};
-use rig_core::providers::{anthropic, gemini, openai, openrouter};
+use rig_core::completion::message::{AssistantMessage, Origin};
+use rig_core::completion::{AssistantContent, CompletionRequest, Message};
+use rig_core::providers::{anthropic, gemini, openai};
+use rig_reqwest::ReqwestClient;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::future::Future;
@@ -70,26 +69,16 @@ impl Completion {
 
 impl From<Completion> for rig_core::completion::CompletionRequest {
     fn from(value: Completion) -> Self {
-        let chat_history = value
-            .history
-            .into_iter()
-            .chain(std::iter::once(value.prompt))
-            .collect::<Vec<_>>();
-        rig_core::completion::CompletionRequest {
-            model: None,
-            chat_history: OneOrMany::many(chat_history)
-                .expect("completion request must include at least one message"),
-            preamble: value.preamble,
-            documents: Vec::new(),
-            tools: value.tools,
-            temperature: None,
-            max_tokens: value.max_tokens,
-            additional_params: value.additional_params,
-            output_schema: None,
-            tool_choice: value.tool_choice,
-            // local telemetry policy only (`#[serde(skip)]`), never sent to a provider
-            record_telemetry_content: false,
+        let mut request = Self::new(value.prompt)
+            .messages(value.history)
+            .tools(value.tools);
+        if let Some(preamble) = value.preamble {
+            request = request.preamble(preamble);
         }
+        request.max_tokens = value.max_tokens;
+        request.additional_params = value.additional_params;
+        request.tool_choice = value.tool_choice;
+        request
     }
 }
 
@@ -104,7 +93,9 @@ pub enum FinishReason {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CompletionResponse {
-    pub choice: OneOrMany<AssistantContent>,
+    pub choice: Vec<AssistantContent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Origin>,
     pub finish_reason: FinishReason,
     pub usage: TokenUsage,
     pub selected_model: Option<String>,
@@ -125,39 +116,17 @@ pub struct TokenUsage {
     pub cache_creation_input_tokens: u64,
 }
 
-/// Whether a provider's reported prompt count already contains its cache reads. Stated by each
-/// client, never inferred: provider totals can carry categories that are neither prompt nor output
-/// (Gemini) or disagree with their own parts (OpenRouter), so arithmetic tests misclassify.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CacheAccounting {
-    /// Anthropic: cache reads and writes are reported beside `input_tokens`, not within it.
-    OutsidePrompt,
-    /// OpenAI (chat and Responses), OpenRouter, Gemini: cache reads are already in the prompt.
-    InsidePrompt,
-}
-
 impl TokenUsage {
-    /// Normalize usage so `input_tokens` always means every prompt token processed, cache reads
-    /// included — without it an Anthropic cache hit under-reports the prompt and
-    /// `ConversationUsageWindow::should_compact` never fires.
-    ///
-    /// Numbers are re-bucketed, never invented: a provider contradicting itself is reported as it
-    /// reported itself. `total_tokens` is `input + output`, so anything counted outside both
-    /// (Gemini's thinking tokens) goes unmetered.
-    pub fn from_provider(usage: &rig_core::completion::Usage, accounting: CacheAccounting) -> Self {
-        let input_tokens = match accounting {
-            CacheAccounting::OutsidePrompt => usage
-                .input_tokens
-                .saturating_add(usage.cached_input_tokens)
-                .saturating_add(usage.cache_creation_input_tokens),
-            CacheAccounting::InsidePrompt => usage.input_tokens,
-        };
+    /// Rig already includes cache reads and writes in its normalized input count.
+    pub fn from_provider(usage: &rig_core::completion::Usage) -> Self {
+        let input_tokens = usage.input_tokens.unwrap_or_default();
+        let output_tokens = usage.output_tokens.unwrap_or_default();
         Self {
             input_tokens,
-            output_tokens: usage.output_tokens,
-            total_tokens: input_tokens.saturating_add(usage.output_tokens),
-            cached_input_tokens: usage.cached_input_tokens,
-            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            output_tokens,
+            total_tokens: input_tokens.saturating_add(output_tokens),
+            cached_input_tokens: usage.cached_input_tokens.unwrap_or_default(),
+            cache_creation_input_tokens: usage.cache_creation_input_tokens.unwrap_or_default(),
         }
     }
 }
@@ -199,11 +168,35 @@ impl ConversationUsageWindow {
 }
 
 impl CompletionResponse {
-    pub fn message(&self) -> Message {
-        Message::Assistant {
-            id: None,
-            content: self.choice.clone(),
+    pub(crate) fn from_rig(
+        response: rig_core::completion::CompletionResponse,
+        model: String,
+    ) -> Self {
+        use rig_core::completion::FinishReason as RigFinish;
+        if let Some(request_id) = &response.provider_request_id {
+            debug!(model, provider_request_id = %bounded(request_id), "provider response received");
         }
+        let reason = match response.finish_reason() {
+            Some(RigFinish::Stop) => FinishReason::Stop,
+            Some(RigFinish::Length) => FinishReason::MaxTokens,
+            Some(RigFinish::ToolCalls) => FinishReason::ToolUse,
+            Some(RigFinish::Other(reason)) => FinishReason::Other(reason),
+            Some(other) => FinishReason::Other(format!("{other:?}")),
+            None => FinishReason::None,
+        };
+        Self {
+            finish_reason: resolve_finish_reason(&response.choice, reason),
+            origin: Some(response.origin),
+            choice: response.choice,
+            usage: TokenUsage::from_provider(&response.usage),
+            selected_model: Some(model),
+        }
+    }
+
+    pub fn message(&self) -> Message {
+        Message::Assistant(
+            AssistantMessage::new(self.choice.clone()).with_origin(self.origin.clone()),
+        )
     }
 
     pub fn tool_calls(&self) -> Option<Vec<ToolCall>> {
@@ -283,14 +276,9 @@ impl CompletionResponse {
             .choice
             .iter()
             .filter_map(|content| match content {
-                AssistantContent::Reasoning(reasoning) => Some(&reasoning.content),
-                _ => None,
-            })
-            .flatten()
-            .filter_map(|block| match block {
-                ReasoningContent::Text { text, .. } => Some(text.as_str()),
-                // Summary paraphrases and Encrypted/Redacted are opaque; none appear verbatim in
-                // the block, so they would corrupt the reconstruction rather than complete it.
+                AssistantContent::Reasoning(reasoning) if !reasoning.redacted => {
+                    Some(verbatim_reasoning(content, &reasoning.text))
+                }
                 _ => None,
             })
             .collect::<String>();
@@ -299,6 +287,27 @@ impl CompletionResponse {
             false => Some(text),
         }
     }
+}
+
+fn verbatim_reasoning<'a>(item: &'a AssistantContent, text: &'a str) -> std::borrow::Cow<'a, str> {
+    let Some(native) = item.native_item() else {
+        return text.into();
+    };
+    if native.get("type").and_then(Value::as_str) == Some("reasoning") {
+        return "".into();
+    }
+    if !text.is_empty() {
+        return text.into();
+    }
+    native
+        .get("reasoning_details")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|detail| detail.get("type").and_then(Value::as_str) == Some("reasoning.text"))
+        .filter_map(|detail| detail.get("text").and_then(Value::as_str))
+        .collect::<String>()
+        .into()
 }
 
 // some providers (notably MiniMax/GLM/DeepSeek via OpenRouter) emit chain-of-thought
@@ -983,7 +992,7 @@ impl ProviderErrorFacts {
     fn from_report(err: &eyre::Report) -> Option<Self> {
         let completion_error = err
             .chain()
-            .find_map(|source| source.downcast_ref::<CompletionError>())?;
+            .find_map(|source| source.downcast_ref::<ProviderError>())?;
         let mut facts = Self {
             status: completion_error
                 .provider_response_status()
@@ -1244,10 +1253,10 @@ fn jitter_factor() -> f64 {
     0.5 + scaled
 }
 
-fn normalize_openrouter_completion_error(err: CompletionError) -> eyre::Report {
+fn normalize_completion_error(err: ProviderError) -> eyre::Report {
     let empty_response = matches!(
         &err,
-        CompletionError::ResponseError(msg)
+        ProviderError::Response(msg)
             if msg.contains("no message or tool call") || msg.contains("no choices")
     );
     let report = eyre::Report::new(err);
@@ -1261,7 +1270,7 @@ fn normalize_openrouter_completion_error(err: CompletionError) -> eyre::Report {
 /// OpenRouter fails a Gemini turn over between upstreams (Vertex, AI Studio), and each rejects
 /// a thought signature the other minted with a 400 that names it only in the gateway's `raw`
 /// upstream text. History without signatures is accepted.
-fn is_foreign_thought_signature_rejection(err: &CompletionError) -> bool {
+fn is_foreign_thought_signature_rejection(err: &ProviderError) -> bool {
     fn raw_mentions_signature(value: &Value) -> bool {
         match value {
             Value::Object(object) => {
@@ -1290,22 +1299,17 @@ fn is_foreign_thought_signature_rejection(err: &CompletionError) -> bool {
 fn without_reasoning(
     mut request: rig_core::completion::CompletionRequest,
 ) -> Option<rig_core::completion::CompletionRequest> {
-    let history = request
+    request
         .chat_history
-        .into_iter()
-        .filter_map(|message| match message {
-            Message::Assistant { id, content } => {
-                let kept = content
-                    .into_iter()
-                    .filter(|item| !matches!(item, AssistantContent::Reasoning(_)));
-                OneOrMany::many(kept)
-                    .ok()
-                    .map(|content| Message::Assistant { id, content })
+        .retain_mut(|message| match Arc::make_mut(message) {
+            Message::Assistant(turn) => {
+                turn.content
+                    .retain(|item| !matches!(item, AssistantContent::Reasoning(_)));
+                !turn.content.is_empty()
             }
-            other => Some(other),
+            _ => true,
         });
-    request.chat_history = OneOrMany::many(history).ok()?;
-    Some(request)
+    (!request.chat_history.is_empty()).then_some(request)
 }
 
 fn is_local_base_url(base_url: Option<&str>) -> bool {
@@ -1340,6 +1344,21 @@ pub enum LLMProvider {
     OpenRouter {
         api_key_env: String,
     },
+    OpenCode {
+        service: OpenCodeService,
+        base_url: Option<String>,
+        api_key_env: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub enum OpenCodeService {
+    Console,
+    Go,
+}
+
+tokio::task_local! {
+    pub(crate) static OPENCODE_SESSION: String;
 }
 
 impl LLMProvider {
@@ -1356,15 +1375,15 @@ impl LLMProvider {
                 let key_env = api_key_env.as_deref().unwrap_or("ANTHROPIC_API_KEY");
                 let api_key = std::env::var(key_env)
                     .or_else(|_| missing_or_local(key_env, base_url.as_deref()))?;
-                let mut builder = anthropic::Client::builder().api_key(api_key);
-                if let Some(url) = base_url {
-                    builder = builder.base_url(url);
-                }
-                let client = builder.build()?;
-                match enable_prompt_caching {
-                    true => Ok(Box::new(AnthropicPromptCachingClient::new(client))),
-                    false => Ok(Box::new(client)),
-                }
+                let config = anthropic::AnthropicConfig::new(api_key);
+                let config = match base_url {
+                    Some(url) => config.with_base_url(url),
+                    None => config,
+                };
+                Ok(Box::new(RigClient::Anthropic(
+                    config,
+                    enable_prompt_caching,
+                )))
             }
             LLMProvider::Gemini {
                 base_url,
@@ -1384,14 +1403,14 @@ impl LLMProvider {
                             )
                         })?,
                 };
-                let mut builder = gemini::Client::builder().api_key(api_key);
-                if let Some(url) = base_url {
-                    builder = builder.base_url(url);
-                }
-                let client = builder
-                    .build()
-                    .map_err(|e| eyre::eyre!("failed to create Gemini client: {e}"))?;
-                Ok(Box::new(client))
+                let config = gemini::GeminiConfig::new(api_key);
+                let config = match base_url {
+                    Some(url) => config.with_base_url(url),
+                    None => config,
+                };
+                Ok(Box::new(RigClient::Gemini(
+                    config.connect(ReqwestClient::default()),
+                )))
             }
             LLMProvider::OpenAi {
                 base_url,
@@ -1400,22 +1419,72 @@ impl LLMProvider {
                 let key_env = api_key_env.as_deref().unwrap_or("OPENAI_API_KEY");
                 let api_key = std::env::var(key_env)
                     .or_else(|_| missing_or_local(key_env, base_url.as_deref()))?;
-                let mut builder = openai::CompletionsClient::builder().api_key(&api_key);
-                if let Some(url) = base_url {
-                    builder = builder.base_url(url);
-                }
-                Ok(Box::new(builder.build()?))
+                Ok(Box::new(RigClient::openai(api_key, base_url.as_deref())))
             }
             LLMProvider::OpenRouter { api_key_env } => {
                 let api_key = std::env::var(api_key_env)
                     .map_err(|_| eyre::eyre!("missing env var {api_key_env}"))?;
-                let client = openrouter::Client::builder()
-                    .api_key(&api_key)
-                    .http_headers(openrouter_headers()?)
+                Ok(Box::new(RigClient::openrouter(&api_key)?))
+            }
+            LLMProvider::OpenCode {
+                service,
+                base_url,
+                api_key_env,
+            } => {
+                let key_env = api_key_env.as_deref().unwrap_or("OPENCODE_API_KEY");
+                let key = std::env::var(key_env)
+                    .or_else(|_| missing_or_local(key_env, base_url.as_deref()))?;
+                let http = reqwest::Client::builder()
+                    .user_agent(concat!("nitpicker-agent/", env!("CARGO_PKG_VERSION")))
                     .build()?;
-                Ok(Box::new(client))
+                Ok(Box::new(OpenCodeClient {
+                    service: *service,
+                    key: key.into(),
+                    base_url: base_url.clone(),
+                    http: ReqwestClient::from(http),
+                }))
             }
         }
+    }
+}
+
+struct OpenCodeClient {
+    service: OpenCodeService,
+    key: rig_core::wire::Secret,
+    base_url: Option<String>,
+    http: ReqwestClient,
+}
+
+impl LLMClient for OpenCodeClient {
+    async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
+        use rig_core::{catalog::Catalog, providers::registry::ConnectOptions};
+        let provider = match self.service {
+            OpenCodeService::Console => "opencode",
+            OpenCodeService::Go => "opencode-go",
+        };
+        let model_name = completion.model.clone();
+        let reference = format!("{provider}/{model_name}");
+        let mut options = ConnectOptions::new()
+            .api_key(self.key.clone())
+            .http(self.http.clone());
+        if let Some(url) = &self.base_url {
+            options = options.base_url(url);
+        }
+        let model = Catalog::builtin().connect_with(reference.as_str(), options)?;
+        let mut request = CompletionRequest::from(completion);
+        if matches!(self.service, OpenCodeService::Go) {
+            request.options.cache_key = Some(
+                OPENCODE_SESSION
+                    .try_with(String::clone)
+                    .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string()),
+            );
+        }
+        let response = model
+            .call(request)
+            .await
+            .map_err(normalize_completion_error)
+            .wrap_err_with(|| format!("{provider} completion failed for model '{model_name}'"))?;
+        Ok(CompletionResponse::from_rig(response, model_name))
     }
 }
 
@@ -1433,13 +1502,64 @@ pub fn openrouter_headers() -> Result<reqwest::header::HeaderMap> {
     Ok(headers)
 }
 
-impl LLMClient for openrouter::Client {
-    async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
+pub(crate) enum RigClient {
+    Anthropic(anthropic::AnthropicConfig, bool),
+    Gemini(gemini::Gemini),
+    OpenAi(openai::OpenAI),
+    OpenRouter(openai::OpenAI),
+}
+
+impl RigClient {
+    pub(crate) fn openai(key: impl Into<rig_core::wire::Secret>, base_url: Option<&str>) -> Self {
+        let config = openai::OpenAIConfig::new(key).with_route(openai::wire::Route::Chat);
+        let config = match base_url {
+            Some(url) => config.with_base_url(url),
+            None => config,
+        };
+        Self::OpenAi(config.connect(ReqwestClient::default()))
+    }
+
+    pub(crate) fn openrouter(key: &str) -> Result<Self> {
+        let config = openai::OpenAIConfig::with_key(&openai::wire::OPENROUTER, key);
+        let http = reqwest::Client::builder()
+            .default_headers(openrouter_headers()?)
+            .build()?;
+        Ok(Self::OpenRouter(config.connect(ReqwestClient::from(http))))
+    }
+}
+
+impl LLMClient for RigClient {
+    async fn completion(&self, mut completion: Completion) -> Result<CompletionResponse> {
         let model_name = completion.model.clone();
-        let mut request: rig_core::completion::CompletionRequest = completion.into();
-        request.model = Some(model_name.clone());
-        let model = self.completion_model(&model_name);
-        let response = match model.completion(request.clone()).await {
+        if matches!(self, Self::OpenAi(_))
+            && model_needs_max_completion_tokens(&model_name)
+            && let Some(max) = completion.max_tokens.take()
+        {
+            let extra = serde_json::json!({ "max_completion_tokens": max });
+            completion.additional_params = Some(match completion.additional_params.take() {
+                Some(existing) => merge_json(existing, extra),
+                None => extra,
+            });
+        }
+        let mut request = CompletionRequest::from(completion);
+        let response = match self {
+            Self::Anthropic(config, caching) => {
+                request.max_tokens.get_or_insert(ANTHROPIC_DEFAULT_MAX_TOKENS);
+                let wire = config.completion(&model_name);
+                let wire = match caching {
+                    true => {
+                        request.options.cache = Some(rig_core::completion::CacheRetention::Short);
+                        wire.with_prompt_caching()
+                    }
+                    false => wire.with_tool_input_streaming(anthropic::ToolInputStreaming::Off),
+                };
+                rig_core::Model::new(wire, ReqwestClient::default()).call(request).await
+            }
+            Self::Gemini(client) => client.completion(&model_name).call(request).await,
+            Self::OpenAi(client) => client.completion(&model_name).call(request).await,
+            Self::OpenRouter(client) => {
+                let model = client.completion(&model_name);
+                match model.call(request.clone()).await {
             Err(err) if is_foreign_thought_signature_rejection(&err) => {
                 match without_reasoning(request) {
                     Some(stripped) => {
@@ -1447,35 +1567,18 @@ impl LLMClient for openrouter::Client {
                             model = %model_name,
                             "upstream rejected a replayed thought signature; retrying without reasoning history"
                         );
-                        model.completion(stripped).await
+                        model.call(stripped).await
                     }
                     None => Err(err),
                 }
             }
             other => other,
-        };
-        let response = response
-            .map_err(normalize_openrouter_completion_error)
-            .wrap_err_with(|| format!("OpenRouter completion failed for model '{model_name}'"))?;
-        let finish_reason = response
-            .raw_response
-            .choices
-            .first()
-            .and_then(|c| c.finish_reason.as_deref())
-            .map(|reason| match reason {
-                "stop" => FinishReason::Stop,
-                "length" => FinishReason::MaxTokens,
-                "tool_calls" => FinishReason::ToolUse,
-                other => FinishReason::Other(other.to_string()),
-            })
-            .unwrap_or(FinishReason::None);
-        let finish_reason = resolve_finish_reason(&response.choice, finish_reason);
-        Ok(CompletionResponse {
-            choice: response.choice,
-            finish_reason,
-            usage: TokenUsage::from_provider(&response.usage, CacheAccounting::InsidePrompt),
-            selected_model: Some(model_name),
-        })
+                }
+            }
+        }
+        .map_err(normalize_completion_error)
+        .wrap_err_with(|| format!("completion failed for model '{model_name}'"))?;
+        Ok(CompletionResponse::from_rig(response, model_name))
     }
 }
 
@@ -1487,106 +1590,12 @@ pub fn create_gemini_client_with_proxy(
     // Build a Gemini client with the proxy URL as the base URL
     // The API key doesn't matter for OAuth proxy, but is required by the builder
     let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_else(|_| "oauth-proxy".to_string());
-    let client = gemini::Client::builder()
-        .api_key(api_key)
-        .base_url(proxy_url)
-        .build()?;
+    let client = RigClient::Gemini(
+        gemini::GeminiConfig::new(api_key)
+            .with_base_url(proxy_url)
+            .connect(ReqwestClient::default()),
+    );
     Ok(client.with_retry().into_arc())
-}
-
-/// Anthropic client policy used by first-party and Foundry routes. Rig's typed caching modes add
-/// stable tools/system breakpoints plus a moving top-level conversation breakpoint.
-pub(crate) struct AnthropicPromptCachingClient {
-    inner: anthropic::Client,
-}
-
-impl AnthropicPromptCachingClient {
-    pub(crate) fn new(inner: anthropic::Client) -> Self {
-        Self { inner }
-    }
-}
-
-async fn complete_anthropic(
-    client: &anthropic::Client,
-    completion: Completion,
-    prompt_caching: bool,
-) -> Result<CompletionResponse> {
-    let model_name = completion.model.clone();
-    let mut request: rig_core::completion::CompletionRequest = completion.into();
-    request.model = Some(model_name.clone());
-    // Anthropic requires `max_tokens`, so "no cap" cannot be expressed here. rig's own default
-    // covers only model names it recognizes and falls back to 2048 for every compatible gateway —
-    // less than one review turn spends on reasoning.
-    request
-        .max_tokens
-        .get_or_insert(ANTHROPIC_DEFAULT_MAX_TOKENS);
-    let mut model = client.completion_model(model_name.clone());
-    if prompt_caching {
-        model = model.with_prompt_caching().with_automatic_caching();
-    }
-    let response = model
-        .completion(request)
-        .await
-        .wrap_err_with(|| format!("Anthropic completion failed for model '{model_name}'"))?;
-    let finish_reason = response
-        .raw_response
-        .stop_reason
-        .clone()
-        .map(|reason| match reason.as_str() {
-            "end_turn" => FinishReason::Stop,
-            "max_tokens" => FinishReason::MaxTokens,
-            "tool_use" => FinishReason::ToolUse,
-            other => FinishReason::Other(other.to_string()),
-        })
-        .unwrap_or(FinishReason::None);
-    let finish_reason = resolve_finish_reason(&response.choice, finish_reason);
-    Ok(CompletionResponse {
-        choice: response.choice,
-        finish_reason,
-        usage: TokenUsage::from_provider(&response.usage, CacheAccounting::OutsidePrompt),
-        selected_model: Some(model_name),
-    })
-}
-
-impl LLMClient for anthropic::Client {
-    async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
-        complete_anthropic(self, completion, false).await
-    }
-}
-
-impl LLMClient for AnthropicPromptCachingClient {
-    async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
-        complete_anthropic(&self.inner, completion, true).await
-    }
-}
-
-impl LLMClient for gemini::Client {
-    async fn completion(&self, completion: Completion) -> Result<CompletionResponse> {
-        let model_name = completion.model.clone();
-        let params = build_gemini_additional_params(&completion)?;
-        let mut request: rig_core::completion::CompletionRequest = completion.into();
-        request.model = Some(model_name.clone());
-        request.additional_params = Some(params);
-        let model = self.completion_model(model_name.clone());
-        let response = model
-            .completion(request)
-            .await
-            .wrap_err_with(|| format!("Gemini completion failed for model '{model_name}'"))?;
-        let finish_reason = response
-            .raw_response
-            .candidates
-            .first()
-            .and_then(|candidate| candidate.finish_reason.clone())
-            .map(map_gemini_finish_reason)
-            .unwrap_or(FinishReason::None);
-        let finish_reason = resolve_finish_reason(&response.choice, finish_reason);
-        Ok(CompletionResponse {
-            choice: response.choice,
-            finish_reason,
-            usage: TokenUsage::from_provider(&response.usage, CacheAccounting::InsidePrompt),
-            selected_model: Some(model_name),
-        })
-    }
 }
 
 fn model_needs_max_completion_tokens(model: &str) -> bool {
@@ -1619,94 +1628,10 @@ pub(crate) fn merge_json(base: Value, extra: Value) -> Value {
     }
 }
 
-impl LLMClient for openai::CompletionsClient {
-    async fn completion(&self, mut completion: Completion) -> Result<CompletionResponse> {
-        // Newer OpenAI models (o1, o3, o4-mini, gpt-4o, gpt-5, gpt-6, etc.) reject the legacy
-        // `max_tokens` param and require `max_completion_tokens` instead. Since rig always
-        // serializes `max_tokens`, we move the value into `additional_params` and clear it.
-        if let Some(max) = completion.max_tokens {
-            if model_needs_max_completion_tokens(&completion.model) {
-                let extra = serde_json::json!({ "max_completion_tokens": max });
-                completion.additional_params = Some(match completion.additional_params.take() {
-                    Some(existing) => merge_json(existing, extra),
-                    None => extra,
-                });
-                completion.max_tokens = None;
-            }
-        }
-        let model_name = completion.model.clone();
-        let mut request: rig_core::completion::CompletionRequest = completion.into();
-        request.model = Some(model_name.clone());
-        let model = self.completion_model(model_name.clone());
-        let response = model
-            .completion(request)
-            .await
-            .wrap_err_with(|| format!("OpenAI completion failed for model '{model_name}'"))?;
-        let finish_reason = response
-            .raw_response
-            .choices
-            .first()
-            .map(|choice| match choice.finish_reason.as_str() {
-                "stop" => FinishReason::Stop,
-                "length" => FinishReason::MaxTokens,
-                "tool_calls" => FinishReason::ToolUse,
-                other => FinishReason::Other(other.to_string()),
-            })
-            .unwrap_or(FinishReason::None);
-        let finish_reason = resolve_finish_reason(&response.choice, finish_reason);
-        Ok(CompletionResponse {
-            choice: response.choice,
-            finish_reason,
-            usage: TokenUsage::from_provider(&response.usage, CacheAccounting::InsidePrompt),
-            selected_model: Some(model_name),
-        })
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct GeminiAdditionalParams {
-    generation_config: Option<GenerationConfig>,
-}
-
-impl GeminiAdditionalParams {
-    fn from_completion(completion: &Completion) -> Self {
-        let config = GenerationConfig {
-            // saturating: `as i32` would turn a cap past i32::MAX into a negative field
-            max_output_tokens: completion
-                .max_tokens
-                .map(|value| i32::try_from(value).unwrap_or(i32::MAX)),
-        };
-        Self {
-            generation_config: Some(config),
-        }
-    }
-}
-
-/// Overlay the computed generation config onto any caller-supplied `additional_params` instead of
-/// replacing them, mirroring the OpenAI path's `merge_json`. The computed value wins on conflict
-/// (e.g. the typed `max_tokens`), while caller keys like safety settings or a nested
-/// `generation_config.temperature` survive.
-fn build_gemini_additional_params(completion: &Completion) -> Result<Value> {
-    let computed = serde_json::to_value(GeminiAdditionalParams::from_completion(completion))?;
-    Ok(match &completion.additional_params {
-        Some(existing) => merge_json(existing.clone(), computed),
-        None => computed,
-    })
-}
-
-#[derive(Debug, Serialize, Default)]
-struct GenerationConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_output_tokens: Option<i32>,
-}
-
 /// A structured tool call in the choice overrides the wire finish reason: providers can pair
 /// tool calls with `stop`-like reasons, and `CompletionResponse::tool_calls()` only surfaces
 /// calls when the reason is `ToolUse`.
-fn resolve_finish_reason(
-    choice: &OneOrMany<AssistantContent>,
-    wire_reason: FinishReason,
-) -> FinishReason {
+fn resolve_finish_reason(choice: &[AssistantContent], wire_reason: FinishReason) -> FinishReason {
     match choice
         .iter()
         .any(|content| matches!(content, AssistantContent::ToolCall(_)))
@@ -1716,22 +1641,12 @@ fn resolve_finish_reason(
     }
 }
 
-fn map_gemini_finish_reason(
-    reason: gemini::completion::gemini_api_types::FinishReason,
-) -> FinishReason {
-    use gemini::completion::gemini_api_types::FinishReason as GeminiFinishReason;
-    match reason {
-        GeminiFinishReason::Stop => FinishReason::Stop,
-        GeminiFinishReason::MaxTokens => FinishReason::MaxTokens,
-        GeminiFinishReason::FinishReasonUnspecified => FinishReason::None,
-        other => FinishReason::Other(format!("{other:?}")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rig_core::ProviderError as CompletionError;
     use rig_core::completion::Usage;
+    use rig_core::message::{CallId, ToolName};
     use std::sync::Mutex as StdMutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1743,7 +1658,8 @@ mod tests {
 
     fn response_with(choice: Vec<AssistantContent>) -> CompletionResponse {
         CompletionResponse {
-            choice: OneOrMany::many(choice).expect("non-empty choice"),
+            choice,
+            origin: None,
             finish_reason: FinishReason::Stop,
             usage: TokenUsage::default(),
             selected_model: None,
@@ -1792,68 +1708,81 @@ mod tests {
         }
     }
 
+    async fn exchange_http(listener: &TcpListener, response_body: Value) -> (String, Value) {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0_u8; 4096];
+            let read = socket.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "client closed before sending HTTP headers");
+            request.extend_from_slice(&chunk[..read]);
+            if let Some(index) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .expect("request must carry content-length");
+        while request.len() < header_end + content_length {
+            let mut chunk = [0_u8; 4096];
+            let read = socket.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "client closed before sending the request body");
+            request.extend_from_slice(&chunk[..read]);
+        }
+
+        let response_body = response_body.to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+            response_body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+        (
+            String::from_utf8(request[..header_end].to_vec()).unwrap(),
+            serde_json::from_slice::<Value>(&request[header_end..header_end + content_length])
+                .unwrap(),
+        )
+    }
+
     #[tokio::test]
     async fn anthropic_first_party_policy_emits_cache_control_on_the_wire() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let header_end = loop {
-                let mut chunk = [0_u8; 4096];
-                let read = socket.read(&mut chunk).await.unwrap();
-                assert!(read > 0, "client closed before sending HTTP headers");
-                request.extend_from_slice(&chunk[..read]);
-                if let Some(index) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                    break index + 4;
-                }
-            };
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().unwrap())
-                })
-                .expect("request must carry content-length");
-            while request.len() < header_end + content_length {
-                let mut chunk = [0_u8; 4096];
-                let read = socket.read(&mut chunk).await.unwrap();
-                assert!(read > 0, "client closed before sending the request body");
-                request.extend_from_slice(&chunk[..read]);
-            }
-
-            let response_body = json!({
-                "content": [{ "type": "text", "text": "ok" }],
-                "id": "msg_test",
-                "model": "claude-test",
-                "role": "assistant",
-                "type": "message",
-                "stop_reason": "end_turn",
-                "stop_sequence": null,
-                "usage": { "input_tokens": 1, "output_tokens": 1 }
-            })
-            .to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
-                response_body.len()
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-            serde_json::from_slice::<Value>(&request[header_end..header_end + content_length])
-                .unwrap()
+            exchange_http(
+                &listener,
+                json!({
+                    "content": [{ "type": "text", "text": "ok" }],
+                    "id": "msg_test",
+                    "model": "claude-test",
+                    "role": "assistant",
+                    "type": "message",
+                    "stop_reason": "end_turn",
+                    "stop_sequence": null,
+                    "usage": {
+                        "input_tokens": 52, "output_tokens": 8,
+                        "cache_read_input_tokens": 3456, "cache_creation_input_tokens": 120
+                    }
+                }),
+            )
+            .await
+            .1
         });
 
-        let client = anthropic::Client::builder()
-            .api_key("test-key")
-            .base_url(format!("http://{address}"))
-            .build()
-            .unwrap();
-        let caching_client = AnthropicPromptCachingClient::new(client);
+        let caching_client = RigClient::Anthropic(
+            anthropic::AnthropicConfig::new("test-key").with_base_url(format!("http://{address}")),
+            true,
+        );
         let mut completion = test_completion();
         completion.model = "claude-test".to_string();
         completion.tools = vec![rig_core::completion::ToolDefinition {
-            name: "read_file".to_string(),
+            name: ToolName::new("read_file").unwrap(),
+            annotations: Default::default(),
             description: "Read a file".to_string(),
             parameters: json!({
                 "type": "object",
@@ -1862,9 +1791,12 @@ mod tests {
             }),
         }];
 
-        LLMClient::completion(&caching_client, completion)
+        let reply = LLMClient::completion(&caching_client, completion)
             .await
             .unwrap();
+        assert_eq!(reply.usage.input_tokens, 3628);
+        assert_eq!(reply.usage.cached_input_tokens, 3456);
+        assert_eq!(reply.usage.cache_creation_input_tokens, 120);
         let body = server.await.unwrap();
         assert_eq!(body["cache_control"]["type"], "ephemeral");
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
@@ -1872,6 +1804,72 @@ mod tests {
             body["tools"].as_array().unwrap().last().unwrap()["cache_control"]["type"],
             "ephemeral"
         );
+    }
+
+    #[tokio::test]
+    async fn opencode_go_routes_chat_and_keeps_its_session_across_turns() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let response = json!({
+            "id": "chatcmpl_1", "created": 1, "object": "chat.completion", "model": "glm-5.3",
+            "choices": [{
+                "index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+        });
+        let server = tokio::spawn(async move {
+            let first = exchange_http(&listener, json!({
+                "id": "chatcmpl_tool", "created": 1, "object": "chat.completion", "model": "glm-5.3",
+                "choices": [{
+                    "index": 0, "finish_reason": "tool_calls",
+                    "message": {"role": "assistant", "tool_calls": [{
+                        "id": "call_1", "type": "function",
+                        "function": {"name": "read_file", "arguments": "{\"path\":\"fixture.txt\"}"}
+                    }]}
+                }],
+            })).await;
+            let second = exchange_http(&listener, response).await;
+            [first, second]
+        });
+        let client = LLMProvider::OpenCode {
+            service: OpenCodeService::Go,
+            base_url: Some(base_url),
+            api_key_env: Some("NITPICKER_TEST_OPENCODE_LOOPBACK_KEY".to_string()),
+        }
+        .client_from_env()
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("fixture.txt"), "cobalt").unwrap();
+        let answer = crate::AgentBuilder::new("test", "glm-5.3", "system", client.into_arc())
+            .max_turns(3)
+            .run("read the fixture", &crate::tools::all_tools(), dir.path())
+            .await
+            .unwrap();
+        assert_eq!(answer.text, "ok");
+        let requests = server.await.unwrap();
+        let sessions = requests.each_ref().map(|(headers, body)| {
+            let mut lines = headers.lines();
+            assert_eq!(
+                lines.next(),
+                Some("POST /openai/v1/chat/completions HTTP/1.1")
+            );
+            let headers: std::collections::HashMap<_, _> =
+                lines.filter_map(|line| line.split_once(": ")).collect();
+            assert_eq!(
+                headers.get("user-agent"),
+                Some(&concat!("nitpicker-agent/", env!("CARGO_PKG_VERSION")))
+            );
+            assert_eq!(body["model"], "glm-5.3");
+            uuid::Uuid::parse_str(headers["x-opencode-session"]).unwrap()
+        });
+        assert_eq!(sessions[0], sessions[1]);
+        let tool_reply = requests[1].1["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .unwrap();
+        assert_eq!(tool_reply["tool_call_id"], "call_1");
     }
 
     #[tokio::test]
@@ -2046,8 +2044,8 @@ mod tests {
             use rig_core::completion::message::ToolFunction;
             self.calls.fetch_add(1, Ordering::Relaxed);
             let mut response = response_with(vec![AssistantContent::ToolCall(ToolCall::new(
-                "call-1".to_string(),
-                ToolFunction::new("allowed".to_string(), serde_json::json!({})),
+                CallId::from_wire("call-1"),
+                ToolFunction::new(ToolName::new("allowed").unwrap(), serde_json::json!({})),
             ))]);
             response.finish_reason = FinishReason::ToolUse;
             Ok(response)
@@ -2063,8 +2061,8 @@ mod tests {
             use rig_core::completion::message::ToolFunction;
             self.calls.fetch_add(1, Ordering::Relaxed);
             let mut response = response_with(vec![AssistantContent::ToolCall(ToolCall::new(
-                "call-1".to_string(),
-                ToolFunction::new("submit".to_string(), serde_json::json!({})),
+                CallId::from_wire("call-1"),
+                ToolFunction::new(ToolName::new("submit").unwrap(), serde_json::json!({})),
             ))]);
             response.finish_reason = FinishReason::ToolUse;
             Ok(response)
@@ -2107,7 +2105,8 @@ mod tests {
         let client = PriorityClient::new(vec![tool_use, unused]).unwrap();
         let mut completion = test_completion();
         completion.tools.push(rig_core::completion::ToolDefinition {
-            name: "allowed".to_string(),
+            name: ToolName::new("allowed").unwrap(),
+            annotations: Default::default(),
             description: "An allowed tool".to_string(),
             parameters: serde_json::json!({"type": "object"}),
         });
@@ -2135,7 +2134,8 @@ mod tests {
         let client = PriorityClient::new(vec![plain_text, required_tool]).unwrap();
         let mut completion = test_completion();
         completion.tools.push(rig_core::completion::ToolDefinition {
-            name: "submit".to_string(),
+            name: ToolName::new("submit").unwrap(),
+            annotations: Default::default(),
             description: "Submit the result".to_string(),
             parameters: serde_json::json!({"type": "object"}),
         });
@@ -2171,7 +2171,8 @@ mod tests {
         let client = PriorityClient::new(vec![wrong_tool, required_tool]).unwrap();
         let mut completion = test_completion();
         completion.tools.push(rig_core::completion::ToolDefinition {
-            name: "submit".to_string(),
+            name: ToolName::new("submit").unwrap(),
+            annotations: Default::default(),
             description: "Submit the result".to_string(),
             parameters: serde_json::json!({"type": "object"}),
         });
@@ -2208,13 +2209,14 @@ mod tests {
         let mut completion = test_completion();
         for name in ["allowed", "submit"] {
             completion.tools.push(rig_core::completion::ToolDefinition {
-                name: name.to_string(),
+                name: ToolName::new(name).unwrap(),
+                annotations: Default::default(),
                 description: "A declared tool".to_string(),
                 parameters: serde_json::json!({"type": "object"}),
             });
         }
         completion.tool_choice = Some(ToolChoice::Specific {
-            function_names: vec!["submit".to_string()],
+            function_names: vec![ToolName::new("submit").unwrap()],
         });
 
         let response = client.completion(completion).await.unwrap();
@@ -2379,15 +2381,34 @@ mod tests {
         assert!(response.text().is_empty());
     }
 
-    /// A summary is a paraphrase of the chain, not a slice of it, so it cannot be subtracted from
-    /// the body — matching it as a fragment would leave a mangled prefix behind.
     #[test]
-    fn summary_reasoning_is_not_used_to_split_the_body() {
+    fn unrelated_reasoning_is_not_used_to_split_the_body() {
         let response = response_with(vec![
-            AssistantContent::Reasoning(rig_core::completion::message::Reasoning::summaries(vec![
-                "brief".to_string(),
-            ])),
+            reasoning_item("brief"),
             AssistantContent::text("<think>private chain"),
+        ]);
+        assert!(response.text().is_empty());
+    }
+
+    #[test]
+    fn inline_think_recovery_uses_only_verbatim_native_reasoning() {
+        let openrouter_reasoning = reasoning_item("").with_native(json!({
+            "reasoning_details": [
+                {"type": "reasoning.text", "text": "first"},
+                {"type": "reasoning.text", "text": " second."},
+                {"type": "reasoning.summary", "summary": "do not subtract"}
+            ]
+        }));
+        let response = response_with(vec![
+            openrouter_reasoning,
+            AssistantContent::text("<think>first second. Verdict: ship it."),
+        ]);
+        assert_eq!(response.text(), "Verdict: ship it.");
+
+        let summary = reasoning_item("first second.").with_native(json!({"type": "reasoning"}));
+        let response = response_with(vec![
+            summary,
+            AssistantContent::text("<think>first second. Private continuation."),
         ]);
         assert!(response.text().is_empty());
     }
@@ -2450,24 +2471,23 @@ mod tests {
         assert_eq!(response.text(), "Verdict: ship it.");
     }
 
-    /// Mirrors rig's Anthropic mapping: `input_tokens` excludes the cache buckets and
-    /// `total_tokens` is their sum plus output (`anthropic/completion.rs`).
+    /// Rig normalizes Anthropic's disjoint input counts before returning them.
     fn anthropic_usage(input: u64, output: u64, cached: u64, creation: u64) -> Usage {
         let mut usage = Usage::new();
-        usage.input_tokens = input;
-        usage.output_tokens = output;
-        usage.cached_input_tokens = cached;
-        usage.cache_creation_input_tokens = creation;
-        usage.total_tokens = input + cached + creation + output;
+        usage.input_tokens = Some(input + cached + creation);
+        usage.output_tokens = Some(output);
+        usage.cached_input_tokens = Some(cached);
+        usage.cache_creation_input_tokens = Some(creation);
+        usage.total_tokens = Some(input + cached + creation + output);
         usage
     }
 
     fn anthropic(usage: &Usage) -> TokenUsage {
-        TokenUsage::from_provider(usage, CacheAccounting::OutsidePrompt)
+        TokenUsage::from_provider(usage)
     }
 
     fn prompt_inclusive(usage: &Usage) -> TokenUsage {
-        TokenUsage::from_provider(usage, CacheAccounting::InsidePrompt)
+        TokenUsage::from_provider(usage)
     }
 
     /// The same 3508-token prompt served from cache, as each provider reports it: Anthropic shows
@@ -2478,10 +2498,10 @@ mod tests {
     fn provider_shapes_meter_a_cache_hit_identically() {
         let from_anthropic = anthropic(&anthropic_usage(52, 8, 3456, 0));
         let mut openai = Usage::new();
-        openai.input_tokens = 3508;
-        openai.output_tokens = 8;
-        openai.cached_input_tokens = 3456;
-        openai.total_tokens = 3516;
+        openai.input_tokens = Some(3508);
+        openai.output_tokens = Some(8);
+        openai.cached_input_tokens = Some(3456);
+        openai.total_tokens = Some(3516);
         let from_openai = prompt_inclusive(&openai);
 
         assert_eq!(from_anthropic.input_tokens, 3508);
@@ -2503,12 +2523,12 @@ mod tests {
     #[test]
     fn gemini_cache_reads_are_never_added_to_its_prompt() {
         let mut usage = Usage::new();
-        usage.input_tokens = 40;
-        usage.output_tokens = 30;
-        usage.reasoning_tokens = 10;
-        usage.tool_use_prompt_tokens = 12;
-        usage.cached_input_tokens = 8;
-        usage.total_tokens = 100;
+        usage.input_tokens = Some(40);
+        usage.output_tokens = Some(30);
+        usage.reasoning_tokens = Some(10);
+        usage.tool_use_prompt_tokens = Some(12);
+        usage.cached_input_tokens = Some(8);
+        usage.total_tokens = Some(100);
         let usage = prompt_inclusive(&usage);
         assert_eq!(usage.input_tokens, 40);
         assert_eq!(usage.cached_input_tokens, 8);
@@ -2519,10 +2539,10 @@ mod tests {
     #[test]
     fn openrouter_total_disagreement_does_not_inflate_the_prompt() {
         let mut usage = Usage::new();
-        usage.input_tokens = 500;
-        usage.output_tokens = 10;
-        usage.cached_input_tokens = 5;
-        usage.total_tokens = 515;
+        usage.input_tokens = Some(500);
+        usage.output_tokens = Some(10);
+        usage.cached_input_tokens = Some(5);
+        usage.total_tokens = Some(515);
         let usage = prompt_inclusive(&usage);
         assert_eq!(usage.input_tokens, 500);
         assert_eq!(usage.total_tokens, 510);
@@ -2532,8 +2552,8 @@ mod tests {
     #[test]
     fn missing_provider_total_still_meters_reported_input() {
         let mut usage = Usage::new();
-        usage.input_tokens = 1200;
-        usage.output_tokens = 40;
+        usage.input_tokens = Some(1200);
+        usage.output_tokens = Some(40);
         let usage = prompt_inclusive(&usage);
         assert_eq!(usage.input_tokens, 1200);
         assert_eq!(usage.total_tokens, 1240);
@@ -2554,11 +2574,11 @@ mod tests {
     #[test]
     fn contradictory_cache_metadata_is_not_papered_over() {
         let mut usage = Usage::new();
-        usage.input_tokens = 10;
-        usage.output_tokens = 5;
-        usage.total_tokens = 15;
-        usage.cached_input_tokens = 5_000;
-        usage.cache_creation_input_tokens = 700;
+        usage.input_tokens = Some(10);
+        usage.output_tokens = Some(5);
+        usage.total_tokens = Some(15);
+        usage.cached_input_tokens = Some(5_000);
+        usage.cache_creation_input_tokens = Some(700);
         let usage = prompt_inclusive(&usage);
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.total_tokens, 15);
@@ -2617,12 +2637,9 @@ mod tests {
     fn without_reasoning_declines_a_reasoning_only_request() {
         let request: rig_core::completion::CompletionRequest = Completion {
             model: "gemini".to_string(),
-            prompt: Message::Assistant {
-                id: None,
-                content: OneOrMany::one(AssistantContent::Reasoning(
-                    rig_core::completion::message::Reasoning::new("think"),
-                )),
-            },
+            prompt: Message::Assistant(AssistantMessage::new(vec![AssistantContent::Reasoning(
+                rig_core::completion::message::Reasoning::new("think"),
+            )])),
             preamble: None,
             history: Vec::new(),
             tools: Vec::new(),
@@ -2644,15 +2661,11 @@ mod tests {
             preamble: None,
             history: vec![
                 Message::user("task"),
-                Message::Assistant {
-                    id: None,
-                    content: OneOrMany::many([reasoning(), AssistantContent::text("answer")])
-                        .unwrap(),
-                },
-                Message::Assistant {
-                    id: None,
-                    content: OneOrMany::one(reasoning()),
-                },
+                Message::Assistant(AssistantMessage::new(vec![
+                    reasoning(),
+                    AssistantContent::text("answer"),
+                ])),
+                Message::Assistant(AssistantMessage::new(vec![reasoning()])),
             ],
             tools: Vec::new(),
             tool_choice: None,
@@ -2664,15 +2677,13 @@ mod tests {
             .unwrap()
             .chat_history
             .into_iter()
+            .map(Arc::unwrap_or_clone)
             .collect();
         assert_eq!(
             kept,
             vec![
                 Message::user("task"),
-                Message::Assistant {
-                    id: None,
-                    content: OneOrMany::one(AssistantContent::text("answer")),
-                },
+                Message::assistant("answer"),
                 Message::user("follow-up"),
             ]
         );
@@ -2691,6 +2702,19 @@ mod tests {
         }
     }
 
+    fn gemini_wire_body(completion: Completion) -> Result<Value> {
+        use rig_core::wire::{Body, Mode, Wire};
+        let wire = gemini::completion::GenerateContent::new(
+            gemini::GeminiConfig::new("unused"),
+            &completion.model,
+        );
+        let encoded = wire.encode(completion.into(), Mode::Unary)?;
+        let Body::Bytes(bytes) = encoded.request.into_body() else {
+            panic!("expected JSON")
+        };
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
     #[test]
     fn merge_json_is_deep_and_extra_wins() {
         // nested objects merge recursively; scalar conflicts resolve to `extra`.
@@ -2707,30 +2731,28 @@ mod tests {
     #[test]
     fn gemini_params_preserve_caller_config() {
         // A caller's safety settings and nested generation_config must survive the computed overlay.
-        let params = build_gemini_additional_params(&gemini_completion(
+        let params = gemini_wire_body(gemini_completion(
             Some(50),
             Some(json!({
-                "generation_config": {"temperature": 0.2},
+                "generationConfig": {"temperature": 0.2},
                 "safetySettings": [{"category": "HARM", "threshold": "NONE"}]
             })),
         ))
         .unwrap();
         assert_eq!(
-            params,
-            json!({
-                "generation_config": {"temperature": 0.2, "max_output_tokens": 50},
-                "safetySettings": [{"category": "HARM", "threshold": "NONE"}]
-            })
+            params["generationConfig"],
+            json!({"temperature": 0.2, "maxOutputTokens": 50})
+        );
+        assert_eq!(
+            params["safetySettings"],
+            json!([{"category": "HARM", "threshold": "NONE"}])
         );
     }
 
     #[test]
     fn gemini_params_none_yields_generation_config_only() {
-        let params = build_gemini_additional_params(&gemini_completion(Some(50), None)).unwrap();
-        assert_eq!(
-            params,
-            json!({"generation_config": {"max_output_tokens": 50}})
-        );
+        let params = gemini_wire_body(gemini_completion(Some(50), None)).unwrap();
+        assert_eq!(params["generationConfig"], json!({"maxOutputTokens": 50}));
     }
 
     #[test]
@@ -3010,7 +3032,7 @@ mod tests {
 
     #[test]
     fn openrouter_normalization_preserves_typed_provider_source() {
-        let err = normalize_openrouter_completion_error(CompletionError::from_http_response(
+        let err = normalize_completion_error(CompletionError::from_http_response(
             reqwest::StatusCode::TOO_MANY_REQUESTS,
             r#"{"error":{"type":"insufficient_quota"}}"#,
         ));
@@ -3021,8 +3043,11 @@ mod tests {
     fn tool_call_content() -> AssistantContent {
         use rig_core::completion::message::ToolFunction;
         AssistantContent::ToolCall(ToolCall::new(
-            "call-1".to_string(),
-            ToolFunction::new("read_file".to_string(), serde_json::json!({ "path": "x" })),
+            CallId::from_wire("call-1"),
+            ToolFunction::new(
+                ToolName::new("read_file").unwrap(),
+                serde_json::json!({ "path": "x" }),
+            ),
         ))
     }
 
@@ -3030,12 +3055,11 @@ mod tests {
     /// surfaces calls under `ToolUse`, so the override losing would silently end the agent loop.
     #[test]
     fn a_structured_tool_call_overrides_any_wire_finish_reason() {
-        let alone = OneOrMany::one(tool_call_content());
-        let beside_text = OneOrMany::many(vec![
+        let alone = vec![tool_call_content()];
+        let beside_text = vec![
             AssistantContent::text("narration before the call"),
             tool_call_content(),
-        ])
-        .expect("two items");
+        ];
         for choice in [alone, beside_text] {
             for wire in [
                 FinishReason::Stop,
@@ -3050,7 +3074,7 @@ mod tests {
 
     #[test]
     fn without_tool_calls_the_wire_finish_reason_stands() {
-        let choice = OneOrMany::one(AssistantContent::text("done"));
+        let choice = vec![AssistantContent::text("done")];
         for wire in [
             FinishReason::Stop,
             FinishReason::MaxTokens,
@@ -3070,7 +3094,8 @@ mod tests {
         impl LLMClient for UsageClient {
             async fn completion(&self, _completion: Completion) -> Result<CompletionResponse> {
                 Ok(CompletionResponse {
-                    choice: OneOrMany::one(AssistantContent::text("ok")),
+                    choice: vec![AssistantContent::text("ok")],
+                    origin: None,
                     finish_reason: FinishReason::Stop,
                     usage: TokenUsage {
                         input_tokens: 100,

@@ -8,9 +8,8 @@ use crate::session::{SessionWriter, ToolCallRecord, now_unix_ms};
 use crate::tools::{Tool, floor_char_boundary, tool_definitions};
 use eyre::Result;
 use futures::future::join_all;
-use rig_core::OneOrMany;
 use rig_core::completion::Message;
-use rig_core::completion::message::{ToolChoice, ToolResult, ToolResultContent, UserContent};
+use rig_core::completion::message::{ToolChoice, ToolName, ToolResultContent, UserContent};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -329,7 +328,8 @@ impl Tool for FinishTool {
 
     fn definition(&self) -> rig_core::completion::ToolDefinition {
         rig_core::completion::ToolDefinition {
-            name: "finish".to_string(),
+            name: ToolName::new("finish").unwrap(),
+            annotations: Default::default(),
             description:
                 "Finish the assigned subtask and return the final result to the parent agent."
                     .to_string(),
@@ -389,7 +389,11 @@ pub async fn run_agent(
         nitpicker.tool_calls = Empty,
         nitpicker.subagents_spawned = Empty,
     );
-    let result = run_agent_inner(config, initial_message, tools_map, work_dir)
+    let result = crate::llm::OPENCODE_SESSION
+        .scope(
+            uuid::Uuid::new_v4().to_string(),
+            run_agent_inner(config, initial_message, tools_map, work_dir),
+        )
         .instrument(span.clone())
         .await;
     match &result {
@@ -540,7 +544,9 @@ async fn run_agent_inner(
             match terminal_tools.as_slice() {
                 [] => Some(ToolChoice::None),
                 [name] => Some(ToolChoice::Specific {
-                    function_names: vec![name.clone()],
+                    function_names: vec![
+                        ToolName::new(name.clone()).expect("nonempty terminal tool name"),
+                    ],
                 }),
                 _ => Some(ToolChoice::Required),
             }
@@ -597,17 +603,20 @@ async fn run_agent_inner(
             let mut cycle_lens = Vec::with_capacity(tool_calls.len());
             for call in &tool_calls {
                 let tool_name = &call.function.name;
-                let args = &call.function.arguments;
-                let tool_call_key = format!("{tool_name}:{args}");
+                let args = Value::Object(call.function.arguments.clone());
+                let tool_call_key = match &call.function.invalid_arguments {
+                    Some(raw) => format!("{tool_name}:invalid:{raw}"),
+                    None => tool_call_cycle_key(tool_name, args.clone()),
+                };
                 tool_call_history.push_back(tool_call_key);
                 if tool_call_history.len() > TOOL_CALL_HISTORY_WINDOW {
                     tool_call_history.pop_front();
                 }
                 cycle_lens.push(detect_tool_call_cycle(&tool_call_history));
-                if tool_name == "spawn_subagent" {
-                    if let Some(task) = args.get("task").and_then(|v| v.as_str()) {
-                        last_subagent = Some(first_line(task));
-                    }
+                if tool_name == "spawn_subagent"
+                    && let Some(task) = args.get("task").and_then(|v| v.as_str())
+                {
+                    last_subagent = Some(first_line(task));
                 }
                 match &selected_model {
                     Some(m) => {
@@ -637,7 +646,8 @@ async fn run_agent_inner(
                             selected_model: selected_model.as_deref(),
                         },
                         call.function.name.as_str(),
-                        call.function.arguments.clone(),
+                        Value::Object(call.function.arguments.clone()),
+                        call.function.invalid_arguments.is_some(),
                         cycle_len,
                     )
                 },
@@ -669,7 +679,7 @@ async fn run_agent_inner(
                 let ToolCallOutcome {
                     mut output,
                     nested_tool_calls,
-                    status: _,
+                    status,
                     spawned_agent: _,
                     subagent_usage,
                 } = outcome;
@@ -681,16 +691,17 @@ async fn run_agent_inner(
                 // re-resolve the finish payload here in provider order, so the authoritative value is
                 // deterministic even though FinishTool also wrote it during concurrent phase-2
                 // execution (a malformed turn with multiple finish calls → provider-last wins)
-                if config.depth.is_subagent() && !blocked && call.function.name == "finish" {
-                    if let Some(result) = call
+                if config.depth.is_subagent()
+                    && status == ToolCallStatus::Ok
+                    && call.function.name == "finish"
+                    && let Some(result) = call
                         .function
                         .arguments
                         .get("result")
                         .and_then(|v| v.as_str())
-                    {
-                        *finish_store.lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some(result.to_string());
-                    }
+                {
+                    *finish_store.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(result.to_string());
                 }
                 if output.len() > MAX_TOOL_RESULT_BYTES {
                     let original_len = output.len();
@@ -701,11 +712,10 @@ async fn run_agent_inner(
                         original_len.saturating_sub(boundary)
                     ));
                 }
-                results.push(ToolResult {
-                    id: call.id.clone(),
-                    call_id: call.call_id.clone(),
-                    content: OneOrMany::one(ToolResultContent::text(output)),
-                });
+                let mut result = call.result(vec![ToolResultContent::text(output)]);
+                result.is_error =
+                    matches!(status, ToolCallStatus::Error | ToolCallStatus::BlockedCycle);
+                results.push(result);
             }
             report_progress(
                 &config,
@@ -715,28 +725,27 @@ async fn run_agent_inner(
                 last_subagent.clone(),
             );
 
-            if config.depth.is_subagent() {
-                if let Some(result) = finish_store
+            if config.depth.is_subagent()
+                && let Some(result) = finish_store
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .take()
-                {
-                    info!(
-                        agent = %config.name,
-                        turn,
-                        response_input_tokens = response.usage.input_tokens,
-                        response_output_tokens = response.usage.output_tokens,
-                        response_total_tokens = response.usage.total_tokens,
-                        response_cached_input_tokens = response.usage.cached_input_tokens,
-                        total_input_tokens = totals.usage.input_tokens,
-                        total_output_tokens = totals.usage.output_tokens,
-                        total_tokens_so_far = totals.usage.total_tokens,
-                        total_cached_input_tokens = totals.usage.cached_input_tokens,
-                        response_len = result.len(),
-                        "subagent finished"
-                    );
-                    return Ok(totals.finish(&config, result, turn + 1));
-                }
+            {
+                info!(
+                    agent = %config.name,
+                    turn,
+                    response_input_tokens = response.usage.input_tokens,
+                    response_output_tokens = response.usage.output_tokens,
+                    response_total_tokens = response.usage.total_tokens,
+                    response_cached_input_tokens = response.usage.cached_input_tokens,
+                    total_input_tokens = totals.usage.input_tokens,
+                    total_output_tokens = totals.usage.output_tokens,
+                    total_tokens_so_far = totals.usage.total_tokens,
+                    total_cached_input_tokens = totals.usage.cached_input_tokens,
+                    response_len = result.len(),
+                    "subagent finished"
+                );
+                return Ok(totals.finish(&config, result, turn + 1));
             }
 
             if should_terminate {
@@ -754,8 +763,7 @@ async fn run_agent_inner(
             }
 
             let tool_message = Message::User {
-                content: OneOrMany::many(results.into_iter().map(UserContent::ToolResult))
-                    .expect("tool results must not be empty"),
+                content: results.into_iter().map(UserContent::ToolResult).collect(),
             };
 
             history.push(tool_message.clone());
@@ -891,7 +899,8 @@ impl Tool for SpawnSubagentTool {
 
     fn definition(&self) -> rig_core::completion::ToolDefinition {
         rig_core::completion::ToolDefinition {
-            name: "spawn_subagent".to_string(),
+            name: ToolName::new("spawn_subagent").unwrap(),
+            annotations: Default::default(),
             description:
                 "Delegate a complex multi-step investigation to a subagent. Only use when the task requires several tool calls (e.g. tracing logic across multiple files). Do NOT use for single file reads or simple lookups — call those tools directly instead.
 
@@ -1026,6 +1035,11 @@ fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or(s).to_string()
 }
 
+fn tool_call_cycle_key(tool_name: &ToolName, mut args: Value) -> String {
+    args.sort_all_objects();
+    format!("{tool_name}:{args}")
+}
+
 /// Returns the cycle period (1, 2, or 3) if the tail of `history` forms a repeated cycle,
 /// or 0 if no cycle is detected. Period-1 maps to the existing consecutive-identical check.
 fn detect_tool_call_cycle(history: &VecDeque<String>) -> usize {
@@ -1058,6 +1072,7 @@ async fn execute_tool_call(
     ctx: ToolCallContext<'_>,
     tool_name: &str,
     args: Value,
+    invalid_args: bool,
     cycle_len: usize,
 ) -> ToolCallOutcome {
     // the tool name comes from model output: only a registered tool may name the span, and
@@ -1080,7 +1095,7 @@ async fn execute_tool_call(
         nitpicker.turn = (ctx.turn + 1) as u64,
         nitpicker.tool.status = Empty,
     );
-    let outcome = execute_tool_call_inner(ctx, tool_name, args, cycle_len)
+    let outcome = execute_tool_call_inner(ctx, tool_name, args, invalid_args, cycle_len)
         .instrument(span.clone())
         .await;
     span.record("nitpicker.tool.status", outcome.status.as_str());
@@ -1094,6 +1109,7 @@ async fn execute_tool_call_inner(
     ctx: ToolCallContext<'_>,
     tool_name: &str,
     args: Value,
+    invalid_args: bool,
     cycle_len: usize,
 ) -> ToolCallOutcome {
     if cycle_len > 0 {
@@ -1133,6 +1149,28 @@ async fn execute_tool_call_inner(
         )
         .await;
         return outcome;
+    }
+
+    if invalid_args {
+        let output = "Error: tool arguments must be a complete JSON object".to_string();
+        log_tool_call(
+            ctx.config,
+            ctx.turn + 1,
+            tool_name,
+            &args,
+            ToolCallStatus::Error,
+            None,
+            Some(&output),
+            ctx.selected_model,
+        )
+        .await;
+        return ToolCallOutcome {
+            output,
+            status: ToolCallStatus::Error,
+            nested_tool_calls: 0,
+            spawned_agent: None,
+            subagent_usage: TokenUsage::default(),
+        };
     }
 
     if !ctx.executable_tools.contains(tool_name) {
@@ -1359,7 +1397,27 @@ mod tests {
     use super::*;
     use crate::llm::{CompletionResponse, FinishReason, LLMClient};
     use rig_core::completion::AssistantContent;
-    use rig_core::completion::message::{ToolCall, ToolFunction};
+    use rig_core::completion::message::{CallId, ToolCall, ToolFunction};
+
+    #[test]
+    fn tool_cycle_detection_ignores_object_key_order() {
+        let tool = ToolName::new("read_file").unwrap();
+        let input = [
+            r#"{"path":"a","range":[{"start":1,"end":3}],"limit":3}"#,
+            r#"{"range":[{"end":3,"start":1}],"path":"a","limit":3}"#,
+            r#"{"limit":3,"path":"a","range":[{"end":3,"start":1}]}"#,
+            r#"{"limit":3,"range":[{"start":1,"end":3}],"path":"a"}"#,
+        ];
+        let history = input
+            .into_iter()
+            .map(|raw| tool_call_cycle_key(&tool, serde_json::from_str(raw).unwrap()))
+            .collect();
+        assert_eq!(detect_tool_call_cycle(&history), 1);
+        assert_ne!(
+            tool_call_cycle_key(&tool, json!({"lines": [1, 3]})),
+            tool_call_cycle_key(&tool, json!({"lines": [3, 1]})),
+        );
+    }
 
     fn usage(input: u64, output: u64, cached: u64, creation: u64) -> TokenUsage {
         TokenUsage {
@@ -1448,7 +1506,8 @@ mod tests {
     impl LLMClient for TruncatedTextClient {
         async fn completion(&self, _completion: Completion) -> Result<CompletionResponse> {
             Ok(CompletionResponse {
-                choice: OneOrMany::one(AssistantContent::text("partial answer")),
+                choice: vec![AssistantContent::text("partial answer")],
+                origin: None,
                 finish_reason: FinishReason::MaxTokens,
                 usage: TokenUsage::default(),
                 selected_model: Some("selected-model".to_string()),
@@ -1469,9 +1528,9 @@ mod tests {
             let (choice, finish_reason) = match forced {
                 true => (
                     AssistantContent::ToolCall(ToolCall::new(
-                        "finish-call".to_string(),
+                        CallId::from_wire("finish-call"),
                         ToolFunction::new(
-                            "finish".to_string(),
+                            ToolName::new("finish").unwrap(),
                             json!({"result": "structured result"}),
                         ),
                     )),
@@ -1483,7 +1542,8 @@ mod tests {
                 ),
             };
             Ok(CompletionResponse {
-                choice: OneOrMany::one(choice),
+                choice: vec![choice],
+                origin: None,
                 finish_reason,
                 usage: TokenUsage::default(),
                 selected_model: Some("scripted".to_string()),
@@ -1551,6 +1611,7 @@ mod tests {
             },
             "git",
             json!({"command": "log --oneline | head -n 3"}),
+            false,
             0,
         )
         .await;
@@ -1577,7 +1638,7 @@ mod tests {
         assert_eq!(
             calls[1].tool_choice,
             Some(ToolChoice::Specific {
-                function_names: vec!["finish".to_string()]
+                function_names: vec![ToolName::new("finish").unwrap()]
             })
         );
         let first_tool_names = calls[0]
@@ -1619,7 +1680,7 @@ mod tests {
         assert_eq!(
             calls[0].tool_choice,
             Some(ToolChoice::Specific {
-                function_names: vec!["finish".to_string()]
+                function_names: vec![ToolName::new("finish").unwrap()]
             })
         );
     }
@@ -1692,6 +1753,7 @@ mod tests {
             },
             "finish",
             json!({"result": "must not be stored"}),
+            false,
             0,
         )
         .await;
@@ -1764,8 +1826,8 @@ mod tests {
 
         fn tool_call(id: &str, name: &str, args: Value) -> AssistantContent {
             AssistantContent::ToolCall(ToolCall::new(
-                id.to_string(),
-                ToolFunction::new(name.to_string(), args),
+                CallId::from_wire(id),
+                ToolFunction::new(ToolName::new(name).unwrap(), args),
             ))
         }
 
@@ -1778,7 +1840,8 @@ mod tests {
                 false => FinishReason::Stop,
             };
             Ok(CompletionResponse {
-                choice: OneOrMany::many(contents).expect("non-empty"),
+                choice: contents,
+                origin: None,
                 finish_reason,
                 usage: TokenUsage {
                     input_tokens,

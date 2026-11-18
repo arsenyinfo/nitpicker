@@ -111,7 +111,8 @@ impl Tool for SubmitVerdictTool {
 
     fn definition(&self) -> rig_core::completion::ToolDefinition {
         rig_core::completion::ToolDefinition {
-            name: "submit_verdict".to_string(),
+            name: rig_core::message::ToolName::new("submit_verdict").unwrap(),
+            annotations: Default::default(),
             description: "Submit your final position for this round. \
                 Set agree=true only when the opponent's latest position can be forwarded \
                 unchanged. A caveat already accounted for in that position can be forwarded as-is. \
@@ -1347,7 +1348,7 @@ mod tests {
 
     #[test]
     fn operational_failure_warning_is_concise_and_emitted_once() {
-        let err = eyre::Report::new(rig_core::completion::CompletionError::from_http_response(
+        let err = eyre::Report::new(rig_core::ProviderError::from_http_response(
             reqwest::StatusCode::FORBIDDEN,
             r#"{"error":{"type":"access_terminated_error","message":"You've reached your usage limit for this billing cycle. Your quota will be refreshed in the next cycle"}}"#,
         ));

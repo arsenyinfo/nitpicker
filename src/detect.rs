@@ -181,10 +181,10 @@ pub async fn detect_all() -> Vec<Detected> {
     // agy keyring token (Antigravity CLI) — research-only path, see README warning.
     // Gated behind the `antigravity` feature (off by default), like the auth path itself.
     #[cfg(feature = "antigravity")]
-    if !detected.iter().any(|d| d.name == "gemini") {
-        if let Some(d) = detect_agy_keyring() {
-            detected.push(d);
-        }
+    if !detected.iter().any(|d| d.name == "gemini")
+        && let Some(d) = detect_agy_keyring()
+    {
+        detected.push(d);
     }
 
     // opencode api-key providers not already found via env vars
@@ -200,28 +200,28 @@ pub async fn detect_all() -> Vec<Detected> {
     // ChatGPT/Codex subscription token (Codex CLI) — research-only path, see README warning.
     // Only surface it when no paid OpenAI key already covers the OpenAI family, to avoid a
     // redundant second OpenAI-flavored reviewer.
-    if !detected.iter().any(|d| d.name == "openai") {
-        if let Some(d) = detect_codex() {
-            detected.push(d);
-        }
+    if !detected.iter().any(|d| d.name == "openai")
+        && let Some(d) = detect_codex()
+    {
+        detected.push(d);
     }
 
     // local servers
-    if let Some(d) = detect_ollama().await {
-        if !detected.iter().any(|e| e.name == "ollama") {
-            detected.push(d);
-        }
+    if let Some(d) = detect_ollama().await
+        && !detected.iter().any(|e| e.name == "ollama")
+    {
+        detected.push(d);
     }
-    if let Some(d) = detect_lmstudio().await {
-        if !detected.iter().any(|e| e.name == "lmstudio") {
-            detected.push(d);
-        }
+    if let Some(d) = detect_lmstudio().await
+        && !detected.iter().any(|e| e.name == "lmstudio")
+    {
+        detected.push(d);
     }
 
-    if let Some(d) = detect_databricks() {
-        if !detected.iter().any(|e| e.name == "databricks") {
-            detected.push(d);
-        }
+    if let Some(d) = detect_databricks()
+        && !detected.iter().any(|e| e.name == "databricks")
+    {
+        detected.push(d);
     }
 
     detected.sort_by_key(|d| priority_index(d.name));
@@ -301,18 +301,15 @@ async fn detect_ollama() -> Option<Detected> {
         .build()
         .ok()?;
 
-    if let Ok(resp) = client.get("http://localhost:11434/api/tags").send().await {
-        if resp.status().is_success() {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                if let Some(model) = json["models"]
-                    .as_array()
-                    .and_then(|m| m.first())
-                    .and_then(|m| m["name"].as_str())
-                {
-                    return Some(ollama_detected(model.to_string(), "ollama (running)"));
-                }
-            }
-        }
+    if let Ok(resp) = client.get("http://localhost:11434/api/tags").send().await
+        && resp.status().is_success()
+        && let Ok(json) = resp.json::<serde_json::Value>().await
+        && let Some(model) = json["models"]
+            .as_array()
+            .and_then(|m| m.first())
+            .and_then(|m| m["name"].as_str())
+    {
+        return Some(ollama_detected(model.to_string(), "ollama (running)"));
     }
 
     // installed but not running
@@ -358,18 +355,15 @@ async fn detect_lmstudio() -> Option<Detected> {
         .build()
         .ok()?;
 
-    if let Ok(resp) = client.get("http://localhost:1234/v1/models").send().await {
-        if resp.status().is_success() {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                if let Some(model) = json["data"]
-                    .as_array()
-                    .and_then(|m| m.first())
-                    .and_then(|m| m["id"].as_str())
-                {
-                    return Some(lmstudio_detected(model.to_string(), "lmstudio (running)"));
-                }
-            }
-        }
+    if let Ok(resp) = client.get("http://localhost:1234/v1/models").send().await
+        && resp.status().is_success()
+        && let Ok(json) = resp.json::<serde_json::Value>().await
+        && let Some(model) = json["data"]
+            .as_array()
+            .and_then(|m| m.first())
+            .and_then(|m| m["id"].as_str())
+    {
+        return Some(lmstudio_detected(model.to_string(), "lmstudio (running)"));
     }
 
     if lmstudio_app_exists() {
@@ -455,12 +449,10 @@ fn read_databricks_host_from_cfg() -> Option<String> {
             in_default = false;
             continue;
         }
-        if in_default {
-            if let Some(rest) = line.strip_prefix("host") {
-                let val = rest.trim_start_matches([' ', '=']).trim();
-                if !val.is_empty() {
-                    return Some(val.to_string());
-                }
+        if in_default && let Some(rest) = line.strip_prefix("host") {
+            let val = rest.trim_start_matches([' ', '=']).trim();
+            if !val.is_empty() {
+                return Some(val.to_string());
             }
         }
     }

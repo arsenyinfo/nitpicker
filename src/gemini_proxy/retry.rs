@@ -104,23 +104,23 @@ pub async fn fetch_with_retry(
             None
         };
 
-        if let Some(ref ctx) = quota_context {
-            if ctx.terminal {
-                if ctx.reason.as_deref() == Some("MODEL_CAPACITY_EXHAUSTED") {
-                    let cooldown_ms = ctx.retry_delay_ms.unwrap_or(MODEL_CAPACITY_COOLDOWN_MS);
-                    set_retry_cooldown(&retry_state.cooldowns, &throttle_key, cooldown_ms).await;
-                    warn!(
-                        "Retry: terminal model capacity; cooldown {}ms before next request",
-                        cooldown_ms
-                    );
-                }
+        if let Some(ref ctx) = quota_context
+            && ctx.terminal
+        {
+            if ctx.reason.as_deref() == Some("MODEL_CAPACITY_EXHAUSTED") {
+                let cooldown_ms = ctx.retry_delay_ms.unwrap_or(MODEL_CAPACITY_COOLDOWN_MS);
+                set_retry_cooldown(&retry_state.cooldowns, &throttle_key, cooldown_ms).await;
                 warn!(
-                    "Retry: attempt {} terminal 429 ({}), returning without retry",
-                    attempt,
-                    ctx.reason.as_deref().unwrap_or("unknown")
+                    "Retry: terminal model capacity; cooldown {}ms before next request",
+                    cooldown_ms
                 );
-                return Ok(response);
             }
+            warn!(
+                "Retry: attempt {} terminal 429 ({}), returning without retry",
+                attempt,
+                ctx.reason.as_deref().unwrap_or("unknown")
+            );
+            return Ok(response);
         }
 
         if attempt >= DEFAULT_MAX_ATTEMPTS {
@@ -174,10 +174,10 @@ async fn wait_for_retry_cooldown(cooldowns: &Arc<Mutex<HashMap<String, Instant>>
             );
             tokio::time::sleep(Duration::from_millis(remaining as u64)).await;
             let mut map = cooldowns.lock().await;
-            if let Some(&current_until) = map.get(key) {
-                if current_until <= Instant::now() {
-                    map.remove(key);
-                }
+            if let Some(&current_until) = map.get(key)
+                && current_until <= Instant::now()
+            {
+                map.remove(key);
             }
         } else {
             map.remove(key);
@@ -233,13 +233,11 @@ fn resolve_retry_delay_ms(
     quota_context: Option<&QuotaContext>,
 ) -> u64 {
     // 1. Check Retry-After header
-    if let Some(header) = response.headers().get("retry-after") {
-        if let Ok(text) = header.to_str() {
-            if let Ok(seconds) = text.parse::<u64>() {
-                return seconds * 1000;
-            }
-            // Try parsing as HTTP date? For now, skip.
-        }
+    if let Some(header) = response.headers().get("retry-after")
+        && let Ok(text) = header.to_str()
+        && let Ok(seconds) = text.parse::<u64>()
+    {
+        return seconds * 1000;
     }
 
     // 2. Check quota context delay

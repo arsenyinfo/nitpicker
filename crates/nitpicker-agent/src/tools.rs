@@ -2,6 +2,7 @@ use eyre::Result;
 use glob::glob;
 use regex::Regex;
 use rig_core::completion::ToolDefinition;
+use rig_core::message::ToolName;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -209,7 +210,8 @@ impl Tool for ReadFileTool {
 
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "read_file".to_string(),
+            name: ToolName::new("read_file").unwrap(),
+            annotations: Default::default(),
             description:
                 "Read a text file inside the workspace and return numbered lines. Use this after glob or grep to inspect specific files; prefer start_line/end_line for focused reads."
                     .to_string(),
@@ -316,7 +318,8 @@ impl Tool for GlobTool {
 
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "glob".to_string(),
+            name: ToolName::new("glob").unwrap(),
+            annotations: Default::default(),
             description:
                 "Find workspace-relative file paths by glob pattern. Use this when you know the file name or extension pattern but not the exact path; returns at most 200 matches."
                     .to_string(),
@@ -359,10 +362,10 @@ impl Tool for GlobTool {
             let full_pattern = work_dir.join(pattern);
             let full_pattern = full_pattern.to_string_lossy();
             for entry in glob(&full_pattern)? {
-                if let Ok(path) = entry {
-                    if let Ok(relative) = path.strip_prefix(&work_dir) {
-                        results.push(relative.display().to_string());
-                    }
+                if let Ok(path) = entry
+                    && let Ok(relative) = path.strip_prefix(&work_dir)
+                {
+                    results.push(relative.display().to_string());
                 }
                 if results.len() >= 200 {
                     break;
@@ -385,7 +388,8 @@ impl Tool for GrepTool {
 
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "grep".to_string(),
+            name: ToolName::new("grep").unwrap(),
+            annotations: Default::default(),
             description: "Search text files for a regex and return path:line:content matches. Use this to locate relevant code before calling read_file; optionally limit by path or file_glob, and expect at most 100 matches."
                 .to_string(),
             parameters: json!({
@@ -480,10 +484,10 @@ impl Tool for GrepTool {
                             }
                             stack.push(entry_path);
                         } else if file_type.is_file() {
-                            if let Some(filter) = &file_glob {
-                                if !filter.is_match(&name) {
-                                    continue;
-                                }
+                            if let Some(filter) = &file_glob
+                                && !filter.is_match(&name)
+                            {
+                                continue;
                             }
                             match search_file(&entry_path, &regex, &work_dir, &mut results).await {
                                 Ok(_) => {}
@@ -615,7 +619,8 @@ impl Tool for GitTool {
 
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "git".to_string(),
+            name: ToolName::new("git").unwrap(),
+            annotations: Default::default(),
             description: "Run an allowlisted read-only git command for review context: diff, log, show, blame, status, rev-parse, shortlog, ls-files, for-each-ref, show-ref. To list or query branches/tags use for-each-ref (e.g. `for-each-ref --contains <sha> refs/heads/`), not branch/tag. Use this for repository history or patch context, not for general file search. Arguments are split on whitespace and passed straight to git: there is no shell, so pipes, redirects, `&&`, and command substitution do not work."
                 .to_string(),
             parameters: json!({

@@ -48,6 +48,13 @@ provider = "openrouter"
 # provider = "openai"
 # auth = "codex"
 
+# OpenCode Console (`opencode`) or Go subscription (`opencode-go`).
+# Both use OPENCODE_API_KEY; supply the model ID without the provider prefix.
+# [[reviewer]]
+# name = "opencode-go"
+# provider = "opencode-go"
+# model = "glm-5.3"
+
 # OpenRouter with explicit model
 # [[reviewer]]
 # name = "openrouter"

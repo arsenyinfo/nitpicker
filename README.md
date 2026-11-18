@@ -34,6 +34,8 @@ nitpicker fixes this by pitching models against each other in an adversarial deb
 
 ## Quick Start
 
+Building from source with `cargo install` requires Rust 1.97.1 or newer.
+
 ```bash
 cargo install nitpicker
 ```
@@ -207,6 +209,8 @@ provider = "openrouter"
 | `openai` | `OPENAI_API_KEY` | Compatible with OpenAI models and custom OpenAI gateways. |
 | `codex` *(OpenAI)* | Reuses `~/.codex/auth.json` | Uses your existing ChatGPT Plus/Pro subscription token from OpenAI Codex CLI. No API key needed. [Details below](#chatgpt--codex-subscription). |
 | `openrouter` | `OPENROUTER_API_KEY` | Access open-weights & Chinese frontier models (Qwen, DeepSeek, Kimi, GLM). |
+| `opencode` | `OPENCODE_API_KEY` | OpenCode Console (formerly Zen), pay-as-you-go. |
+| `opencode-go` | `OPENCODE_API_KEY` | OpenCode Go subscription; preserves a session ID across each agent's turns. |
 | `gemini` | `GEMINI_API_KEY` | Google Gemini models via official API. |
 | `azure` *(Entra ID)* | `auth = "azure-ad"` | Azure AI Foundry models with auto-refreshing tokens (requires `--features azure`). |
 
@@ -241,6 +245,20 @@ provider = "openrouter"
 [[reviewer]]
 model = "free"
 provider = "openrouter"
+```
+
+### OpenCode Console & Go
+
+Use an API key from [OpenCode Console](https://opencode.ai/console) and set
+`provider = "opencode"` for pay-as-you-go or `provider = "opencode-go"` for Go.
+Use the model ID without the provider prefix. Console's free chat models are
+restricted to the OpenCode client.
+
+```toml
+[[reviewer]]
+name = "opencode-go"
+provider = "opencode-go"
+model = "glm-5.3"
 ```
 
 ---

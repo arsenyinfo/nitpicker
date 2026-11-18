@@ -147,6 +147,10 @@ pub enum ProviderType {
     OpenAi,
     #[serde(rename = "openrouter")]
     OpenRouter,
+    #[serde(rename = "opencode")]
+    OpenCode,
+    #[serde(rename = "opencode-go")]
+    OpenCodeGo,
 }
 
 impl ProviderType {
@@ -522,6 +526,7 @@ fn default_env_var(provider: &ProviderType) -> Option<&'static str> {
         ProviderType::Gemini => Some("GEMINI_API_KEY"),
         ProviderType::OpenAi => Some("OPENAI_API_KEY"),
         ProviderType::OpenRouter => Some("OPENROUTER_API_KEY"),
+        ProviderType::OpenCode | ProviderType::OpenCodeGo => Some("OPENCODE_API_KEY"),
     }
 }
 

@@ -180,10 +180,10 @@ impl Telemetry {
     /// exit code: telemetry must not alter the run's outcome.
     pub fn shutdown(self) {
         #[cfg(feature = "otel")]
-        if let Some(provider) = self.provider {
-            if let Err(err) = provider.shutdown() {
-                eprintln!("warning: OpenTelemetry export did not shut down cleanly: {err}");
-            }
+        if let Some(provider) = self.provider
+            && let Err(err) = provider.shutdown()
+        {
+            eprintln!("warning: OpenTelemetry export did not shut down cleanly: {err}");
         }
     }
 }

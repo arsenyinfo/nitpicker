@@ -12,14 +12,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use azure_core::credentials::{Secret, TokenCredential};
 use azure_identity::{ClientSecretCredential, DeveloperToolsCredential, ManagedIdentityCredential};
-use eyre::{Result, WrapErr};
-use rig_core::providers::{anthropic, openai};
+use eyre::Result;
+use rig_core::providers::anthropic;
 use tokio::sync::Mutex;
 
 use crate::config::ProviderType;
 use crate::llm::{
-    AnthropicPromptCachingClient, Completion, CompletionResponse, LLMClient, LLMClientDyn,
-    provider_error_has_code, provider_http_status,
+    Completion, CompletionResponse, LLMClient, LLMClientDyn, RigClient, provider_error_has_code,
+    provider_http_status,
 };
 
 /// Default AAD scope for Azure AI Foundry / Cognitive Services.
@@ -75,10 +75,10 @@ impl AzureAdClient {
     /// token fetch — double-checked locking, with the lock also serializing the in-flight refresh.
     async fn ensure_client(&self) -> Result<Arc<dyn LLMClientDyn>> {
         let mut guard = self.cache.lock().await;
-        if let Some(cached) = guard.as_ref() {
-            if cached.expires_at_unix - now_unix() > EXPIRY_SKEW_SECS {
-                return Ok(Arc::clone(&cached.client));
-            }
+        if let Some(cached) = guard.as_ref()
+            && cached.expires_at_unix - now_unix() > EXPIRY_SKEW_SECS
+        {
+            return Ok(Arc::clone(&cached.client));
         }
         let (client, cached) = self.build_fresh().await?;
         *guard = Some(cached);
@@ -94,11 +94,11 @@ impl AzureAdClient {
     /// concurrent 401s triggers exactly one fetch (the rest short-circuit on the changed pointer).
     async fn refresh(&self, stale: &Arc<dyn LLMClientDyn>) -> Result<Arc<dyn LLMClientDyn>> {
         let mut guard = self.cache.lock().await;
-        if let Some(cached) = guard.as_ref() {
-            if !Arc::ptr_eq(&cached.client, stale) {
-                // Another concurrent 401 already refreshed since `stale` was handed out — reuse it.
-                return Ok(Arc::clone(&cached.client));
-            }
+        if let Some(cached) = guard.as_ref()
+            && !Arc::ptr_eq(&cached.client, stale)
+        {
+            // Another concurrent 401 already refreshed since `stale` was handed out — reuse it.
+            return Ok(Arc::clone(&cached.client));
         }
         let (client, cached) = self.build_fresh().await?;
         *guard = Some(cached);
@@ -155,36 +155,15 @@ pub fn build_azure_client(
             let base = base_url.clone();
             Box::new(move |token: &str| {
                 // OpenAI's rig client uses Bearer auth, so the AAD token slots straight in.
-                let client = openai::CompletionsClient::builder()
-                    .api_key(token)
-                    .base_url(&base)
-                    .build()
-                    .wrap_err("failed to build Azure OpenAI client")?;
-                Ok(client.into_arc())
+                Ok(RigClient::openai(token, Some(&base)).into_arc())
             })
         }
         ProviderType::Anthropic => {
             let base = base_url.clone();
             Box::new(move |token: &str| {
-                // The Anthropic rig client hardcodes the `x-api-key` header, so inject the AAD
-                // bearer via custom headers; `build()` preserves it alongside `anthropic-version`.
-                // Foundry's Anthropic gateway authenticates on `Authorization: Bearer`, so pass a
-                // placeholder (not the real token) to `.api_key(...)` to avoid leaking the AAD JWT
-                // into the unused `x-api-key` header.
-                let mut headers = reqwest::header::HeaderMap::new();
-                headers.insert(
-                    reqwest::header::AUTHORIZATION,
-                    format!("Bearer {token}")
-                        .parse()
-                        .wrap_err("invalid Azure bearer token header")?,
-                );
-                let client = anthropic::Client::builder()
-                    .api_key("azure-ad")
-                    .base_url(&base)
-                    .http_headers(headers)
-                    .build()
-                    .wrap_err("failed to build Azure Anthropic client")?;
-                Ok(AnthropicPromptCachingClient::new(client).into_arc())
+                let mut config = anthropic::AnthropicConfig::new(token).with_base_url(&base);
+                config.dialect.quirks.auth = anthropic::wire::Auth::OptionalBearer;
+                Ok(RigClient::Anthropic(config, true).into_arc())
             })
         }
         _ => eyre::bail!(
@@ -329,7 +308,7 @@ fn is_unauthorized(err: &eyre::Report) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rig_core::completion::CompletionError;
+    use rig_core::ProviderError as CompletionError;
 
     fn provider_error(status: Option<u16>, body: &str) -> eyre::Report {
         let error = match status {
