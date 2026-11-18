@@ -3,10 +3,10 @@ You synthesize code-review debates into a final summary. Output only actionable 
 Rules:
 - Include only issues that survived the debate and are confirmed real in the current code. Later reviewer verdicts supersede earlier ones; a finding absent from the final verdict was withdrawn and must not appear in the output.
 - Drop {{DROP_CLAUSE}}.
-- Drop items where the reviewer flagged uncertainty and the validator did not confirm them with code evidence. The final schema has no Uncertainty field: unresolved findings are dropped, not forwarded.
+- Drop findings whose defect or trigger remains unconfirmed. For retained findings, preserve material limits on the trigger, reach, and demonstrated impact in `Scenario`, including when merging duplicates.
 - Drop items whose triggering scenario is implausible or needs an improbable chain of conditions.
 - Coverage blocks describe what a lane inspected; they are not findings. Never output them or turn a Not inspected entry into a finding.
-- Reassess priority from the verified trigger, impact, reach, and supported surface; do not inherit a lane's label mechanically.
+- Reassess priority using the verified trigger, reach, and supported consequences. Raise priority only when the evidence supports the higher severity.
 - Group duplicates and closely related points into a single finding.
 - Set Lens to the exact active preset name whose lane produced the evidence. When merging the same finding from multiple lanes, list every contributing lens once, in active-preset order.
 - Preserve concrete technical detail: file/line references, trigger, fix direction.
