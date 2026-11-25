@@ -952,12 +952,33 @@ const RATE_LIMIT_ERROR_CODES: &[&str] = &[
     "overloaded_error",
 ];
 
-/// Exact provider codes for allowance exhaustion which cannot recover during this command.
+/// Exact provider codes/types for allowance or billing exhaustion which cannot recover during
+/// this command. Matched before message heuristics so providers with structured quota types do
+/// not depend on English error wording.
 const PERMANENT_QUOTA_ERROR_CODES: &[&str] = &[
+    // OpenAI / Codex
     "insufficient_quota",
     "usage_limit_reached",
+    "billing_hard_limit_reached",
+    // Grok CLI
     "subscription:free-usage-exhausted",
     "subscription:usage-exhausted",
+    // Kimi / Moonshot
+    "exceeded_current_quota_error",
+    "insufficient_balance_error",
+    // Anthropic / OpenAI-compatible gateways
+    "billing_error",
+    "credit_balance_too_low",
+    "insufficient_balance",
+    "quota_exceeded",
+    // Z.ai / Zhipu (GLM Coding Plan): 1113 = insufficient balance / no package,
+    // 1308 / 1310 = rolling 5h / weekly / monthly usage limit reached
+    "1113",
+    "1308",
+    "1310",
+    // MiniMax (PAYG / M Plan): 1008 = insufficient balance, 2056 = usage/token-plan quota reached
+    "1008",
+    "2056",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1076,6 +1097,16 @@ fn collect_provider_error_fields(value: &Value, facts: &mut ProviderErrorFacts) 
                     ("code" | "type" | "status" | "error_type", Value::String(value)) => {
                         facts.codes.push(value.to_ascii_lowercase());
                     }
+                    // Vendor-specific numeric business error codes (e.g. Z.ai 1113/1308, MiniMax
+                    // 1008/2056) live above the HTTP status range; normalize them into `codes`
+                    // so string and integer encodings match identically.
+                    ("code" | "status_code", Value::Number(num))
+                        if num.as_u64().is_some_and(|n| n >= 1000) =>
+                    {
+                        if let Some(n) = num.as_u64() {
+                            facts.codes.push(n.to_string());
+                        }
+                    }
                     ("message", Value::String(value)) => facts.messages.push(value.clone()),
                     _ => collect_provider_error_fields(value, facts),
                 }
@@ -1149,7 +1180,10 @@ fn classify_provider_failure(err: &eyre::Report) -> ProviderFailureClass {
     if status.is_some_and(|status| (500..600).contains(&status)) {
         return ProviderFailureClass::Server;
     }
-    if facts.has_code(PERMANENT_QUOTA_ERROR_CODES)
+    // Structured quota/billing signals take precedence over message heuristics and generic 4xx/429.
+    // HTTP 402 (Payment Required) always indicates exhausted credits/balance (OpenRouter, etc.).
+    if status == Some(402)
+        || facts.has_code(PERMANENT_QUOTA_ERROR_CODES)
         || facts
             .messages
             .iter()
@@ -1212,11 +1246,19 @@ fn is_long_window_quota_error(err: &eyre::Report) -> bool {
     classify_provider_failure(err) == ProviderFailureClass::PermanentQuota
 }
 
+/// Narrow fallback for providers that report quota/balance exhaustion under a generic error type
+/// (e.g. Anthropic `400 invalid_request_error` with "credit balance is too low", Gemini `429
+/// RESOURCE_EXHAUSTED` with "exceeded your current quota", or older Kimi `access_terminated_error`
+/// 5h-window limits). Prefer adding structured `code`/`type` values to
+/// [`PERMANENT_QUOTA_ERROR_CODES`] whenever a provider exposes one.
 fn is_long_window_quota_message(msg: &str) -> bool {
     let msg = msg.to_ascii_lowercase();
     msg.contains("out of tokens")
         || msg.contains("hit your usage limit")
         || msg.contains("usage limit has been reached")
+        || msg.contains("credit balance is too low")
+        || msg.contains("insufficient balance")
+        || msg.contains("exceeded your current quota")
         || ((msg.contains("usage limit") || msg.contains("token limit"))
             && (msg.contains("window")
                 || msg.contains("reset")
@@ -2863,6 +2905,105 @@ mod tests {
             assert!(!retry_policy(&err).retry, "{code}");
             assert!(is_sticky_fallback_error(&err), "{code}");
         }
+    }
+
+    #[test]
+    fn vendor_billing_and_quota_shapes_classify_as_permanent_quota() {
+        // HTTP 402 (OpenRouter, gateways): no retries and sticky fallback blacklist.
+        let payment_required = provider_error(
+            Some(402),
+            r#"{"error":{"code":402,"message":"Insufficient credits"}}"#,
+        );
+        assert!(is_long_window_quota_error(&payment_required));
+        assert!(!retry_policy(&payment_required).retry);
+        assert!(is_sticky_fallback_error(&payment_required));
+
+        // Kimi weekly quota: classified by exact `error.type` even without English wording.
+        let kimi = provider_error(
+            Some(429),
+            r#"{"type":"error","error":{"type":"exceeded_current_quota_error","message":"limit"}}"#,
+        );
+        assert!(is_long_window_quota_error(&kimi));
+        assert!(!retry_policy(&kimi).retry);
+        assert!(is_sticky_fallback_error(&kimi));
+
+        // Grok CLI subscription exhaustion: top-level `code` string.
+        let grok = provider_error(
+            Some(429),
+            r#"{"code":"subscription:free-usage-exhausted","error":"You've used all the included free usage"}"#,
+        );
+        assert!(is_long_window_quota_error(&grok));
+        assert!(!retry_policy(&grok).retry);
+        assert!(is_sticky_fallback_error(&grok));
+
+        // Anthropic low credit balance arrives as 400 invalid_request_error.
+        let anthropic = provider_error(
+            Some(400),
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}"#,
+        );
+        assert!(is_long_window_quota_error(&anthropic));
+        assert!(!retry_policy(&anthropic).retry);
+        assert!(is_sticky_fallback_error(&anthropic));
+
+        // Gemini permanent quota vs transient RPM throttling on RESOURCE_EXHAUSTED.
+        let gemini_quota = provider_error(
+            Some(429),
+            r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"You exceeded your current quota, please check your plan and billing details."}}"#,
+        );
+        assert!(is_long_window_quota_error(&gemini_quota));
+        assert!(!retry_policy(&gemini_quota).retry);
+
+        let gemini_rpm = provider_error(
+            Some(429),
+            r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"Resource has been exhausted (e.g. check quota)."}}"#,
+        );
+        assert!(is_rate_limit_error(&gemini_rpm));
+        assert!(retry_policy(&gemini_rpm).retry);
+
+        // Z.ai Coding Plan: 1113 (balance) & 1308 (5h/weekly quota) vs 1302 (transient RPM).
+        let zai_balance = provider_error(
+            Some(429),
+            r#"{"type":"error","error":{"type":"rate_limit_error","code":"1113","message":"余额不足或无可用资源包"}}"#,
+        );
+        assert!(is_long_window_quota_error(&zai_balance));
+        assert!(!retry_policy(&zai_balance).retry);
+        assert!(is_sticky_fallback_error(&zai_balance));
+
+        let zai_window = provider_error(
+            Some(429),
+            r#"{"type":"error","error":{"type":"rate_limit_error","code":"1308","message":"limit"}}"#,
+        );
+        assert!(is_long_window_quota_error(&zai_window));
+        assert!(!retry_policy(&zai_window).retry);
+
+        let zai_rpm = provider_error(
+            Some(429),
+            r#"{"type":"error","error":{"type":"rate_limit_error","code":"1302","message":"Rate limit reached"}}"#,
+        );
+        assert!(is_rate_limit_error(&zai_rpm));
+        assert!(retry_policy(&zai_rpm).retry);
+
+        // MiniMax: numeric or string 1008 (balance) & 2056 (usage quota) vs 1002 (transient RPM).
+        let minimax_quota = provider_error(
+            Some(429),
+            r#"{"type":"error","error":{"type":"rate_limit_error","code":2056,"message":"quota"}}"#,
+        );
+        assert!(is_long_window_quota_error(&minimax_quota));
+        assert!(!retry_policy(&minimax_quota).retry);
+
+        let minimax_balance = provider_error(
+            Some(429),
+            r#"{"base_resp":{"status_code":1008,"status_msg":"insufficient balance"}}"#,
+        );
+        assert!(is_long_window_quota_error(&minimax_balance));
+        assert!(!retry_policy(&minimax_balance).retry);
+
+        let minimax_rpm = provider_error(
+            Some(429),
+            r#"{"type":"error","error":{"type":"rate_limit_error","code":1002,"message":"rate limit"}}"#,
+        );
+        assert!(is_rate_limit_error(&minimax_rpm));
+        assert!(retry_policy(&minimax_rpm).retry);
     }
 
     #[test]
