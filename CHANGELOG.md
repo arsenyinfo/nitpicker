@@ -6,6 +6,18 @@ Notable user-visible changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-11-25
+
+`nitpicker-agent` 0.6.1
+
+### Added
+
+- Grok CLI subscription auth (`auth = "grok"` with `provider = "openai"`), reusing
+  `~/.grok/auth.json` (read-only) with automatic OIDC discovery/refresh and `nitpicker init`
+  detection (`grok-4.7`).
+- Immediate fail-fast / `--fallback` rotation on Grok subscription quota exhaustion
+  (`subscription:free-usage-exhausted`, `subscription:usage-exhausted`) without retry backoff.
+
 ## [0.11.0] - 2026-11-18
 
 `nitpicker-agent` 0.6.0

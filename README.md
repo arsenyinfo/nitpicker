@@ -208,6 +208,7 @@ provider = "openrouter"
 | `anthropic` | `ANTHROPIC_API_KEY` | Automatic 5-minute prompt caching enabled by default. |
 | `openai` | `OPENAI_API_KEY` | Compatible with OpenAI models and custom OpenAI gateways. |
 | `codex` *(OpenAI)* | Reuses `~/.codex/auth.json` | Uses your existing ChatGPT Plus/Pro subscription token from OpenAI Codex CLI. No API key needed. [Details below](#chatgpt--codex-subscription). |
+| `grok` *(xAI)* | Reuses `~/.grok/auth.json` | Uses your Grok Build CLI OAuth token (`grok login`). No API key needed. [Details below](#grok-cli-subscription). |
 | `openrouter` | `OPENROUTER_API_KEY` | Access open-weights & Chinese frontier models (Qwen, DeepSeek, Kimi, GLM). |
 | `opencode` | `OPENCODE_API_KEY` | OpenCode Console (formerly Zen), pay-as-you-go. |
 | `opencode-go` | `OPENCODE_API_KEY` | OpenCode Go subscription; preserves a session ID across each agent's turns. |
@@ -230,6 +231,24 @@ name = "codex"
 model = "gpt-6.1-sol"
 provider = "openai"
 auth = "codex"
+```
+
+### Grok CLI Subscription
+If you have logged in with the [Grok Build CLI](https://github.com/xai-org/grok-build) (`grok login`), nitpicker can reuse the OAuth token from `~/.grok/auth.json` (read-only) without a separate `XAI_API_KEY` (research only):
+
+```bash
+# 1. Log in once via the Grok Build CLI
+grok login
+
+# 2. Configure nitpicker to reuse the token (read-only)
+```
+
+```toml
+[[reviewer]]
+name = "grok"
+model = "grok-4.7"
+provider = "openai"
+auth = "grok"
 ```
 
 ### OpenRouter & Model Economics

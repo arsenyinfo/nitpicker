@@ -1,7 +1,8 @@
 #[cfg(feature = "antigravity")]
 use crate::config::Config;
 use crate::config::{
-    AggregatorConfig, ClientSettings, ProviderType, ReviewerConfig, is_azure_ad_auth, is_codex_auth,
+    AggregatorConfig, ClientSettings, ProviderType, ReviewerConfig, is_azure_ad_auth,
+    is_codex_auth, is_grok_auth,
 };
 use crate::llm::{LLMClient, LLMClientDyn, LLMProvider, WithRetryExt};
 use eyre::Result;
@@ -109,6 +110,10 @@ fn build_client_from_settings(
 
     if is_codex_auth(settings.auth) {
         return crate::codex::shared_client();
+    }
+
+    if is_grok_auth(settings.auth) {
+        return crate::grok::shared_client();
     }
 
     Ok(
