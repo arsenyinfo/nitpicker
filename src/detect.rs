@@ -36,9 +36,10 @@ const PROVIDER_ORDER: &[&str] = &[
     "mistral",
     "zai",
     "minimax",
-    // research-only subscription path: ranks above local servers (a real model beats a local one
-    // for the primary slot) but below every paid API key, so it never displaces a paid provider.
+    // research-only subscription paths: rank above local servers (a real model beats a local one
+    // for the primary slot) but below every paid API key, so they never displace a paid provider.
     "codex",
+    "grok",
     "ollama",
     "lmstudio",
 ];
@@ -206,6 +207,11 @@ pub async fn detect_all() -> Vec<Detected> {
         detected.push(d);
     }
 
+    // Grok CLI subscription token — research-only path, see README warning.
+    if let Some(d) = detect_grok() {
+        detected.push(d);
+    }
+
     // local servers
     if let Some(d) = detect_ollama().await
         && !detected.iter().any(|e| e.name == "ollama")
@@ -255,6 +261,19 @@ fn detect_codex() -> Option<Detected> {
         api_key_env: None,
         auth: Some("codex"),
         source: "codex CLI (research only — see README)",
+        local_server: false,
+    })
+}
+
+fn detect_grok() -> Option<Detected> {
+    nitpicker_agent::grok::auth_available().then(|| Detected {
+        name: "grok",
+        provider: "openai",
+        model: "grok-4.7".to_string(),
+        base_url: None,
+        api_key_env: None,
+        auth: Some("grok"),
+        source: "grok CLI (research only — see README)",
         local_server: false,
     })
 }

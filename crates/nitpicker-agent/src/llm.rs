@@ -953,7 +953,12 @@ const RATE_LIMIT_ERROR_CODES: &[&str] = &[
 ];
 
 /// Exact provider codes for allowance exhaustion which cannot recover during this command.
-const PERMANENT_QUOTA_ERROR_CODES: &[&str] = &["insufficient_quota", "usage_limit_reached"];
+const PERMANENT_QUOTA_ERROR_CODES: &[&str] = &[
+    "insufficient_quota",
+    "usage_limit_reached",
+    "subscription:free-usage-exhausted",
+    "subscription:usage-exhausted",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderFailureClass {

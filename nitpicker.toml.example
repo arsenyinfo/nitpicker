@@ -48,6 +48,14 @@ provider = "openrouter"
 # provider = "openai"
 # auth = "codex"
 
+# Grok CLI subscription (research only — reuses the Grok Build CLI token from
+# ~/.grok/auth.json; no API key needed). Run `grok login` first.
+# [[reviewer]]
+# name = "grok"
+# model = "grok-4.7"
+# provider = "openai"
+# auth = "grok"
+
 # OpenCode Console (`opencode`) or Go subscription (`opencode-go`).
 # Both use OPENCODE_API_KEY; supply the model ID without the provider prefix.
 # [[reviewer]]

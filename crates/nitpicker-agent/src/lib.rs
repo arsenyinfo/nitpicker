@@ -23,6 +23,7 @@ pub mod agent;
 pub mod codex;
 pub mod compact;
 pub mod config;
+pub mod grok;
 pub mod llm;
 pub mod openrouter;
 pub mod prompts;

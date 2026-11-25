@@ -419,6 +419,24 @@ fn validate_auth(label: &str, settings: ClientSettings<'_>) -> Result<()> {
         (_, Some("codex")) => {
             eyre::bail!("{label}: auth = \"codex\" is only supported with provider \"openai\"");
         }
+        // Grok CLI subscription auth routes through the Grok CLI proxy's OpenAI Responses
+        // endpoint; tokens come from `~/.grok/auth.json`, not an env var.
+        (ProviderType::OpenAi, Some("grok")) => {
+            if settings.base_url.is_some() {
+                eyre::bail!(
+                    "{label}: auth = \"grok\" ignores `base_url` (requests always go to the Grok proxy endpoint) — remove it"
+                );
+            }
+            if settings.api_key_env.is_some() {
+                eyre::bail!(
+                    "{label}: auth = \"grok\" ignores `api_key_env` (the token comes from ~/.grok/auth.json) — remove it"
+                );
+            }
+            Ok(())
+        }
+        (_, Some("grok")) => {
+            eyre::bail!("{label}: auth = \"grok\" is only supported with provider \"openai\"");
+        }
         // Any other auth value on a non-Gemini provider is a typo or unsupported — reject it at
         // config time rather than failing cryptically at client construction.
         (_, Some(other)) => {
@@ -493,7 +511,7 @@ fn required_env_var<'a>(settings: ClientSettings<'a>) -> Option<&'a str> {
     if is_azure_ad_auth(settings.auth) {
         return None;
     }
-    if is_codex_auth(settings.auth) {
+    if is_codex_auth(settings.auth) || is_grok_auth(settings.auth) {
         return None;
     }
     if is_local_server(settings.base_url) {
@@ -518,6 +536,11 @@ pub fn is_azure_ad_auth(auth: Option<&str>) -> bool {
 /// Codex/ChatGPT subscription auth. Canonical check shared with `provider.rs`.
 pub fn is_codex_auth(auth: Option<&str>) -> bool {
     matches!(auth, Some("codex"))
+}
+
+/// Grok CLI subscription auth. Canonical check shared with `provider.rs`.
+pub fn is_grok_auth(auth: Option<&str>) -> bool {
+    matches!(auth, Some("grok"))
 }
 
 fn default_env_var(provider: &ProviderType) -> Option<&'static str> {
@@ -632,6 +655,35 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn validate_auth_grok_rejects_ignored_fields_and_other_providers() {
+        let auth = Some("grok");
+        assert!(validate_auth("[t]", client_settings(&ProviderType::OpenAi, auth)).is_ok());
+        assert!(
+            validate_auth(
+                "[t]",
+                ClientSettings {
+                    base_url: Some("https://example.com"),
+                    ..client_settings(&ProviderType::OpenAi, auth)
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            validate_auth(
+                "[t]",
+                ClientSettings {
+                    api_key_env: Some("MY_KEY"),
+                    ..client_settings(&ProviderType::OpenAi, auth)
+                },
+            )
+            .is_err()
+        );
+        assert!(validate_auth("[t]", client_settings(&ProviderType::Anthropic, auth)).is_err());
+        assert!(validate_auth("[t]", client_settings(&ProviderType::Gemini, auth)).is_err());
+        assert!(validate_auth("[t]", client_settings(&ProviderType::OpenRouter, auth)).is_err());
     }
 
     #[test]
@@ -785,6 +837,8 @@ mod tests {
             ("openai",     Some("azure-ad"),    Some("https://f.example/v1"),      Some("EXPLICIT"), None),
             ("openai",     Some("codex"),       None,                              None,             None),
             ("openai",     Some("codex"),       None,                              Some("EXPLICIT"), None),
+            ("openai",     Some("grok"),        None,                              None,             None),
+            ("openai",     Some("grok"),        None,                              Some("EXPLICIT"), None),
             ("openai",     None,                Some("http://localhost:1234/v1"),  Some("EXPLICIT"), None),
             ("openai",     None,                Some("http://127.0.0.1:1234/v1"),  None,             None),
             // a non-local base_url does not bypass the key; explicit env beats the default
