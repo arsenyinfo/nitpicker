@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 pub const DEFAULT_MAX_TURNS: usize = 100;
 
 /// The aggregator writes one bounded synthesis and never calls a tool, so a budget fits there.
-/// Reviewer turns get no cap by default, since any fixed one is spent on reasoning first.
+/// Reviewer turns get no cap by default (except on Anthropic-wire providers, which require one),
+/// since any fixed one is spent on reasoning first.
 pub const DEFAULT_AGGREGATOR_MAX_TOKENS: u64 = 16_384;
 
 #[derive(Serialize, Deserialize)]
@@ -84,7 +85,8 @@ pub struct ReviewerConfig {
     pub base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
-    /// Output cap per turn. Unset means no cap: the provider's own per-model limit applies.
+    /// Output cap per turn. Unset sends no cap, so the provider's own per-model limit applies;
+    /// Anthropic-wire providers (`anthropic`, `anthropic_compatible`) require one and use 32768.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]

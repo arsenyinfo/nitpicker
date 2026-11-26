@@ -26,7 +26,7 @@ const BASE_BACKOFF_MS: u64 = 250;
 const MAX_BACKOFF_MS: u64 = 5_000;
 const RATE_LIMIT_BASE_BACKOFF_MS: u64 = 5_000;
 const RATE_LIMIT_MAX_BACKOFF_MS: u64 = 60_000;
-const ANTHROPIC_DEFAULT_MAX_TOKENS: u64 = 8_192;
+const ANTHROPIC_DEFAULT_MAX_TOKENS: u64 = 32_768;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Completion {
@@ -430,8 +430,8 @@ fn empty_response_diagnosis(response: &CompletionResponse) -> String {
     match &response.finish_reason {
         FinishReason::MaxTokens => format!(
             "hit the output limit after {output_tokens} tokens without emitting content — \
-             reasoning consumed the whole budget, so raise max_tokens or leave it unset to use \
-             the provider's own limit"
+             reasoning consumed the whole budget, so raise max_tokens in the reviewer block \
+             (unset means 32768 on Anthropic-wire providers and the provider's own limit elsewhere)"
         ),
         other => format!("finish_reason {other:?}, {output_tokens} output tokens"),
     }
