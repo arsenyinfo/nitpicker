@@ -77,6 +77,7 @@ crates/nitpicker-agent/  — published library crate `nitpicker-agent`
   session.rs      session/trajectory JSONL writers
   telemetry.rs    span contract (`bounded`, attribute vocabulary) + test-only span capture layer
   config.rs       TOML config deserialization (Config, ReviewerConfig, AggregatorConfig)
+  env.rs          zero-dep `.env` parser + in-process fallback map for API keys (`var`, `load_files`)
   provider.rs     build LLM clients from config (build_reviewer_client, provider_from_config)
   codex.rs        ChatGPT/Codex subscription auth — reuses `~/.codex/auth.json`
   azure.rs        Azure AD token auth for Foundry-hosted models (feature `azure`, off by default)

@@ -174,6 +174,7 @@ async fn dispatch(args: Args) -> Result<Exit> {
             if path.exists() {
                 eyre::bail!("{} already exists", path.display());
             }
+            settings::load_env_files((!global).then_some(args.common.repo.as_path()))?;
             init::run_init(path, free).await?;
             return Ok(Exit::Clean);
         }
@@ -186,6 +187,7 @@ async fn dispatch(args: Args) -> Result<Exit> {
             max_turns,
         }) => {
             let repo = resolve_repo_root(&args.common.repo)?;
+            settings::load_env_files(Some(&repo))?;
             let mut config = settings::load_config(args.common.config.as_deref(), &repo)?;
             // CLI-only routing validation must precede free-model smoke completions.
             let (use_alloy, use_fallback) =
@@ -270,6 +272,7 @@ async fn dispatch(args: Args) -> Result<Exit> {
             dump: None,
         }) => {
             let repo = resolve_repo_root(&args.common.repo)?;
+            settings::load_env_files(Some(&repo))?;
             let config =
                 settings::load_resolved_config(args.common.config.as_deref(), &repo).await?;
             reflect::run_reflect(reflect::ReflectArgs {
@@ -285,6 +288,7 @@ async fn dispatch(args: Args) -> Result<Exit> {
     }
 
     let repo = resolve_repo_root(&args.common.repo)?;
+    settings::load_env_files(Some(&repo))?;
 
     let mut config = settings::load_config(args.common.config.as_deref(), &repo)?;
     // Resolve presets and CLI-only routing validation before free-model resolution: pure usage

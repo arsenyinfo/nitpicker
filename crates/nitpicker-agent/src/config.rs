@@ -492,12 +492,14 @@ fn validate_azure_credentials_mode(label: &str, source: &str, mode: &str) -> Res
 fn check_env_var(name: &str) -> Result<(), std::env::VarError> {
     // gemini accepts either GEMINI_API_KEY or GOOGLE_AI_API_KEY
     if name == "GEMINI_API_KEY" {
-        if std::env::var("GEMINI_API_KEY").is_ok() || std::env::var("GOOGLE_AI_API_KEY").is_ok() {
+        if crate::env::var("GEMINI_API_KEY").is_ok()
+            || crate::env::var("GOOGLE_AI_API_KEY").is_ok()
+        {
             return Ok(());
         }
         return Err(std::env::VarError::NotPresent);
     }
-    std::env::var(name).map(|_| ())
+    crate::env::var(name).map(|_| ())
 }
 
 fn is_local_server(base_url: Option<&str>) -> bool {

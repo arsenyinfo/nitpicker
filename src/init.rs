@@ -189,7 +189,7 @@ fn should_prefer_openrouter_free(detected: &[detect::Detected], prefer_free: boo
     }
 
     let has_openrouter = detected.iter().any(|d| d.name == "openrouter");
-    has_openrouter && std::env::var("OPENROUTER_API_KEY").is_ok()
+    has_openrouter && nitpicker_agent::env::var("OPENROUTER_API_KEY").is_ok()
 }
 
 fn prioritize_init_detected(
@@ -226,7 +226,7 @@ fn print_init_hints(detected: &[detect::Detected]) {
         .filter(|d| {
             !d.local_server
                 && d.api_key_env
-                    .map(|env| std::env::var(env).is_err())
+                    .map(|env| nitpicker_agent::env::var(env).is_err())
                     .unwrap_or(false)
         })
         .collect();
@@ -242,8 +242,8 @@ fn print_init_hints(detected: &[detect::Detected]) {
         }
     }
 
-    let has_google_ai_key =
-        std::env::var("GOOGLE_AI_API_KEY").is_ok() && std::env::var("GEMINI_API_KEY").is_err();
+    let has_google_ai_key = nitpicker_agent::env::var("GOOGLE_AI_API_KEY").is_ok()
+        && nitpicker_agent::env::var("GEMINI_API_KEY").is_err();
     if has_google_ai_key {
         println!("\n  Note: found GOOGLE_AI_API_KEY — the gemini client reads GEMINI_API_KEY;");
         println!("  add `export GEMINI_API_KEY=$GOOGLE_AI_API_KEY` to your shell profile.");

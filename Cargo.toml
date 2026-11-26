@@ -1,6 +1,6 @@
 [package]
 name = "nitpicker"
-version = "0.11.1"
+version = "0.11.2"
 edition = "2024"
 rust-version = "1.97.1"
 default-run = "nitpicker"
@@ -23,7 +23,7 @@ path = "src/main.rs"
 members = ["crates/nitpicker-agent"]
 
 [dependencies]
-nitpicker-agent = { path = "crates/nitpicker-agent", version = "0.6.1" }
+nitpicker-agent = { path = "crates/nitpicker-agent", version = "0.6.2" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "time", "sync", "net"] }
 futures = "0.3"
 rig-core = "0.46"

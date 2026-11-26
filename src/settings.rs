@@ -1,6 +1,21 @@
 use eyre::Result;
 use nitpicker_agent::{config, openrouter};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Load fallback API-key env files: `<repo>/.env.nitpicker` (when `repo` is `Some`)
+/// followed by `~/.nitpicker/.env`. Real process environment variables always take
+/// precedence. `pr` mode passes `None` so an untrusted PR working tree is never read.
+pub(crate) fn load_env_files(repo: Option<&Path>) -> Result<()> {
+    let mut paths = Vec::new();
+    if let Some(repo) = repo {
+        paths.push(repo.join(".env.nitpicker"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        paths.push(home.join(".nitpicker").join(".env"));
+    }
+    let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+    nitpicker_agent::env::load_files(&refs)
+}
 
 pub(crate) fn load_config(explicit_path: Option<&Path>, repo: &Path) -> Result<config::Config> {
     if let Some(path) = explicit_path {

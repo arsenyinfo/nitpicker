@@ -6,6 +6,15 @@ Notable user-visible changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-11-26
+
+`nitpicker-agent` 0.6.2
+
+### Added
+
+- Fallback `.env` loading for API keys: reads `<repo>/.env.nitpicker` (skipped in `pr` mode)
+  and `~/.nitpicker/.env`, with real process environment variables always taking precedence.
+
 ## [0.11.1] - 2026-11-25
 
 `nitpicker-agent` 0.6.1

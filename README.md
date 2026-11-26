@@ -40,7 +40,7 @@ Building from source with `cargo install` requires Rust 1.97.1 or newer.
 cargo install nitpicker
 ```
 
-Set an API key for your preferred provider:
+Set an API key for your preferred provider (via your shell environment, `<repo>/.env.nitpicker`, or `~/.nitpicker/.env`):
 
 ```bash
 export ANTHROPIC_API_KEY="your-api-key"
@@ -214,6 +214,8 @@ provider = "openrouter"
 | `opencode-go` | `OPENCODE_API_KEY` | OpenCode Go subscription; preserves a session ID across each agent's turns. |
 | `gemini` | `GEMINI_API_KEY` | Google Gemini models via official API. |
 | `azure` *(Entra ID)* | `auth = "azure-ad"` | Azure AI Foundry models with auto-refreshing tokens (requires `--features azure`). |
+
+> **API key files:** In addition to shell environment variables, nitpicker reads `<repo>/.env.nitpicker` (skipped in `pr` mode) and `~/.nitpicker/.env`. Precedence is: process env > `<repo>/.env.nitpicker` > `~/.nitpicker/.env`. Standard `.gitignore` rules for `.env.*` ignore `.env.nitpicker` automatically.
 
 ### ChatGPT / Codex Subscription
 If you have a ChatGPT Plus or Pro subscription and the [OpenAI Codex CLI](https://developers.openai.com/codex) installed, nitpicker can authenticate through your subscription without a separate paid API key:
