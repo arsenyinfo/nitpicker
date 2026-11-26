@@ -659,7 +659,7 @@ pub async fn resolve_free_models_with_fallback(config: &mut Config, fallback: bo
                 .api_key_env
                 .as_deref()
                 .unwrap_or(DEFAULT_API_KEY_ENV);
-            match std::env::var(key_env) {
+            match crate::env::var(key_env) {
                 Ok(key) => Some(Ok((idx, key))),
                 Err(_) if fallback => {
                     tracing::warn!(
@@ -680,7 +680,7 @@ pub async fn resolve_free_models_with_fallback(config: &mut Config, fallback: bo
             .api_key_env
             .as_deref()
             .unwrap_or(DEFAULT_API_KEY_ENV);
-        match std::env::var(key_env) {
+        match crate::env::var(key_env) {
             Ok(key) => Some(key),
             Err(_) if fallback => {
                 tracing::warn!(

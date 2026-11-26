@@ -158,13 +158,17 @@ pub async fn detect_all() -> Vec<Detected> {
 
     // env vars for known providers (dedup by provider name)
     for &def in ENV_PROVIDERS {
-        if std::env::var(def.api_key_env).is_ok() && !detected.iter().any(|d| d.name == def.name) {
+        if nitpicker_agent::env::var(def.api_key_env).is_ok()
+            && !detected.iter().any(|d| d.name == def.name)
+        {
             detected.push(from_def(def, "env var"));
         }
     }
 
     // GOOGLE_AI_API_KEY as alias for GEMINI_API_KEY
-    if std::env::var("GOOGLE_AI_API_KEY").is_ok() && !detected.iter().any(|d| d.name == "gemini") {
+    if nitpicker_agent::env::var("GOOGLE_AI_API_KEY").is_ok()
+        && !detected.iter().any(|d| d.name == "gemini")
+    {
         detected.push(Detected {
             name: "gemini",
             provider: "gemini",
@@ -419,7 +423,7 @@ fn lmstudio_app_exists() -> bool {
 }
 
 fn detect_databricks() -> Option<Detected> {
-    let has_token = std::env::var("DATABRICKS_TOKEN").is_ok();
+    let has_token = nitpicker_agent::env::var("DATABRICKS_TOKEN").is_ok();
     let has_cli = std::process::Command::new("which")
         .arg("databricks")
         .output()
@@ -430,7 +434,7 @@ fn detect_databricks() -> Option<Detected> {
         return None;
     }
 
-    let host = std::env::var("DATABRICKS_HOST")
+    let host = nitpicker_agent::env::var("DATABRICKS_HOST")
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(read_databricks_host_from_cfg)?;

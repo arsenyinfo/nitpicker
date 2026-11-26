@@ -1,6 +1,6 @@
 [package]
 name = "nitpicker-agent"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 rust-version = "1.97.1"
 description = "Reusable agentic loop (file/git tools + parallel subagents) extracted from nitpicker"

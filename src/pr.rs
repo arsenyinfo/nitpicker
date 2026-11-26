@@ -622,6 +622,9 @@ async fn run_pr_inner(
         tracing::Span::current().record("nitpicker.pr.number", u64::from(number));
     }
 
+    // Only load ~/.nitpicker/.env in pr mode — never read <repo>/.env.nitpicker from a PR checkout.
+    crate::settings::load_env_files(None)?;
+
     // Config loads AFTER prep because its repo-level source is the PR base branch blob —
     // the base ref comes from the PR metadata, and the checkout must already have happened
     // for the working tree to even be the head. Guards restore state if this errors.

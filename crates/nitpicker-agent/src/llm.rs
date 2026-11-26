@@ -1420,7 +1420,7 @@ impl LLMProvider {
                 // they are constructed explicitly as an AnthropicPromptCachingClient.
                 let enable_prompt_caching = base_url.is_none();
                 let key_env = api_key_env.as_deref().unwrap_or("ANTHROPIC_API_KEY");
-                let api_key = std::env::var(key_env)
+                let api_key = crate::env::var(key_env)
                     .or_else(|_| missing_or_local(key_env, base_url.as_deref()))?;
                 let config = anthropic::AnthropicConfig::new(api_key);
                 let config = match base_url {
@@ -1439,10 +1439,10 @@ impl LLMProvider {
                 // An explicit api_key_env overrides the GEMINI_API_KEY → GOOGLE_AI_API_KEY default
                 // chain; a local base_url needs no key (mirrors the Anthropic/OpenAi arms).
                 let api_key = match api_key_env {
-                    Some(key_env) => std::env::var(key_env)
+                    Some(key_env) => crate::env::var(key_env)
                         .or_else(|_| missing_or_local(key_env, base_url.as_deref()))?,
-                    None => std::env::var("GEMINI_API_KEY")
-                        .or_else(|_| std::env::var("GOOGLE_AI_API_KEY"))
+                    None => crate::env::var("GEMINI_API_KEY")
+                        .or_else(|_| crate::env::var("GOOGLE_AI_API_KEY"))
                         .or_else(|_| {
                             missing_or_local(
                                 "GEMINI_API_KEY (or GOOGLE_AI_API_KEY)",
@@ -1464,12 +1464,12 @@ impl LLMProvider {
                 api_key_env,
             } => {
                 let key_env = api_key_env.as_deref().unwrap_or("OPENAI_API_KEY");
-                let api_key = std::env::var(key_env)
+                let api_key = crate::env::var(key_env)
                     .or_else(|_| missing_or_local(key_env, base_url.as_deref()))?;
                 Ok(Box::new(RigClient::openai(api_key, base_url.as_deref())))
             }
             LLMProvider::OpenRouter { api_key_env } => {
-                let api_key = std::env::var(api_key_env)
+                let api_key = crate::env::var(api_key_env)
                     .map_err(|_| eyre::eyre!("missing env var {api_key_env}"))?;
                 Ok(Box::new(RigClient::openrouter(&api_key)?))
             }
@@ -1479,7 +1479,7 @@ impl LLMProvider {
                 api_key_env,
             } => {
                 let key_env = api_key_env.as_deref().unwrap_or("OPENCODE_API_KEY");
-                let key = std::env::var(key_env)
+                let key = crate::env::var(key_env)
                     .or_else(|_| missing_or_local(key_env, base_url.as_deref()))?;
                 let http = reqwest::Client::builder()
                     .user_agent(concat!("nitpicker-agent/", env!("CARGO_PKG_VERSION")))
